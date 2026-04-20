@@ -1,0 +1,28 @@
+# macOS-specific files
+.DS_Store
+
+# VSCode settings
+.vscode/
+
+# Rust build artifacts
+target/
+*.lock
+
+# Generated WGSL files
+data/**
+/*.wgsl
+
+# Extra files from testing
+/*.txt
+/*.log
+/*.py
+
+# Trace dumps
+trace/
+trace-*/
+
+# Web build artifacts
+pkg/
+web/node_modules/
+web/dist/
+web/public/wasm/

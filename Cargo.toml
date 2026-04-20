@@ -1,0 +1,47 @@
+[package]
+name = "nagami"
+version = "2026.4.57"
+edition = "2021"
+license = "MIT"
+description = "Shrinks WGSL shaders via Naga IR optimization passes"
+repository = "https://github.com/ekarad1um/Nagami.git"
+keywords = ["wgsl", "shader", "minifier", "webgpu", "naga"]
+categories = ["development-tools", "compilers", "wasm"]
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE"
+]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap"]
+wasm = ["dep:wasm-bindgen", "dep:js-sys"]
+
+[dependencies]
+naga = { version = "29.0.1", default-features = false, features = ["wgsl-in", "wgsl-out"] }
+clap = { version = "4.6", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"], optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+
+[dev-dependencies]
+half = "2.7"
+
+[[bin]]
+name = "nagami"
+path = "src/bin/nagami.rs"
+required-features = ["cli"]
+
+[profile.release]
+lto = "fat"
+opt-level = 3
+strip = true
+panic = "abort"
+codegen-units = 1

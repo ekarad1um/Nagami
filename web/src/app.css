@@ -1,0 +1,110 @@
+@import "tailwindcss";
+
+@theme {
+  --font-mono: ui-monospace, "Fira Code", "Cascadia Code", Consolas, monospace;
+}
+
+html {
+  color-scheme: dark;
+}
+
+textarea {
+  field-sizing: content;
+}
+
+/* Scrollbar styling for code panels - rely on native overlay, style subtly */
+.code-panel {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+}
+
+/* Editor typography - single source of truth for code font metrics */
+.code-text {
+  font-size: 13px;
+  line-height: 20px;
+  /* matches leading-5 */
+  font-family: var(--font-mono);
+}
+
+/* Line number gutter */
+.line-gutter {
+  background: #0c0c0c;
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* Loading shimmer bar */
+@keyframes shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.loading-bar {
+  height: 2px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.loading-bar::after {
+  content: "";
+  display: block;
+  height: 100%;
+  width: 50%;
+  background: linear-gradient(90deg, transparent, var(--color-emerald-400), transparent);
+  animation: shimmer 1.2s ease-in-out infinite;
+}
+
+/* Editor input stack: grid overlay for code highlighting */
+.editor-stack {
+  display: grid;
+}
+
+.editor-stack>* {
+  grid-area: 1 / 1;
+}
+
+/* Shiki highlight overrides (output panel + input overlay) */
+.highlight-panel .shiki,
+.highlight-input .shiki {
+  background: transparent !important;
+  margin: 0;
+  padding: 0;
+  overflow: visible;
+}
+
+.highlight-panel .shiki code,
+.highlight-input .shiki code {
+  counter-reset: none;
+  font-size: inherit;
+  font-family: inherit;
+  line-height: inherit;
+}
+
+.highlight-panel.wrap-on .shiki {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Options panel collapse animation (grid-template-rows 0fr -> 1fr) */
+.options-tray {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 150ms ease-out;
+}
+
+.options-tray.options-open {
+  grid-template-rows: 1fr;
+}
+
+.options-tray>.options-inner {
+  min-height: 0;
+  overflow: clip;
+}
+
+.options-tray.options-open>.options-inner {
+  overflow: clip;
+}
