@@ -123,20 +123,18 @@ fn fold_global_expressions(module: &mut naga::Module) -> usize {
             size,
             scalar,
         }) = value
-        {
-            if let Some(new_expr) = materialize_vector(
+            && let Some(new_expr) = materialize_vector(
                 handle,
                 components,
                 size,
                 scalar,
                 &literal_cache,
                 &vector_type_cache,
-            ) {
-                if module.global_expressions[handle] != new_expr {
-                    module.global_expressions[handle] = new_expr;
-                    changed += 1;
-                }
-            }
+            )
+            && module.global_expressions[handle] != new_expr
+        {
+            module.global_expressions[handle] = new_expr;
+            changed += 1;
         }
     }
 
@@ -224,20 +222,19 @@ fn fold_local_expressions(
                 // already emittable.  Replacing a non-emittable expression
                 // (ZeroValue, Constant, etc.) with an emittable Compose would
                 // produce invalid IR because the handle isn't in any Emit range.
-                if needs_emit(&arena[handle]) {
-                    if let Some(new_expr) = materialize_vector(
+                if needs_emit(&arena[handle])
+                    && let Some(new_expr) = materialize_vector(
                         handle,
                         components,
                         size,
                         scalar,
                         &literal_cache,
                         &vector_type_cache,
-                    ) {
-                        if arena[handle] != new_expr {
-                            arena[handle] = new_expr;
-                            // Compose is emittable - do NOT add to folded set.
-                        }
-                    }
+                    )
+                    && arena[handle] != new_expr
+                {
+                    arena[handle] = new_expr;
+                    // Compose is emittable - do NOT add to folded set.
                 }
             }
             None => {}
@@ -283,14 +280,14 @@ fn fold_local_expressions(
                     op,
                     naga::BinaryOperator::LogicalAnd | naga::BinaryOperator::LogicalOr
                 );
-                if is_logical_op || both_literal {
-                    if let Some(absorb) = check_absorbing_operand(op, left, right, arena) {
-                        arena[handle] = arena[absorb].clone();
-                        simplify_count += 1;
-                        // Absorbing result is always a Literal -> must leave Emit ranges.
-                        folded.insert(handle);
-                        continue;
-                    }
+                if (is_logical_op || both_literal)
+                    && let Some(absorb) = check_absorbing_operand(op, left, right, arena)
+                {
+                    arena[handle] = arena[absorb].clone();
+                    simplify_count += 1;
+                    // Absorbing result is always a Literal -> must leave Emit ranges.
+                    folded.insert(handle);
+                    continue;
                 }
                 // Then try identity (result is the other operand).
                 //
@@ -314,15 +311,14 @@ fn fold_local_expressions(
                     op: inner_op,
                     expr: inner,
                 } = arena[expr]
+                    && op == inner_op
                 {
-                    if op == inner_op {
-                        arena[handle] = arena[inner].clone();
-                        simplify_count += 1;
-                        if !needs_emit(&arena[handle]) {
-                            folded.insert(handle);
-                        }
-                        continue;
+                    arena[handle] = arena[inner].clone();
+                    simplify_count += 1;
+                    if !needs_emit(&arena[handle]) {
+                        folded.insert(handle);
                     }
+                    continue;
                 }
             }
             naga::Expression::Select { accept, reject, .. } => {

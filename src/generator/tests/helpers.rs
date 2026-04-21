@@ -7,7 +7,7 @@
 //! to confirm it round-trips cleanly, and [`compact_with_passes`]
 //! layers the full IR-pass pipeline on top for end-to-end assertions.
 
-use super::super::{generate_wgsl, GenerateOptions};
+use super::super::{GenerateOptions, generate_wgsl};
 pub use crate::config::{Config, Profile};
 
 /// Parse, validate, and emit `src` with the baseline

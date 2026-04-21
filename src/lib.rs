@@ -25,7 +25,7 @@ mod wasm;
 
 use config::Config;
 use error::Error;
-use generator::{generate, GenerateOptions};
+use generator::{GenerateOptions, generate};
 use pipeline::{PassReport, Report};
 use std::collections::HashSet;
 
@@ -656,7 +656,7 @@ mod tests {
         // Verify the generator_emit pass report fields are internally consistent.
         let config = Config::default();
         let output = run(TRIVIAL_SHADER, &config).unwrap();
-        let gen = output
+        let gen_report = output
             .report
             .pass_reports
             .iter()
@@ -664,21 +664,21 @@ mod tests {
             .expect("generator_emit pass must exist");
 
         // If not rolled back, final source should equal output
-        if !gen.rolled_back {
+        if !gen_report.rolled_back {
             assert_eq!(
-                gen.after_bytes,
+                gen_report.after_bytes,
                 Some(output.source.len()),
                 "after_bytes must match output source length"
             );
-            assert!(gen.validation_ok);
-            assert_eq!(gen.text_validation_ok, Some(true));
+            assert!(gen_report.validation_ok);
+            assert_eq!(gen_report.text_validation_ok, Some(true));
         }
         // Whether rolled back or not, before_bytes must be present
-        assert!(gen.before_bytes.is_some());
-        assert!(gen.after_bytes.is_some());
+        assert!(gen_report.before_bytes.is_some());
+        assert!(gen_report.after_bytes.is_some());
         // changed must be false when rolled_back
-        if gen.rolled_back {
-            assert!(!gen.changed);
+        if gen_report.rolled_back {
+            assert!(!gen_report.changed);
         }
     }
 
@@ -863,14 +863,14 @@ mod tests {
         };
         let output = run(src, &config).unwrap();
         // The generator must not roll back.
-        let gen = output
+        let gen_report = output
             .report
             .pass_reports
             .iter()
             .find(|p| p.pass_name == "generator_emit")
             .expect("generator_emit pass must exist");
         assert!(
-            !gen.rolled_back,
+            !gen_report.rolled_back,
             "generator should not roll back; struct names must not collide \
              with function parameter names: {}",
             output.source
@@ -905,14 +905,14 @@ mod tests {
             ..Default::default()
         };
         let output = run(src, &config).unwrap();
-        let gen = output
+        let gen_report = output
             .report
             .pass_reports
             .iter()
             .find(|p| p.pass_name == "generator_emit")
             .expect("generator_emit pass must exist");
         assert!(
-            !gen.rolled_back,
+            !gen_report.rolled_back,
             "generator should not roll back; struct names must not collide \
              with local variable names: {}",
             output.source
@@ -1097,14 +1097,14 @@ mod tests {
         };
         let output = run(src, &config).expect("run should succeed");
 
-        let gen = output
+        let gen_report = output
             .report
             .pass_reports
             .iter()
             .find(|p| p.pass_name == "generator_emit")
             .expect("generator_emit pass must exist");
         assert!(
-            !gen.rolled_back,
+            !gen_report.rolled_back,
             "generator should not roll back for atomic compare-exchange member access: {}",
             output.source
         );

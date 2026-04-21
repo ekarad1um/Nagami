@@ -6,7 +6,7 @@
 //! the `max_precision` round-trip, beautify combined with mangling,
 //! and a handful of parenthesisation edge cases.
 
-use super::super::{generate_wgsl, GenerateOptions};
+use super::super::{GenerateOptions, generate_wgsl};
 use super::helpers::*;
 
 // MARK: Short expression names
@@ -382,9 +382,9 @@ fn extracts_repeated_long_literal_into_const() {
     let out = compact(src);
     let fn_body_count = out.matches("3.333333").count();
     assert_eq!(
-            fn_body_count, 1,
-            "expected literal extracted to shared const (1 declaration), got {fn_body_count} occurrences: {out}"
-        );
+        fn_body_count, 1,
+        "expected literal extracted to shared const (1 declaration), got {fn_body_count} occurrences: {out}"
+    );
     assert_valid_wgsl(&out);
 }
 

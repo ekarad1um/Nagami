@@ -123,69 +123,64 @@ fn desugar_short_circuit(
                 // Pattern 1 (&&): if (cond) { d = val; } else { d = false; }
                 if let (Some((ptr_a, val_a)), Some((ptr_r, val_r))) =
                     (single_store_info(&accept), single_store_info(&reject))
+                    && same_local_pointer(ptr_a, ptr_r, expressions)
+                    && is_bool_false(expressions, val_r)
                 {
-                    if same_local_pointer(ptr_a, ptr_r, expressions)
-                        && is_bool_false(expressions, val_r)
-                    {
-                        let binary = expressions.append(
-                            naga::Expression::Binary {
-                                op: naga::BinaryOperator::LogicalAnd,
-                                left: condition,
-                                right: val_a,
-                            },
-                            naga::Span::default(),
-                        );
-                        hoist_emits(accept, &mut rebuilt);
-                        hoist_emits(reject, &mut rebuilt);
-                        rebuilt.push(
-                            naga::Statement::Emit(naga::Range::new_from_bounds(binary, binary)),
-                            span,
-                        );
-                        rebuilt.push(
-                            naga::Statement::Store {
-                                pointer: ptr_a,
-                                value: binary,
-                            },
-                            span,
-                        );
-                        changed += 1;
-                        continue;
-                    }
+                    let binary = expressions.append(
+                        naga::Expression::Binary {
+                            op: naga::BinaryOperator::LogicalAnd,
+                            left: condition,
+                            right: val_a,
+                        },
+                        naga::Span::default(),
+                    );
+                    hoist_emits(accept, &mut rebuilt);
+                    hoist_emits(reject, &mut rebuilt);
+                    rebuilt.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(binary, binary)),
+                        span,
+                    );
+                    rebuilt.push(
+                        naga::Statement::Store {
+                            pointer: ptr_a,
+                            value: binary,
+                        },
+                        span,
+                    );
+                    changed += 1;
+                    continue;
                 }
 
                 // Pattern 2 (||): if (!cond) { d = val; } else { d = true; }
-                if let Some(inner_cond) = unwrap_logical_not(condition, expressions) {
-                    if let (Some((ptr_a, val_a)), Some((ptr_r, val_r))) =
+                if let Some(inner_cond) = unwrap_logical_not(condition, expressions)
+                    && let (Some((ptr_a, val_a)), Some((ptr_r, val_r))) =
                         (single_store_info(&accept), single_store_info(&reject))
-                    {
-                        if same_local_pointer(ptr_a, ptr_r, expressions)
-                            && is_bool_true(expressions, val_r)
-                        {
-                            let binary = expressions.append(
-                                naga::Expression::Binary {
-                                    op: naga::BinaryOperator::LogicalOr,
-                                    left: inner_cond,
-                                    right: val_a,
-                                },
-                                naga::Span::default(),
-                            );
-                            hoist_emits(accept, &mut rebuilt);
-                            hoist_emits(reject, &mut rebuilt);
-                            rebuilt.push(
-                                naga::Statement::Emit(naga::Range::new_from_bounds(binary, binary)),
-                                span,
-                            );
-                            rebuilt.push(
-                                naga::Statement::Store {
-                                    pointer: ptr_a,
-                                    value: binary,
-                                },
-                                span,
-                            );
-                            changed += 1;
-                            continue;
-                        }
-                    }
+                    && same_local_pointer(ptr_a, ptr_r, expressions)
+                    && is_bool_true(expressions, val_r)
+                {
+                    let binary = expressions.append(
+                        naga::Expression::Binary {
+                            op: naga::BinaryOperator::LogicalOr,
+                            left: inner_cond,
+                            right: val_a,
+                        },
+                        naga::Span::default(),
+                    );
+                    hoist_emits(accept, &mut rebuilt);
+                    hoist_emits(reject, &mut rebuilt);
+                    rebuilt.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(binary, binary)),
+                        span,
+                    );
+                    rebuilt.push(
+                        naga::Statement::Store {
+                            pointer: ptr_a,
+                            value: binary,
+                        },
+                        span,
+                    );
+                    changed += 1;
+                    continue;
                 }
 
                 // No pattern matched - keep the If.
@@ -1063,21 +1058,19 @@ fn narrow_for_accept(
     expressions: &naga::Arena<naga::Expression>,
     known_values: &mut ScopedMap<naga::Handle<naga::LocalVariable>, KnownValue>,
 ) {
-    if let naga::Expression::Load { pointer } = &expressions[*condition] {
-        if let naga::Expression::LocalVariable(cond_local) = expressions[*pointer] {
-            known_values.insert(cond_local, KnownValue::Literal(naga::Literal::Bool(true)));
-        }
+    if let naga::Expression::Load { pointer } = &expressions[*condition]
+        && let naga::Expression::LocalVariable(cond_local) = expressions[*pointer]
+    {
+        known_values.insert(cond_local, KnownValue::Literal(naga::Literal::Bool(true)));
     }
     if let naga::Expression::Unary {
         op: naga::UnaryOperator::LogicalNot,
         expr: inner,
     } = &expressions[*condition]
+        && let naga::Expression::Load { pointer } = &expressions[*inner]
+        && let naga::Expression::LocalVariable(cond_local) = expressions[*pointer]
     {
-        if let naga::Expression::Load { pointer } = &expressions[*inner] {
-            if let naga::Expression::LocalVariable(cond_local) = expressions[*pointer] {
-                known_values.insert(cond_local, KnownValue::Zero);
-            }
-        }
+        known_values.insert(cond_local, KnownValue::Zero);
     }
 }
 
@@ -1088,21 +1081,19 @@ fn narrow_for_reject(
     expressions: &naga::Arena<naga::Expression>,
     known_values: &mut ScopedMap<naga::Handle<naga::LocalVariable>, KnownValue>,
 ) {
-    if let naga::Expression::Load { pointer } = &expressions[*condition] {
-        if let naga::Expression::LocalVariable(cond_local) = expressions[*pointer] {
-            known_values.insert(cond_local, KnownValue::Zero);
-        }
+    if let naga::Expression::Load { pointer } = &expressions[*condition]
+        && let naga::Expression::LocalVariable(cond_local) = expressions[*pointer]
+    {
+        known_values.insert(cond_local, KnownValue::Zero);
     }
     if let naga::Expression::Unary {
         op: naga::UnaryOperator::LogicalNot,
         expr: inner,
     } = &expressions[*condition]
+        && let naga::Expression::Load { pointer } = &expressions[*inner]
+        && let naga::Expression::LocalVariable(cond_local) = expressions[*pointer]
     {
-        if let naga::Expression::Load { pointer } = &expressions[*inner] {
-            if let naga::Expression::LocalVariable(cond_local) = expressions[*pointer] {
-                known_values.insert(cond_local, KnownValue::Literal(naga::Literal::Bool(true)));
-            }
-        }
+        known_values.insert(cond_local, KnownValue::Literal(naga::Literal::Bool(true)));
     }
 }
 
@@ -1120,13 +1111,12 @@ fn block_only_has_redundant_known_stores(
         match stmt {
             naga::Statement::Emit(_) => continue,
             naga::Statement::Store { pointer, value } => {
-                if let naga::Expression::LocalVariable(lh) = expressions[*pointer] {
-                    if let Some(known) = known_values.get(&lh) {
-                        if expr_matches_known(expressions, *value, known, const_lits) {
-                            has_store = true;
-                            continue;
-                        }
-                    }
+                if let naga::Expression::LocalVariable(lh) = expressions[*pointer]
+                    && let Some(known) = known_values.get(&lh)
+                    && expr_matches_known(expressions, *value, known, const_lits)
+                {
+                    has_store = true;
+                    continue;
                 }
                 return false;
             }

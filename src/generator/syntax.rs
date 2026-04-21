@@ -131,11 +131,7 @@ fn fmt_f64_debug(v: f64, max_precision: Option<u8>) -> String {
 fn shortest_uint_repr(v: u64, suffix: &str) -> String {
     let dec = format!("{v}{suffix}");
     let hex = format!("0x{v:x}{suffix}");
-    if hex.len() < dec.len() {
-        hex
-    } else {
-        dec
-    }
+    if hex.len() < dec.len() { hex } else { dec }
 }
 
 /// Signed-integer sibling of [`shortest_uint_repr`].  Non-negative
@@ -148,11 +144,7 @@ fn shortest_int_repr(v: i64, suffix: &str) -> String {
         let abs = v.unsigned_abs();
         let dec = format!("-{abs}{suffix}");
         let hex = format!("-0x{abs:x}{suffix}");
-        if hex.len() < dec.len() {
-            hex
-        } else {
-            dec
-        }
+        if hex.len() < dec.len() { hex } else { dec }
     }
 }
 
@@ -209,10 +201,10 @@ fn hex_float_f64(v: f64, suffix: &str) -> Option<String> {
 /// [`hex_float_f32`] or [`hex_float_f64`] and is only adopted when
 /// strictly shorter than `decimal`.
 fn pick_shorter(decimal: String, hex: Option<String>) -> String {
-    if let Some(h) = hex {
-        if h.len() < decimal.len() {
-            return h;
-        }
+    if let Some(h) = hex
+        && h.len() < decimal.len()
+    {
+        return h;
     }
     decimal
 }

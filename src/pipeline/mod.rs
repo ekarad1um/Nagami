@@ -532,7 +532,7 @@ mod hard_fail_tests {
     //! first function or entry point it sees.  The validator rejects
     //! such a store because the pointer operand matches neither the
     //! value-pointer nor module-pointer shape.
-    use super::{run_ir_passes_with, Pass, PassContext};
+    use super::{Pass, PassContext, run_ir_passes_with};
     use crate::config::Config;
     use crate::error::Error;
     use crate::io;

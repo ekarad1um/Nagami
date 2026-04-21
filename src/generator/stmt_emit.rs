@@ -108,10 +108,10 @@ impl<'a> Generator<'a> {
     ) -> Result<(), Error> {
         let mut stmts: Vec<_> = block.iter().collect();
         // Optionally drop trailing `return;` (void return) that WGSL does not require.
-        if elide_trailing_void_return {
-            if let Some(naga::Statement::Return { value: None }) = stmts.last() {
-                stmts.pop();
-            }
+        if elide_trailing_void_return
+            && let Some(naga::Statement::Return { value: None }) = stmts.last()
+        {
+            stmts.pop();
         }
         self.emit_stmts(&stmts, ctx)
     }
@@ -138,51 +138,46 @@ impl<'a> Generator<'a> {
                 continuing,
                 break_if,
             } = stmt
+                && self.try_emit_for_loop(body, continuing, break_if, None, ctx)?
             {
-                if self.try_emit_for_loop(body, continuing, break_if, None, ctx)? {
-                    i += 1;
-                    continue;
-                }
+                i += 1;
+                continue;
             }
             // Look ahead: if stmt[i] is a deferred-var Store and stmt[i+1]
             // is a for-loop-shaped Loop, absorb the Store as the for-init.
-            if i + 1 < len {
-                if let naga::Statement::Store { pointer, value } = stmt {
-                    if let naga::Expression::LocalVariable(lh) = ctx.func.expressions[*pointer] {
-                        if ctx.deferred_vars[lh.index()] {
-                            // Safety check: the for-init scopes `lh` inside the
-                            // loop body.  If `lh` is referenced after the Loop
-                            // (stmts[i+2..]), absorbing it would leave those
-                            // later uses out of scope -> skip the absorption.
-                            let safe = i + 2 >= len
-                                || !super::module_emit::local_var_in_stmts(
-                                    &stmts[i + 2..],
-                                    lh,
-                                    &ctx.func.expressions,
-                                );
-                            if safe {
-                                if let naga::Statement::Loop {
-                                    body,
-                                    continuing,
-                                    break_if,
-                                } = stmts[i + 1]
-                                {
-                                    if self.try_emit_for_loop(
-                                        body,
-                                        continuing,
-                                        break_if,
-                                        Some((*pointer, *value)),
-                                        ctx,
-                                    )? {
-                                        // Mark deferred var as emitted.
-                                        ctx.deferred_vars[lh.index()] = false;
-                                        i += 2; // skip both Store and Loop
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    }
+            if i + 1 < len
+                && let naga::Statement::Store { pointer, value } = stmt
+                && let naga::Expression::LocalVariable(lh) = ctx.func.expressions[*pointer]
+                && ctx.deferred_vars[lh.index()]
+            {
+                // Safety check: the for-init scopes `lh` inside the
+                // loop body.  If `lh` is referenced after the Loop
+                // (stmts[i+2..]), absorbing it would leave those
+                // later uses out of scope -> skip the absorption.
+                let safe = i + 2 >= len
+                    || !super::module_emit::local_var_in_stmts(
+                        &stmts[i + 2..],
+                        lh,
+                        &ctx.func.expressions,
+                    );
+                if safe
+                    && let naga::Statement::Loop {
+                        body,
+                        continuing,
+                        break_if,
+                    } = stmts[i + 1]
+                    && self.try_emit_for_loop(
+                        body,
+                        continuing,
+                        break_if,
+                        Some((*pointer, *value)),
+                        ctx,
+                    )?
+                {
+                    // Mark deferred var as emitted.
+                    ctx.deferred_vars[lh.index()] = false;
+                    i += 2; // skip both Store and Loop
+                    continue;
                 }
             }
 
@@ -926,15 +921,15 @@ impl<'a> Generator<'a> {
         // Pre-validate: Store / Call / ImageStore are supported in the for-loop
         // update slot.  Bail out *before* writing any output so the caller
         // can fall back to normal `loop` emission cleanly.
-        if let Some(stmt) = update_stmt {
-            if !matches!(
+        if let Some(stmt) = update_stmt
+            && !matches!(
                 stmt,
                 naga::Statement::Store { .. }
                     | naga::Statement::Call { .. }
                     | naga::Statement::ImageStore { .. }
-            ) {
-                return Ok(false);
-            }
+            )
+        {
+            return Ok(false);
         }
 
         // If no init was provided (from deferred-var absorption), try to
@@ -950,12 +945,11 @@ impl<'a> Generator<'a> {
             // (its `var` was suppressed).  Bail out so the Store is emitted
             // as a normal statement and the Loop falls through to path 1,
             // which can absorb the for_loop_var.
-            if let Some(naga::Statement::Store { pointer, .. }) = update_stmt {
-                if let naga::Expression::LocalVariable(lh) = ctx.func.expressions[*pointer] {
-                    if ctx.for_loop_vars[lh.index()] {
-                        return Ok(false);
-                    }
-                }
+            if let Some(naga::Statement::Store { pointer, .. }) = update_stmt
+                && let naga::Expression::LocalVariable(lh) = ctx.func.expressions[*pointer]
+                && ctx.for_loop_vars[lh.index()]
+            {
+                return Ok(false);
             }
             init
         } else if let Some(naga::Statement::Store { pointer, .. }) = update_stmt {
@@ -1130,28 +1124,28 @@ impl<'a> Generator<'a> {
                 non_emit.push(k);
             }
         }
-        if non_emit.len() == 1 {
-            if let naga::Statement::Block(inner) = remaining[non_emit[0]] {
-                // Emit leading Emits, then the inner block contents directly.
-                for (k, s) in remaining.iter().enumerate() {
-                    if k == non_emit[0] {
-                        continue;
-                    }
-                    let before = self.out.len();
-                    self.push_indent();
-                    let after_indent = self.out.len();
-                    self.generate_statement(s, ctx)?;
-                    if self.out.len() > after_indent {
-                        self.push_newline();
-                    } else {
-                        self.out.truncate(before);
-                    }
+        if non_emit.len() == 1
+            && let naga::Statement::Block(inner) = remaining[non_emit[0]]
+        {
+            // Emit leading Emits, then the inner block contents directly.
+            for (k, s) in remaining.iter().enumerate() {
+                if k == non_emit[0] {
+                    continue;
                 }
-                self.generate_block(inner, ctx)?;
-                self.close_brace();
-                self.push_newline();
-                return Ok(true);
+                let before = self.out.len();
+                self.push_indent();
+                let after_indent = self.out.len();
+                self.generate_statement(s, ctx)?;
+                if self.out.len() > after_indent {
+                    self.push_newline();
+                } else {
+                    self.out.truncate(before);
+                }
             }
+            self.generate_block(inner, ctx)?;
+            self.close_brace();
+            self.push_newline();
+            return Ok(true);
         }
 
         self.emit_stmts(&remaining, ctx)?;
@@ -1253,12 +1247,12 @@ impl<'a> Generator<'a> {
         }
 
         // For commutative ops, also check the right side.
-        if commutative && !ctx.expr_names.contains_key(right) {
-            if let naga::Expression::Load { pointer: p } = &ctx.func.expressions[*right] {
-                if ptrs_structurally_equal(*p, pointer, &ctx.func.expressions) {
-                    return Some((cop, *left));
-                }
-            }
+        if commutative
+            && !ctx.expr_names.contains_key(right)
+            && let naga::Expression::Load { pointer: p } = &ctx.func.expressions[*right]
+            && ptrs_structurally_equal(*p, pointer, &ctx.func.expressions)
+        {
+            return Some((cop, *left));
         }
 
         None

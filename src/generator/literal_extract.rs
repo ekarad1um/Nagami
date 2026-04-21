@@ -17,9 +17,9 @@ use crate::name_gen::next_name_unique;
 
 use super::core::Generator;
 use super::expr_emit::{
-    compose_is_splat, concretize_abstract_literal_via_inner, ConcretizedAbstract,
+    ConcretizedAbstract, compose_is_splat, concretize_abstract_literal_via_inner,
 };
-use super::syntax::{literal_extract_key, LiteralExtractKey};
+use super::syntax::{LiteralExtractKey, literal_extract_key};
 
 impl<'a> Generator<'a> {
     /// Scan every function's expression arena for repeated literal
@@ -222,10 +222,10 @@ impl<'a> Generator<'a> {
                     }
                 }
                 walk_block_for_atomic_lits(&func.body, &mut |h| {
-                    if let Some(lit) = literal_lit(h) {
-                        if is_int_lit(lit) {
-                            adjust[h.index()] += 1;
-                        }
+                    if let Some(lit) = literal_lit(h)
+                        && is_int_lit(lit)
+                    {
+                        adjust[h.index()] += 1;
                     }
                 });
 

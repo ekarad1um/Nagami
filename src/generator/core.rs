@@ -297,10 +297,10 @@ fn compute_live_constants(
     // Constants whose names the user asked to preserve are always live.
     if !preserve_names.is_empty() {
         for (h, c) in module.constants.iter() {
-            if let Some(name) = c.name.as_deref() {
-                if preserve_names.contains(name) {
-                    live.insert(h);
-                }
+            if let Some(name) = c.name.as_deref()
+                && preserve_names.contains(name)
+            {
+                live.insert(h);
             }
         }
     }

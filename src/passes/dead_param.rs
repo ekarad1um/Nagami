@@ -94,7 +94,7 @@ impl Pass for DeadParamPass {
             // value; live entries shift down by the count of removed
             // slots below them.
             for (_, expr) in func.expressions.iter_mut() {
-                if let naga::Expression::FunctionArgument(ref mut arg_idx) = expr {
+                if let naga::Expression::FunctionArgument(arg_idx) = expr {
                     let old = *arg_idx as usize;
                     if removed_set.contains(&old) {
                         *expr = naga::Expression::ZeroValue(removed_types[&old]);

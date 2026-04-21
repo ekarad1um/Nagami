@@ -50,31 +50,31 @@ impl Pass for RenamePass {
         // naga's `UniqueArena<Type>` is immutable after lowering.
         if self.mangle {
             for (_, c) in module.constants.iter_mut() {
-                if let Some(name) = c.name.as_deref() {
-                    if !self.preserve.contains(name) {
-                        let new_name = next_available_name(&mut counter, &mut used_names);
-                        changed |= c.name.as_deref() != Some(new_name.as_str());
-                        c.name = Some(new_name);
-                    }
+                if let Some(name) = c.name.as_deref()
+                    && !self.preserve.contains(name)
+                {
+                    let new_name = next_available_name(&mut counter, &mut used_names);
+                    changed |= c.name.as_deref() != Some(new_name.as_str());
+                    c.name = Some(new_name);
                 }
             }
 
             for (_, ov) in module.overrides.iter_mut() {
-                if let Some(name) = ov.name.as_deref() {
-                    if !self.preserve.contains(name) {
-                        let new_name = next_available_name(&mut counter, &mut used_names);
-                        changed |= ov.name.as_deref() != Some(new_name.as_str());
-                        ov.name = Some(new_name);
-                    }
+                if let Some(name) = ov.name.as_deref()
+                    && !self.preserve.contains(name)
+                {
+                    let new_name = next_available_name(&mut counter, &mut used_names);
+                    changed |= ov.name.as_deref() != Some(new_name.as_str());
+                    ov.name = Some(new_name);
                 }
             }
         }
 
         for (_, global) in module.global_variables.iter_mut() {
-            if let Some(name) = global.name.as_deref() {
-                if self.preserve.contains(name) {
-                    continue;
-                }
+            if let Some(name) = global.name.as_deref()
+                && self.preserve.contains(name)
+            {
+                continue;
             }
             let new_name = next_available_name(&mut counter, &mut used_names);
             changed |= global.name.as_deref() != Some(new_name.as_str());
@@ -135,10 +135,10 @@ fn rename_function(
     }
 
     for argument in function.arguments.iter_mut() {
-        if let Some(name) = argument.name.as_deref() {
-            if preserve.contains(name) {
-                continue;
-            }
+        if let Some(name) = argument.name.as_deref()
+            && preserve.contains(name)
+        {
+            continue;
         }
         let next = next_available_name(counter, used_names);
         changed |= argument.name.as_deref() != Some(next.as_str());
@@ -146,10 +146,10 @@ fn rename_function(
     }
 
     for (_, local) in function.local_variables.iter_mut() {
-        if let Some(name) = local.name.as_deref() {
-            if preserve.contains(name) {
-                continue;
-            }
+        if let Some(name) = local.name.as_deref()
+            && preserve.contains(name)
+        {
+            continue;
         }
         let next = next_available_name(counter, used_names);
         changed |= local.name.as_deref() != Some(next.as_str());
@@ -201,34 +201,34 @@ fn collect_reserved_names(
         // Even when mangling, preserve-listed constants and overrides
         // retain their names and must be reserved.
         for (_, c) in module.constants.iter() {
-            if let Some(name) = c.name.as_deref() {
-                if preserve.contains(name) {
-                    reserved.insert(name.to_string());
-                }
+            if let Some(name) = c.name.as_deref()
+                && preserve.contains(name)
+            {
+                reserved.insert(name.to_string());
             }
         }
         for (_, ov) in module.overrides.iter() {
-            if let Some(name) = ov.name.as_deref() {
-                if preserve.contains(name) {
-                    reserved.insert(name.to_string());
-                }
+            if let Some(name) = ov.name.as_deref()
+                && preserve.contains(name)
+            {
+                reserved.insert(name.to_string());
             }
         }
     }
 
     for (_, global) in module.global_variables.iter() {
-        if let Some(name) = global.name.as_deref() {
-            if preserve.contains(name) {
-                reserved.insert(name.to_string());
-            }
+        if let Some(name) = global.name.as_deref()
+            && preserve.contains(name)
+        {
+            reserved.insert(name.to_string());
         }
     }
 
     for (_, function) in module.functions.iter() {
-        if let Some(name) = function.name.as_deref() {
-            if preserve.contains(name) {
-                reserved.insert(name.to_string());
-            }
+        if let Some(name) = function.name.as_deref()
+            && preserve.contains(name)
+        {
+            reserved.insert(name.to_string());
         }
         collect_preserved_function_names(function, preserve, &mut reserved);
     }
@@ -250,18 +250,18 @@ fn collect_preserved_function_names(
     reserved: &mut HashSet<String>,
 ) {
     for argument in function.arguments.iter() {
-        if let Some(name) = argument.name.as_deref() {
-            if preserve.contains(name) {
-                reserved.insert(name.to_string());
-            }
+        if let Some(name) = argument.name.as_deref()
+            && preserve.contains(name)
+        {
+            reserved.insert(name.to_string());
         }
     }
 
     for (_, local) in function.local_variables.iter() {
-        if let Some(name) = local.name.as_deref() {
-            if preserve.contains(name) {
-                reserved.insert(name.to_string());
-            }
+        if let Some(name) = local.name.as_deref()
+            && preserve.contains(name)
+        {
+            reserved.insert(name.to_string());
         }
     }
 }

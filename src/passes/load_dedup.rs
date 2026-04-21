@@ -101,11 +101,11 @@ fn remove_dead_inits(function: &mut naga::Function) -> bool {
 
     // Phase 1: zero inits are always redundant in WGSL.
     for (_, lvar) in function.local_variables.iter_mut() {
-        if let Some(init) = lvar.init {
-            if is_zero_init(&function.expressions, init) {
-                lvar.init = None;
-                changed = true;
-            }
+        if let Some(init) = lvar.init
+            && is_zero_init(&function.expressions, init)
+        {
+            lvar.init = None;
+            changed = true;
         }
     }
 
@@ -195,10 +195,10 @@ fn find_dead_inits(
         match stmt {
             naga::Statement::Emit(range) => {
                 for h in range.clone() {
-                    if let naga::Expression::Load { pointer } = &expressions[h] {
-                        if let Some(local) = get_stored_local(expressions, *pointer) {
-                            pending.remove(&local); // init is read
-                        }
+                    if let naga::Expression::Load { pointer } = &expressions[h]
+                        && let Some(local) = get_stored_local(expressions, *pointer)
+                    {
+                        pending.remove(&local); // init is read
                     }
                 }
             }
@@ -294,10 +294,10 @@ fn collect_loaded_locals_in_block(
         match stmt {
             naga::Statement::Emit(range) => {
                 for h in range.clone() {
-                    if let naga::Expression::Load { pointer } = &expressions[h] {
-                        if let Some(local) = get_stored_local(expressions, *pointer) {
-                            loaded.insert(local);
-                        }
+                    if let naga::Expression::Load { pointer } = &expressions[h]
+                        && let Some(local) = get_stored_local(expressions, *pointer)
+                    {
+                        loaded.insert(local);
                     }
                 }
             }
@@ -376,10 +376,10 @@ fn remove_dead_stores_in_block(
             naga::Statement::Emit(range) => {
                 // A Load from a local makes its pending Store live (not dead).
                 for h in range.clone() {
-                    if let naga::Expression::Load { pointer } = &expressions[h] {
-                        if let Some(local) = get_stored_local(expressions, *pointer) {
-                            pending_store.remove(&local);
-                        }
+                    if let naga::Expression::Load { pointer } = &expressions[h]
+                        && let Some(local) = get_stored_local(expressions, *pointer)
+                    {
+                        pending_store.remove(&local);
                     }
                 }
             }
@@ -487,10 +487,10 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
     // are shorter than inline vector/matrix constructors, so forwarding
     // a Compose to multiple Load sites inflates the output.
     for (lh, lvar) in function.local_variables.iter() {
-        if let Some(init) = lvar.init {
-            if !matches!(function.expressions[init], naga::Expression::Compose { .. }) {
-                cache.insert(PointerKey::Local(lh), init);
-            }
+        if let Some(init) = lvar.init
+            && !matches!(function.expressions[init], naga::Expression::Compose { .. })
+        {
+            cache.insert(PointerKey::Local(lh), init);
         }
     }
 
@@ -655,10 +655,10 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
 
     // Undo: only undo candidates whose Store is NOT fully dead.
     for h in undo_candidates {
-        if let Some(&(ptr, val, _in_loop)) = seeded_by_store.get(&h) {
-            if dead_store_ids.contains(&(ptr, val)) {
-                continue; // Store is dead - keep forwarding
-            }
+        if let Some(&(ptr, val, _in_loop)) = seeded_by_store.get(&h)
+            && dead_store_ids.contains(&(ptr, val))
+        {
+            continue; // Store is dead - keep forwarding
         }
         replacements.remove(&h);
     }
@@ -798,10 +798,10 @@ fn collect_escaped_and_partially_stored(
     for stmt in block {
         match stmt {
             naga::Statement::Store { pointer, .. } => {
-                if !matches!(expressions[*pointer], naga::Expression::LocalVariable(_)) {
-                    if let Some(local) = get_stored_local(expressions, *pointer) {
-                        partially_stored.insert(local);
-                    }
+                if !matches!(expressions[*pointer], naga::Expression::LocalVariable(_))
+                    && let Some(local) = get_stored_local(expressions, *pointer)
+                {
+                    partially_stored.insert(local);
                 }
             }
             naga::Statement::Call { arguments, .. } => {
@@ -1003,43 +1003,42 @@ fn collect_redundant_loads(
         match statement {
             naga::Statement::Emit(range) => {
                 for handle in range.clone() {
-                    if let naga::Expression::Load { pointer } = &expressions[handle] {
-                        if let Some(key) = get_pointer_key(expressions, *pointer) {
-                            // Track all live loads per local variable.
-                            if let Some(local) = get_stored_local(expressions, *pointer) {
-                                all_loads.entry(local).or_default().push(handle);
+                    if let naga::Expression::Load { pointer } = &expressions[handle]
+                        && let Some(key) = get_pointer_key(expressions, *pointer)
+                    {
+                        // Track all live loads per local variable.
+                        if let Some(local) = get_stored_local(expressions, *pointer) {
+                            all_loads.entry(local).or_default().push(handle);
+                        }
+                        if let Some(&canonical) = cache.get(&key) {
+                            replacements.insert(handle, canonical);
+                            // Track whether this replacement was seeded by a Store.
+                            if let Some(&store_id) = store_source.get(&key) {
+                                seeded_by_store.insert(handle, store_id);
                             }
-                            if let Some(&canonical) = cache.get(&key) {
-                                replacements.insert(handle, canonical);
-                                // Track whether this replacement was seeded by a Store.
-                                if let Some(&store_id) = store_source.get(&key) {
-                                    seeded_by_store.insert(handle, store_id);
-                                }
-                                // When the canonical came from store seeding
-                                // (not a Load), also register this Load as
-                                // the canonical for subsequent Load-to-Load
-                                // dedup.  The undo phase may later revert
-                                // the store-forwarded replacement, but the
-                                // Load-to-Load chain remains valid.
-                                //
-                                // INVARIANT (paired with `has_later_live_load`
-                                // in `dedup_loads_in_function`):
-                                //   when canonical IS a `Load`, do NOT rebind -
-                                //   the producer-Load's handle must remain the
-                                //   canonical so it stays out of `replacements`,
-                                //   keeping its producing Store alive against the
-                                //   `has_later_live_load` dead-store check.
-                                //   Removing this gate would mark perfectly-live
-                                //   stores dead across loop / branch boundaries
-                                //   where the cache may have been cleared and
-                                //   the producing Store is the only path-bridge.
-                                if !matches!(expressions[canonical], naga::Expression::Load { .. })
-                                {
-                                    cache.insert(key, handle);
-                                }
-                            } else {
+                            // When the canonical came from store seeding
+                            // (not a Load), also register this Load as
+                            // the canonical for subsequent Load-to-Load
+                            // dedup.  The undo phase may later revert
+                            // the store-forwarded replacement, but the
+                            // Load-to-Load chain remains valid.
+                            //
+                            // INVARIANT (paired with `has_later_live_load`
+                            // in `dedup_loads_in_function`):
+                            //   when canonical IS a `Load`, do NOT rebind -
+                            //   the producer-Load's handle must remain the
+                            //   canonical so it stays out of `replacements`,
+                            //   keeping its producing Store alive against the
+                            //   `has_later_live_load` dead-store check.
+                            //   Removing this gate would mark perfectly-live
+                            //   stores dead across loop / branch boundaries
+                            //   where the cache may have been cleared and
+                            //   the producing Store is the only path-bridge.
+                            if !matches!(expressions[canonical], naga::Expression::Load { .. }) {
                                 cache.insert(key, handle);
                             }
+                        } else {
+                            cache.insert(key, handle);
                         }
                     }
                 }
@@ -1563,10 +1562,10 @@ fn apply_to_block(
             }
             naga::Statement::Store { pointer, value } => {
                 // Skip stores to dead locals (all loads already replaced).
-                if let Some(lh) = get_stored_local(expressions, *pointer) {
-                    if dead_locals.contains(&lh) {
-                        continue;
-                    }
+                if let Some(lh) = get_stored_local(expressions, *pointer)
+                    && dead_locals.contains(&lh)
+                {
+                    continue;
                 }
                 // Skip only the specific Store whose (pointer, value) was
                 // identified as dead (last-store inlining).
@@ -1664,11 +1663,11 @@ mod tests {
             .expressions
             .iter()
             .filter(|(handle, expr)| {
-                if let naga::Expression::Load { pointer } = expr {
-                    if let naga::Expression::LocalVariable(_) = &function.expressions[*pointer] {
-                        // Check if this handle is actually referenced (in an Emit range)
-                        return is_handle_in_any_emit(&function.body, *handle);
-                    }
+                if let naga::Expression::Load { pointer } = expr
+                    && let naga::Expression::LocalVariable(_) = &function.expressions[*pointer]
+                {
+                    // Check if this handle is actually referenced (in an Emit range)
+                    return is_handle_in_any_emit(&function.body, *handle);
                 }
                 false
             })
@@ -2482,15 +2481,14 @@ fn fs_main() -> @location(0) vec4f {
             .expressions
             .iter()
             .filter(|(handle, expr)| {
-                if let naga::Expression::Load { pointer } = expr {
-                    if let naga::Expression::Access { base, .. } = &test_fn.expressions[*pointer] {
-                        if matches!(
-                            test_fn.expressions[*base],
-                            naga::Expression::LocalVariable(_)
-                        ) {
-                            return is_handle_in_any_emit(&test_fn.body, *handle);
-                        }
-                    }
+                if let naga::Expression::Load { pointer } = expr
+                    && let naga::Expression::Access { base, .. } = &test_fn.expressions[*pointer]
+                    && matches!(
+                        test_fn.expressions[*base],
+                        naga::Expression::LocalVariable(_)
+                    )
+                {
+                    return is_handle_in_any_emit(&test_fn.body, *handle);
                 }
                 false
             })
@@ -3454,10 +3452,10 @@ fn fs_main() -> @location(0) vec4f {
             for stmt in block {
                 match stmt {
                     naga::Statement::Store { pointer, .. } => {
-                        if let naga::Expression::LocalVariable(lh) = expressions[*pointer] {
-                            if lh == local {
-                                *count += 1;
-                            }
+                        if let naga::Expression::LocalVariable(lh) = expressions[*pointer]
+                            && lh == local
+                        {
+                            *count += 1;
                         }
                     }
                     naga::Statement::Block(inner) => walk(inner, expressions, local, count),

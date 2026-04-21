@@ -243,14 +243,14 @@ impl<'a> Generator<'a> {
                 // the shortest output when the literal is not extracted.
                 return Ok(bare);
             }
-            if let naga::Expression::Binary { op, .. } = &ctx.func.expressions[arg] {
-                if matches!(
+            if let naga::Expression::Binary { op, .. } = &ctx.func.expressions[arg]
+                && matches!(
                     op,
                     naga::BinaryOperator::Less | naga::BinaryOperator::LessEqual
-                ) {
-                    let s = self.emit_expr_uncached(arg, ctx)?;
-                    return Ok(format!("({s})"));
-                }
+                )
+            {
+                let s = self.emit_expr_uncached(arg, ctx)?;
+                return Ok(format!("({s})"));
             }
         }
         self.emit_expr(arg, ctx)
@@ -384,10 +384,10 @@ impl<'a> Generator<'a> {
                 // For vector composes, try to emit as a bare swizzle
                 // (e.g. vec3f(v.x,v.y,v.z) -> v.xyz), eliminating the
                 // type constructor entirely.
-                if matches!(self.module.types[*ty].inner, naga::TypeInner::Vector { .. }) {
-                    if let Some(swizzle) = self.try_compose_as_full_swizzle(components, ctx)? {
-                        break 'compose swizzle;
-                    }
+                if matches!(self.module.types[*ty].inner, naga::TypeInner::Vector { .. })
+                    && let Some(swizzle) = self.try_compose_as_full_swizzle(components, ctx)?
+                {
+                    break 'compose swizzle;
                 }
 
                 let mut s = String::new();
@@ -1452,10 +1452,10 @@ impl<'a> Generator<'a> {
             },
         };
 
-        if let Some(h) = ty_handle {
-            if let Some(mangled) = self.member_names.get(&(h, index)) {
-                return Some(mangled.clone());
-            }
+        if let Some(h) = ty_handle
+            && let Some(mangled) = self.member_names.get(&(h, index))
+        {
+            return Some(mangled.clone());
         }
 
         members
@@ -1526,10 +1526,10 @@ impl<'a> Generator<'a> {
         };
 
         // If we have a mangled member name, use it.
-        if let Some(h) = ty_handle {
-            if let Some(mangled) = self.member_names.get(&(h, index)) {
-                return Some(mangled.clone());
-            }
+        if let Some(h) = ty_handle
+            && let Some(mangled) = self.member_names.get(&(h, index))
+        {
+            return Some(mangled.clone());
         }
 
         members
@@ -1588,33 +1588,32 @@ impl<'a> Generator<'a> {
         let arena = &ctx.func.expressions;
 
         // Pattern A: direct AccessIndex on a vector value.
-        if let naga::Expression::AccessIndex { base, index } = arena[handle] {
-            if index <= 3 {
-                let inner = ctx.info[base].ty.inner_with(&self.module.types);
-                if matches!(inner, naga::TypeInner::Vector { .. }) {
-                    return Some((base, index));
-                }
+        if let naga::Expression::AccessIndex { base, index } = arena[handle]
+            && index <= 3
+        {
+            let inner = ctx.info[base].ty.inner_with(&self.module.types);
+            if matches!(inner, naga::TypeInner::Vector { .. }) {
+                return Some((base, index));
             }
         }
 
         // Pattern B: Load { pointer: AccessIndex { base: ptr_to_vec, index } }
-        if let naga::Expression::Load { pointer } = arena[handle] {
-            if let naga::Expression::AccessIndex { base, index } = arena[pointer] {
-                if index <= 3 {
-                    let inner = ctx.info[base].ty.inner_with(&self.module.types);
-                    let is_ptr_to_vec =
-                        matches!(
-                            inner,
-                            naga::TypeInner::Pointer { base: bty, .. }
-                                if matches!(
-                                    self.module.types[*bty].inner,
-                                    naga::TypeInner::Vector { .. }
-                                )
-                        ) || matches!(inner, naga::TypeInner::ValuePointer { size: Some(_), .. });
-                    if is_ptr_to_vec {
-                        return Some((base, index));
-                    }
-                }
+        if let naga::Expression::Load { pointer } = arena[handle]
+            && let naga::Expression::AccessIndex { base, index } = arena[pointer]
+            && index <= 3
+        {
+            let inner = ctx.info[base].ty.inner_with(&self.module.types);
+            let is_ptr_to_vec =
+                matches!(
+                    inner,
+                    naga::TypeInner::Pointer { base: bty, .. }
+                        if matches!(
+                            self.module.types[*bty].inner,
+                            naga::TypeInner::Vector { .. }
+                        )
+                ) || matches!(inner, naga::TypeInner::ValuePointer { size: Some(_), .. });
+            if is_ptr_to_vec {
+                return Some((base, index));
             }
         }
 
@@ -1656,11 +1655,11 @@ impl<'a> Generator<'a> {
         // Identity check: pattern is [0, 1, ..., N-1] and source vector
         // has exactly N components -> emit just the base expression.
         let source_size = self.vector_size_of(base, ctx);
-        if let Some(src_n) = source_size {
-            if pattern.len() == src_n && pattern.iter().enumerate().all(|(i, &idx)| idx == i as u32)
-            {
-                return Ok(Some(self.emit_expr(base, ctx)?));
-            }
+        if let Some(src_n) = source_size
+            && pattern.len() == src_n
+            && pattern.iter().enumerate().all(|(i, &idx)| idx == i as u32)
+        {
+            return Ok(Some(self.emit_expr(base, ctx)?));
         }
 
         // Emit as `base.xyzw`
@@ -1694,12 +1693,12 @@ impl<'a> Generator<'a> {
                 let mut indices = vec![idx];
                 let mut j = i + 1;
                 while j < components.len() {
-                    if let Some((b2, idx2)) = self.swizzle_component(components[j], ctx) {
-                        if b2 == base {
-                            indices.push(idx2);
-                            j += 1;
-                            continue;
-                        }
+                    if let Some((b2, idx2)) = self.swizzle_component(components[j], ctx)
+                        && b2 == base
+                    {
+                        indices.push(idx2);
+                        j += 1;
+                        continue;
                     }
                     break;
                 }
@@ -1798,49 +1797,45 @@ impl<'a> Generator<'a> {
         hint: Option<naga::Scalar>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
-        if !ctx.expr_names.contains_key(&expr) {
-            if let Some(scalar) = hint {
-                match ctx.func.expressions[expr] {
-                    naga::Expression::Binary { op, left, right }
-                        if matches!(
-                            op,
-                            naga::BinaryOperator::Add | naga::BinaryOperator::Subtract
-                        ) =>
-                    {
-                        let arena = &ctx.func.expressions;
-                        let lc = ctx.expr_names.contains_key(&left);
-                        let rc = ctx.expr_names.contains_key(&right);
-                        let wrap_l = child_needs_parens(left, arena, op, false, lc);
-                        let wrap_r = child_needs_parens(right, arena, op, true, rc);
-                        let ls = self.emit_expr_with_scalar_hint(left, Some(scalar), ctx)?;
-                        let rs = self.emit_expr_with_scalar_hint(right, Some(scalar), ctx)?;
-                        let op_str = binary_op_str(op);
-                        let sp = self.bin_op_sep();
-                        return Ok(assemble_binary(&ls, &rs, op_str, sp, wrap_l, wrap_r));
-                    }
-                    naga::Expression::Literal(lit) => {
-                        if let Some(concrete) =
-                            self.concretize_abstract_literal_for_scalar(lit, scalar)
-                        {
-                            return Ok(concrete);
-                        }
-                    }
-                    naga::Expression::Constant(h) => {
-                        let c = &self.module.constants[h];
-                        if c.name.is_none() {
-                            if let naga::Expression::Literal(lit) =
-                                self.module.global_expressions[c.init]
-                            {
-                                if let Some(concrete) =
-                                    self.concretize_abstract_literal_for_scalar(lit, scalar)
-                                {
-                                    return Ok(concrete);
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
+        if !ctx.expr_names.contains_key(&expr)
+            && let Some(scalar) = hint
+        {
+            match ctx.func.expressions[expr] {
+                naga::Expression::Binary { op, left, right }
+                    if matches!(
+                        op,
+                        naga::BinaryOperator::Add | naga::BinaryOperator::Subtract
+                    ) =>
+                {
+                    let arena = &ctx.func.expressions;
+                    let lc = ctx.expr_names.contains_key(&left);
+                    let rc = ctx.expr_names.contains_key(&right);
+                    let wrap_l = child_needs_parens(left, arena, op, false, lc);
+                    let wrap_r = child_needs_parens(right, arena, op, true, rc);
+                    let ls = self.emit_expr_with_scalar_hint(left, Some(scalar), ctx)?;
+                    let rs = self.emit_expr_with_scalar_hint(right, Some(scalar), ctx)?;
+                    let op_str = binary_op_str(op);
+                    let sp = self.bin_op_sep();
+                    return Ok(assemble_binary(&ls, &rs, op_str, sp, wrap_l, wrap_r));
                 }
+                naga::Expression::Literal(lit) => {
+                    if let Some(concrete) = self.concretize_abstract_literal_for_scalar(lit, scalar)
+                    {
+                        return Ok(concrete);
+                    }
+                }
+                naga::Expression::Constant(h) => {
+                    let c = &self.module.constants[h];
+                    if c.name.is_none()
+                        && let naga::Expression::Literal(lit) =
+                            self.module.global_expressions[c.init]
+                        && let Some(concrete) =
+                            self.concretize_abstract_literal_for_scalar(lit, scalar)
+                    {
+                        return Ok(concrete);
+                    }
+                }
+                _ => {}
             }
         }
         self.emit_expr(expr, ctx)
@@ -2002,15 +1997,13 @@ fn child_needs_parens(
         naga::BinaryOperator::And
             | naga::BinaryOperator::ExclusiveOr
             | naga::BinaryOperator::InclusiveOr
-    ) {
-        if let Some(op) = child_op {
-            if matches!(
-                op,
-                naga::BinaryOperator::Add | naga::BinaryOperator::Subtract
-            ) {
-                return true;
-            }
-        }
+    ) && let Some(op) = child_op
+        && matches!(
+            op,
+            naga::BinaryOperator::Add | naga::BinaryOperator::Subtract
+        )
+    {
+        return true;
     }
 
     // WGSL shift operators require `unary_expression` on both sides.
@@ -2082,10 +2075,11 @@ fn assemble_binary(
     } else if !wrap_r {
         // Disambiguate `a--b` and `a//b` which WGSL would parse as
         // decrement / line-comment.
-        if let (Some(&oc), Some(&rc)) = (op_str.as_bytes().last(), rs.as_bytes().first()) {
-            if oc == rc && (oc == b'-' || oc == b'/') {
-                s.push(' ');
-            }
+        if let (Some(&oc), Some(&rc)) = (op_str.as_bytes().last(), rs.as_bytes().first())
+            && oc == rc
+            && (oc == b'-' || oc == b'/')
+        {
+            s.push(' ');
         }
     }
     if wrap_r {
@@ -2295,7 +2289,7 @@ pub(super) fn is_arithmetic_op(op: naga::BinaryOperator) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{concretize_abstract_literal_via_inner, ConcretizedAbstract};
+    use super::{ConcretizedAbstract, concretize_abstract_literal_via_inner};
     use naga::Literal as L;
 
     fn scalar_inner(kind: naga::ScalarKind, width: u8) -> naga::TypeInner {

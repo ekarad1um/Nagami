@@ -326,28 +326,28 @@ fn inline_in_block(
                 arguments,
                 result: Some(result_handle),
             } => {
-                if let Some(template) = templates.get(&function) {
-                    if template.argument_count == arguments.len() {
-                        let old_len = expressions.len();
-                        let mut memo = HashMap::new();
-                        if let Some(root_handle) = clone_inline_expression(
-                            template.return_expr,
-                            template,
-                            &arguments,
+                if let Some(template) = templates.get(&function)
+                    && template.argument_count == arguments.len()
+                {
+                    let old_len = expressions.len();
+                    let mut memo = HashMap::new();
+                    if let Some(root_handle) = clone_inline_expression(
+                        template.return_expr,
+                        template,
+                        &arguments,
+                        expressions,
+                        &mut memo,
+                    ) {
+                        push_emit_ranges_for_new_expressions(
+                            &mut rebuilt,
                             expressions,
-                            &mut memo,
-                        ) {
-                            push_emit_ranges_for_new_expressions(
-                                &mut rebuilt,
-                                expressions,
-                                old_len,
-                                span,
-                            );
+                            old_len,
+                            span,
+                        );
 
-                            replacements.insert(result_handle, root_handle);
-                            changed += 1;
-                            continue;
-                        }
+                        replacements.insert(result_handle, root_handle);
+                        changed += 1;
+                        continue;
                     }
                 }
 

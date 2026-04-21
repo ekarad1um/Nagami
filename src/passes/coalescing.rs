@@ -135,10 +135,10 @@ fn collect_local_usage(
         naga::Handle<naga::LocalVariable>,
     > = HashMap::new();
     for (eh, expr) in function.expressions.iter() {
-        if let naga::Expression::Load { pointer } = *expr {
-            if let Some(local) = resolve_ptr_to_local(pointer, &function.expressions) {
-                load_to_local.insert(eh, local);
-            }
+        if let naga::Expression::Load { pointer } = *expr
+            && let Some(local) = resolve_ptr_to_local(pointer, &function.expressions)
+        {
+            load_to_local.insert(eh, local);
         }
     }
 

@@ -310,12 +310,11 @@ impl<'a> Generator<'a> {
                 if special_type_handles.contains(&h) {
                     continue;
                 }
-                if !preamble.is_empty() {
-                    if let Some(name) = ty.name.as_deref() {
-                        if preamble.contains(name) {
-                            continue;
-                        }
-                    }
+                if !preamble.is_empty()
+                    && let Some(name) = ty.name.as_deref()
+                    && preamble.contains(name)
+                {
+                    continue;
                 }
                 section_gap!(self, has_prev_section);
                 self.generate_struct(h, members, *span)?;
@@ -338,12 +337,11 @@ impl<'a> Generator<'a> {
             if !self.live_constants.contains(&h) {
                 continue;
             }
-            if !preamble.is_empty() {
-                if let Some(name) = c.name.as_deref() {
-                    if preamble.contains(name) {
-                        continue;
-                    }
-                }
+            if !preamble.is_empty()
+                && let Some(name) = c.name.as_deref()
+                && preamble.contains(name)
+            {
+                continue;
             }
             self.out.push_str("const ");
             self.out.push_str(&self.constant_names[h.index()]);
@@ -390,12 +388,11 @@ impl<'a> Generator<'a> {
             section_gap!(self, has_prev_section);
         }
         for (h, ov) in self.module.overrides.iter() {
-            if !preamble.is_empty() {
-                if let Some(name) = ov.name.as_deref() {
-                    if preamble.contains(name) {
-                        continue;
-                    }
-                }
+            if !preamble.is_empty()
+                && let Some(name) = ov.name.as_deref()
+                && preamble.contains(name)
+            {
+                continue;
             }
             if let Some(id) = ov.id {
                 self.out.push_str("@id(");
@@ -426,12 +423,11 @@ impl<'a> Generator<'a> {
             section_gap!(self, has_prev_section);
         }
         for (h, g) in self.module.global_variables.iter() {
-            if !preamble.is_empty() {
-                if let Some(name) = g.name.as_deref() {
-                    if preamble.contains(name) {
-                        continue;
-                    }
-                }
+            if !preamble.is_empty()
+                && let Some(name) = g.name.as_deref()
+                && preamble.contains(name)
+            {
+                continue;
             }
             if let Some(binding) = g.binding {
                 self.out.push_str("@group(");
@@ -516,12 +512,11 @@ impl<'a> Generator<'a> {
         let num_functions = self.module.functions.len();
 
         for (h, f) in self.module.functions.iter() {
-            if !preamble.is_empty() {
-                if let Some(name) = f.name.as_deref() {
-                    if preamble.contains(name) {
-                        continue;
-                    }
-                }
+            if !preamble.is_empty()
+                && let Some(name) = f.name.as_deref()
+                && preamble.contains(name)
+            {
+                continue;
             }
             section_gap!(self, has_prev_section);
             let fn_name = self.function_names[h.index()].clone();
@@ -1497,10 +1492,10 @@ fn collect_block_local_refs(
                     | naga::GatherMode::QuadBroadcast(h) => Some(*h),
                     _ => None,
                 };
-                if let Some(idx) = index {
-                    if let Some(lh) = resolve_local_var(idx, expressions) {
-                        seen[lh.index()] = true;
-                    }
+                if let Some(idx) = index
+                    && let Some(lh) = resolve_local_var(idx, expressions)
+                {
+                    seen[lh.index()] = true;
                 }
             }
             naga::Statement::SubgroupCollectiveOperation { argument, .. } => {
@@ -1874,10 +1869,10 @@ fn find_deferrable_vars(func: &naga::Function) -> (Vec<bool>, Vec<bool>) {
     // pointer chain resolves to a LocalVariable).
     let mut expr_reads: Vec<Option<naga::Handle<naga::LocalVariable>>> = vec![None; expr_len];
     for (eh, expr) in func.expressions.iter() {
-        if let E::Load { pointer } = *expr {
-            if let Some(lh) = resolve_local_var(pointer, &func.expressions) {
-                expr_reads[eh.index()] = Some(lh);
-            }
+        if let E::Load { pointer } = *expr
+            && let Some(lh) = resolve_local_var(pointer, &func.expressions)
+        {
+            expr_reads[eh.index()] = Some(lh);
         }
     }
 
@@ -1940,10 +1935,10 @@ fn scan_block_deferrable_vars(
         match stmt {
             naga::Statement::Emit(range) => {
                 for h in range.clone() {
-                    if let Some(lh) = expr_reads[h.index()] {
-                        if candidates[lh.index()] {
-                            seen[lh.index()] = true;
-                        }
+                    if let Some(lh) = expr_reads[h.index()]
+                        && candidates[lh.index()]
+                    {
+                        seen[lh.index()] = true;
                     }
                 }
             }
@@ -1964,19 +1959,19 @@ fn scan_block_deferrable_vars(
             }
             naga::Statement::Call { arguments, .. } => {
                 for &arg in arguments {
-                    if let Some(lh) = resolve_local_var(arg, expressions) {
-                        if candidates[lh.index()] {
-                            seen[lh.index()] = true;
-                        }
+                    if let Some(lh) = resolve_local_var(arg, expressions)
+                        && candidates[lh.index()]
+                    {
+                        seen[lh.index()] = true;
                     }
                 }
             }
             naga::Statement::Atomic { pointer, .. }
             | naga::Statement::WorkGroupUniformLoad { pointer, .. } => {
-                if let Some(lh) = resolve_local_var(*pointer, expressions) {
-                    if candidates[lh.index()] {
-                        seen[lh.index()] = true;
-                    }
+                if let Some(lh) = resolve_local_var(*pointer, expressions)
+                    && candidates[lh.index()]
+                {
+                    seen[lh.index()] = true;
                 }
             }
             naga::Statement::ImageStore {
@@ -1989,10 +1984,10 @@ fn scan_block_deferrable_vars(
                     .into_iter()
                     .flatten()
                 {
-                    if let Some(lh) = resolve_local_var(e, expressions) {
-                        if candidates[lh.index()] {
-                            seen[lh.index()] = true;
-                        }
+                    if let Some(lh) = resolve_local_var(e, expressions)
+                        && candidates[lh.index()]
+                    {
+                        seen[lh.index()] = true;
                     }
                 }
             }
@@ -2007,34 +2002,34 @@ fn scan_block_deferrable_vars(
                     .into_iter()
                     .flatten()
                 {
-                    if let Some(lh) = resolve_local_var(e, expressions) {
-                        if candidates[lh.index()] {
-                            seen[lh.index()] = true;
-                        }
+                    if let Some(lh) = resolve_local_var(e, expressions)
+                        && candidates[lh.index()]
+                    {
+                        seen[lh.index()] = true;
                     }
                 }
             }
             naga::Statement::Return { value: Some(v) } => {
-                if let Some(lh) = resolve_local_var(*v, expressions) {
-                    if candidates[lh.index()] {
-                        seen[lh.index()] = true;
-                    }
+                if let Some(lh) = resolve_local_var(*v, expressions)
+                    && candidates[lh.index()]
+                {
+                    seen[lh.index()] = true;
                 }
             }
             naga::Statement::SubgroupBallot {
                 predicate: Some(p), ..
             } => {
-                if let Some(lh) = resolve_local_var(*p, expressions) {
-                    if candidates[lh.index()] {
-                        seen[lh.index()] = true;
-                    }
+                if let Some(lh) = resolve_local_var(*p, expressions)
+                    && candidates[lh.index()]
+                {
+                    seen[lh.index()] = true;
                 }
             }
             naga::Statement::SubgroupGather { mode, argument, .. } => {
-                if let Some(lh) = resolve_local_var(*argument, expressions) {
-                    if candidates[lh.index()] {
-                        seen[lh.index()] = true;
-                    }
+                if let Some(lh) = resolve_local_var(*argument, expressions)
+                    && candidates[lh.index()]
+                {
+                    seen[lh.index()] = true;
                 }
                 let index = match mode {
                     naga::GatherMode::Broadcast(h)
@@ -2045,19 +2040,18 @@ fn scan_block_deferrable_vars(
                     | naga::GatherMode::QuadBroadcast(h) => Some(*h),
                     _ => None,
                 };
-                if let Some(idx) = index {
-                    if let Some(lh) = resolve_local_var(idx, expressions) {
-                        if candidates[lh.index()] {
-                            seen[lh.index()] = true;
-                        }
-                    }
+                if let Some(idx) = index
+                    && let Some(lh) = resolve_local_var(idx, expressions)
+                    && candidates[lh.index()]
+                {
+                    seen[lh.index()] = true;
                 }
             }
             naga::Statement::SubgroupCollectiveOperation { argument, .. } => {
-                if let Some(lh) = resolve_local_var(*argument, expressions) {
-                    if candidates[lh.index()] {
-                        seen[lh.index()] = true;
-                    }
+                if let Some(lh) = resolve_local_var(*argument, expressions)
+                    && candidates[lh.index()]
+                {
+                    seen[lh.index()] = true;
                 }
             }
             naga::Statement::RayPipelineFunction(fun) => match fun {
@@ -2067,28 +2061,28 @@ fn scan_block_deferrable_vars(
                     payload,
                 } => {
                     for e in [*acceleration_structure, *descriptor, *payload] {
-                        if let Some(lh) = resolve_local_var(e, expressions) {
-                            if candidates[lh.index()] {
-                                seen[lh.index()] = true;
-                            }
+                        if let Some(lh) = resolve_local_var(e, expressions)
+                            && candidates[lh.index()]
+                        {
+                            seen[lh.index()] = true;
                         }
                     }
                 }
             },
             naga::Statement::CooperativeStore { target, data } => {
                 for e in [*target, data.pointer, data.stride] {
-                    if let Some(lh) = resolve_local_var(e, expressions) {
-                        if candidates[lh.index()] {
-                            seen[lh.index()] = true;
-                        }
+                    if let Some(lh) = resolve_local_var(e, expressions)
+                        && candidates[lh.index()]
+                    {
+                        seen[lh.index()] = true;
                     }
                 }
             }
             naga::Statement::RayQuery { query, fun } => {
-                if let Some(lh) = resolve_local_var(*query, expressions) {
-                    if candidates[lh.index()] {
-                        seen[lh.index()] = true;
-                    }
+                if let Some(lh) = resolve_local_var(*query, expressions)
+                    && candidates[lh.index()]
+                {
+                    seen[lh.index()] = true;
                 }
                 match fun {
                     naga::RayQueryFunction::Initialize {
@@ -2096,18 +2090,18 @@ fn scan_block_deferrable_vars(
                         descriptor,
                     } => {
                         for e in [*acceleration_structure, *descriptor] {
-                            if let Some(lh) = resolve_local_var(e, expressions) {
-                                if candidates[lh.index()] {
-                                    seen[lh.index()] = true;
-                                }
+                            if let Some(lh) = resolve_local_var(e, expressions)
+                                && candidates[lh.index()]
+                            {
+                                seen[lh.index()] = true;
                             }
                         }
                     }
                     naga::RayQueryFunction::GenerateIntersection { hit_t } => {
-                        if let Some(lh) = resolve_local_var(*hit_t, expressions) {
-                            if candidates[lh.index()] {
-                                seen[lh.index()] = true;
-                            }
+                        if let Some(lh) = resolve_local_var(*hit_t, expressions)
+                            && candidates[lh.index()]
+                        {
+                            seen[lh.index()] = true;
                         }
                     }
                     naga::RayQueryFunction::Proceed { .. }
@@ -2252,10 +2246,10 @@ fn find_for_loop_vars(func: &naga::Function) -> Vec<bool> {
     // Build Load->LocalVariable map, same pattern as find_deferrable_vars.
     let mut expr_reads: Vec<Option<naga::Handle<naga::LocalVariable>>> = vec![None; expr_len];
     for (eh, expr) in func.expressions.iter() {
-        if let E::Load { pointer } = *expr {
-            if let Some(lh) = resolve_local_var(pointer, &func.expressions) {
-                expr_reads[eh.index()] = Some(lh);
-            }
+        if let E::Load { pointer } = *expr
+            && let Some(lh) = resolve_local_var(pointer, &func.expressions)
+        {
+            expr_reads[eh.index()] = Some(lh);
         }
     }
 
@@ -2395,10 +2389,10 @@ fn compute_block_ownership(
                     | naga::GatherMode::QuadBroadcast(h) => Some(*h),
                     _ => None,
                 };
-                if let Some(idx_h) = index {
-                    if let Some(lh) = resolve_local_var(idx_h, expressions) {
-                        mark_owner(&mut ref_owner, lh.index(), idx);
-                    }
+                if let Some(idx_h) = index
+                    && let Some(lh) = resolve_local_var(idx_h, expressions)
+                {
+                    mark_owner(&mut ref_owner, lh.index(), idx);
                 }
             }
             naga::Statement::SubgroupCollectiveOperation { argument, .. } => {
@@ -2524,15 +2518,15 @@ fn is_for_loop_candidate(
         }
     }
     // Update must be Store or Call (matching try_emit_for_loop's pre-validation).
-    if let Some(stmt) = update_stmt {
-        if !matches!(
+    if let Some(stmt) = update_stmt
+        && !matches!(
             stmt,
             naga::Statement::Store { .. }
                 | naga::Statement::Call { .. }
                 | naga::Statement::ImageStore { .. }
-        ) {
-            return false;
-        }
+        )
+    {
+        return false;
     }
     // Body must start with an If-break guard (after leading Emits and optional
     // WorkGroupUniformLoad preloads).
@@ -2597,21 +2591,20 @@ fn scan_block_for_loop_vars(
                 continuing,
                 break_if,
             } = stmts[owner]
+                && is_for_loop_candidate(body, continuing, break_if)
             {
-                if is_for_loop_candidate(body, continuing, break_if) {
-                    let has_update = continuing.iter().any(|s| {
-                        if let naga::Statement::Store { pointer, .. } = s {
-                            matches!(
-                                expressions[*pointer],
-                                naga::Expression::LocalVariable(lh) if lh == h
-                            )
-                        } else {
-                            false
-                        }
-                    });
-                    if has_update {
-                        result[i] = true;
+                let has_update = continuing.iter().any(|s| {
+                    if let naga::Statement::Store { pointer, .. } = s {
+                        matches!(
+                            expressions[*pointer],
+                            naga::Expression::LocalVariable(lh) if lh == h
+                        )
+                    } else {
+                        false
                     }
+                });
+                if has_update {
+                    result[i] = true;
                 }
             }
         }
