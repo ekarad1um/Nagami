@@ -258,9 +258,9 @@ exception of `ActiveHeadManifest`, where the `serde(flatten)`
 `workspace_revision.id` increments by one per accepted upload
 or delete under EITHER tree (`datasets/` or `converters/`);
 `workspace_revision.at` records the RFC3339 wall-clock.  `tags`
-is mutable user metadata (max 32 entries; <= 64 bytes each;
-ASCII case-insensitive uniqueness).  Tag edits do NOT bump
-`workspace_revision`.
+is mutable user metadata (max 32 entries; <= 64 UTF-8 bytes each;
+Unicode case-insensitive uniqueness via `str::to_lowercase`).
+Tag edits do NOT bump `workspace_revision`.
 
 Hard size cap: `MAX_WORKSPACE_CORE_BYTES = 64 KiB`.
 

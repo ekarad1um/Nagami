@@ -109,12 +109,12 @@ async fn create_workspace(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PatchWorkspaceReq {
-    /// New display name.  Length / charset / ASCII case-insensitive
+    /// New display name.  Length / charset / Unicode case-insensitive
     /// uniqueness (excluding the target) enforced daemon-side.
     #[serde(default)]
     name: Option<String>,
     /// New tag set; replaces (does not merge with) the existing tags.
-    /// Max 32 entries; trimmed + de-duplicated under ASCII
+    /// Max 32 entries; trimmed + de-duplicated under Unicode
     /// case-insensitive comparison.
     #[serde(default)]
     tags: Option<Vec<String>>,

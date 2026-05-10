@@ -53,13 +53,14 @@ pub struct WorkspaceRevision {
 pub struct WorkspaceCore {
     /// Workspace identifier; matches the directory name.
     pub id: WorkspaceId,
-    /// Operator-supplied display name.  Validation (length, charset,
-    /// ASCII case-insensitive uniqueness) is owned by the lifecycle
-    /// handler; this struct is the on-disk shape, not the validator.
+    /// Operator-supplied display name (UTF-8).  Validation (length,
+    /// charset, Unicode case-insensitive uniqueness via
+    /// `str::to_lowercase`) is owned by the lifecycle handler; this
+    /// struct is the on-disk shape, not the validator.
     pub name: String,
-    /// Operator-supplied tags.  Validation (trim, length, charset,
-    /// case-insensitive uniqueness, max 32 entries) is owned by the
-    /// lifecycle handler.  Tag edits do not advance
+    /// Operator-supplied tags (UTF-8).  Validation (trim, length,
+    /// charset, Unicode case-insensitive uniqueness, max 32 entries)
+    /// is owned by the lifecycle handler.  Tag edits do not advance
     /// `workspace_revision` or affect head status.
     pub tags: Vec<String>,
     /// RFC3339 wall-clock timestamp of workspace creation.

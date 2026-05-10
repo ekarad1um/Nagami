@@ -182,10 +182,11 @@ parse time.
    at: created_at }`, `tags = []`, and `head_count = 0`.
 4. Fsync workspace dir then root.
 
-Names are validated for length (<=128 bytes), absence of
+Names are validated for length (<=128 UTF-8 bytes), absence of
 controls / NUL / path separators, no leading/trailing
-whitespace, and uniqueness under ASCII case-insensitive
-comparison.
+whitespace, and uniqueness under Unicode case-insensitive
+comparison via `str::to_lowercase` (simple case folding; no
+NFC normalization).
 
 ### Summary
 

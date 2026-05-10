@@ -124,10 +124,15 @@ Request:
 }
 ```
 
-Constraints: non-empty, <=128 bytes, no controls, no NUL,
-no path separators, no leading/trailing whitespace.  Names are
-unique under ASCII case-insensitive comparison.  `tags` is an
-optional list of strings.
+Constraints: non-empty UTF-8, <=128 bytes (byte count, not
+char count), no controls, no NUL, no path separators, no
+leading/trailing whitespace.  Names are unique under Unicode
+case-insensitive comparison via `str::to_lowercase` (simple case
+folding: handles `Café`/`café` and Cyrillic/Greek case pairs;
+does not normalize NFC vs NFD or apply locale-specific folding
+like Turkish dotted/dotless I).  `tags` is an optional list of
+strings under the same charset rules with a 64-byte per-tag cap
+and 32-entry total cap.
 
 Response:
 ```json

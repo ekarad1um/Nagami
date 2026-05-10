@@ -336,7 +336,8 @@ fn patch_workspace_rejects_name_collision_with_other() {
     let (_dir, mgr) = fresh_root();
     let _other = mgr.create("taken").unwrap();
     let id = mgr.create("free").unwrap();
-    // ASCII case-insensitive collision with `taken` is rejected.
+    // Case-insensitive collision with `taken` is rejected
+    // (`str::to_lowercase` covers ASCII and Unicode pairs alike).
     let err = mgr.patch_workspace(&id, Some("TAKEN"), None).unwrap_err();
     assert!(matches!(err, FileError::NameConflict(_)));
 }

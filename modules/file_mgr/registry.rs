@@ -63,12 +63,12 @@ const MAX_TAG_BYTES: usize = 64;
 /// before validation; the trimmed form is what gets stored.
 /// Constraints (post-trim):
 /// 1. non-empty,
-/// 2. <=64 bytes,
+/// 2. <=64 bytes (UTF-8 byte count),
 /// 3. no NUL,
 /// 4. no path separators (`/` or `\`),
 /// 5. no control characters,
-/// 6. no duplicate under ASCII case-insensitive comparison
-///    within the same workspace,
+/// 6. no duplicate under Unicode case-insensitive comparison
+///    (`str::to_lowercase`; simple case folding, no NFC),
 /// 7. caller-side: <=32 entries total.
 ///
 /// Returns the trimmed, validated tag set so the caller can
@@ -106,7 +106,15 @@ fn validate_workspace_tags(tags: &[String]) -> Result<Vec<String>, FileError> {
                 "tag contains control character: {trimmed:?}"
             )));
         }
-        let lower = trimmed.to_ascii_lowercase();
+        // Unicode-aware case fold: `str::to_lowercase` handles
+        // Latin-extended, Cyrillic, Greek, etc. via the Unicode
+        // `Lowercase` core property.  Simple (not full) case folding
+        // -- German `ß` stays as `ß`, Turkish dotted/dotless I uses
+        // root locale.  No NFC normalization, so decomposed and
+        // composed forms of the same visual string are treated as
+        // distinct (acceptable trade-off; adding NFC requires the
+        // `unicode-normalization` crate).
+        let lower = trimmed.to_lowercase();
         if !seen_lower.insert(lower) {
             return Err(FileError::InvalidName(format!(
                 "duplicate tag (case-insensitive): {trimmed:?}"
@@ -239,10 +247,10 @@ impl WorkspaceMgr {
     ///
     /// Validation:
     /// - `name`: same rules as `create` (length, charset, no
-    ///   whitespace edges, ASCII case-insensitive uniqueness
+    ///   whitespace edges, Unicode case-insensitive uniqueness
     ///   across the workspace registry **excluding the current
     ///   workspace**).
-    /// - `tags`: trim + per-tag rules + within-workspace
+    /// - `tags`: trim + per-tag rules + within-workspace Unicode
     ///   case-insensitive uniqueness + max 32 entries.
     ///
     /// Crash consistency:
@@ -338,16 +346,23 @@ impl WorkspaceMgr {
             .clone())
     }
 
-    /// Ensure `name` is ASCII-case-insensitively unique across
+    /// Ensure `name` is Unicode-case-insensitively unique across
     /// published workspaces.  Callers hold `registry_lock` across
     /// this scan and their subsequent commit so create/rename races
     /// cannot slip through the gap.
+    ///
+    /// Case fold uses `str::to_lowercase` (simple Unicode case
+    /// folding via the `Lowercase` core property).  This catches
+    /// `"Café"` ↔ `"café"` collisions but not exotic edge cases:
+    /// German `ß` stays as `ß`, Turkish dotted/dotless I uses root
+    /// locale, and decomposed vs composed forms (NFC vs NFD) are
+    /// treated as distinct.
     fn ensure_workspace_name_available(
         &self,
         name: &str,
         except: Option<&WorkspaceId>,
     ) -> Result<(), FileError> {
-        let lower = name.to_ascii_lowercase();
+        let lower = name.to_lowercase();
         for existing in self.list_workspaces()? {
             if except.is_some_and(|id| existing == *id) {
                 continue;
@@ -363,7 +378,7 @@ impl WorkspaceMgr {
                 }
                 Err(e) => return Err(e),
             };
-            if core.name.to_ascii_lowercase() == lower {
+            if core.name.to_lowercase() == lower {
                 return Err(FileError::NameConflict(name.to_string()));
             }
         }

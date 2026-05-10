@@ -273,3 +273,37 @@ async fn patch_workspace_returns_404_for_unknown_id() {
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+/// Names are case-insensitive under Unicode case folding via
+/// `str::to_lowercase`, not just ASCII.  Pre-relax behavior used
+/// `to_ascii_lowercase` which left non-ASCII letter-pairs
+/// distinct (`Café` and `café` would have both been allowed).
+/// Pin the relaxed behavior so a future regression that drops
+/// back to ASCII folding fails this test loudly.
+#[tokio::test]
+async fn create_workspace_rejects_unicode_case_collision() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    // Latin-extended pair: é (U+00E9) vs É (U+00C9).
+    let resp = call(
+        &r,
+        Method::POST,
+        "/api/v1/workspace",
+        Some(r#"{"name":"Café"}"#),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = call(
+        &r,
+        Method::POST,
+        "/api/v1/workspace",
+        Some(r#"{"name":"café"}"#),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "lowercase variant of an existing Latin-extended name must collide \
+         (Unicode case folding, not ASCII-only)",
+    );
+}
