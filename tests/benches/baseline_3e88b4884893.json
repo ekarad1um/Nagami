@@ -1,0 +1,41 @@
+{
+  "captured_at_utc": "2026-05-02T01:52:30Z",
+  "git_sha": "3e88b4884893",
+  "host": {
+    "kernel": "Darwin 25.4.0",
+    "arch": "arm64",
+    "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)"
+  },
+  "regression_threshold_pct": 5.0,
+  "comment": "P.4 baseline. Subsequent layers must not regress median by >5% without a waiver. Re-baseline by rerunning the benches and renaming the file to baseline_<new-sha>.json.",
+  "benches": {
+    "audio_buffer/push_period": {
+      "median_ns": 175.61180703624734,
+      "median_ci_low_ns": 175.19293979718753,
+      "median_ci_high_ns": 176.48751919092678,
+      "mean_ns": 177.49472105373127,
+      "stderr_ns": 0.7362985527054133
+    },
+    "audio_buffer/peek_window": {
+      "median_ns": 6264.780678289945,
+      "median_ci_low_ns": 6256.296770317373,
+      "median_ci_high_ns": 6291.250632911392,
+      "mean_ns": 6263.023735702493,
+      "stderr_ns": 7.255974963391968
+    },
+    "opus_stream/encode_frame": {
+      "median_ns": 147396.10141941393,
+      "median_ci_low_ns": 147014.5656779661,
+      "median_ci_high_ns": 147765.12618847203,
+      "mean_ns": 147081.562771927,
+      "stderr_ns": 202.49666222823967
+    },
+    "inference/run_window_burn": {
+      "median_ns": 1198429.1843434344,
+      "median_ci_low_ns": 1195475.9185799318,
+      "median_ci_high_ns": 1203564.3324579834,
+      "mean_ns": 1200416.5118596274,
+      "stderr_ns": 2829.80468065644
+    }
+  }
+}
