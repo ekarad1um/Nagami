@@ -544,20 +544,16 @@ impl JobRegistry {
         let (cap, slot_predicate): (usize, fn(JobType) -> bool) = match job_type {
             JobType::Train => (self.inner.cfg.max_train_jobs, |t| t == JobType::Train),
             JobType::Convert => (self.inner.cfg.max_convert_jobs, |t| t == JobType::Convert),
+            // Spelled out so the compiler proves exhaustiveness;
+            // the predicate reuses `is_delete_subtype` so the
+            // family stays defined in one place.
             JobType::DatasetDelete
             | JobType::ConverterDelete
             | JobType::TrainingLogsDelete
             | JobType::ConverterLogsDelete
-            | JobType::WorkspaceDelete => (self.inner.cfg.max_delete_jobs, |t| {
-                matches!(
-                    t,
-                    JobType::DatasetDelete
-                        | JobType::ConverterDelete
-                        | JobType::TrainingLogsDelete
-                        | JobType::ConverterLogsDelete
-                        | JobType::WorkspaceDelete
-                )
-            }),
+            | JobType::WorkspaceDelete => {
+                (self.inner.cfg.max_delete_jobs, JobType::is_delete_subtype)
+            }
         };
         let active_same_type = state
             .entries

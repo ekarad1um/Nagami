@@ -424,6 +424,25 @@ pub enum JobType {
     WorkspaceDelete,
 }
 
+impl JobType {
+    /// Whether this variant belongs to the async-delete family
+    /// (datasets, converters, training-logs, converter-logs,
+    /// whole-workspace).  All five share one `max_delete_jobs`
+    /// admission slot in the registry; this predicate is the
+    /// single classifier consulted by
+    /// [`crate::file_mgr::JobRegistry::try_acquire`].
+    pub(crate) fn is_delete_subtype(self) -> bool {
+        matches!(
+            self,
+            JobType::DatasetDelete
+                | JobType::ConverterDelete
+                | JobType::TrainingLogsDelete
+                | JobType::ConverterLogsDelete
+                | JobType::WorkspaceDelete
+        )
+    }
+}
+
 /// State a running job touches.  Producers and delete jobs register
 /// exactly one whole-workspace reference for `WorkspaceDelete`
 /// exclusion; uploads and file deletes overlap train/convert without

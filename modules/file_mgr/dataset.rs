@@ -114,6 +114,20 @@ impl AssetTree {
     pub fn accepts_uploads(self) -> bool {
         matches!(self, AssetTree::Datasets | AssetTree::Converters)
     }
+
+    /// `JobType` for the async-delete job that wipes this tree.
+    /// Total over the four variants; both `start_async_tree_delete`
+    /// (datasets/converters) and `start_async_log_delete`
+    /// (training/converter logs) admit through this mapping so the
+    /// per-tree job-type discriminator lives in one place.
+    fn async_delete_job_type(self) -> JobType {
+        match self {
+            AssetTree::Datasets => JobType::DatasetDelete,
+            AssetTree::Converters => JobType::ConverterDelete,
+            AssetTree::TrainingLogs => JobType::TrainingLogsDelete,
+            AssetTree::ConverterLogs => JobType::ConverterLogsDelete,
+        }
+    }
 }
 
 /// Clone `prev_core`, advance its `workspace_revision` (id +1,
@@ -260,23 +274,27 @@ fn build_delete_target(workspace_dir: &Path, tree: AssetTree, sub: Option<&Asset
 /// Snapshot's display target_path for an async asset delete:
 /// the bare tree name for whole-tree wipes, otherwise
 /// `<tree>/<sub>`.  Shared by the dataset/converter and
-/// log-tree async dispatchers.  The fallback in the parse
-/// failure branch should be unreachable in practice (`tree`
-/// and `sub` are already valid `AssetPath` segments by the
-/// time we get here), but the explicit fallback keeps the
-/// function total without leaking a `Result` to the caller.
+/// log-tree async dispatchers.
+///
+/// Precondition (held by both call sites):
+///
+/// * `sub` was produced by [`parse_mutable_path`] stripping a
+///   tree-name prefix off a parsed [`AssetPath`].  Therefore
+///   `tree.dir_name() + "/" + sub.as_str()` reconstructs the
+///   original validated path's bytes byte-for-byte; depth, length,
+///   per-component, and allowed-byte invariants all round-trip.
+///   `AssetPath::parse` cannot fail under this precondition; an
+///   arbitrary `sub` (e.g. one already at `MAX_DEPTH`) would
+///   overflow when joined and is NOT a supported input.
 fn build_display_path(tree: AssetTree, sub: Option<&AssetPath>) -> AssetPath {
-    let bare = || AssetPath::parse(tree.dir_name()).expect("tree dir name is a valid AssetPath");
-    match sub {
-        Some(rel) => {
-            let mut s = String::with_capacity(tree.dir_name().len() + 1 + rel.as_str().len());
-            s.push_str(tree.dir_name());
-            s.push('/');
-            s.push_str(rel.as_str());
-            AssetPath::parse(&s).unwrap_or_else(|_| bare())
-        }
-        None => bare(),
-    }
+    let raw = match sub {
+        Some(rel) => format!("{}/{}", tree.dir_name(), rel.as_str()),
+        None => tree.dir_name().to_string(),
+    };
+    AssetPath::parse(&raw).expect(
+        "build_display_path precondition violated: \
+         join exceeds AssetPath limits (sub must come from a tree-prefix strip)",
+    )
 }
 
 // MARK: DatasetEntry / DatasetListing
@@ -763,13 +781,7 @@ impl WorkspaceMgr {
         // `max_delete_jobs` slot serializes simultaneous deletes
         // across the dataset / converter / workspace-delete
         // family.
-        let job_type = match tree {
-            AssetTree::Datasets => JobType::DatasetDelete,
-            AssetTree::Converters => JobType::ConverterDelete,
-            AssetTree::TrainingLogs | AssetTree::ConverterLogs => {
-                unreachable!("debug_assert above forbids log trees in this branch")
-            }
-        };
+        let job_type = tree.async_delete_job_type();
         // The snapshot's display target_path mirrors what the
         // operator asked for: a sub-path for sub-tree deletes,
         // the bare tree name for whole-tree wipes.
@@ -903,13 +915,7 @@ impl WorkspaceMgr {
         // for 404 explicitly.
         std::fs::symlink_metadata(&target).map_err(|source| io_err(target.display(), source))?;
 
-        let job_type = match tree {
-            AssetTree::TrainingLogs => JobType::TrainingLogsDelete,
-            AssetTree::ConverterLogs => JobType::ConverterLogsDelete,
-            AssetTree::Datasets | AssetTree::Converters => {
-                unreachable!("debug_assert above forbids non-log trees in this branch")
-            }
-        };
+        let job_type = tree.async_delete_job_type();
         let display_path = build_display_path(tree, sub.as_ref());
         let job_handle = self
             .jobs
