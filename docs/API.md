@@ -739,17 +739,29 @@ trainer walks the fixed `<workspace>/datasets/` root.
 Request:
 ```json
 {
-  "epochs":        12,
-  "batch_size":    32,
-  "learning_rate": 0.001,
-  "seed":          42
+  "epochs":           12,
+  "batch_size":       32,
+  "learning_rate":    0.001,
+  "seed":             42,
+  "validation_split": 0.2
 }
 ```
 
 The body shape is `{epochs: u32, batch_size: u32,
-learning_rate: f32, seed?: u64}` with `deny_unknown_fields`,
-so any unknown key is rejected at the wire boundary; `seed` is
-optional and may be omitted.
+learning_rate: f32, seed?: u64, validation_split?: f32}` with
+`deny_unknown_fields`, so any unknown key is rejected at the
+wire boundary; both `seed` and `validation_split` are optional
+and may be omitted (defaults: daemon-picked seed,
+`validation_split = 0.0`).
+
+`validation_split` controls a stratified per-class deterministic
+holdout.  `0.0` (the default) uses the full dataset and
+publishes the last-epoch head.  Any value in `(0.0, 1.0)` runs
+validation each epoch and publishes the best-val-loss
+snapshot.  Per-class clamping guarantees at least one train
+and one val sample per class when enabled; a singleton class
+under a non-zero split fails closed with a structured error
+naming the offending class.
 
 The trainer discovers labels from non-hidden direct child
 directories under `<workspace>/datasets/`, sorted by canonical
@@ -762,8 +774,10 @@ as `dataset_read_failure` (HTTP 500 -- the daemon-owned
 
 Lazy per-batch FD opens cap concurrent FDs at
 `batch_size × parallel_loaders` regardless of dataset size.
-The deployment-bundled backbone at
-`<workspace_root>/backbone/backbone.mpk` is the single source.
+The backbone artefact is resolved at daemon boot from the
+first `[[backbone.candidates]]` entry with `kind = "burn"` in
+the launch TOML; a missing or absent file produces a
+structured 404 at request time.
 
 Response:
 ```json

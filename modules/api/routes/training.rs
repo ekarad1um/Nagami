@@ -3,13 +3,15 @@
 //! path -- the trainer always walks `<workspace>/datasets/`), with
 //! list / status / cancel surfaces under
 //! `/workspace/{id}/training[/{job}]`.  Backbone selection is
-//! daemon-side: the deployment-bundled
-//! `<root>/backbone/backbone.mpk` is the single source.
+//! daemon-side: the trainer reads the path from
+//! [`crate::api::AppState::training_backbone_path`], which the
+//! daemon resolves at boot from the first `kind = "burn"` entry
+//! in the launch TOML's `[[backbone.candidates]]`.  No upload API.
 
 use std::sync::Arc;
 
 use crate::common::ids::{HeadId, JobId, WorkspaceId};
-use crate::file_mgr::{BACKBONE_DIR_NAME, FsService, TrainingCfg, validate_training_cfg};
+use crate::file_mgr::{FsService, TrainingCfg, validate_training_cfg};
 use crate::training::{TrainingJob, TrainingRegistry};
 use axum::Router;
 use axum::extract::{Path, State};
@@ -39,8 +41,7 @@ struct TrainingListResp {
 }
 
 async fn start_training(
-    State(training): State<Arc<dyn TrainingRegistry>>,
-    State(files): State<Arc<dyn FsService>>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     ApiJson(cfg): ApiJson<TrainingCfg>,
 ) -> Result<Json<TrainStartResp>, ApiError> {
@@ -49,9 +50,38 @@ async fn start_training(
     // this enforces only numeric range gates (epochs / batch / lr).
     validate_training_cfg(&cfg).map_err(|e| ApiError::Bad(e.to_string()))?;
 
+    // Resolve the backbone path BEFORE the workspace check: a
+    // launch-config without a Burn candidate is a deployment
+    // misconfiguration the operator should see immediately, not
+    // after a successful workspace lookup that suggests the
+    // request is otherwise valid.  `state` is owned (axum's
+    // `State<AppState>` extractor clones the AppState once at
+    // the request boundary), so move the field out directly
+    // rather than re-cloning the `PathBuf` inside.
+    let backbone_path = state.training_backbone_path.ok_or_else(|| {
+        ApiError::File(crate::file_mgr::io_err(
+            "<launch.backbone.candidates[kind=\"burn\"]>",
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no Burn backbone configured in launch TOML",
+            ),
+        ))
+    })?;
+    if !backbone_path.is_file() {
+        return Err(ApiError::File(crate::file_mgr::io_err(
+            backbone_path.display(),
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "deployment backbone not found",
+            ),
+        )));
+    }
+
     // Workspace existence + revision snapshot on the blocking pool
     // so the runtime stays free under eMMC pressure.  The cached
     // `summary` read also seeds the per-workspace cell on first hit.
+    let files = state.files.clone();
+    let training = state.training.clone();
     let workspace_id_for_check = workspace_id;
     let files_for_check = files.clone();
     let workspace_revision: crate::common::workspace::WorkspaceRevision =
@@ -62,17 +92,6 @@ async fn start_training(
                 .map(|s| s.core.workspace_revision.clone())
         })
         .await??;
-
-    let backbone_path = files.root().join(BACKBONE_DIR_NAME).join("backbone.mpk");
-    if !backbone_path.is_file() {
-        return Err(ApiError::File(crate::file_mgr::io_err(
-            backbone_path.display(),
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "deployment backbone not found",
-            ),
-        )));
-    }
 
     // Allocate head id before spawn so the response can return it; the
     // publish at job end reuses the same id verbatim.

@@ -93,9 +93,12 @@ pub struct TrainingResult {
     pub classes: Vec<String>,
     /// Training accuracy of the published head.
     pub final_train_acc: f32,
-    /// NaN when `val_split == 0`; finetune currently fixes
-    /// `val_split = 0.0` because the wire `TrainingCfg` carries no
-    /// validation knob.
+    /// NaN when the request's `validation_split` was `0.0` (no
+    /// holdout): with no validation set the finetuner publishes
+    /// the last-epoch head and skips val-accuracy reporting.
+    /// Finite when `validation_split` was in `(0.0, 1.0)` and
+    /// the stratified per-class split produced a non-empty val
+    /// partition.
     pub final_val_acc: f32,
 }
 
@@ -641,9 +644,11 @@ async fn run_job_inner(
         epochs: job.training_cfg.epochs as usize,
         batch: job.training_cfg.batch_size as usize,
         lr: job.training_cfg.learning_rate,
-        // The wire `TrainingCfg` carries no val_split knob;
-        // val_split = 0 disables the stratified split.
-        val_split: 0.0,
+        // 0.0 disables the stratified split; any value in
+        // `(0.0, 1.0)` runs validation and publishes the
+        // best-val-loss epoch.  Range gated by
+        // `validate_training_cfg` at the request boundary.
+        val_split: job.training_cfg.validation_split,
         seed: job.training_cfg.seed.unwrap_or(42),
     };
     let cancel_for_run = cancel.clone();

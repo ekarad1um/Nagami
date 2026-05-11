@@ -137,6 +137,19 @@ pub struct AppState {
     /// on `POST /active {default: true}`.  Resolved once at daemon
     /// boot from the launch config.
     pub default_head: Option<crate::config::DefaultHeadRef>,
+    /// Path to the trainer's Burn-format backbone artefact,
+    /// resolved at daemon boot from the first
+    /// `[[backbone.candidates]]` entry whose `kind = "burn"` in
+    /// the launch TOML.  `POST /workspace/{id}/train` reads
+    /// these bytes into RAM at job-start; the file is never
+    /// modified by the daemon.  `None` when the launch
+    /// catalogue contains no Burn candidate, in which case
+    /// `POST /train` 404s with a "no Burn backbone configured"
+    /// diagnostic.  Sharing this path with the inference
+    /// engine's catalogue ([`crate::inference::BackboneCatalogue`])
+    /// means a single launch-TOML edit hot-swaps both consumers
+    /// at their next boot / next job start.
+    pub training_backbone_path: Option<std::path::PathBuf>,
     /// Cross-cutting in-process job registry.  Owns the admission
     /// gate (per-`JobType` concurrency caps plus reference-overlap
     /// detection), the per-job event ring for SSE replay, the

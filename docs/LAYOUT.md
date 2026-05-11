@@ -139,15 +139,12 @@ workspace is just `workspace.json` + `heads.json`; the leaf
 subdirs (`datasets/`, `converters/`, `heads/`,
 `training_logs/`, `converter_logs/`, `.tmp/`) appear when their
 respective producer first runs.  The same lazy-mkdir rule
-applies at the root level: `.tmp/`, `active/`, and the
-operator-managed `backbone/` only appear once needed.
+applies at the root level: `.tmp/` and `active/` only appear
+once needed.
 
 ```
 <workspace_root>/
     config.toml                                   -- mutable user-pref config; auto-created if missing
-    backbone/                                     -- operator-managed backbone drop; lazy
-        backbone.mpk                              -- shared default; deployment-managed
-        backbone.meta.json                        -- {sha256, n_features}
     workspaces/<workspace_id>/                    -- created on workspace create
         workspace.json                            -- hot core metadata (WorkspaceCore)
         heads.json                                -- compact 2-slot head index (HeadIndex)
@@ -208,16 +205,15 @@ it lives inside the workspace tree so a single
 `--workspace <PATH>` argument is sufficient to locate everything
 mutable the daemon owns.
 
-`<workspace_root>/backbone/backbone.mpk` is the trainer's
-backbone artefact, checked by `POST /workspace/{id}/train` at
-job-launch time.  The daemon does not auto-create the
-directory or populate the file -- operators (or deployment
-scripts) place a `.mpk` there before training jobs run, and
-no API route accepts an upload.  This path is distinct from
-the inference engine's `[backbone.candidates]` (configured in
-the launch TOML and pointing OUTSIDE the workspace tree); a
-deployment may share the file via symlink or use two distinct
-artefacts.
+**Backbone artefact**: a single Burn `.mpk` file lives outside
+the workspace tree, configured via `[[backbone.candidates]]`
+in the launch TOML.  Both the inference engine ([`load_first_supported`](../modules/inference/backbone.rs))
+and the trainer (`POST /workspace/{id}/train`) read it.  The
+trainer picks the first candidate with `kind = "burn"` at boot
+and refuses the request with a structured 404 if none is
+configured.  The daemon does not auto-create the path or accept
+uploads — operators (or deployment scripts) place the file
+there once.
 
 The trainer treats this file as **frozen, read-only**: it
 loads the weights into RAM at job start (no long-lived fd, no
@@ -241,8 +237,6 @@ managed independently.
 | Path | Role | Schema | Atomicity invariants |
 |---|---|---|---|
 | `config.toml` | Hot-reloadable user-preference TOML | [`Config`](../modules/config.rs) | Atomic rewrite (tempfile + fsync + rename); auto-created on first boot if missing |
-| `backbone/backbone.mpk` | Frozen feature extractor (shared by every workspace and the runtime engine) | Burn `.mpk` | Deployment-supplied; daemon does not mutate |
-| `backbone/backbone.meta.json` | `{sha256, n_features}` companion | JSON | Deployment-supplied |
 | `workspaces/<id>/workspace.json` | Hot core metadata; eagerly loaded into `ArcSwap<WorkspaceCore>` | [`WorkspaceCore`](#workspacecore) | Atomic rewrite via `put_atomic` (tempfile + fsync + rename + parent fsync); revision-bump precedes dataset byte mutation |
 | `workspaces/<id>/heads.json` | Compact head index (<=2 entries); eagerly loaded into `ArcSwap<HeadIndex>` | [`HeadIndex`](#headindex) | The publish point for trained heads — committed AFTER `<head_id>.{mpk,json}` are renamed |
 | `workspaces/<id>/datasets/<path>/<file>` | Daemon-owned dataset tree | raw bytes | Each accepted mutation advances `workspace.json.workspace_revision` BEFORE bytes change |

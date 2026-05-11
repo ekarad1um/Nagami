@@ -109,8 +109,8 @@ file to both flags is rejected.
 
 The active head is persisted under `<workspace>/active/`, not in
 the user-preference TOML; both TOMLs are parsed with
-`serde(deny_unknown_fields)`, so any unknown key (e.g. a legacy
-`[head_active]` block) is rejected at config load.
+`serde(deny_unknown_fields)`, so any unknown key is rejected at
+config load.
 
 ### Long-running (typical)
 
@@ -260,30 +260,6 @@ working directory.
 A missing or corrupt bundled default surfaces as: boot
 without inference, status unhealthy, no synthetic head.  The
 daemon does not fall back to a fabricated head.
-
-## Upgrading from an older daemon
-
-There is no migration tool.  The on-disk schema is parsed with
-`#[serde(deny_unknown_fields)]` (or, for `ActiveHeadManifest`,
-structural validation via `ActiveHeadManifest::validate`), so
-any older body shape parse-fails at the read boundary.
-Operators upgrading from any earlier daemon MUST wipe
-`<workspace_root>/workspaces/` and
-`<workspace_root>/active/generations/` before launching; the
-daemon's first boot recreates the layout and materializes the
-bundled-default active generation from
-`[head.default]` in the launch config.
-
-The launch / user-pref split is a structural change: anything
-that is not actually mutated at runtime (training defaults, file
-admission caps, workspace_root, the mic catalogue, stream binds,
-the bundled-default head pair) lives in the launch TOML; the
-workspace `config.toml` now only carries the mic policy and
-inference cadence.  When upgrading, either delete
-`<workspace_root>/config.toml` and let first-boot recreate it,
-or hand-edit it to drop the retired `workspace_root`,
-`[training_defaults]`, and `[file]` keys.  Move the latter two
-into the launch TOML if you previously customized them.
 
 ## Deploy (Linux SBC)
 

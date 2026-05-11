@@ -85,6 +85,11 @@ fn fresh_state(dir: &std::path::Path) -> AppState {
             path: dir.join("bundled_default/head.mpk"),
             labels_path: dir.join("bundled_default/labels.txt"),
         }),
+        // No `POST /train` tests in this file; `None` is the
+        // correct default.  The dedicated train-pipeline
+        // integration tests under `tests/train_pipeline.rs`
+        // stub a backbone and set this to the stub path.
+        training_backbone_path: None,
         jobs,
     }
 }

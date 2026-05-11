@@ -66,6 +66,18 @@ pub struct TrainingCfg {
     /// pick a seed (per-job entropy); `Some(_)` pins replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+    /// Per-class fraction held out for validation.  Bounds:
+    /// finite, `0.0 <= split < 1.0` (default `0.0`).
+    ///
+    /// When `0.0`, the trainer uses the full dataset and the
+    /// published head is the last-epoch snapshot.  When in
+    /// `(0.0, 1.0)`, the trainer performs a stratified per-class
+    /// deterministic split and publishes the best-val-loss epoch.
+    /// Per-class clamping guarantees at least one train and one
+    /// val sample per class when enabled; singleton classes are
+    /// rejected with a structured error.
+    #[serde(default)]
+    pub validation_split: f32,
 }
 
 // MARK: ConverterPath
@@ -286,6 +298,12 @@ pub enum ValidationError {
         /// Allowed maximum.
         max: f32,
     },
+    /// Validation split not finite, negative, or `>= 1.0`.
+    #[error("validation_split out of range: got {got}, allowed [0.0, 1.0) and finite")]
+    ValidationSplitOutOfRange {
+        /// Observed value (rendered with full precision).
+        got: f32,
+    },
     /// Convert request had zero shards.
     #[error("convert request must declare at least one shard")]
     NoShards,
@@ -332,6 +350,16 @@ pub fn validate_training_cfg(cfg: &TrainingCfg) -> Result<(), ValidationError> {
         return Err(ValidationError::LearningRateOutOfRange {
             got: cfg.learning_rate,
             max: MAX_LEARNING_RATE,
+        });
+    }
+    // Half-open `[0.0, 1.0)`: 0.0 disables validation (full
+    // dataset → last-epoch head); 1.0 would split off every
+    // sample, leaving no training data.  `Range::contains`
+    // returns false for NaN and ±∞ (both comparisons short-
+    // circuit to false), so the finiteness check is implicit.
+    if !(0.0..1.0).contains(&cfg.validation_split) {
+        return Err(ValidationError::ValidationSplitOutOfRange {
+            got: cfg.validation_split,
         });
     }
     // `seed` is unconstrained: any `u64` is a valid replay seed.
@@ -428,6 +456,7 @@ mod tests {
             batch_size: 16,
             learning_rate: 1e-3,
             seed: Some(42),
+            validation_split: 0.0,
         }
     }
 

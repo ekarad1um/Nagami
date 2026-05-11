@@ -114,6 +114,9 @@ fn fresh_router(dir: &Path) -> (Router, Arc<dyn FsService>) {
             path: dir.join("bundled_default/head.mpk"),
             labels_path: dir.join("bundled_default/labels.txt"),
         }),
+        // Converter tests do not invoke `POST /train`; `None`
+        // is the correct default.
+        training_backbone_path: None,
         jobs,
     };
     (router_v1_nested(app), files)

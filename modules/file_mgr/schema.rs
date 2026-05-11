@@ -55,8 +55,6 @@ pub const WORKSPACES_DIR_NAME: &str = "workspaces";
 pub const ROOT_TMP_DIR_NAME: &str = ".tmp";
 /// Top-level subdirectory for the active-head generation tree.
 pub const ACTIVE_DIR_NAME: &str = "active";
-/// Top-level subdirectory for the deployment-bundled backbone.
-pub const BACKBONE_DIR_NAME: &str = "backbone";
 /// Subdirectory under `<root>/active/` holding retained generations.
 pub const ACTIVE_GENERATIONS_DIR_NAME: &str = "generations";
 /// Subdirectory under `<root>/active/` for activation staging.
@@ -160,12 +158,6 @@ pub fn active_generation_dir(root: &Path, activation_id: &str) -> PathBuf {
 #[inline]
 pub fn active_staging_dir(root: &Path) -> PathBuf {
     active_dir(root).join(ACTIVE_TMP_DIR_NAME)
-}
-
-/// `<root>/backbone/`.  Deployment-managed backbone artefacts.
-#[inline]
-pub fn backbone_dir(root: &Path) -> PathBuf {
-    root.join(BACKBONE_DIR_NAME)
 }
 
 // MARK: ActiveCurrentPointer (active/current.json)

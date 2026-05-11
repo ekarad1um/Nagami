@@ -199,6 +199,11 @@ pub fn fresh_app_state(dir: &Path) -> AppState {
             path: dir.join("bundled_default/head.mpk"),
             labels_path: dir.join("bundled_default/labels.txt"),
         }),
+        // None by default: no integration test using this
+        // fixture exercises `POST /train` (the train pipeline
+        // has its own `fresh_router` in `tests/train_pipeline.rs`
+        // that stubs a backbone and wires it through here).
+        training_backbone_path: None,
         jobs,
     }
 }

@@ -1473,6 +1473,22 @@ async fn async_main(args: Cli) -> Result<()> {
         std::sync::Arc::new(monitor.clone());
     let training_registry: std::sync::Arc<dyn crate::training::TrainingRegistry> =
         std::sync::Arc::new(training);
+    // Resolve the trainer's backbone path from the launch
+    // catalogue: the first `kind = "burn"` candidate is the
+    // single source of truth for both inference (which picks
+    // it via `load_first_supported` if it's also the first
+    // supported kind) and training (which always needs a Burn
+    // `.mpk` regardless of the inference build features).
+    // `None` when the catalogue carries no Burn entry; the
+    // training route 404s with a clear "no Burn backbone
+    // configured" diagnostic at request time so the daemon
+    // still boots and other endpoints stay reachable.
+    let training_backbone_path = launch
+        .backbone
+        .candidates
+        .iter()
+        .find(|c| c.kind == crate::inference::BackboneKind::Burn)
+        .map(|c| c.path.clone());
     let app_state = crate::api::AppState {
         config: config.clone(),
         head: head_store,
@@ -1486,6 +1502,7 @@ async fn async_main(args: Cli) -> Result<()> {
         // entirely inside the route's `spawn_blocking` worker.
         active_mutex: std::sync::Arc::new(parking_lot::Mutex::new(())),
         default_head: default_head.clone(),
+        training_backbone_path,
         // Hand the api the same registry the workspace-side
         // admission paths register against.
         jobs: jobs_registry,

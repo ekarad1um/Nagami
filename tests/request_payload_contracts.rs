@@ -85,12 +85,14 @@ fn validate_training_cfg_pins_redesign_bounds() {
             batch_size: 1,
             learning_rate: 1e-9,
             seed: None,
+            validation_split: 0.0,
         },
         TrainingCfg {
             epochs: MAX_EPOCHS,
             batch_size: MAX_BATCH_SIZE,
             learning_rate: MAX_LEARNING_RATE,
             seed: Some(0),
+            validation_split: 0.999,
         },
     ] {
         validate_training_cfg(&cfg).expect("boundary cfg within bounds");
@@ -103,6 +105,7 @@ fn validate_training_cfg_pins_redesign_bounds() {
                 batch_size: 1,
                 learning_rate: 1e-3,
                 seed: None,
+                validation_split: 0.0,
             },
             "EpochsOutOfRange",
         ),
@@ -112,6 +115,7 @@ fn validate_training_cfg_pins_redesign_bounds() {
                 batch_size: MAX_BATCH_SIZE + 1,
                 learning_rate: 1e-3,
                 seed: None,
+                validation_split: 0.0,
             },
             "BatchSizeOutOfRange",
         ),
@@ -121,14 +125,71 @@ fn validate_training_cfg_pins_redesign_bounds() {
                 batch_size: 1,
                 learning_rate: f32::NAN,
                 seed: None,
+                validation_split: 0.0,
             },
             "LearningRateOutOfRange",
+        ),
+        (
+            TrainingCfg {
+                epochs: 1,
+                batch_size: 1,
+                learning_rate: 1e-3,
+                seed: None,
+                validation_split: -0.1,
+            },
+            "ValidationSplitOutOfRange",
+        ),
+        (
+            TrainingCfg {
+                epochs: 1,
+                batch_size: 1,
+                learning_rate: 1e-3,
+                seed: None,
+                validation_split: 1.0,
+            },
+            "ValidationSplitOutOfRange",
+        ),
+        (
+            TrainingCfg {
+                epochs: 1,
+                batch_size: 1,
+                learning_rate: 1e-3,
+                seed: None,
+                validation_split: f32::NAN,
+            },
+            "ValidationSplitOutOfRange",
         ),
     ] {
         let err = validate_training_cfg(&cfg).expect_err("expected reject");
         let s = format!("{err:?}");
         assert!(s.contains(expected), "got {err:?}, expected {expected}");
     }
+}
+
+/// `validation_split` defaults to `0.0` when omitted from the
+/// wire, matching the pre-feature behavior (no holdout,
+/// last-epoch head).  Pinned so a future caller-facing change
+/// to the default surfaces in CI rather than as a silent
+/// trainer-behavior shift.
+#[test]
+fn validation_split_default_is_zero_when_omitted() {
+    let body = r#"{"epochs": 4, "batch_size": 16, "learning_rate": 0.001}"#;
+    let cfg: TrainingCfg = serde_json::from_str(body).expect("parse");
+    assert_eq!(cfg.validation_split, 0.0);
+    validate_training_cfg(&cfg).expect("default cfg validates");
+}
+
+/// A non-zero `validation_split` round-trips through JSON
+/// without precision loss inside the validator's accepted
+/// half-open `[0.0, 1.0)` range.  Pins the wire-shape promise
+/// to clients that drive the trainer's stratified-split path.
+#[test]
+fn validation_split_round_trips_through_json() {
+    let body =
+        r#"{"epochs": 4, "batch_size": 16, "learning_rate": 0.001, "validation_split": 0.25}"#;
+    let cfg: TrainingCfg = serde_json::from_str(body).expect("parse");
+    assert_eq!(cfg.validation_split, 0.25);
+    validate_training_cfg(&cfg).expect("0.25 split validates");
 }
 
 // MARK: ConverterPath wire shape
@@ -343,6 +404,7 @@ fn manifest_value_round_trip_is_canonical() {
         batch_size: 16,
         learning_rate: 1e-3,
         seed: Some(42),
+        validation_split: 0.2,
     };
     let value = to_manifest_value(&cfg);
     let back = from_manifest_value(&value).expect("round-trip parses");
@@ -353,9 +415,10 @@ fn manifest_value_round_trip_is_canonical() {
     );
 
     // Reordered JSON parses back to the same struct -> same hash.
-    let reordered: serde_json::Value =
-        serde_json::from_str(r#"{"learning_rate":0.001,"seed":42,"epochs":4,"batch_size":16}"#)
-            .unwrap();
+    let reordered: serde_json::Value = serde_json::from_str(
+        r#"{"learning_rate":0.001,"seed":42,"validation_split":0.2,"epochs":4,"batch_size":16}"#,
+    )
+    .unwrap();
     let back2 = from_manifest_value(&reordered).expect("reordered parses");
     assert_eq!(
         canonical_training_cfg_sha256(&cfg),

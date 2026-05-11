@@ -7,7 +7,6 @@
 //!     active/
 //!         current.json
 //!         generations/<activation_id>/{head.mpk,labels.txt,manifest.json}
-//!     backbone/backbone.mpk          -- deployment-bundled
 //!     workspaces/<workspace_id>/
 //!         workspace.json             -- core (id, name, tags,
 //!                                       created_at, workspace_revision,
@@ -169,14 +168,14 @@ pub use request_payload::{
 pub use schema::{
     ACTIVE_CURRENT_FILENAME, ACTIVE_DIR_NAME, ACTIVE_GENERATIONS_DIR_NAME, ACTIVE_HEAD_FILENAME,
     ACTIVE_LABELS_FILENAME, ACTIVE_MANIFEST_FILENAME, ACTIVE_TMP_DIR_NAME, ActiveCurrentPointer,
-    BACKBONE_DIR_NAME, HEAD_ARTIFACT_EXTENSION, HEAD_INDEX_FILENAME, HEAD_MANIFEST_EXTENSION,
-    HEADS_DIR_NAME, MAX_WORKSPACE_CORE_BYTES, ROOT_TMP_DIR_NAME, WORKSPACE_CORE_FILENAME,
-    WORKSPACES_DIR_NAME, active_current_path, active_dir, active_generation_dir,
-    active_generations_dir, active_staging_dir, backbone_dir, head_artifact_path, head_index_path,
-    head_manifest_path, heads_dir, read_active_current, read_active_manifest, read_head_index,
-    read_head_manifest, read_workspace_core, root_tmp_dir, workspace_core_path, workspace_dir_for,
-    workspaces_dir, write_active_current, write_active_manifest, write_head_index,
-    write_head_manifest, write_workspace_core,
+    HEAD_ARTIFACT_EXTENSION, HEAD_INDEX_FILENAME, HEAD_MANIFEST_EXTENSION, HEADS_DIR_NAME,
+    MAX_WORKSPACE_CORE_BYTES, ROOT_TMP_DIR_NAME, WORKSPACE_CORE_FILENAME, WORKSPACES_DIR_NAME,
+    active_current_path, active_dir, active_generation_dir, active_generations_dir,
+    active_staging_dir, head_artifact_path, head_index_path, head_manifest_path, heads_dir,
+    read_active_current, read_active_manifest, read_head_index, read_head_manifest,
+    read_workspace_core, root_tmp_dir, workspace_core_path, workspace_dir_for, workspaces_dir,
+    write_active_current, write_active_manifest, write_head_index, write_head_manifest,
+    write_workspace_core,
 };
 pub use staging::{
     DATASET_TOMBSTONE_PREFIX, DEFAULT_DELETE_BATCH_ENTRIES, DeleteTombstone, DrainResult,

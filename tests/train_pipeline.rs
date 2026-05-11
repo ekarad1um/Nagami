@@ -54,32 +54,35 @@ impl LagSource for StubLagSource {
 }
 
 /// Build a router rooted at `dir`, with a synthetic backbone
-/// stub at `<root>/backbone/backbone.mpk`.  The stub is opaque
-/// bytes -- the trainer fails at backbone-load time with the
-/// producer-allocated job entering `JobState::Failed`, which is
+/// stub on disk and the path wired through
+/// `AppState::training_backbone_path` (the same channel
+/// production uses, resolved from `[[backbone.candidates]]` in
+/// the launch TOML at boot).  The stub is opaque bytes -- the
+/// trainer fails at backbone-load time with the producer-
+/// allocated job entering `JobState::Failed`, which is
 /// sufficient for the producer-admission assertions in this
 /// file.  No head record is committed on failure.
 fn fresh_router(dir: &Path) -> Router {
-    // `FsServiceImpl` roots at `dir` (not `dir/workspaces`) so
-    // the producer's backbone resolution can find the stub at
-    // `dir/backbone/backbone.mpk` below.  Per-workspace dirs
-    // land at `dir/workspaces/<id>/`.  Production paths
-    // (uploader, training, converter, head_rotation, staging)
-    // self-mkdir the per-workspace subtree on first write, so
-    // pre-creating `dir/workspaces/` here is purely defensive
-    // -- the test still passes without it.
+    // `FsServiceImpl` roots at `dir` here so per-workspace dirs
+    // land at `dir/workspaces/<id>/` (not the doubled layout
+    // the shared `tests/api_fixtures/mod.rs` fixture uses).
+    // Production paths (uploader, training, converter,
+    // head_rotation, staging) self-mkdir the per-workspace
+    // subtree on first write, so pre-creating `dir/workspaces/`
+    // here is purely defensive -- the test still passes without
+    // it.
     std::fs::create_dir_all(dir.join("workspaces")).expect("workspace root");
 
-    // Stub backbone fixture under <root>/backbone/.  The
-    // producer admission gate stats it; the trainer's
-    // `Backbone::load_mpk` will fail with a malformed-mpk
-    // error, but that surfaces as `JobState::Failed` AFTER the
-    // producer returns -- the admission contract is the unit
-    // under test here.
-    let backbone_dir = dir.join("backbone");
-    std::fs::create_dir_all(&backbone_dir).expect("backbone dir");
-    std::fs::write(backbone_dir.join("backbone.mpk"), b"stub-backbone-bytes")
-        .expect("write backbone stub");
+    // Stub backbone fixture at an arbitrary in-tempdir path.
+    // The producer admission gate stats it (via the
+    // `training_backbone_path` we hand to `AppState` below);
+    // the trainer's `Backbone::load_mpk` will fail with a
+    // malformed-mpk error, but that surfaces as
+    // `JobState::Failed` AFTER the producer returns -- the
+    // admission contract is the unit under test here.
+    let backbone_path = dir.join("backbone").join("backbone.mpk");
+    std::fs::create_dir_all(backbone_path.parent().unwrap()).expect("backbone dir");
+    std::fs::write(&backbone_path, b"stub-backbone-bytes").expect("write backbone stub");
 
     let cfg_path = dir.join("config.toml");
     let cfg = Config::default_for();
@@ -99,10 +102,11 @@ fn fresh_router(dir: &Path) -> Router {
         head_id: acoustics_lab::common::ids::HeadId::new(),
         n_classes: 2,
     }));
-    // FsServiceImpl roots at `dir` so the producer's backbone
-    // resolution (`files.root().join("backbone").join("backbone.mpk")`)
-    // hits the stub above.  `workspaces/` is the per-workspace
-    // subdirectory under the same root.
+    // FsServiceImpl roots at `dir`; per-workspace dirs land at
+    // `dir/workspaces/<id>/`.  The trainer's backbone now comes
+    // from `AppState::training_backbone_path` (resolved at boot
+    // from the launch catalogue in production), so the
+    // FsService root no longer constrains where the stub lives.
     let jobs = Arc::new(acoustics_lab::file_mgr::JobRegistry::new(
         acoustics_lab::file_mgr::JobRegistryCfg::default(),
     ));
@@ -127,6 +131,7 @@ fn fresh_router(dir: &Path) -> Router {
             path: dir.join("bundled_default/head.mpk"),
             labels_path: dir.join("bundled_default/labels.txt"),
         }),
+        training_backbone_path: Some(backbone_path),
         jobs,
     })
 }
