@@ -1,0 +1,195 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', Menlo, Consolas, monospace;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+/* Squircle corner curves on every rounded element.  CSS Corner Shaping
+   (Chrome 139+ / Firefox in progress as of May 2026) replaces the
+   circular border-radius arc with a smoother superellipse.  Browsers
+   without support silently fall back to circular curves -- purely
+   additive. */
+*,
+*::before,
+*::after {
+  corner-shape: squircle;
+}
+
+/* Pill / circular shapes keep their original perfect-circular arcs --
+   squircle on a maxed-out border-radius creates a subtly different cap
+   curve that breaks the established "pill" visual identity. */
+.rounded-full,
+.rounded-full::before,
+.rounded-full::after {
+  corner-shape: round;
+}
+
+button {
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Native <select> elements render the dropdown chevron with browser-
+   specific padding, weight, and colour.  Strip the appearance and paint
+   our own chevron so every select in the app reads identically. */
+.select-chevron {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%2371717a' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='3 5 6 8 9 5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.55rem center;
+  background-size: 0.75rem;
+  padding-right: 1.875rem;
+}
+
+/* Scroll-aware fade masks for overflowing lists.  The owner toggles
+   these classes from JS based on scrollTop / scrollHeight so the fade
+   only appears in the direction where more content is hidden.  A larger
+   gradient (28px) reads more clearly as a "more below / above" affordance
+   than a hairline. */
+.fade-edge-top {
+  mask-image: linear-gradient(to bottom, transparent 0, black 28px, black 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, black 28px, black 100%);
+}
+.fade-edge-bottom {
+  mask-image: linear-gradient(to top, transparent 0, black 28px, black 100%);
+  -webkit-mask-image: linear-gradient(to top, transparent 0, black 28px, black 100%);
+}
+.fade-edge-top.fade-edge-bottom {
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    black 28px,
+    black calc(100% - 28px),
+    transparent 100%
+  );
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    black 28px,
+    black calc(100% - 28px),
+    transparent 100%
+  );
+}
+
+/* Normalized range slider.  Native rendering diverges between Chromium
+   and Firefox; we collapse the differences so every slider in the app
+   has the same track height, thumb size, hover feedback, and focus
+   ring.  The overall input height is tuned to match the height of a
+   text-xs / py-1.5 / 1px-border select control so sliders and selects
+   share row baselines when placed side-by-side. */
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 1.875rem; /* 30px -- matches select height */
+  background: transparent;
+  cursor: pointer;
+  padding: 0;
+  margin: 0;
+}
+
+input[type='range']:focus {
+  outline: none;
+}
+
+/* Colored fill for the filled portion of the track.  The Svelte
+   component sets `--slider-percent: NN%` inline so Chrome can paint a
+   two-stop gradient on the runnable-track.  Firefox uses its dedicated
+   ::-moz-range-progress pseudo for the filled side.  Thicker track (6px)
+   gives the slider a visual weight comparable to the 30px-tall selects
+   it sits beside. */
+input[type='range']::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 9999px;
+  corner-shape: round;
+  background: linear-gradient(
+    to right,
+    #3b82f6 0,
+    #3b82f6 var(--slider-percent, 0%),
+    #e4e4e7 var(--slider-percent, 0%),
+    #e4e4e7 100%
+  );
+}
+input[type='range']::-moz-range-track {
+  height: 6px;
+  border-radius: 9999px;
+  corner-shape: round;
+  background: #e4e4e7;
+}
+input[type='range']::-moz-range-progress {
+  height: 6px;
+  border-radius: 9999px;
+  corner-shape: round;
+  background: #3b82f6;
+}
+
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  corner-shape: round;
+  background: #3b82f6; /* blue-500 */
+  border: 2px solid #ffffff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
+  /* WebKit's default thumb sits with its top at the track's top; to
+     centre the thumb on the track we shift up by (thumb_h - track_h)/2
+     = (16 - 6) / 2 = 5px.  By coincidence this is the same offset that
+     applied at the 4/14 pairing, so the formula stays consistent if we
+     retune again later. */
+  margin-top: -5px;
+  transition:
+    transform 120ms ease,
+    box-shadow 120ms ease;
+}
+input[type='range']::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  corner-shape: round;
+  background: #3b82f6;
+  border: 2px solid #ffffff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.16);
+  transition:
+    transform 120ms ease,
+    box-shadow 120ms ease;
+}
+
+input[type='range']:hover::-webkit-slider-thumb {
+  transform: scale(1.08);
+}
+input[type='range']:hover::-moz-range-thumb {
+  transform: scale(1.08);
+}
+
+input[type='range']:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.22);
+}
+input[type='range']:focus-visible::-moz-range-thumb {
+  box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.22);
+}
+
+input[type='range']:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+input[type='range']:disabled::-webkit-slider-thumb {
+  background: #a1a1aa; /* zinc-400 */
+}
+input[type='range']:disabled::-moz-range-thumb {
+  background: #a1a1aa;
+}
