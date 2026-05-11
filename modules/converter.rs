@@ -65,6 +65,7 @@ use std::path::{Path, PathBuf};
 use crate::common::dims::BACKBONE_FEATURE_DIM;
 use crate::common::hex::hex_lowercase;
 use crate::common::ids::HeadId;
+use crate::common::log_truncate::truncate_log_message;
 use crate::file_mgr::FsService;
 use crate::model::{self, Head};
 use burn::backend::NdArray;
@@ -1500,26 +1501,6 @@ fn build_head_mpk_blob(weights: &HeadWeights) -> Result<Vec<u8>, ConvertError> {
     Ok(blob)
 }
 
-/// Truncate a log-event message at 8 KiB, snapping to a UTF-8
-/// char boundary so a multi-byte codepoint straddling the cap
-/// does not panic the slice.  Appends `...[truncated]` on
-/// truncation.
-fn truncate_log_message(m: &str) -> String {
-    const MAX_LOG_LINE_BYTES: usize = 8 * 1024;
-    if m.len() <= MAX_LOG_LINE_BYTES {
-        return m.to_string();
-    }
-    // UTF-8 codepoints are at most 4 bytes, so the snap-down
-    // loop runs at most 3 iterations.
-    let mut idx = MAX_LOG_LINE_BYTES;
-    while idx > 0 && !m.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    let mut s = m[..idx].to_string();
-    s.push_str("...[truncated]");
-    s
-}
-
 /// Bounded JSONL writer for
 /// `<workspace_dir>/converter_logs/<job_id>.jsonl`.  One event per
 /// line; flushes once per terminal event (open / publish / close).
@@ -1649,59 +1630,6 @@ mod tests {
         let stripped = dir.join("payload_only.mpk");
         std::fs::write(&stripped, payload).expect("write stripped");
         stripped
-    }
-
-    /// Naive `&str[..MAX]` would panic when the cap lands inside
-    /// a multi-byte UTF-8 codepoint; pin the boundary-snapping
-    /// behavior so a future revert surfaces as a test failure.
-    #[test]
-    fn truncate_log_message_handles_utf8_boundary() {
-        // 4-byte codepoint (U+1F600 grinning face).  Build a
-        // message of exactly 8 KiB - 1 ASCII byte + one 4-byte
-        // codepoint -> total 8 KiB + 3 bytes, with the codepoint
-        // straddling byte index 8191..=8194.  Slice at
-        // MAX_LOG_LINE_BYTES = 8192 is mid-codepoint.
-        let mut m = String::with_capacity(8 * 1024 + 4);
-        for _ in 0..(8 * 1024 - 1) {
-            m.push('a');
-        }
-        m.push('\u{1F600}');
-        let out = truncate_log_message(&m);
-        assert!(
-            out.ends_with("...[truncated]"),
-            "expected truncation marker; got len={}",
-            out.len(),
-        );
-        // The truncated body itself is valid UTF-8 (snap-down
-        // landed on a char boundary).  Length <= cap because the
-        // 4-byte codepoint at the boundary is dropped.
-        let body = out.trim_end_matches("...[truncated]");
-        assert!(
-            body.is_char_boundary(body.len()),
-            "body must end on a char boundary",
-        );
-        assert!(
-            body.len() <= 8 * 1024,
-            "body must not exceed cap; got {}",
-            body.len(),
-        );
-    }
-
-    /// Short messages pass through untruncated.
-    #[test]
-    fn truncate_log_message_short_unchanged() {
-        let m = "hello world";
-        assert_eq!(truncate_log_message(m), "hello world");
-    }
-
-    /// A message of exactly the cap length passes through
-    /// untruncated.
-    #[test]
-    fn truncate_log_message_exact_cap_unchanged() {
-        let m: String = std::iter::repeat_n('a', 8 * 1024).collect();
-        let out = truncate_log_message(&m);
-        assert_eq!(out, m);
-        assert!(!out.contains("...[truncated]"));
     }
 
     #[test]

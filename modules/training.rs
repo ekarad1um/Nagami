@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::common::ids::{HeadId, JobId, WorkspaceId};
+use crate::common::log_truncate::truncate_log_message;
 use crate::common::workspace::{HeadManifest, WorkspaceRevision};
 use crate::file_mgr::{
     DATASETS_DIR_NAME, FsService, PendingHead, TrainingCfg, now_rfc3339, sha256_file_streaming,
@@ -811,26 +812,6 @@ impl TrainJobLog {
     }
 }
 
-/// Truncate an operator-supplied diagnostic at 8 KiB, snapping
-/// to a UTF-8 char boundary so a multi-byte codepoint straddling
-/// the cap does not panic the slice.  Appends `...[truncated]`
-/// on truncation.  Mirrors the converter's helper byte-for-byte.
-fn truncate_log_message(m: &str) -> String {
-    const MAX_LOG_LINE_BYTES: usize = 8 * 1024;
-    if m.len() <= MAX_LOG_LINE_BYTES {
-        return m.to_string();
-    }
-    // UTF-8 codepoints are at most 4 bytes, so the snap-down
-    // loop runs at most 3 iterations.
-    let mut idx = MAX_LOG_LINE_BYTES;
-    while idx > 0 && !m.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    let mut s = m[..idx].to_string();
-    s.push_str("...[truncated]");
-    s
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::disallowed_methods)]
@@ -1216,32 +1197,5 @@ mod tests {
         let third: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(third["seq"], 3);
         assert_eq!(third["state"], "completed");
-    }
-
-    /// `truncate_log_message` snaps a >8 KiB diagnostic to a
-    /// UTF-8 char boundary and tags the truncation.  Pinned
-    /// against a regression that would let a multi-byte
-    /// codepoint straddling the cap panic the slice.
-    #[test]
-    fn train_log_truncate_message_caps_at_8kib_at_char_boundary() {
-        // Pad with 9 KiB of `é` (2-byte UTF-8) so the cap lands
-        // mid-codepoint.
-        let mut s = String::new();
-        while s.len() < 9 * 1024 {
-            s.push('é');
-        }
-        let truncated = truncate_log_message(&s);
-        // Capped under the 8 KiB + suffix budget.
-        assert!(
-            truncated.len() <= 8 * 1024 + b"...[truncated]".len(),
-            "truncated len {} > cap",
-            truncated.len(),
-        );
-        assert!(truncated.ends_with("...[truncated]"));
-        // Round-trip: the truncated body is still valid UTF-8
-        // (snap-down to char boundary held).  String already
-        // implies UTF-8, so a successful slice is the
-        // assertion.
-        let _ = truncated.chars().count();
     }
 }

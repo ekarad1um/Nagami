@@ -33,6 +33,12 @@ pub mod head_header;
 // inference, api) is allowed to import it.
 pub mod hex;
 pub mod ids;
+// Bounded UTF-8 truncation for operator-supplied log lines.
+// Shared between the converter and training JSONL writers; the
+// per-line cap (`MAX_LOG_LINE_BYTES`) keeps a single event small
+// enough to scan with `head` / `jq -c` even when the producer
+// misbehaves.
+pub mod log_truncate;
 pub mod time;
 pub mod traits;
 pub mod version;
