@@ -19,7 +19,8 @@
 //!   is committed on failure.
 //!
 //! Daemon-side archive extraction was removed; bulk dataset loads
-//! use repeated single-file uploads via `POST /upload`.
+//! use repeated single-file uploads via
+//! `PUT /workspace/{id}/assets/{*path}`.
 
 #![warn(missing_debug_implementations)]
 

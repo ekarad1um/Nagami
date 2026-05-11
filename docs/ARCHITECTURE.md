@@ -289,9 +289,10 @@ Every long-running operation goes through the in-process
   `GET /jobs/{job_id}` never open log files.
 
 Admission gates:
-- `POST /upload`, `DELETE /assets/{*path}`, `POST /train`,
-  `POST /convert`, and `DELETE /workspace/{id}` all consult
-  the JobRegistry's overlap-detection before mutating.
+- `PUT /assets/{*path}`, `DELETE /assets/{*path}`,
+  `POST /train`, `POST /convert`, and `DELETE /workspace/{id}`
+  all consult the JobRegistry's overlap-detection before
+  mutating.
 - `POST /train` additionally checks the `max_train_jobs` cap
   (returns 409 `another_train_running` with a dedicated
   discriminator code).
@@ -314,11 +315,12 @@ an idempotent recovery sweep
    is missing/corrupt, boot without inference and mark status
    unhealthy rather than synthesising a production head.
 2. **Per-workspace recovery**: for each workspace, complete
-   any explicit `.tmp/delete-assets-*.json` tombstones, then
-   walk `heads/` and drop any `<head_id>.{mpk, json}` whose
-   `head_id` is not in `heads.json.heads[]`.  Parse
-   `heads.json` once to repair `workspace.json.head_count`
-   before serving summaries.
+   any explicit
+   `.tmp/delete-{assets,converters,training-logs,converter-logs}-*.json`
+   tombstones (one pass per prefix), then walk `heads/` and
+   drop any `<head_id>.{mpk, json}` whose `head_id` is not in
+   `heads.json.heads[]`.  Parse `heads.json` once to repair
+   `workspace.json.head_count` before serving summaries.
 3. **Root staging cleanup**: complete any
    `<root>/.tmp/delete-workspace-*` payloads in batches.
 
@@ -330,28 +332,39 @@ Counter side-effects: every orphan swept increments
 
 ## Async delete pipeline
 
-Both dataset deletes and workspace deletes follow the
-**tombstone -> revision-bump -> stage -> drain -> finalize**
-ordering ([`file_mgr::staging`](../modules/file_mgr/staging.rs)).
-The publish-step under-lock is < 10 ms; the bulk payload
-removal happens in batches (`max_delete_batch_entries`,
-default 256) without holding workspace locks.
+Every workspace-asset delete and the workspace delete follow
+the **tombstone -> revision-bump (where applicable) -> stage
+-> drain -> finalize** ordering
+([`file_mgr::staging`](../modules/file_mgr/staging.rs)).  The
+publish-step under-lock is < 10 ms; the bulk payload removal
+happens in batches (`max_delete_batch_entries`, default 256)
+without holding workspace locks.
 
-Dataset delete (`DELETE /assets/{*path}`):
+Asset delete (`DELETE /assets/{*path}`):
 
 1. JobRegistry overlap check (409 `job_conflict` on overlap).
-2. Lock the workspace; write `<workspace>/.tmp/delete-assets-<job_id>.json`
-   tombstone; fsync `.tmp/`.
-3. Atomic-rewrite `workspace.json` with the next
-   `WorkspaceRevision`.
-4. Rename the target file/tree into
-   `<workspace>/.tmp/delete-assets-<job_id>/payload`.
+   For log trees (`training_logs/`, `converter_logs/`) the
+   dispatcher additionally pre-checks for an active producer
+   in the same workspace and returns 409 with a producer-named
+   diagnostic.
+2. Lock the workspace; write the per-tree tombstone JSON under
+   `<workspace>/.tmp/`.  Filename prefix dispatches the tree:
+   `delete-assets-<job_id>` (datasets), `delete-converters-<job_id>`
+   (converters), `delete-training-logs-<job_id>`,
+   `delete-converter-logs-<job_id>`.  Fsync `.tmp/`.
+3. (`datasets/...` / `converters/...` only) Atomic-rewrite
+   `workspace.json` with the next `WorkspaceRevision`.  Log
+   trees skip this step — logs aren't workspace state in the §9
+   sense, so the revision counter doesn't track them.
+4. Rename the target file/tree into the matching staging
+   payload directory.
 5. Fsync the old parent dir and `.tmp/`.
-6. Publish the new core cache; unlock.
-7. Worker: remove the staged payload in bounded batches;
-   emit progress / log events to the JobRegistry (durable
-   in `<workspace>/training_logs/...` is convert-only;
-   delete jobs rely on the tombstone for crash recovery).
+6. (`datasets/...` / `converters/...` only) Publish the new
+   core cache.  Unlock.
+7. Worker: remove the staged payload in bounded batches; emit
+   progress / log events to the JobRegistry.  Boot recovery's
+   four per-prefix sweeps resume any drain interrupted by a
+   daemon crash.
 
 Workspace delete (`DELETE /workspace/{id}`):
 

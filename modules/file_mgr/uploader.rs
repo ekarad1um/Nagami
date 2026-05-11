@@ -9,7 +9,7 @@
 //!   the per-workspace lock.
 //! - [`WorkspaceMgr::install_from_path`] -- sync atomic
 //!   install of an already-staged tempfile (the api uses
-//!   this after streaming the multipart body itself).
+//!   this after streaming the request body itself).
 //!
 //! # Admission caps
 //!

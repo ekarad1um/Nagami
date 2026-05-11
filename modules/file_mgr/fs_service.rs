@@ -27,7 +27,7 @@
 //! - [`FsService::install_from_path`] takes `&Path` (a
 //!   pre-staged tempfile) instead of an `AsyncRead`; that
 //!   keeps the trait tokio-free and lets api callers stage
-//!   multipart bodies in their own `spawn_blocking`-friendly
+//!   request bodies in their own `spawn_blocking`-friendly
 //!   form.  See [`FsService::acquire_upload_permit`] for the
 //!   admission gate that the api wraps around the
 //!   streaming-then-install pair.
@@ -47,9 +47,7 @@ use crate::common::asset_path::AssetPath;
 use crate::common::error::{Categorized, ErrorKind};
 use crate::common::ids::{HeadId, JobId, WorkspaceId};
 use crate::common::workspace::JobReference;
-use crate::file_mgr::dataset::{
-    AssetDeleteOutcome, DatasetListing, DatasetUploadReceipt, JobRefHandle,
-};
+use crate::file_mgr::dataset::{DatasetListing, DatasetUploadReceipt, JobRefHandle};
 use crate::file_mgr::error::{FileError, io_err};
 use crate::file_mgr::metadata::{AssetKind, AssetRecord, WorkspaceMetadata};
 use crate::file_mgr::{AssetReceipt, WorkspaceReport, WorkspaceSummary};
@@ -343,26 +341,19 @@ pub trait FsService: Send + Sync + 'static {
     ) -> Result<DatasetUploadReceipt, FsError>;
 
     /// Begin an asynchronous workspace asset delete; returns the
-    /// job id immediately.  Dispatches by the path's top-level
-    /// component:
-    ///   - `datasets/...` / `converters/...` (or the bare tree
-    ///     name for whole-tree wipes): async tombstone+stage
-    ///     path; returns
-    ///     [`AssetDeleteOutcome::Async`] with the owning JobId.
-    ///   - `training_logs/...` / `converter_logs/...` (or the
-    ///     bare tree name): sync wipe gated against the
-    ///     workspace's active producer; returns
-    ///     [`AssetDeleteOutcome::SyncRemoved`] with the unlink
-    ///     count.
-    ///
-    /// See
+    /// owning [`JobId`] immediately.  All four mutable trees
+    /// (`datasets/`, `converters/`, `training_logs/`,
+    /// `converter_logs/`) share the same async tombstone+stage+drain
+    /// shape — datasets/converters bump `workspace_revision`,
+    /// log trees skip the bump but go through identical staging +
+    /// drain machinery + recovery scan.  See
     /// [`crate::file_mgr::WorkspaceMgr::start_workspace_asset_delete`]
-    /// for the dispatcher.
+    /// for the per-tree details.
     fn start_workspace_asset_delete(
         &self,
         ws: &WorkspaceId,
         path: &AssetPath,
-    ) -> Result<AssetDeleteOutcome, FsError>;
+    ) -> Result<JobId, FsError>;
 
     /// Synchronously remove a single trained head from the
     /// workspace's 2-slot index.  Holds the per-workspace
@@ -734,7 +725,7 @@ impl FsService for FsServiceImpl {
         &self,
         ws: &WorkspaceId,
         path: &AssetPath,
-    ) -> Result<AssetDeleteOutcome, FsError> {
+    ) -> Result<JobId, FsError> {
         self.mgr
             .start_workspace_asset_delete(ws, path)
             .map_err(FsError::new)

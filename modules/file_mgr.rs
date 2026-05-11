@@ -129,9 +129,9 @@ pub use active_head_writer::{
 };
 pub use cache::WorkspaceCacheCell;
 pub use dataset::{
-    AssetDeleteOutcome, CONVERTER_LOGS_DIR_NAME, DATASETS_DIR_NAME, DEFAULT_DATASET_LIST_LIMIT,
-    DatasetEntry, DatasetListing, DatasetUploadReceipt, EntryKind, JobRefHandle,
-    MAX_DATASET_LIST_LIMIT, TRAINING_LOGS_DIR_NAME,
+    CONVERTER_LOGS_DIR_NAME, DATASETS_DIR_NAME, DEFAULT_DATASET_LIST_LIMIT, DatasetEntry,
+    DatasetListing, DatasetUploadReceipt, EntryKind, JobRefHandle, MAX_DATASET_LIST_LIMIT,
+    TRAINING_LOGS_DIR_NAME,
 };
 pub use error::FileError;
 // `pub(crate)` so any in-crate caller that constructs

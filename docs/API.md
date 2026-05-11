@@ -18,8 +18,8 @@ decoupled from any source workspace.  See
 
 ## Conventions
 
-- Requests and responses are JSON unless noted (multipart for
-  `/upload`; SSE for `/jobs/{id}/events`).
+- Requests and responses are JSON unless noted (raw binary
+  body for `/upload`; SSE for `/jobs/{id}/events`).
 - Successful responses use HTTP 200 OK except where noted.
 - Every error response is wrapped in:
   ```json
@@ -49,7 +49,7 @@ need to distinguish at a glance.
 
 | Status | Code | When |
 |---|---|---|
-| 400 | `bad_request` | Malformed body, validation failed, [`AssetPath`](#assetpath) traversal, multipart field-order violation |
+| 400 | `bad_request` | Malformed body, validation failed, [`AssetPath`](#assetpath) traversal, missing required query parameter |
 | 404 | `not_found` | Workspace, job, asset, or head missing |
 | 405 | `method_not_allowed` | Path matched, verb did not |
 | 409 | `conflict` | Generic conflict (sibling-name collision, terminal-state cancel) |
@@ -235,27 +235,48 @@ or any dataset path under it.
 ## Workspace assets
 
 Both `datasets/` and `converters/` trees are daemon-owned:
-file mutations only flow through `/upload` and
-`/assets/{*path}` DELETE, with the top-level component
+file mutations only flow through `PUT /assets/{*path}` and
+`DELETE /assets/{*path}`, with the top-level component
 selecting which tree.  Operator-side rsync / scp into either
 tree is unsupported.  Every accepted mutation under either
 tree advances `workspace.json`'s `WorkspaceRevision` (one
 counter spans both trees).
 
-### `POST /api/v1/workspace/{id}/upload`
+### `PUT /api/v1/workspace/{id}/assets/{*path}`
 
-Single-file upload.  Multipart/form-data with two fields in
-this exact order:
+Single-file upload.  Destination is the URL-path wildcard
+segment after `/assets/`; the request body is the raw file bytes
+(no multipart envelope).  The asset surface is unified under
+`/assets/{*path}` — `GET` reads, `PUT` writes, `DELETE` removes
+— so all addressed-asset operations share one URI family with the
+HTTP method picking the operation.
 
-| Field | Type | Required | Notes |
+PUT (rather than POST) reflects the operator-named-URI semantics:
+the caller fully specifies the destination, and a successful
+upload places the named bytes at that URI.  Replays with the
+same body produce the same final state on disk; each call still
+bumps `workspace.json.workspace_revision` per the daemon's
+revision discipline (the counter is bookkeeping, not part of the
+resource state PUT addresses).
+
+| Component | Type | Required | Notes |
 |---|---|---|---|
-| `path` | text, <= 320 B | yes | Workspace-rooted [`AssetPath`](#assetpath).  Must start with `datasets/` or `converters/`.  `converters/` requires at least one child component (`converters/<name>`).  `datasets/` requires at least two child components (`datasets/<class>/<file>`) because the trainer keys class labels off the first subdirectory of `datasets/`; deeper subtrees under a class are fine.  A leading `/` is accepted and stripped. |
-| `file` | binary stream | yes | File body; capped at `max_upload_bytes` (default 256 MiB) |
+| `{*path}` URL segment | text, [`AssetPath`](#assetpath) (≤ 256 UTF-8 bytes total) | yes | Workspace-rooted destination.  Must start with `datasets/` or `converters/`.  `converters/` requires at least one child component (`converters/<name>`).  `datasets/` requires at least two child components (`datasets/<class>/<file>`) because the trainer keys class labels off the first subdirectory of `datasets/`; deeper subtrees under a class are fine.  Per-component characters outside the URI unreserved set need percent-encoding; the `/` separators between components flow through unchanged.  axum URL-decodes before validation, so `%2E%2E%2F...` is rejected the same way as a literal `../...`. |
+| Request body | binary stream | yes | File bytes; bounded twice. (1) `DefaultBodyLimit::max(256 MiB)` middleware on the `/assets/{*path}` MethodRouter — short-circuits with HTTP 413 when `Content-Length` exceeds the cap, and surfaces a stream error mid-handler for chunked uploads that overflow without a `Content-Length`.  (2) The handler's mid-stream check against the operator-tunable `max_upload_bytes` (default 256 MiB) returns the typed `PayloadTooLarge` error and aborts the tempfile on overflow. |
 
-`path` MUST precede `file`; the `file` field arriving first is
-rejected with 400 (the streaming write needs the validated
-destination before allocating a tempfile).  Legacy `kind` field
-is rejected explicitly.
+`Content-Type` is not required (the server doesn't inspect it);
+clients typically send `application/octet-stream`.
+
+`PUT /workspace/{id}/assets` (no wildcard tail) targets the
+root-listing route, which only registers `GET`, so the response
+is 405 Method Not Allowed — not 404.  Clients that omit the
+destination get the canonical method-mismatch surface.
+
+curl example:
+```bash
+curl -X PUT 'http://127.0.0.1:8787/api/v1/workspace/<id>/assets/datasets/cat/sample.wav' \
+    --data-binary @sample.wav
+```
 
 Response (`DatasetUploadReceipt`):
 ```json
@@ -282,25 +303,27 @@ fsync the parent dir, publish the new core cache, unlock.
 Errors: 400 `bad_request` if `path` is not under
 `datasets/<...>` or `converters/<...>`, fails the dataset
 class-folder depth gate (`datasets/<file>` is rejected; the
-trainer needs `datasets/<class>/<file>`), or fails
-[`AssetPath`](#assetpath) validation; 404 `not_found`
-for a missing workspace; 409 `job_conflict` if a
-`WorkspaceDelete` is in flight for this workspace; 413
-`bad_request` if the body exceeds `max_upload_bytes`.
+trainer needs `datasets/<class>/<file>`), fails
+[`AssetPath`](#assetpath) validation, or the body exceeds
+the operator-tunable `max_upload_bytes` (categorised as
+`UserInput`, mapped to HTTP 400; the canonical 413 lives on
+the upper bound enforced by the route's `DefaultBodyLimit`
+middleware via tower-http); 404 `not_found` for a missing
+workspace; 409 `job_conflict` if a `WorkspaceDelete` is in
+flight for this workspace.
 
 ### `GET /api/v1/workspace/{id}/assets`
 
 Paginated direct-child listing rooted at the workspace dir
 (returns top-level entries `datasets`, `converters`, `heads`,
 `training_logs`, `converter_logs`; internal `.tmp/` is filtered
-out).  When `?path=` is supplied,
-lists the named sub-tree (e.g. `?path=datasets/audio` lists
-direct children of `<ws>/datasets/audio/`).  Reads filesystem
-entries; does not take the workspace mutation mutex.
+out).  Subdirectory listings live on the wildcard form
+[`GET /assets/{*path}`](#get-apiv1workspaceidassetspath) — the
+previous `?path=` query on the root listing was dropped as
+redundant with that URL.  Reads filesystem entries; does not
+take the workspace mutation mutex.
 
 Query:
-- `path` (optional) — workspace-rooted [`AssetPath`](#assetpath).
-  Defaults to the workspace dir's top level.
 - `offset` (optional u64) — default 0.
 - `limit` (optional u64) — default 100, max 1000.
 
@@ -339,10 +362,43 @@ of bytes).
 
 Response on a regular file: raw bytes; `Content-Type` from the
 [MIME table](#mime-type-table-for-asset-get); `Content-Length`
-populated.
+populated (reflects the slice when a byte range is requested).
 
 Response on a directory: same `DatasetListing` shape as
-`GET /assets?path=`.
+[`GET /assets`](#get-apiv1workspaceidassets) (root listing).
+Accepts the same `?offset=&limit=` pagination fields.
+
+#### Optional byte-range slicing
+
+For regular files (any extension), the route accepts two
+optional query parameters that select a byte range:
+
+- `byte_offset` (optional `u64`) — start byte (inclusive).
+  Default `0`.
+- `byte_limit` (optional `u64`) — max bytes returned.  Absent
+  means "from `byte_offset` to EOF".  Silently clamps to the
+  remainder if `byte_offset + byte_limit` exceeds the file
+  size.
+
+Either parameter alone activates byte-range mode (the partner
+defaults to `0` for `byte_offset`, "remainder" for `byte_limit`).
+The response is still raw bytes with `Content-Type` from the
+extension; `Content-Length` reflects the slice the response
+actually carries.  This is the path random-access binary
+clients (e.g. WAV-seek players, log forwarders sampling raw
+JSONL) use without downloading the full file.
+
+Out-of-range handling:
+
+- `byte_offset > file_size` → 400 `bad_request`.
+- `byte_offset == file_size` → 200 OK with a zero-byte body
+  (valid edge case).
+- `byte_offset + byte_limit > file_size` → silently clamped to
+  the remainder.
+
+The byte-range axis is query-parameter-driven; no HTTP `Range:`
+header support yet.  The `Range:` namespace is reserved
+orthogonally for a future RFC 7233 implementation.
 
 #### Optional JSONL paging
 
@@ -370,63 +426,92 @@ when the page is empty it echoes the caller's `after_seq` so a
 poll that catches up reads `next_after_seq == after_seq`.
 
 The JSONL paging branch only activates on `.jsonl` files and only
-when at least one of the two query parameters is set; otherwise
-the route stays in byte-stream mode (no `Range:` header support
-yet — query-parameter and byte-range namespaces are reserved
-orthogonally for a future implementation).
+when at least one of the two query parameters is set; clients
+that want raw `.jsonl` bytes (rather than the parsed event page)
+use the byte-range axis instead.  The two namespaces are
+mutually exclusive — mixing them returns 400.
 
 Errors: 404 `not_found` for a missing asset or workspace;
-400 `bad_request` for an invalid path, if the resolved target is
-neither a regular file nor a directory, if `?after_seq=` /
-`?limit=` is set on a non-`.jsonl` file, or if either is set
-when the resolved target is a directory.
+400 `bad_request` for an invalid path, if the resolved target
+is neither a regular file nor a directory, or for a query
+parameter that doesn't apply to the resolved kind:
+
+- `?after_seq=` is rejected on a directory or a non-`.jsonl`
+  file (it's the JSONL paging cursor).
+- `?offset=` is rejected on any file (it's the dir-listing
+  pagination offset).
+- `?limit=` on a non-`.jsonl` file is rejected (the bare GET
+  byte-stream surface stays unambiguous); on a directory it
+  acts as the listing cap, on a `.jsonl` file as the page-line
+  cap.
+- `?byte_offset=` / `?byte_limit=` are rejected on a directory
+  (file-only); they cannot combine with `?after_seq=` /
+  `?limit=` (mutually exclusive with the JSONL-page namespace);
+  `byte_offset` past EOF returns 400.
+
+When multiple query-parameter rejections apply, the first listed
+in the bullets above surfaces as the diagnostic.
 
 ### `DELETE /api/v1/workspace/{id}/assets/{*path}`
 
-Workspace-asset delete dispatcher.  Two semantics share the
-endpoint, picked by the path's top-level component.
+Workspace-asset delete dispatcher.  All four mutable trees
+(`datasets/`, `converters/`, `training_logs/`, `converter_logs/`)
+share one async tombstone+stage+drain shape — operators get the
+same wire contract regardless of tree, large folders never block
+the request thread, and boot recovery resumes interrupted drains
+uniformly.
 
-#### Async tombstone+stage+drain — `datasets/...` and `converters/...`
+#### Pipeline
 
-Validates the path, asks the JobRegistry for the per-tree lease
-(`DatasetDelete` for `datasets/...`, `ConverterDelete` for
-`converters/...`), records a tombstone (filename prefix
-`delete-assets-<job_id>` / `delete-converters-<job_id>`),
-atomically rewrites `workspace.json` with the next
-`WorkspaceRevision`, renames the target into the matching staging
-dir, then drains the staged payload in bounded batches off the
-lock.
-
-The bare tree name (`DELETE /assets/datasets`,
-`DELETE /assets/converters`) wipes the whole tree: the entire
-`<workspace>/<tree>/` directory is renamed into staging and the
-empty tree dir is recreated so the workspace's structural shape
-survives.
+1. Validate the path's top-level component (must be one of the
+   four mutable trees) and the per-tree shape constraints (log
+   sub-paths must be a single `<id>.jsonl` filename).
+2. (`training_logs/...` / `converter_logs/...` only) Pre-check
+   for an active producer (Train / Convert) in the same
+   workspace; refuse with `409 conflict` if found.  The check
+   is best-effort: the registry doesn't synchronise with the
+   workspace mutex, so a producer can still start between the
+   check and the rename.
+3. Acquire the per-tree lease from the JobRegistry
+   (`DatasetDelete` / `ConverterDelete` /
+   `TrainingLogsDelete` / `ConverterLogsDelete`).  All four
+   share the `max_delete_jobs` slot.
+4. Take the per-workspace mutex.
+5. (`datasets/...` / `converters/...` only) Bump
+   `workspace_revision` and rewrite `workspace.json`
+   atomically (revision-before-bytes invariant).  Log trees
+   skip this step — logs aren't workspace state in the §9
+   sense.
+6. Write the tombstone JSON (`delete-assets-<job_id>` /
+   `delete-converters-<job_id>` /
+   `delete-training-logs-<job_id>` /
+   `delete-converter-logs-<job_id>`) under the workspace
+   `.tmp/` directory.
+7. Atomically rename the target into the matching staging
+   payload directory.
+8. Whole-tree wipe (bare `datasets` / `converters` /
+   `training_logs` / `converter_logs`) recreates the empty
+   tree dir so the workspace's structural shape survives.
+9. (`datasets/...` / `converters/...` only) Publish the new
+   workspace core to the cache.
+10. Drop the workspace mutex.
+11. Drain the staged payload in bounded batches on the
+    blocking pool.
 
 Response: **202 Accepted** + `{ "job_id": "<UUIDv4>" }`.  The
 202 status reflects the async semantic: the rename + tombstone
 landed durably under the per-workspace mutex, but the staged
-drain runs in the background.  Clients can poll
-`GET /jobs/{job_id}` or stream `GET /jobs/{job_id}/events` for
-terminal state.
+drain runs in the background.  Clients poll `GET /jobs/{job_id}`
+or stream `GET /jobs/{job_id}/events` for terminal state.
 
-#### Sync wipe — `training_logs[/...]` and `converter_logs[/...]`
+#### Per-tree differences
 
-JSONL backstop for per-job training / convert events.  Refuses
-with `409 conflict` while a producer (Train for `training_logs`,
-Convert for `converter_logs`) is currently active in the same
-workspace; otherwise unlinks the matching `.jsonl` file
-(`DELETE /assets/training_logs/<id>.jsonl`) or every `.jsonl`
-file in the directory
-(`DELETE /assets/training_logs` whole-dir wipe).  No tombstone,
-no revision bump — logs are an internal backstop, not workspace
-state.
-
-Response: **200 OK** + `{ "removed": <usize> }` (count of
-`.jsonl` files unlinked; `0` is a legitimate response for "the
-file / dir was already empty or the requested file did not
-exist").  200 (vs the async path's 202) signals "done before
-the response returns".
+| Tree | JobType | Tombstone variant | Bumps `workspace_revision`? | Producer-conflict 409? |
+|---|---|---|---|---|
+| `datasets/` | `DatasetDelete` | `Dataset` | yes | no |
+| `converters/` | `ConverterDelete` | `Converter` | yes | no |
+| `training_logs/` | `TrainingLogsDelete` | `TrainingLogs` | no | yes (Train) |
+| `converter_logs/` | `ConverterLogsDelete` | `ConverterLogs` | no | yes (Convert) |
 
 #### Errors
 
@@ -435,14 +520,18 @@ the response returns".
 - 400 `bad_request` for a non-`.jsonl` file under a log dir, or
   a nested path under a log dir
   (e.g. `training_logs/sub/x.jsonl`).
-- 404 `not_found` for a missing workspace.  Missing async-path
-  targets surface as 404 `not_found` (the lib symlink-stat
-  returns ENOENT); missing sync-path targets are not 404 — they
-  reply `200 OK` with `removed: 0`.
+- 404 `not_found` for a missing workspace, or a missing target
+  (the lib symlink-stat returns ENOENT before any state
+  mutation).  Workspace creation lays log dirs (`training_logs/`,
+  `converter_logs/`) down empty, so whole-tree wipes always
+  find the target and proceed; only single-file deletes against
+  a missing `.jsonl` produce 404.
 - 409 `job_conflict`:
-  - `WorkspaceDelete` in flight for this workspace (async path).
-  - Active Train job for `training_logs` (sync path).
-  - Active Convert job for `converter_logs` (sync path).
+  - `WorkspaceDelete` in flight for this workspace (any tree).
+  - Active Train job for `training_logs` (best-effort
+    pre-check).
+  - Active Convert job for `converter_logs` (best-effort
+    pre-check).
 
 ## Trained heads
 
@@ -1121,9 +1210,8 @@ curl -X POST http://127.0.0.1:8787/api/v1/workspace \
   -d '{"name": "pilot-1"}'
 # -> { "id": "<WS>", "name": "pilot-1", ... }
 
-curl -X POST http://127.0.0.1:8787/api/v1/workspace/<WS>/upload \
-  -F 'path=datasets/cat/001.wav' \
-  -F 'file=@./001.wav'
+curl -X PUT http://127.0.0.1:8787/api/v1/workspace/<WS>/assets/datasets/cat/001.wav \
+  --data-binary @./001.wav
 
 curl -X POST http://127.0.0.1:8787/api/v1/workspace/<WS>/train \
   -H 'Content-Type: application/json' \
@@ -1139,9 +1227,8 @@ Convert a TFJS bundle:
 ```bash
 # Upload converter inputs to the converters/ tree.
 for f in model.json group1-shard1of2 group1-shard2of2 metadata.json; do
-  curl -X POST http://127.0.0.1:8787/api/v1/workspace/<WS>/upload \
-    -F "path=converters/tfjs/${f}" \
-    -F "file=@./${f}"
+  curl -X PUT "http://127.0.0.1:8787/api/v1/workspace/<WS>/assets/converters/tfjs/${f}" \
+    --data-binary "@./${f}"
 done
 
 # Convert; every path field is converter-rooted (slashless

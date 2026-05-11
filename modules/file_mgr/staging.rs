@@ -77,6 +77,15 @@ pub const DATASET_TOMBSTONE_PREFIX: &str = "delete-assets-";
 /// distinct from `DATASET_TOMBSTONE_PREFIX` so a boot scan can
 /// dispatch by filename without opening each tombstone.
 pub const CONVERTER_TOMBSTONE_PREFIX: &str = "delete-converters-";
+/// Filename prefix for training-logs-delete tombstones (async
+/// wipe of `<workspace>/training_logs/`).  Logs aren't tracked
+/// in `workspace.json.workspace_revision`, so the tombstone
+/// shape carries no `workspace_revision_id` field.
+pub const TRAINING_LOGS_TOMBSTONE_PREFIX: &str = "delete-training-logs-";
+/// Filename prefix for converter-logs-delete tombstones (async
+/// wipe of `<workspace>/converter_logs/`).  Mirror of
+/// [`TRAINING_LOGS_TOMBSTONE_PREFIX`] for the converter producer.
+pub const CONVERTER_LOGS_TOMBSTONE_PREFIX: &str = "delete-converter-logs-";
 /// Filename prefix for workspace-delete tombstone JSON files.
 pub const WORKSPACE_TOMBSTONE_PREFIX: &str = "delete-workspace-";
 
@@ -91,9 +100,9 @@ pub const STAGED_PAYLOAD_NAME: &str = "payload";
 /// Tombstone JSON written before staging an async delete
 /// payload.  Boot recovery deserializes these to resume an
 /// interrupted delete.  The discriminator (`Dataset` /
-/// `Converter` / `Workspace`) is also encoded in the filename
-/// prefix so a boot scan can dispatch without first opening
-/// every file.
+/// `Converter` / `TrainingLogs` / `ConverterLogs` / `Workspace`)
+/// is also encoded in the filename prefix so a boot scan can
+/// dispatch without first opening every file.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DeleteTombstone {
@@ -139,6 +148,38 @@ pub enum DeleteTombstone {
         /// RFC3339 wall-clock at tombstone creation.
         created_at: String,
     },
+    /// Async training-logs delete under `training_logs/` (single
+    /// `.jsonl` file or whole-tree wipe).  Logs are not workspace
+    /// state in the §9 sense, so this variant does NOT carry a
+    /// `workspace_revision_id` -- the publish-order invariant
+    /// (revision-before-bytes) does not apply.
+    TrainingLogs {
+        /// Owning delete job.
+        job_id: JobId,
+        /// Workspace whose `training_logs/` tree was mutated.
+        workspace_id: WorkspaceId,
+        /// Asset path being deleted, relative to
+        /// `training_logs/`.  `None` records a whole-tree wipe.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<AssetPath>,
+        /// RFC3339 wall-clock at tombstone creation.
+        created_at: String,
+    },
+    /// Async converter-logs delete under `converter_logs/`.
+    /// Mirror of [`Self::TrainingLogs`] for the converter
+    /// producer.
+    ConverterLogs {
+        /// Owning delete job.
+        job_id: JobId,
+        /// Workspace whose `converter_logs/` tree was mutated.
+        workspace_id: WorkspaceId,
+        /// Asset path being deleted, relative to
+        /// `converter_logs/`.  `None` records a whole-tree wipe.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<AssetPath>,
+        /// RFC3339 wall-clock at tombstone creation.
+        created_at: String,
+    },
     /// Async whole-workspace delete.  No `path` -- the entire
     /// workspace directory tree was renamed under the root
     /// staging dir.
@@ -158,6 +199,8 @@ impl DeleteTombstone {
         match self {
             DeleteTombstone::Dataset { job_id, .. }
             | DeleteTombstone::Converter { job_id, .. }
+            | DeleteTombstone::TrainingLogs { job_id, .. }
+            | DeleteTombstone::ConverterLogs { job_id, .. }
             | DeleteTombstone::Workspace { job_id, .. } => *job_id,
         }
     }
@@ -167,17 +210,22 @@ impl DeleteTombstone {
         match self {
             DeleteTombstone::Dataset { workspace_id, .. }
             | DeleteTombstone::Converter { workspace_id, .. }
+            | DeleteTombstone::TrainingLogs { workspace_id, .. }
+            | DeleteTombstone::ConverterLogs { workspace_id, .. }
             | DeleteTombstone::Workspace { workspace_id, .. } => *workspace_id,
         }
     }
 
     /// Tombstone-name prefix for this variant (`delete-assets-`,
-    /// `delete-converters-`, `delete-workspace-`).  Pinned per
-    /// variant; boot recovery dispatches by prefix.
+    /// `delete-converters-`, `delete-training-logs-`,
+    /// `delete-converter-logs-`, `delete-workspace-`).  Pinned
+    /// per variant; boot recovery dispatches by prefix.
     fn prefix(&self) -> &'static str {
         match self {
             DeleteTombstone::Dataset { .. } => DATASET_TOMBSTONE_PREFIX,
             DeleteTombstone::Converter { .. } => CONVERTER_TOMBSTONE_PREFIX,
+            DeleteTombstone::TrainingLogs { .. } => TRAINING_LOGS_TOMBSTONE_PREFIX,
+            DeleteTombstone::ConverterLogs { .. } => CONVERTER_LOGS_TOMBSTONE_PREFIX,
             DeleteTombstone::Workspace { .. } => WORKSPACE_TOMBSTONE_PREFIX,
         }
     }
@@ -185,8 +233,10 @@ impl DeleteTombstone {
     /// Conventional tombstone filename for this delete (without
     /// the staging directory prefix).  Boot recovery scans for
     /// files matching `delete-assets-*.json` /
-    /// `delete-converters-*.json` / `delete-workspace-*.json`
-    /// and dispatches by prefix.
+    /// `delete-converters-*.json` /
+    /// `delete-training-logs-*.json` /
+    /// `delete-converter-logs-*.json` /
+    /// `delete-workspace-*.json` and dispatches by prefix.
     pub fn filename(&self) -> String {
         format!("{}{}.json", self.prefix(), self.job_id())
     }
@@ -203,23 +253,29 @@ impl DeleteTombstone {
 
 /// Resolved filesystem paths for one in-flight async delete.
 /// Built from a `[DeleteTombstone]` and the staging-dir parent
-/// (workspace `.tmp/` for dataset deletes, root `.tmp/` for
-/// workspace deletes).  Carrying this struct beats re-deriving
-/// the four paths at every step; it also gives tests a single
-/// shape to assert against.
+/// (workspace `.tmp/` for dataset / converter / log-tree
+/// deletes; root `.tmp/` for whole-workspace deletes).  Carrying
+/// this struct beats re-deriving the four paths at every step;
+/// it also gives tests a single shape to assert against.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedDelete {
-    /// `<staging>/delete-{assets,workspace}-<job_id>.json`.
+    /// `<staging>/<prefix><job_id>.json`, where `<prefix>` is the
+    /// per-variant filename prefix on the source [`DeleteTombstone`]
+    /// (`delete-assets-`, `delete-converters-`,
+    /// `delete-training-logs-`, `delete-converter-logs-`,
+    /// `delete-workspace-`).
     pub tombstone: PathBuf,
-    /// `<staging>/delete-{assets,workspace}-<job_id>/`.
+    /// `<staging>/<prefix><job_id>/`.
     pub stage_dir: PathBuf,
-    /// `<staging>/delete-{assets,workspace}-<job_id>/payload`.
+    /// `<staging>/<prefix><job_id>/payload`.
     pub payload: PathBuf,
 }
 
 impl StagedDelete {
     /// Resolve the bundle for a tombstone written under the
-    /// given `staging_dir` (workspace `.tmp/` or root `.tmp/`).
+    /// given `staging_dir` (workspace `.tmp/` for dataset /
+    /// converter / log-tree deletes; root `.tmp/` for
+    /// whole-workspace deletes).
     pub fn for_tombstone(staging_dir: &Path, tombstone: &DeleteTombstone) -> Self {
         let tombstone_path = staging_dir.join(tombstone.filename());
         let stage_dir = staging_dir.join(tombstone.stage_dir_name());
@@ -530,6 +586,24 @@ mod tests {
         }
     }
 
+    fn training_logs_tombstone() -> DeleteTombstone {
+        DeleteTombstone::TrainingLogs {
+            job_id: job_id(),
+            workspace_id: ws_id(),
+            path: Some(AssetPath::parse("11111111-2222-4333-8444-555555555555.jsonl").unwrap()),
+            created_at: "2026-05-07T13:00:00Z".to_string(),
+        }
+    }
+
+    fn converter_logs_tombstone() -> DeleteTombstone {
+        DeleteTombstone::ConverterLogs {
+            job_id: job_id(),
+            workspace_id: ws_id(),
+            path: None,
+            created_at: "2026-05-07T13:00:00Z".to_string(),
+        }
+    }
+
     fn make_target_dir(root: &Path, layout: &[(&str, &[u8])]) -> PathBuf {
         let target = root.join("target");
         for (rel, bytes) in layout {
@@ -591,6 +665,55 @@ mod tests {
         // dataset variant so a boot scan can dispatch by name.
         assert!(json.contains("\"kind\":\"converter\""));
         assert!(t.filename().starts_with(CONVERTER_TOMBSTONE_PREFIX));
+        assert!(!t.filename().starts_with(DATASET_TOMBSTONE_PREFIX));
+        assert_eq!(t.filename(), format!("{}.json", t.stage_dir_name()));
+    }
+
+    #[test]
+    fn training_logs_tombstone_round_trips_and_names_files() {
+        let t = training_logs_tombstone();
+        let json = serde_json::to_string(&t).unwrap();
+        let parsed: DeleteTombstone = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, t);
+        assert!(json.contains("\"kind\":\"training_logs\""));
+        // Logs aren't workspace state -- the tombstone shape carries
+        // no workspace_revision_id (unlike Dataset/Converter).
+        assert!(
+            !json.contains("workspace_revision_id"),
+            "training-logs tombstone must not carry workspace_revision_id; got {json}",
+        );
+        assert!(t.filename().starts_with(TRAINING_LOGS_TOMBSTONE_PREFIX));
+        // Prefix collision check: the converter-logs prefix shares
+        // the `delete-` head but diverges at `converter-`, so the
+        // training-logs prefix never accidentally matches it.
+        assert!(!t.filename().starts_with(CONVERTER_LOGS_TOMBSTONE_PREFIX));
+        // The dataset/converter-tree prefixes differ at the second
+        // segment too: `delete-assets-` and `delete-converters-`
+        // (note the trailing `s`) do not overlap with the log
+        // prefixes.
+        assert!(!t.filename().starts_with(DATASET_TOMBSTONE_PREFIX));
+        assert!(!t.filename().starts_with(CONVERTER_TOMBSTONE_PREFIX));
+        assert_eq!(t.filename(), format!("{}.json", t.stage_dir_name()));
+    }
+
+    #[test]
+    fn converter_logs_tombstone_round_trips_and_names_files() {
+        let t = converter_logs_tombstone();
+        let json = serde_json::to_string(&t).unwrap();
+        let parsed: DeleteTombstone = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, t);
+        assert!(json.contains("\"kind\":\"converter_logs\""));
+        assert!(
+            !json.contains("workspace_revision_id"),
+            "converter-logs tombstone must not carry workspace_revision_id; got {json}",
+        );
+        assert!(t.filename().starts_with(CONVERTER_LOGS_TOMBSTONE_PREFIX));
+        // Critical: `delete-converter-logs-` MUST NOT prefix-match
+        // `delete-converters-` (the converter-tree prefix).  The
+        // distinct trailing `s` is what keeps boot recovery's
+        // prefix dispatch unambiguous.
+        assert!(!t.filename().starts_with(CONVERTER_TOMBSTONE_PREFIX));
+        assert!(!t.filename().starts_with(TRAINING_LOGS_TOMBSTONE_PREFIX));
         assert!(!t.filename().starts_with(DATASET_TOMBSTONE_PREFIX));
         assert_eq!(t.filename(), format!("{}.json", t.stage_dir_name()));
     }
@@ -929,18 +1052,39 @@ mod tests {
     fn tombstone_filename_prefix_dispatches_kind() {
         let dataset = dataset_tombstone();
         let converter = converter_tombstone();
+        let training_logs = training_logs_tombstone();
+        let converter_logs = converter_logs_tombstone();
         let workspace = workspace_tombstone();
-        // Each variant's filename prefix is unique so a boot scan
-        // can classify by name before opening the JSON body.
-        assert!(dataset.filename().starts_with(DATASET_TOMBSTONE_PREFIX));
-        assert!(!dataset.filename().starts_with(CONVERTER_TOMBSTONE_PREFIX));
-        assert!(!dataset.filename().starts_with(WORKSPACE_TOMBSTONE_PREFIX));
-        assert!(converter.filename().starts_with(CONVERTER_TOMBSTONE_PREFIX));
-        assert!(!converter.filename().starts_with(DATASET_TOMBSTONE_PREFIX));
-        assert!(!converter.filename().starts_with(WORKSPACE_TOMBSTONE_PREFIX));
-        assert!(workspace.filename().starts_with(WORKSPACE_TOMBSTONE_PREFIX));
-        assert!(!workspace.filename().starts_with(DATASET_TOMBSTONE_PREFIX));
-        assert!(!workspace.filename().starts_with(CONVERTER_TOMBSTONE_PREFIX));
+        let all_prefixes = [
+            DATASET_TOMBSTONE_PREFIX,
+            CONVERTER_TOMBSTONE_PREFIX,
+            TRAINING_LOGS_TOMBSTONE_PREFIX,
+            CONVERTER_LOGS_TOMBSTONE_PREFIX,
+            WORKSPACE_TOMBSTONE_PREFIX,
+        ];
+        for (variant, own) in [
+            (&dataset, DATASET_TOMBSTONE_PREFIX),
+            (&converter, CONVERTER_TOMBSTONE_PREFIX),
+            (&training_logs, TRAINING_LOGS_TOMBSTONE_PREFIX),
+            (&converter_logs, CONVERTER_LOGS_TOMBSTONE_PREFIX),
+            (&workspace, WORKSPACE_TOMBSTONE_PREFIX),
+        ] {
+            let name = variant.filename();
+            assert!(
+                name.starts_with(own),
+                "{variant:?} must use its own prefix `{own}`; got {name}"
+            );
+            for other in all_prefixes {
+                if other == own {
+                    continue;
+                }
+                assert!(
+                    !name.starts_with(other),
+                    "{variant:?} filename `{name}` must not collide with `{other}` -- \
+                     boot recovery dispatches by prefix",
+                );
+            }
+        }
     }
 
     // MARK: Defaults / constants pinned

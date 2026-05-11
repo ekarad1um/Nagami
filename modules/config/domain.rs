@@ -380,8 +380,8 @@ fn describe_unix_file_type(ft: &std::fs::FileType) -> &'static str {
 /// The `extract_caps` override field was removed during the
 /// workspace redesign (archive extraction is no longer a
 /// daemon-side operation; datasets are now uploaded as single
-/// files via `POST /workspace/{id}/upload`).  Legacy TOMLs
-/// carrying `[training_defaults.extract_caps]` will fail
+/// files via `PUT /workspace/{id}/assets/{*path}`).  Legacy
+/// TOMLs carrying `[training_defaults.extract_caps]` will fail
 /// validation with serde's "unknown field" error -- the upgrade
 /// note in `docs/BUILD.md` documents the removal.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

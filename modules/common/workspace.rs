@@ -391,9 +391,8 @@ pub enum ConverterType {
 
 // MARK: JobType / JobReference
 
-/// Discriminator for typed job snapshots.  Matches the five
-/// long-running operations the daemon bounds via the
-/// `JobRegistry`.
+/// Discriminator for typed job snapshots.  Matches the long-running
+/// operations the daemon bounds via the `JobRegistry`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobType {
@@ -411,6 +410,15 @@ pub enum JobType {
     /// Tombstoned + staged; boot resumes interrupted payload
     /// removal.
     ConverterDelete,
+    /// Async training-log file / tree delete under
+    /// `training_logs/`.  Tombstoned + staged like
+    /// [`Self::DatasetDelete`] but does NOT bump
+    /// `workspace_revision` (logs aren't workspace state).
+    TrainingLogsDelete,
+    /// Async converter-log file / tree delete under
+    /// `converter_logs/`.  Mirror of
+    /// [`Self::TrainingLogsDelete`] for the converter producer.
+    ConverterLogsDelete,
     /// Async workspace delete.  Stages the entire workspace
     /// directory under root `.tmp/` then drains in batches.
     WorkspaceDelete,
@@ -888,6 +896,8 @@ mod tests {
             (JobType::Convert, "\"convert\""),
             (JobType::DatasetDelete, "\"dataset_delete\""),
             (JobType::ConverterDelete, "\"converter_delete\""),
+            (JobType::TrainingLogsDelete, "\"training_logs_delete\""),
+            (JobType::ConverterLogsDelete, "\"converter_logs_delete\""),
             (JobType::WorkspaceDelete, "\"workspace_delete\""),
         ] {
             assert_eq!(serde_json::to_string(&jt).unwrap(), expected);

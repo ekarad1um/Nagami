@@ -58,8 +58,6 @@ pub enum ApiError {
     /// routing matches the underlying `ActivationError` variant.
     #[error("activation: {0}")]
     Activation(#[from] crate::file_mgr::ActivationError),
-    #[error("multipart: {0}")]
-    Multipart(#[from] axum::extract::multipart::MultipartError),
     #[error("internal: spawn_blocking join: {0}")]
     Join(#[from] task::JoinError),
     #[error("not implemented (Phase {phase})")]
@@ -91,7 +89,7 @@ impl crate::common::error::Categorized for ApiError {
     fn kind(&self) -> crate::common::error::ErrorKind {
         use crate::common::error::ErrorKind::*;
         match self {
-            ApiError::Bad(_) | ApiError::Multipart(_) => UserInput,
+            ApiError::Bad(_) => UserInput,
             ApiError::NotFound(_) => NotFound,
             ApiError::NotImplemented { .. } => NotImplemented,
             // Delegate to the wrapped domain error's classifier.

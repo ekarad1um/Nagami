@@ -7,7 +7,8 @@
 //! crash-recovery state:
 //!
 //! - root `.tmp/delete-workspace-*` tombstones + payloads -> drain + finalize.
-//! - workspace `<id>/.tmp/delete-assets-*` tombstones + payloads -> drain + finalize.
+//! - workspace `<id>/.tmp/delete-{assets,converters,training-logs,converter-logs}-*`
+//!   tombstones + payloads -> drain + finalize (one pass per prefix).
 //! - per-workspace daemon-owned head orphans (`<head_id>.{mpk,json}`
 //!   not in `heads.json`) -> sweep.
 //! - `workspace.json.head_count` <- `heads.json.heads.len()` (repair).
@@ -62,9 +63,9 @@ use crate::file_mgr::schema::{
     workspaces_dir, write_active_current, write_head_index, write_workspace_core,
 };
 use crate::file_mgr::staging::{
-    CONVERTER_TOMBSTONE_PREFIX, DATASET_TOMBSTONE_PREFIX, DEFAULT_DELETE_BATCH_ENTRIES,
-    DrainResult, StagedDelete, WORKSPACE_TOMBSTONE_PREFIX, drain_staged_payload,
-    finalize_staged_delete, read_tombstone,
+    CONVERTER_LOGS_TOMBSTONE_PREFIX, CONVERTER_TOMBSTONE_PREFIX, DATASET_TOMBSTONE_PREFIX,
+    DEFAULT_DELETE_BATCH_ENTRIES, DrainResult, StagedDelete, TRAINING_LOGS_TOMBSTONE_PREFIX,
+    WORKSPACE_TOMBSTONE_PREFIX, drain_staged_payload, finalize_staged_delete, read_tombstone,
 };
 use crate::file_mgr::time_util::now_rfc3339;
 use crate::file_mgr::validate::{fsync_dir, hex_lowercase};
@@ -197,6 +198,20 @@ pub struct RecoveryWorkspaceReport {
     /// Converter-delete stage directories without a matching
     /// tombstone removed.
     pub converter_stage_orphans_swept: usize,
+    /// Training-logs-delete tombstones drained + finalized.  Like
+    /// [`Self::dataset_tombstones_completed`] but for the
+    /// per-workspace `training_logs/` async-wipe path.
+    pub training_logs_tombstones_completed: usize,
+    /// Training-logs-delete stage directories without a matching
+    /// tombstone removed.
+    pub training_logs_stage_orphans_swept: usize,
+    /// Converter-logs-delete tombstones drained + finalized.
+    /// Mirror of [`Self::training_logs_tombstones_completed`] for
+    /// the converter producer.
+    pub converter_logs_tombstones_completed: usize,
+    /// Converter-logs-delete stage directories without a matching
+    /// tombstone removed.
+    pub converter_logs_stage_orphans_swept: usize,
     /// Workspace directories without `workspace.json` (incomplete
     /// creates) removed; `<root>/workspaces/` is fsynced so the
     /// unlink is durable.
@@ -645,6 +660,11 @@ pub fn recover_workspaces(root: &Path) -> Result<RecoveryWorkspaceReport, Recove
                 report.dataset_stage_orphans_swept += per.dataset_stage_orphans_swept;
                 report.converter_tombstones_completed += per.converter_tombstones_completed;
                 report.converter_stage_orphans_swept += per.converter_stage_orphans_swept;
+                report.training_logs_tombstones_completed += per.training_logs_tombstones_completed;
+                report.training_logs_stage_orphans_swept += per.training_logs_stage_orphans_swept;
+                report.converter_logs_tombstones_completed +=
+                    per.converter_logs_tombstones_completed;
+                report.converter_logs_stage_orphans_swept += per.converter_logs_stage_orphans_swept;
             }
             Err(e) => {
                 tracing::warn!(
@@ -702,6 +722,10 @@ struct PerWorkspaceCounts {
     dataset_stage_orphans_swept: usize,
     converter_tombstones_completed: usize,
     converter_stage_orphans_swept: usize,
+    training_logs_tombstones_completed: usize,
+    training_logs_stage_orphans_swept: usize,
+    converter_logs_tombstones_completed: usize,
+    converter_logs_stage_orphans_swept: usize,
 }
 
 /// Recover one workspace dir.  Order:
@@ -711,10 +735,10 @@ struct PerWorkspaceCounts {
 /// 2. Sweep `<workspace>/heads/<head_id>.{mpk,json}` whose
 ///    `head_id` is not in `heads.json.heads[]`.
 /// 3. Repair `workspace.json.head_count` <- `heads.json.heads.len()`.
-/// 4. Complete `<workspace>/.tmp/delete-assets-*.json`
-///    tombstones (drain + finalize).
-/// 5. Sweep `<workspace>/.tmp/delete-assets-*` directories
-///    without a matching tombstone.
+/// 4. Complete `<workspace>/.tmp/delete-{assets,converters,training-logs,converter-logs}-*.json`
+///    tombstones (drain + finalize) — one pass per prefix.
+/// 5. Sweep `<workspace>/.tmp/delete-{assets,converters,training-logs,converter-logs}-*`
+///    directories without a matching tombstone.
 fn recover_one_workspace(workspace_dir: &Path) -> Result<PerWorkspaceCounts, FileError> {
     let mut counts = PerWorkspaceCounts::default();
 
@@ -744,11 +768,12 @@ fn recover_one_workspace(workspace_dir: &Path) -> Result<PerWorkspaceCounts, Fil
     // 3. Head-count repair.
     counts.head_count_repaired += repair_head_count(workspace_dir, &heads)?;
 
-    // 4+5. Dataset + converter delete tombstones + orphans.
-    // The per-workspace `.tmp/` carries `delete-assets-*` (dataset)
-    // and `delete-converters-*` (converter) prefixes; each gets
-    // its own pass.  The sweep is bounded so a malformed
-    // listing in one tree does not block the other.
+    // 4+5. Per-workspace tombstones + orphans.  The per-workspace
+    // `.tmp/` carries four prefixes (`delete-assets-*` dataset,
+    // `delete-converters-*` converter, `delete-training-logs-*`
+    // training logs, `delete-converter-logs-*` converter logs);
+    // each gets its own pass.  The sweep is bounded per pass so a
+    // malformed listing in one tree does not block the others.
     let staging_dir = workspace_dir.join(".tmp");
     if staging_dir.is_dir() {
         let (completed, orphan_swept) = drain_staging_dir(&staging_dir, StagingScope::Dataset)?;
@@ -757,6 +782,14 @@ fn recover_one_workspace(workspace_dir: &Path) -> Result<PerWorkspaceCounts, Fil
         let (completed, orphan_swept) = drain_staging_dir(&staging_dir, StagingScope::Converter)?;
         counts.converter_tombstones_completed += completed;
         counts.converter_stage_orphans_swept += orphan_swept;
+        let (completed, orphan_swept) =
+            drain_staging_dir(&staging_dir, StagingScope::TrainingLogs)?;
+        counts.training_logs_tombstones_completed += completed;
+        counts.training_logs_stage_orphans_swept += orphan_swept;
+        let (completed, orphan_swept) =
+            drain_staging_dir(&staging_dir, StagingScope::ConverterLogs)?;
+        counts.converter_logs_tombstones_completed += completed;
+        counts.converter_logs_stage_orphans_swept += orphan_swept;
     }
     Ok(counts)
 }
@@ -914,6 +947,12 @@ enum StagingScope {
     /// converter-tree deletes (mirror of the `delete-assets-*`
     /// prefix used by dataset deletes).
     Converter,
+    /// Workspace-scoped `.tmp/`: `delete-training-logs-*` files
+    /// for training-logs async wipes.
+    TrainingLogs,
+    /// Workspace-scoped `.tmp/`: `delete-converter-logs-*` files
+    /// for converter-logs async wipes.
+    ConverterLogs,
 }
 
 /// Walk `staging_dir` for tombstones matching the given scope's
@@ -925,6 +964,8 @@ fn drain_staging_dir(staging_dir: &Path, scope: StagingScope) -> Result<(usize, 
     let prefix = match scope {
         StagingScope::Dataset => DATASET_TOMBSTONE_PREFIX,
         StagingScope::Converter => CONVERTER_TOMBSTONE_PREFIX,
+        StagingScope::TrainingLogs => TRAINING_LOGS_TOMBSTONE_PREFIX,
+        StagingScope::ConverterLogs => CONVERTER_LOGS_TOMBSTONE_PREFIX,
     };
     walk_staging(staging_dir, prefix, |_| {})
 }
@@ -1595,6 +1636,106 @@ mod tests {
         std::fs::write(orphan_dir.join("payload/leftover"), b"x").unwrap();
         let report = recover_workspaces(tmp.path()).unwrap();
         assert_eq!(report.converter_stage_orphans_swept, 1);
+        assert!(!orphan_dir.exists());
+    }
+
+    #[test]
+    fn recover_workspace_training_logs_tombstone_completed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspaces_dir(tmp.path())).unwrap();
+        let ws = ws_id(0xAA);
+        let head = head_id(0xBB);
+        let ws_dir = fresh_workspace_with_head(tmp.path(), ws, head);
+        // Stage a training-logs-delete tombstone + payload that
+        // recovery should drain.  Logs aren't workspace state, so
+        // the tombstone variant carries no `workspace_revision_id`
+        // (unlike Dataset/Converter); recovery just drains.
+        let staging = ws_dir.join(".tmp");
+        let tombstone = DeleteTombstone::TrainingLogs {
+            job_id: job_id(),
+            workspace_id: ws,
+            path: Some(AssetPath::parse("aaaaaaaa-1111-4222-8333-444444444444.jsonl").unwrap()),
+            created_at: now_rfc3339(),
+        };
+        let staged = write_tombstone(&staging, &tombstone).unwrap();
+        let target = tmp.path().join("training_log.jsonl");
+        std::fs::write(&target, b"{\"seq\":1}\n").unwrap();
+        stage_payload(&target, &staged).unwrap();
+        let report = recover_workspaces(tmp.path()).unwrap();
+        assert_eq!(report.training_logs_tombstones_completed, 1);
+        // Other tree counters unchanged: prefix-dispatch keeps
+        // each tree's recovery independent.
+        assert_eq!(report.dataset_tombstones_completed, 0);
+        assert_eq!(report.converter_tombstones_completed, 0);
+        assert_eq!(report.converter_logs_tombstones_completed, 0);
+        assert!(!staged.tombstone.exists());
+        assert!(!staged.stage_dir.exists());
+    }
+
+    #[test]
+    fn recover_workspace_training_logs_stage_orphan_without_tombstone_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspaces_dir(tmp.path())).unwrap();
+        let ws = ws_id(0xAA);
+        let head = head_id(0xBB);
+        let ws_dir = fresh_workspace_with_head(tmp.path(), ws, head);
+        let staging = ws_dir.join(".tmp");
+        std::fs::create_dir_all(&staging).unwrap();
+        let orphan_dir = staging.join("delete-training-logs-11111111-2222-4333-8444-555555555555");
+        std::fs::create_dir_all(orphan_dir.join("payload")).unwrap();
+        std::fs::write(orphan_dir.join("payload/leftover.jsonl"), b"{}").unwrap();
+        let report = recover_workspaces(tmp.path()).unwrap();
+        assert_eq!(report.training_logs_stage_orphans_swept, 1);
+        assert!(!orphan_dir.exists());
+    }
+
+    #[test]
+    fn recover_workspace_converter_logs_tombstone_completed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspaces_dir(tmp.path())).unwrap();
+        let ws = ws_id(0xAA);
+        let head = head_id(0xBB);
+        let ws_dir = fresh_workspace_with_head(tmp.path(), ws, head);
+        // Whole-tree wipe shape: `path = None` records the
+        // bare-tree wipe; recovery drains and finalizes the same
+        // way.
+        let staging = ws_dir.join(".tmp");
+        let tombstone = DeleteTombstone::ConverterLogs {
+            job_id: job_id(),
+            workspace_id: ws,
+            path: None,
+            created_at: now_rfc3339(),
+        };
+        let staged = write_tombstone(&staging, &tombstone).unwrap();
+        let target = tmp.path().join("converter_logs_tree");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("a.jsonl"), b"{}").unwrap();
+        std::fs::write(target.join("b.jsonl"), b"{}").unwrap();
+        stage_payload(&target, &staged).unwrap();
+        let report = recover_workspaces(tmp.path()).unwrap();
+        assert_eq!(report.converter_logs_tombstones_completed, 1);
+        // Sibling tree counters unchanged.
+        assert_eq!(report.training_logs_tombstones_completed, 0);
+        assert_eq!(report.dataset_tombstones_completed, 0);
+        assert_eq!(report.converter_tombstones_completed, 0);
+        assert!(!staged.tombstone.exists());
+        assert!(!staged.stage_dir.exists());
+    }
+
+    #[test]
+    fn recover_workspace_converter_logs_stage_orphan_without_tombstone_swept() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspaces_dir(tmp.path())).unwrap();
+        let ws = ws_id(0xAA);
+        let head = head_id(0xBB);
+        let ws_dir = fresh_workspace_with_head(tmp.path(), ws, head);
+        let staging = ws_dir.join(".tmp");
+        std::fs::create_dir_all(&staging).unwrap();
+        let orphan_dir = staging.join("delete-converter-logs-22222222-3333-4444-8555-666666666666");
+        std::fs::create_dir_all(orphan_dir.join("payload")).unwrap();
+        std::fs::write(orphan_dir.join("payload/x.jsonl"), b"{}").unwrap();
+        let report = recover_workspaces(tmp.path()).unwrap();
+        assert_eq!(report.converter_logs_stage_orphans_swept, 1);
         assert!(!orphan_dir.exists());
     }
 

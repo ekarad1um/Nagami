@@ -584,8 +584,13 @@ async fn workspace_create_list_delete_round_trip() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// `PUT /workspace/{id}/assets/{*path}` with raw body bytes.
+/// Verifies the unified asset surface: GET / PUT / DELETE all on
+/// `/assets/{*path}` with the HTTP method picking the operation,
+/// raw body carries the file (no multipart envelope, no separate
+/// `/upload/` URL family).
 #[tokio::test]
-async fn workspace_upload_via_multipart() {
+async fn workspace_upload_happy_path() {
     use axum::http::header;
     let dir = tempfile::tempdir().unwrap();
     let r = router(fresh_state(dir.path()));
@@ -595,35 +600,18 @@ async fn workspace_upload_via_multipart() {
     let v: serde_json::Value = json_body(resp).await;
     let id = v["id"].as_str().unwrap().to_string();
 
-    // Multipart `{path, file}` where `path` is workspace-rooted
-    // (`datasets/<...>` or `converters/<...>`); leading `/` is also
-    // accepted, canonical form drops it.
-    let boundary = "----acousticslabtestbnd";
-    let body = format!(
-        "--{boundary}\r\n\
-             Content-Disposition: form-data; name=\"path\"\r\n\r\n\
-             datasets/cls/demo.bin\r\n\
-             --{boundary}\r\n\
-             Content-Disposition: form-data; name=\"file\"; filename=\"demo.bin\"\r\n\
-             Content-Type: application/octet-stream\r\n\r\n\
-             {payload}\r\n\
-             --{boundary}--\r\n",
-        payload = "DEMO-MPK-PAYLOAD"
-    );
+    let payload = b"DEMO-MPK-PAYLOAD";
     let req = Request::builder()
-        .method(Method::POST)
-        .uri(format!("/workspace/{id}/upload"))
-        .header(
-            header::CONTENT_TYPE,
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(Body::from(body))
+        .method(Method::PUT)
+        .uri(format!("/workspace/{id}/assets/datasets/cls/demo.bin"))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(payload.to_vec()))
         .expect("build req");
     let resp = r.clone().oneshot(req).await.expect("oneshot");
     assert_eq!(resp.status(), StatusCode::OK, "upload status");
     let v: serde_json::Value = json_body(resp).await;
     assert_eq!(v["path"], "datasets/cls/demo.bin");
-    assert_eq!(v["size_bytes"], "DEMO-MPK-PAYLOAD".len());
+    assert_eq!(v["size_bytes"], payload.len());
     assert!(v["sha256"].as_str().unwrap().len() == 64);
     assert_eq!(v["workspace_revision_id"], 1);
 
@@ -657,10 +645,11 @@ async fn workspace_upload_via_multipart() {
     assert_eq!(entries[0]["name"], "cls");
 }
 
-/// 5 MiB body verifies the chunked reader works end-to-end and
-/// doesn't depend on `field.bytes()`; pins the streaming path so a
-/// regression to a buffered read shows up as a test failure (we
-/// can't observe peak RSS in a unit test).
+/// 5 MiB body verifies the chunked `Body::into_data_stream()`
+/// reader works end-to-end without buffering the whole payload.
+/// Pins the streaming path so a regression to a buffered read
+/// shows up as a test failure (we can't observe peak RSS in a
+/// unit test).
 #[tokio::test]
 async fn workspace_upload_streams_large_payload() {
     use axum::http::header;
@@ -678,104 +667,44 @@ async fn workspace_upload_streams_large_payload() {
         payload.push(pat[i % pat.len()]);
     }
     let expected_sha = crate::api::routes::converter::sha256_hex(&payload);
-
-    let boundary = "----acousticslab-large";
-    let head = format!(
-        "--{boundary}\r\n\
-             Content-Disposition: form-data; name=\"path\"\r\n\r\n\
-             datasets/cls/big.bin\r\n\
-             --{boundary}\r\n\
-             Content-Disposition: form-data; name=\"file\"; filename=\"big.bin\"\r\n\
-             Content-Type: application/octet-stream\r\n\r\n"
-    );
-    let tail = format!("\r\n--{boundary}--\r\n");
-    let mut body = Vec::with_capacity(head.len() + payload.len() + tail.len());
-    body.extend_from_slice(head.as_bytes());
-    body.extend_from_slice(&payload);
-    body.extend_from_slice(tail.as_bytes());
+    let payload_len = payload.len();
 
     let req = Request::builder()
-        .method(Method::POST)
-        .uri(format!("/workspace/{id}/upload"))
-        .header(
-            header::CONTENT_TYPE,
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(Body::from(body))
+        .method(Method::PUT)
+        .uri(format!("/workspace/{id}/assets/datasets/cls/big.bin"))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(payload))
         .expect("build req");
     let resp = r.clone().oneshot(req).await.expect("oneshot");
     assert_eq!(resp.status(), StatusCode::OK);
     let v: serde_json::Value = json_body(resp).await;
-    assert_eq!(v["size_bytes"].as_u64(), Some(payload.len() as u64));
+    assert_eq!(v["size_bytes"].as_u64(), Some(payload_len as u64));
     assert_eq!(v["sha256"].as_str().unwrap(), expected_sha);
 }
 
-/// Legacy `kind` field is rejected unconditionally; old clients get
-/// a 400 explaining the `{path, file}` shape.
+/// `PUT /workspace/{id}/assets` (no wildcard tail) targets the
+/// root listing endpoint, which has only a `GET` registered.  The
+/// router-level method dispatch returns 405 (rather than 404),
+/// pinning the unified asset surface: a method that doesn't apply
+/// to the resource gets the canonical "method not allowed"
+/// response, not a "resource doesn't exist" 404.
 #[tokio::test]
-async fn workspace_upload_rejects_legacy_kind_field() {
+async fn workspace_upload_without_path_returns_405() {
     use axum::http::header;
     let dir = tempfile::tempdir().unwrap();
     let r = router(fresh_state(dir.path()));
-    let resp = call(&r, Method::POST, "/workspace", Some(r#"{"name":"k"}"#)).await;
+    let resp = call(&r, Method::POST, "/workspace", Some(r#"{"name":"q"}"#)).await;
     let v: serde_json::Value = json_body(resp).await;
     let id = v["id"].as_str().unwrap().to_string();
 
-    let boundary = "----al-bigkind";
-    let body = format!(
-        "--{boundary}\r\n\
-             Content-Disposition: form-data; name=\"kind\"\r\n\r\n\
-             head_mpk\r\n\
-             --{boundary}\r\n\
-             Content-Disposition: form-data; name=\"file\"; filename=\"x.mpk\"\r\n\r\n\
-             DATA\r\n\
-             --{boundary}--\r\n"
-    );
     let req = Request::builder()
-        .method(Method::POST)
-        .uri(format!("/workspace/{id}/upload"))
-        .header(
-            header::CONTENT_TYPE,
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(Body::from(body))
+        .method(Method::PUT)
+        .uri(format!("/workspace/{id}/assets"))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from("DATA"))
         .expect("build req");
     let resp = r.clone().oneshot(req).await.expect("oneshot");
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-}
-
-/// `file` arriving before `path` is rejected with 400; the streaming
-/// write needs the validated destination before allocating a tempfile.
-#[tokio::test]
-async fn workspace_upload_rejects_file_before_path() {
-    use axum::http::header;
-    let dir = tempfile::tempdir().unwrap();
-    let r = router(fresh_state(dir.path()));
-    let resp = call(&r, Method::POST, "/workspace", Some(r#"{"name":"o"}"#)).await;
-    let v: serde_json::Value = json_body(resp).await;
-    let id = v["id"].as_str().unwrap().to_string();
-
-    let boundary = "----al-orderbug";
-    let body = format!(
-        "--{boundary}\r\n\
-             Content-Disposition: form-data; name=\"file\"; filename=\"x.bin\"\r\n\r\n\
-             DATA\r\n\
-             --{boundary}\r\n\
-             Content-Disposition: form-data; name=\"path\"\r\n\r\n\
-             foo.bin\r\n\
-             --{boundary}--\r\n"
-    );
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(format!("/workspace/{id}/upload"))
-        .header(
-            header::CONTENT_TYPE,
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(Body::from(body))
-        .expect("build req");
-    let resp = r.clone().oneshot(req).await.expect("oneshot");
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
 #[tokio::test]
@@ -810,25 +739,11 @@ async fn upload_to_nonexistent_workspace_is_404_no_orphan_dir() {
         "phantom workspace dir must not exist before the upload",
     );
 
-    let boundary = "----acousticslab-orphan";
-    let body = format!(
-        "--{boundary}\r\n\
-             Content-Disposition: form-data; name=\"path\"\r\n\r\n\
-             datasets/cls/x.bin\r\n\
-             --{boundary}\r\n\
-             Content-Disposition: form-data; name=\"file\"; filename=\"x.bin\"\r\n\
-             Content-Type: application/octet-stream\r\n\r\n\
-             DATA\r\n\
-             --{boundary}--\r\n",
-    );
     let req = Request::builder()
-        .method(Method::POST)
-        .uri(format!("/workspace/{PHANTOM_ID}/upload"))
-        .header(
-            header::CONTENT_TYPE,
-            format!("multipart/form-data; boundary={boundary}"),
-        )
-        .body(Body::from(body))
+        .method(Method::PUT)
+        .uri(format!("/workspace/{PHANTOM_ID}/assets/datasets/cls/x.bin"))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from("DATA"))
         .unwrap();
     let resp = r.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);

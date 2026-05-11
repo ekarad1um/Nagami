@@ -84,8 +84,9 @@ pub struct JobRegistryCfg {
     pub max_train_jobs: usize,
     /// `max_convert_jobs`: bounded concurrent convert jobs.
     pub max_convert_jobs: usize,
-    /// `max_delete_jobs`: bounded concurrent delete jobs
-    /// (dataset + workspace combined).
+    /// `max_delete_jobs`: bounded concurrent delete jobs (one
+    /// shared slot across all five delete subtypes -- dataset,
+    /// converter, training-logs, converter-logs, workspace).
     pub max_delete_jobs: usize,
     /// `max_recent_jobs = max_running_jobs + 1`.  Bounds the
     /// memory-only `GET /jobs` history.
@@ -536,23 +537,27 @@ impl JobRegistry {
 
         // Per-type concurrency cap.  Counts only RUNNING /
         // QUEUED entries; terminal entries do not occupy a
-        // slot.  The async-delete family
-        // (Dataset/Converter/Workspace) shares one
+        // slot.  The async-delete family (Dataset / Converter /
+        // TrainingLogs / ConverterLogs / Workspace) shares one
         // `max_delete_jobs` slot, so the count must include any
         // in-flight delete subtype.
         let (cap, slot_predicate): (usize, fn(JobType) -> bool) = match job_type {
             JobType::Train => (self.inner.cfg.max_train_jobs, |t| t == JobType::Train),
             JobType::Convert => (self.inner.cfg.max_convert_jobs, |t| t == JobType::Convert),
-            JobType::DatasetDelete | JobType::ConverterDelete | JobType::WorkspaceDelete => {
-                (self.inner.cfg.max_delete_jobs, |t| {
-                    matches!(
-                        t,
-                        JobType::DatasetDelete
-                            | JobType::ConverterDelete
-                            | JobType::WorkspaceDelete
-                    )
-                })
-            }
+            JobType::DatasetDelete
+            | JobType::ConverterDelete
+            | JobType::TrainingLogsDelete
+            | JobType::ConverterLogsDelete
+            | JobType::WorkspaceDelete => (self.inner.cfg.max_delete_jobs, |t| {
+                matches!(
+                    t,
+                    JobType::DatasetDelete
+                        | JobType::ConverterDelete
+                        | JobType::TrainingLogsDelete
+                        | JobType::ConverterLogsDelete
+                        | JobType::WorkspaceDelete
+                )
+            }),
         };
         let active_same_type = state
             .entries

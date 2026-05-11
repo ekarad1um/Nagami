@@ -1,14 +1,13 @@
 //! Envelope-preserving extractor wrappers.
 //!
-//! axum's stock `Json<T>` / `Query<T>` / `Path<T>` / `Multipart`
-//! extractors emit their own `IntoResponse` rejections (typically a
-//! plain-text body with a `400` / `415` / `422` status) when the
-//! request body, query string, or path parameter fails to
-//! deserialize.  Those default rejections bypass our `ApiError`
-//! `{error, code}` envelope, so a client that catches `code` for
-//! every other failure mode sees a different shape on common
-//! mistakes (malformed JSON, unknown fields, bad query types,
-//! wrong content-type).
+//! axum's stock `Json<T>` / `Query<T>` / `Path<T>` extractors emit
+//! their own `IntoResponse` rejections (typically a plain-text
+//! body with a `400` / `422` status) when the request body, query
+//! string, or path parameter fails to deserialize.  Those default
+//! rejections bypass our `ApiError` `{error, code}` envelope, so a
+//! client that catches `code` for every other failure mode sees a
+//! different shape on common mistakes (malformed JSON, unknown
+//! fields, bad query types).
 //!
 //! Every route in the API crate consumes user-supplied input
 //! through one of the wrappers in this module instead.  Each
@@ -26,11 +25,13 @@
 //! ) -> Result<Json<MyResp>, ApiError> { ... }
 //! ```
 //!
-//! ## Multipart
-//!
-//! [`ApiMultipart`] wraps the extractor itself (no `T` to lift)
-//! and only catches the pre-handler "wrong content-type / no
-//! boundary" rejections; per-field checks remain in the route.
+//! Routes that consume raw body bytes
+//! (`PUT /workspace/{id}/assets/{*path}`) take `axum::body::Body`
+//! directly and stream via `Body::into_data_stream()`; no envelope
+//! wrapper is needed because `Body`-extraction itself is
+//! infallible (any failure surfaces during the in-handler stream
+//! reads, where the route can wrap the `axum::Error` in its own
+//! [`ApiError`] envelope).
 
 use axum::extract::FromRequest;
 use axum::extract::FromRequestParts;
@@ -107,28 +108,4 @@ where
 
 fn map_query_rejection(rej: QueryRejection) -> ApiError {
     ApiError::Bad(format!("invalid query string: {rej}"))
-}
-
-/// Multipart extractor that maps "missing/wrong content-type"
-/// and "no boundary" rejections into [`ApiError::Bad`].  Wraps
-/// the inner [`axum::extract::Multipart`] so the route handler
-/// can iterate fields exactly like the stock extractor.
-#[derive(Debug)]
-pub struct ApiMultipart(pub axum::extract::Multipart);
-
-impl<S> FromRequest<S> for ApiMultipart
-where
-    S: Send + Sync,
-{
-    type Rejection = ApiError;
-
-    async fn from_request(
-        req: axum::http::Request<axum::body::Body>,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        match axum::extract::Multipart::from_request(req, state).await {
-            Ok(mp) => Ok(ApiMultipart(mp)),
-            Err(rej) => Err(ApiError::Bad(format!("invalid multipart request: {rej}"))),
-        }
-    }
 }

@@ -1,6 +1,7 @@
 //! Workspace asset-tree surface: the `AssetPath`-shaped methods
-//! on [`WorkspaceMgr`] that back the `/upload` / `/assets` /
-//! `/assets/{*path}` / `DELETE /assets/{*path}` routes.
+//! on [`WorkspaceMgr`] that back the `GET /assets` /
+//! `GET /assets/{*path}` / `PUT /assets/{*path}` /
+//! `DELETE /assets/{*path}` routes.
 //!
 //! # Method taxonomy
 //!
@@ -19,9 +20,10 @@
 //!   revision-before-bytes write, atomic rename + parent fsync,
 //!   and cache publish.
 //! - [`WorkspaceMgr::start_workspace_asset_delete`] -- begin async
-//!   asset-tree delete.  Holds the per-workspace mutex across
-//!   tombstone + revision-bump + stage-payload, then drains
-//!   off-mutex.  Boot recovery resumes interrupted drains.
+//!   asset-tree delete (all four mutable trees).  Holds the
+//!   per-workspace mutex across tombstone + (datasets/converters
+//!   only) revision-bump + stage-payload, then drains off-mutex.
+//!   Boot recovery resumes interrupted drains.
 //!
 //! Conflict admission consumes the cross-cutting
 //! [`crate::file_mgr::job_registry::JobRegistry`]; HTTP 409
@@ -54,7 +56,9 @@ pub const CONVERTERS_DIR_NAME: &str = "converters";
 
 /// Subdirectory holding the trainer's per-job JSONL log backstop.
 /// Producer: `TrainJobLog` in [`crate::training`].  Deletes drain
-/// through the unified asset surface (sync-wipe branch).
+/// through the unified async asset surface (with a producer-active
+/// pre-check that returns 409 while a Train job for the workspace
+/// is running).
 pub const TRAINING_LOGS_DIR_NAME: &str = "training_logs";
 
 /// Subdirectory holding the converter's per-job JSONL log
@@ -66,10 +70,10 @@ pub const TRAINING_LOGS_DIR_NAME: &str = "training_logs";
 pub const CONVERTER_LOGS_DIR_NAME: &str = "converter_logs";
 
 /// Discriminator for which workspace tree a workspace-rooted
-/// asset path targets.  Drives tombstone variant + `JobType` for
-/// async deletes (datasets / converters) and selects the
-/// producer-conflict gate for sync-wipe deletes (training_logs /
-/// converter_logs).
+/// asset path targets.  Drives the tombstone variant + `JobType`
+/// for async deletes; for log trees it also selects the
+/// producer-conflict pre-check (Train for `training_logs`,
+/// Convert for `converter_logs`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetTree {
     /// Datasets tree (`<workspace_dir>/datasets/`).  Operator
@@ -80,13 +84,15 @@ pub enum AssetTree {
     Converters,
     /// Trainer's per-job JSONL backstop
     /// (`<workspace_dir>/training_logs/`).  Daemon-only producer;
-    /// no operator uploads.  Deletes are sync wipes gated against
-    /// the workspace's active Train job.
+    /// no operator uploads.  Deletes are async
+    /// (JobType::TrainingLogsDelete) but pre-checked against the
+    /// workspace's active Train job (returns 409 if running).
     TrainingLogs,
     /// Converter's per-job JSONL backstop
     /// (`<workspace_dir>/converter_logs/`).  Daemon-only producer;
-    /// no operator uploads.  Deletes are sync wipes gated against
-    /// the workspace's active Convert job.
+    /// no operator uploads.  Deletes are async
+    /// (JobType::ConverterLogsDelete) but pre-checked against the
+    /// workspace's active Convert job (returns 409 if running).
     ConverterLogs,
 }
 
@@ -110,19 +116,15 @@ impl AssetTree {
     }
 }
 
-/// Parse a workspace-rooted path into a `(tree, sub)` pair where
-/// `sub` is `None` for the bare-tree form (e.g. `"datasets"`,
-/// `"training_logs"`) and `Some(rel)` for a child-rooted path
-/// (e.g. `"datasets/cls/sample.wav"`).  The bare-tree form is
-/// used by `DELETE /assets/<tree>` whole-tree wipes; uploads and
-/// single-file / sub-tree deletes always carry a `Some(rel)`.
 /// Clone `prev_core`, advance its `workspace_revision` (id +1,
 /// timestamp = now), and return the bumped core alongside the new
 /// revision id.  Used by `upload_workspace_file` and
-/// `start_workspace_asset_delete`, both of which write the bumped
-/// `workspace.json` revision-before-bytes and need the same
-/// `id.saturating_add(1)` policy on overflow.  The caller still
-/// owns the cache publish and the `workspace.json` write.
+/// `start_async_tree_delete` (datasets/converters), both of which
+/// write the bumped `workspace.json` revision-before-bytes and
+/// need the same `id.saturating_add(1)` policy on overflow.  The
+/// caller still owns the cache publish and the `workspace.json`
+/// write.  Log-tree deletes do NOT call this -- logs aren't
+/// workspace state in the §9 sense.
 fn bump_workspace_revision(prev_core: &WorkspaceCore) -> (u64, WorkspaceCore) {
     let next_revision_id = prev_core.workspace_revision.id.saturating_add(1);
     let mut next_core = prev_core.clone();
@@ -133,6 +135,12 @@ fn bump_workspace_revision(prev_core: &WorkspaceCore) -> (u64, WorkspaceCore) {
     (next_revision_id, next_core)
 }
 
+/// Parse a workspace-rooted path into a `(tree, sub)` pair where
+/// `sub` is `None` for the bare-tree form (e.g. `"datasets"`,
+/// `"training_logs"`) and `Some(rel)` for a child-rooted path
+/// (e.g. `"datasets/cls/sample.wav"`).  The bare-tree form is
+/// used by `DELETE /assets/<tree>` whole-tree wipes; uploads and
+/// single-file / sub-tree deletes always carry a `Some(rel)`.
 fn parse_mutable_path(path: &AssetPath) -> Result<(AssetTree, Option<AssetPath>), FileError> {
     let mut comps = path.components();
     let first = comps.next().ok_or_else(|| {
@@ -210,99 +218,64 @@ pub const DEFAULT_DATASET_LIST_LIMIT: usize = 100;
 /// Hard ceiling on `?limit=`.
 pub const MAX_DATASET_LIST_LIMIT: usize = 1000;
 
-/// Outcome of [`WorkspaceMgr::start_workspace_asset_delete`].  The
-/// route layer maps the variant to the canonical HTTP status:
-/// `Async` is `202 Accepted` (the drain runs in the background),
-/// `SyncRemoved` is `200 OK` (the wipe completed on the request
-/// thread).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AssetDeleteOutcome {
-    /// Async tombstone+stage+drain fired; the drain itself runs
-    /// off-mutex on the blocking pool.
-    Async {
-        /// JobId for SSE follow-up via `GET /jobs/{job_id}/events`.
-        job_id: JobId,
-    },
-    /// Sync wipe completed on the request thread.
-    SyncRemoved {
-        /// Number of files unlinked (0 when the dir was already
-        /// empty or the requested file did not exist).
-        removed: usize,
-    },
-}
-
-/// Sync-wipe helper: unlink every `.jsonl` file under `dir` and
-/// return the count.  Missing dir is treated as "0 removed".
-/// Symlinks are unlinked via `remove_file` (not followed) so a
-/// hostile symlink at `<dir>/something.jsonl` is dropped without
-/// touching the target.
-fn wipe_log_dir(dir: &Path) -> Result<usize, FileError> {
-    if !dir.exists() {
-        return Ok(0);
-    }
-    let mut removed = 0usize;
-    let entries = std::fs::read_dir(dir).map_err(|source| io_err(dir.display(), source))?;
-    for entry in entries {
-        let entry = entry.map_err(|source| io_err(dir.display(), source))?;
-        let entry_path = entry.path();
-        // Symlink-safe stat so a hostile `<dir>/x.jsonl` symlink
-        // pointed at a workspace file we own is not followed.
-        let ft = match std::fs::symlink_metadata(&entry_path) {
-            Ok(md) => md.file_type(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => {
-                return Err(io_err(entry_path.display(), source));
-            }
-        };
-        if !(ft.is_file() || ft.is_symlink()) {
-            continue;
-        }
-        let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.ends_with(".jsonl") {
-            continue;
-        }
-        std::fs::remove_file(&entry_path).map_err(|source| io_err(entry_path.display(), source))?;
-        removed += 1;
-    }
-    // Best-effort dir fsync so the unlinks reach stable storage.
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(removed)
-}
-
-/// Sync-wipe helper for a single `.jsonl` file under `dir`.  The
-/// `sub` path must be exactly one component (the file name);
-/// nested paths under a log dir are rejected by
-/// `parse_mutable_path`'s post-processing in the caller.
-fn wipe_log_file(dir: &Path, sub: &AssetPath) -> Result<usize, FileError> {
+/// Per-log-tree shape constraint: the only addressable shapes
+/// are the bare tree (`training_logs` / `converter_logs` —
+/// whole-tree wipe) and a single `.jsonl` filename
+/// (`training_logs/<id>.jsonl`).  Nested sub-paths and
+/// non-`.jsonl` extensions are rejected at the dispatcher
+/// before any state mutation.
+fn validate_log_subpath(sub: &AssetPath) -> Result<(), FileError> {
     let comp_count = sub.components().count();
     if comp_count != 1 {
         return Err(FileError::InvalidName(format!(
-            "log file path must be a single component (e.g. `<job_id>.jsonl`); got {} components in {:?}",
-            comp_count,
+            "log file path must be a single component (e.g. `<job_id>.jsonl`); \
+             got {comp_count} components in {:?}",
             sub.as_str(),
         )));
     }
     let name = sub.as_str();
     if !name.ends_with(".jsonl") {
         return Err(FileError::InvalidName(format!(
-            "log file path must end in `.jsonl`; got {:?}",
-            name,
+            "log file path must end in `.jsonl`; got {name:?}",
         )));
     }
-    let target = dir.join(name);
-    match std::fs::remove_file(&target) {
-        Ok(()) => {
-            if let Ok(d) = std::fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
-            Ok(1)
+    Ok(())
+}
+
+/// Workspace-relative on-disk target for an async asset delete:
+/// `<workspace_dir>/<tree>/<sub>` for sub-path wipes,
+/// `<workspace_dir>/<tree>` for whole-tree wipes.  Shared by
+/// the dataset/converter and log-tree async dispatchers; the
+/// per-tree differences are handled by the caller.
+fn build_delete_target(workspace_dir: &Path, tree: AssetTree, sub: Option<&AssetPath>) -> PathBuf {
+    let mut p = workspace_dir.join(tree.dir_name());
+    if let Some(rel) = sub {
+        for component in rel.components() {
+            p.push(component);
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(source) => Err(io_err(target.display(), source)),
+    }
+    p
+}
+
+/// Snapshot's display target_path for an async asset delete:
+/// the bare tree name for whole-tree wipes, otherwise
+/// `<tree>/<sub>`.  Shared by the dataset/converter and
+/// log-tree async dispatchers.  The fallback in the parse
+/// failure branch should be unreachable in practice (`tree`
+/// and `sub` are already valid `AssetPath` segments by the
+/// time we get here), but the explicit fallback keeps the
+/// function total without leaking a `Result` to the caller.
+fn build_display_path(tree: AssetTree, sub: Option<&AssetPath>) -> AssetPath {
+    let bare = || AssetPath::parse(tree.dir_name()).expect("tree dir name is a valid AssetPath");
+    match sub {
+        Some(rel) => {
+            let mut s = String::with_capacity(tree.dir_name().len() + 1 + rel.as_str().len());
+            s.push_str(tree.dir_name());
+            s.push('/');
+            s.push_str(rel.as_str());
+            AssetPath::parse(&s).unwrap_or_else(|_| bare())
+        }
+        None => bare(),
     }
 }
 
@@ -715,43 +688,53 @@ impl WorkspaceMgr {
 
     /// Workspace-asset delete dispatcher.
     ///
-    /// Two semantics share this entry point:
+    /// All four trees share one async tombstone+stage+drain
+    /// shape: the rename + tombstone land durably under the
+    /// per-workspace mutex, then the staged payload drains
+    /// off-mutex on the blocking pool.  Boot recovery resumes
+    /// any drain interrupted by a daemon crash.
     ///
-    /// - **Async tombstone+stage+drain** for `datasets/...` and
-    ///   `converters/...` (also for the bare `datasets` /
-    ///   `converters` whole-tree wipe).  Acquires a
-    ///   `JobType::DatasetDelete` / `ConverterDelete` slot,
-    ///   bumps `workspace_revision`, atomically renames the
-    ///   target into staging, and drains off-mutex.  Returns
-    ///   [`AssetDeleteOutcome::Async`] with the owning JobId.
-    /// - **Sync wipe** for `training_logs/...` and
-    ///   `converter_logs/...` (single file or whole tree).
-    ///   Refuses with `JobConflict` if the workspace has an
-    ///   active producer (Train / Convert).  No tombstone, no
-    ///   revision bump; logs are an internal backstop, not
-    ///   workspace state in the §9 sense.  Returns
-    ///   [`AssetDeleteOutcome::SyncRemoved`] with the file
-    ///   count.
+    /// Per-tree differences:
     ///
-    /// The route layer maps the outcome to the canonical HTTP
-    /// status: `200 OK` for sync, `202 Accepted` for async.
+    /// - `datasets/...` / `converters/...` bump
+    ///   `workspace_revision` (revision-before-bytes invariant)
+    ///   and use `JobType::DatasetDelete` / `ConverterDelete` +
+    ///   the matching tombstone variant.
+    /// - `training_logs/...` / `converter_logs/...` skip the
+    ///   revision bump (logs aren't workspace state in the §9
+    ///   sense) and use `JobType::TrainingLogsDelete` /
+    ///   `ConverterLogsDelete` + the log tombstone variant.
+    ///   The dispatcher pre-checks for an active producer
+    ///   (`Train` for `training_logs`, `Convert` for
+    ///   `converter_logs`) in the same workspace and refuses
+    ///   with `JobConflict`; the check is best-effort (the
+    ///   registry doesn't synchronise with the workspace mutex,
+    ///   so a producer can still start between the check and
+    ///   stage_payload).  Sub-paths under log trees must be a
+    ///   single `.jsonl` filename; nested sub-paths or other
+    ///   extensions are rejected at the dispatcher.
+    ///
+    /// Returns the owning [`JobId`] in every case; the route
+    /// layer maps to `202 Accepted` + `{ job_id }`.  Clients
+    /// poll `GET /jobs/{job_id}` or stream
+    /// `GET /jobs/{job_id}/events` for terminal state.
     pub fn start_workspace_asset_delete(
         self: &Arc<Self>,
         ws: &WorkspaceId,
         path: &AssetPath,
-    ) -> Result<AssetDeleteOutcome, FileError> {
+    ) -> Result<JobId, FileError> {
         let (tree, sub) = parse_mutable_path(path)?;
         let workspace_dir = self.workspace_dir(ws);
         if !workspace_core_path(&workspace_dir).exists() {
             return Err(FileError::NotFound(ws.to_string()));
         }
         match tree {
-            AssetTree::Datasets | AssetTree::Converters => self
-                .start_async_tree_delete(ws, &workspace_dir, tree, sub)
-                .map(|job_id| AssetDeleteOutcome::Async { job_id }),
-            AssetTree::TrainingLogs | AssetTree::ConverterLogs => self
-                .wipe_log_tree_sync(ws, &workspace_dir, tree, sub)
-                .map(|removed| AssetDeleteOutcome::SyncRemoved { removed }),
+            AssetTree::Datasets | AssetTree::Converters => {
+                self.start_async_tree_delete(ws, &workspace_dir, tree, sub)
+            }
+            AssetTree::TrainingLogs | AssetTree::ConverterLogs => {
+                self.start_async_log_delete(ws, &workspace_dir, tree, sub)
+            }
         }
     }
 
@@ -770,16 +753,7 @@ impl WorkspaceMgr {
             matches!(tree, AssetTree::Datasets | AssetTree::Converters),
             "start_async_tree_delete called with non-async tree {tree:?}",
         );
-        let target = match &sub {
-            Some(rel) => {
-                let mut p = workspace_dir.join(tree.dir_name());
-                for component in rel.components() {
-                    p.push(component);
-                }
-                p
-            }
-            None => workspace_dir.join(tree.dir_name()),
-        };
+        let target = build_delete_target(workspace_dir, tree, sub.as_ref());
         // Symlink-safe metadata read; missing target surfaces as
         // `Io { kind: NotFound }` so the API route can promote
         // to 404.
@@ -799,18 +773,7 @@ impl WorkspaceMgr {
         // The snapshot's display target_path mirrors what the
         // operator asked for: a sub-path for sub-tree deletes,
         // the bare tree name for whole-tree wipes.
-        let display_path = match &sub {
-            Some(rel) => {
-                let mut s = String::with_capacity(tree.dir_name().len() + 1 + rel.as_str().len());
-                s.push_str(tree.dir_name());
-                s.push('/');
-                s.push_str(rel.as_str());
-                AssetPath::parse(&s).unwrap_or_else(|_| {
-                    AssetPath::parse(tree.dir_name()).expect("tree dir name is a valid AssetPath")
-                })
-            }
-            None => AssetPath::parse(tree.dir_name()).expect("tree dir name is a valid AssetPath"),
-        };
+        let display_path = build_display_path(tree, sub.as_ref());
         let job_handle = self
             .jobs
             .try_acquire(
@@ -879,30 +842,49 @@ impl WorkspaceMgr {
         Ok(job_id)
     }
 
-    /// Sync-wipe branch shared by training_logs and converter_logs.
-    /// Refuses with `JobConflict` if a producer (Train for
-    /// `training_logs`, Convert for `converter_logs`) is currently
-    /// active for the workspace; otherwise unlinks the matching
-    /// `.jsonl` file (single-file) or every `.jsonl` in the
-    /// directory (whole-tree).  Returns the unlink count.
-    fn wipe_log_tree_sync(
+    /// Async-delete branch for log trees (`training_logs/`,
+    /// `converter_logs/`).  Same shape as
+    /// [`Self::start_async_tree_delete`] minus the
+    /// `workspace_revision` bump (logs aren't workspace state).
+    /// Pre-checks for an active producer (Train / Convert) in
+    /// the same workspace and returns `JobConflict` before any
+    /// state mutation; the check is best-effort.
+    fn start_async_log_delete(
         self: &Arc<Self>,
         ws: &WorkspaceId,
         workspace_dir: &Path,
         tree: AssetTree,
         sub: Option<AssetPath>,
-    ) -> Result<usize, FileError> {
-        let (job_kind, conflict_label) = match tree {
-            AssetTree::TrainingLogs => ("train", "training_logs"),
-            AssetTree::ConverterLogs => ("convert", "converter_logs"),
+    ) -> Result<JobId, FileError> {
+        debug_assert!(
+            matches!(tree, AssetTree::TrainingLogs | AssetTree::ConverterLogs),
+            "start_async_log_delete called with non-log tree {tree:?}",
+        );
+
+        // Per-log-tree shape constraint comes BEFORE the
+        // producer-active check: a malformed sub-path is a
+        // client-side input error and should surface as 400
+        // regardless of whether a producer is currently running.
+        // Only `<id>.jsonl` single-file deletes and the bare-tree
+        // wipe are addressable.
+        if let Some(rel) = &sub {
+            validate_log_subpath(rel)?;
+        }
+
+        let (job_kind, conflict_label, producer_active) = match tree {
+            AssetTree::TrainingLogs => (
+                "train",
+                "training_logs",
+                self.jobs.has_active_train_for(*ws),
+            ),
+            AssetTree::ConverterLogs => (
+                "convert",
+                "converter_logs",
+                self.jobs.has_active_convert_for(*ws),
+            ),
             AssetTree::Datasets | AssetTree::Converters => {
-                unreachable!("wipe_log_tree_sync called with non-log tree {tree:?}")
+                unreachable!("start_async_log_delete called with non-log tree {tree:?}")
             }
-        };
-        let producer_active = match tree {
-            AssetTree::TrainingLogs => self.jobs.has_active_train_for(*ws),
-            AssetTree::ConverterLogs => self.jobs.has_active_convert_for(*ws),
-            _ => false,
         };
         if producer_active {
             return Err(FileError::JobConflict {
@@ -911,14 +893,82 @@ impl WorkspaceMgr {
                 ),
             });
         }
-        let log_dir = workspace_dir.join(tree.dir_name());
+
+        let target = build_delete_target(workspace_dir, tree, sub.as_ref());
+        // Symlink-safe metadata read; missing target surfaces as
+        // `Io { kind: NotFound }` -> 404.  Whole-tree wipe of a
+        // log dir that the producer never created (operator
+        // never ran train/convert) lands here as 404; the
+        // operator's idempotent "clear logs" pattern checks
+        // for 404 explicitly.
+        std::fs::symlink_metadata(&target).map_err(|source| io_err(target.display(), source))?;
+
+        let job_type = match tree {
+            AssetTree::TrainingLogs => JobType::TrainingLogsDelete,
+            AssetTree::ConverterLogs => JobType::ConverterLogsDelete,
+            AssetTree::Datasets | AssetTree::Converters => {
+                unreachable!("debug_assert above forbids non-log trees in this branch")
+            }
+        };
+        let display_path = build_display_path(tree, sub.as_ref());
+        let job_handle = self
+            .jobs
+            .try_acquire(
+                job_type,
+                vec![JobReference::Workspace { workspace_id: *ws }],
+                Some(display_path),
+            )
+            .map_err(|e| {
+                emit_mutation_rejected(tree);
+                FileError::from(e)
+            })?;
+        let job_id = job_handle.job_id();
+
         let lock = self.metadata_lock(ws);
         let _guard = lock.lock();
-        let removed = match sub {
-            None => wipe_log_dir(&log_dir)?,
-            Some(file) => wipe_log_file(&log_dir, &file)?,
+
+        // Tombstone variant matches the tree.  Logs skip
+        // `workspace_revision_id` (logs aren't workspace state).
+        // Recovery diagnostic only consumes the staging-dir
+        // location (derived from the filename) so the `path`
+        // field is purely informational.
+        let tombstone = match tree {
+            AssetTree::TrainingLogs => DeleteTombstone::TrainingLogs {
+                job_id,
+                workspace_id: *ws,
+                path: sub.clone(),
+                created_at: now_rfc3339(),
+            },
+            AssetTree::ConverterLogs => DeleteTombstone::ConverterLogs {
+                job_id,
+                workspace_id: *ws,
+                path: sub.clone(),
+                created_at: now_rfc3339(),
+            },
+            AssetTree::Datasets | AssetTree::Converters => {
+                unreachable!("debug_assert above forbids non-log trees in this branch")
+            }
         };
-        Ok(removed)
+        let staging_dir = workspace_dir.join(".tmp");
+        let staged = write_tombstone(&staging_dir, &tombstone)?;
+        // No revision bump; tombstone-then-stage is the durable
+        // pair for log async-deletes.
+        stage_payload(&target, &staged)?;
+        // Whole-tree wipe leaves the workspace without the log
+        // tree dir; recreate it empty so subsequent producer
+        // runs find the canonical structural shape.
+        if sub.is_none() {
+            std::fs::create_dir_all(&target).map_err(|source| io_err(target.display(), source))?;
+            fsync_dir(workspace_dir).map_err(|source| io_err(workspace_dir.display(), source))?;
+        }
+
+        // Drop the per-workspace lock before draining; the drain
+        // runs off-mutex.
+        drop(_guard);
+
+        spawn_asset_drain(staged, job_handle);
+
+        Ok(job_id)
     }
 
     /// Internal helper: resolve the cache cell for a dataset
@@ -1130,7 +1180,7 @@ fn spawn_asset_drain(staged: StagedDelete, job_handle: JobHandle) {
 // MARK: Helper -- write a tempfile in a workspace `.tmp/` dir.
 // Used by the API route's streaming-then-commit dance; exposed
 // here so test code can exercise the upload-commit method
-// without redoing the multipart/streaming half.
+// without redoing the body-streaming half.
 
 /// Stage `bytes` to a tempfile under `<workspace_dir>/.tmp/` and
 /// return the path.  Test-only convenience around
@@ -1392,7 +1442,7 @@ mod tests {
         let mgr = fresh_mgr(tmp.path().to_path_buf());
         let ws = new_workspace(&mgr, "main");
         // `training_logs` and `converter_logs` are now mutable
-        // top-levels (sync-wipe branch via `parse_mutable_path`);
+        // top-levels (async log-delete branch via `parse_mutable_path`);
         // the canonical-rejection set is everything else.  Single
         // tree-name components stay rejected because they aren't
         // one of the four mutable trees.
@@ -1412,74 +1462,168 @@ mod tests {
         }
     }
 
-    /// `training_logs/<job>.jsonl` and `converter_logs/<job>.jsonl`
-    /// route to the sync-wipe branch.  Targets that don't exist
-    /// surface as `removed: 0` -- the wipe is idempotent and a
-    /// 404-shape would force callers to ignore an expected
-    /// "already gone" outcome.
+    /// Single-file `training_logs/<job>.jsonl` /
+    /// `converter_logs/<job>.jsonl` deletes for a non-existent
+    /// file surface as `NotFound` -- the async path stats the
+    /// target before staging, matching the dataset/converter
+    /// sub-path semantic.  Operators that need idempotent
+    /// "remove this log file" check 404 explicitly.
+    ///
+    /// The bare-tree paths (`training_logs`, `converter_logs`)
+    /// are NOT covered by this test: workspace creation lays the
+    /// log dirs down empty, so the whole-tree wipe always finds
+    /// the target and proceeds (drain is just a no-op).  That
+    /// keeps the operator's "clear all logs" pattern idempotent
+    /// without any 404 special-case.
     #[test]
-    fn start_workspace_asset_delete_log_path_returns_sync_removed_zero_when_missing() {
+    fn start_workspace_asset_delete_log_file_returns_not_found_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = fresh_mgr(tmp.path().to_path_buf());
         let ws = new_workspace(&mgr, "main");
         for path in [
             "training_logs/00000000-0000-4000-8000-000000000001.jsonl",
             "converter_logs/00000000-0000-4000-8000-000000000002.jsonl",
-            "training_logs",
-            "converter_logs",
         ] {
             let p = AssetPath::parse(path).unwrap();
-            let outcome = mgr.start_workspace_asset_delete(&ws, &p).expect("dispatch");
+            let err = mgr.start_workspace_asset_delete(&ws, &p).unwrap_err();
             assert!(
-                matches!(outcome, AssetDeleteOutcome::SyncRemoved { removed: 0 }),
-                "expected SyncRemoved {{ removed: 0 }} for missing `{path}`; got {outcome:?}",
+                matches!(
+                    &err,
+                    FileError::Io { source, .. }
+                        if source.kind() == std::io::ErrorKind::NotFound
+                ),
+                "expected NotFound for missing `{path}`; got {err:?}",
             );
         }
     }
 
-    /// Single-file log wipe unlinks exactly the named jsonl and
-    /// reports `removed: 1`.  Whole-dir wipe (`training_logs`)
-    /// unlinks every `.jsonl` file under the dir and reports the
-    /// total.  Non-`.jsonl` siblings are untouched -- the wipe is
-    /// scoped to the JSONL backstop, not the directory itself.
+    /// Whole-tree wipe of empty `training_logs/` / `converter_logs/`
+    /// (the freshly-created workspace shape) returns a successful
+    /// async outcome -- the staging machinery handles the empty
+    /// payload gracefully (drain is a no-op, finalize cleans up
+    /// the tombstone).  This keeps the operator's "clear all
+    /// logs" pattern idempotent across fresh-and-aged workspaces.
     #[test]
-    fn start_workspace_asset_delete_log_paths_drain_jsonl_only() {
+    fn start_workspace_asset_delete_log_whole_tree_succeeds_on_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = fresh_mgr(tmp.path().to_path_buf());
+        let ws = new_workspace(&mgr, "main");
+        for path in ["training_logs", "converter_logs"] {
+            let p = AssetPath::parse(path).unwrap();
+            let _job = mgr
+                .start_workspace_asset_delete(&ws, &p)
+                .unwrap_or_else(|e| panic!("whole-tree empty wipe of `{path}` failed: {e:?}"));
+            // Recreated empty dir survives.
+            let dir = mgr.workspace_dir(&ws).join(path);
+            assert!(dir.exists(), "{path}/ recreated after whole-tree wipe");
+        }
+    }
+
+    /// Single-file log delete and whole-dir wipe both go through
+    /// the async tombstone+stage+drain path; both return a
+    /// `JobId`, both stage the target into the workspace `.tmp/`
+    /// staging dir, both let the inline drain (sync test path)
+    /// finish before the call returns.  Whole-dir wipe of a log
+    /// tree recreates the empty dir so subsequent producer runs
+    /// find the canonical structural shape; non-`.jsonl`
+    /// siblings (forbidden by `validate_log_subpath` for
+    /// single-file deletes, but a stray operator-pasted file
+    /// could exist) are renamed away with the rest of the dir
+    /// in the whole-tree wipe.
+    #[test]
+    fn start_workspace_asset_delete_log_paths_async_and_drain_into_staging() {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = fresh_mgr(tmp.path().to_path_buf());
         let ws = new_workspace(&mgr, "main");
         let ws_dir = mgr.workspace_dir(&ws);
         let log_dir = ws_dir.join("training_logs");
         std::fs::create_dir_all(&log_dir).unwrap();
-        // Two valid JSONL siblings + one foreign extension that
-        // must NOT be unlinked by the wipe.
         let a = log_dir.join("00000000-0000-4000-8000-000000000001.jsonl");
         let b = log_dir.join("00000000-0000-4000-8000-000000000002.jsonl");
-        let c = log_dir.join("note.txt");
         std::fs::write(&a, b"{}").unwrap();
         std::fs::write(&b, b"{}").unwrap();
-        std::fs::write(&c, b"keep me").unwrap();
 
-        // Single-file wipe: unlinks `a` only.
+        // Single-file wipe: stages + drains the named jsonl;
+        // sibling jsonl is untouched.
         let p =
             AssetPath::parse("training_logs/00000000-0000-4000-8000-000000000001.jsonl").unwrap();
-        let outcome = mgr.start_workspace_asset_delete(&ws, &p).unwrap();
-        assert!(matches!(
-            outcome,
-            AssetDeleteOutcome::SyncRemoved { removed: 1 }
-        ));
-        assert!(!a.exists());
-        assert!(b.exists());
-        assert!(c.exists());
+        let _job = mgr
+            .start_workspace_asset_delete(&ws, &p)
+            .expect("single-file log delete");
+        // Sync-test drain runs inline; the staged payload should
+        // be gone after the call returns.
+        assert!(!a.exists(), "single-file log delete drained `a`");
+        assert!(b.exists(), "sibling jsonl untouched by single-file delete");
 
-        // Whole-dir wipe: unlinks `b`, leaves `c`.
+        // Whole-dir wipe: stages the directory; the empty
+        // `training_logs/` dir is recreated for the canonical
+        // structural shape.
         let p = AssetPath::parse("training_logs").unwrap();
-        let outcome = mgr.start_workspace_asset_delete(&ws, &p).unwrap();
-        assert!(matches!(
-            outcome,
-            AssetDeleteOutcome::SyncRemoved { removed: 1 }
-        ));
-        assert!(!b.exists());
-        assert!(c.exists(), "non-.jsonl files survive whole-dir wipe");
+        let _job = mgr
+            .start_workspace_asset_delete(&ws, &p)
+            .expect("whole-tree log delete");
+        assert!(!b.exists(), "whole-dir log wipe drained `b`");
+        let recreated = ws_dir.join("training_logs");
+        assert!(
+            recreated.exists() && recreated.is_dir(),
+            "empty training_logs/ recreated after whole-tree wipe",
+        );
+    }
+
+    /// Log sub-paths that don't fit `<dir>/<id>.jsonl` are
+    /// rejected at the dispatcher before any state mutation.
+    /// Pinned because the dispatcher must reject malformed sub-paths
+    /// up-front so a typo doesn't proceed past the producer-active
+    /// gate into the staging machinery.
+    #[test]
+    fn start_workspace_asset_delete_log_subpath_shape_constraints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = fresh_mgr(tmp.path().to_path_buf());
+        let ws = new_workspace(&mgr, "main");
+        for bad in [
+            "training_logs/sub/x.jsonl",  // nested
+            "training_logs/note.txt",     // wrong extension
+            "converter_logs/sub/y.jsonl", // nested
+            "converter_logs/keep.txt",    // wrong extension
+        ] {
+            let p = AssetPath::parse(bad).unwrap();
+            let err = mgr.start_workspace_asset_delete(&ws, &p).unwrap_err();
+            assert!(
+                matches!(err, FileError::InvalidName(_)),
+                "expected InvalidName for `{bad}`; got {err:?}",
+            );
+        }
+    }
+
+    /// Ordering pin: log-tree dispatcher must surface the shape
+    /// `InvalidName` BEFORE the producer-active `JobConflict`.  A
+    /// malformed sub-path is a client-side input error and should
+    /// reject regardless of whether the producer is currently
+    /// running; an active producer must not mask the diagnostic.
+    /// Without this pin the two checks could be silently re-ordered
+    /// in a future refactor and a malformed-path-during-train would
+    /// 409 instead of 400.
+    #[test]
+    fn start_workspace_asset_delete_log_shape_check_runs_before_producer_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = fresh_mgr(tmp.path().to_path_buf());
+        let ws = new_workspace(&mgr, "main");
+        // Acquire a Train job so the producer-active check would
+        // fire if reached.  Held for the duration of the test.
+        let _train = mgr
+            .jobs
+            .try_acquire(
+                JobType::Train,
+                vec![JobReference::Workspace { workspace_id: ws }],
+                None,
+            )
+            .expect("train admission");
+        let bad = AssetPath::parse("training_logs/nested/job.jsonl").unwrap();
+        let err = mgr.start_workspace_asset_delete(&ws, &bad).unwrap_err();
+        assert!(
+            matches!(err, FileError::InvalidName(_)),
+            "shape error must surface before producer-active 409; got {err:?}",
+        );
     }
 
     /// Whole-tree wipe of `datasets/` and `converters/` returns
@@ -1500,8 +1644,9 @@ mod tests {
 
         // Whole-tree wipe.
         let p = AssetPath::parse("datasets").unwrap();
-        let outcome = mgr.start_workspace_asset_delete(&ws, &p).unwrap();
-        assert!(matches!(outcome, AssetDeleteOutcome::Async { .. }));
+        let _job = mgr
+            .start_workspace_asset_delete(&ws, &p)
+            .expect("whole-tree datasets delete");
         // The empty `datasets/` dir survived the rename.
         let datasets_dir = mgr.workspace_dir(&ws).join("datasets");
         assert!(datasets_dir.exists(), "empty datasets/ recreated");

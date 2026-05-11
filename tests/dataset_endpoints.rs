@@ -1,10 +1,11 @@
 //! Integration tests for the dataset routes:
 //!
-//! - `POST /workspace/{id}/upload` (multipart `{path, file}`)
-//! - `GET  /workspace/{id}/assets` (paginated direct-child listing)
-//! - `GET  /workspace/{id}/assets/{*path}` (file stream OR
-//!   directory listing)
-//! - `DELETE /workspace/{id}/assets/{*path}` (async delete)
+//! - `GET    /workspace/{id}/assets` (paginated direct-child listing)
+//! - `GET    /workspace/{id}/assets/{*path}` (file stream, dir
+//!   listing, JSONL page, or byte-range slice)
+//! - `PUT    /workspace/{id}/assets/{*path}` (raw-body upload)
+//! - `DELETE /workspace/{id}/assets/{*path}` (always-async tombstone+
+//!   stage+drain across all four mutable trees)
 //!
 //! Boots the API router in-process via `tower::ServiceExt::oneshot`,
 //! drives the four routes against a tempdir-backed workspace, and
@@ -238,6 +239,14 @@ async fn upload_rejects_path_traversal_variants() {
     let dir = tempfile::tempdir().unwrap();
     let r = router_v1_nested(fresh_app_state(dir.path()));
     let ws = create_workspace(&r, "main").await;
+    // The empty-path case (`""`) is omitted from this list because
+    // it now matches a different surface: with the URL-wildcard
+    // shape `PUT /assets/{*path}`, an empty path produces the URL
+    // `/assets/` which doesn't match the wildcard route; the
+    // helper-built URL collapses to `/assets`, which has only `GET`
+    // registered, so the wire surface is 405 (method not allowed),
+    // not 400.  See the `workspace_upload_without_path_returns_405`
+    // unit test.
     for (label, bad_path) in [
         (".. literal", ".."),
         (".. with subpath", "../etc/passwd"),
@@ -245,7 +254,6 @@ async fn upload_rejects_path_traversal_variants() {
         ("interior dotdot", "foo/../bar"),
         ("url-encoded ..", "%2E%2E%2Fetc"),
         ("backslash", "foo\\bar"),
-        ("empty", ""),
         ("trailing slash", "foo/"),
         ("double slash", "foo//bar"),
         ("nul byte", "foo\0bar"),
@@ -391,12 +399,13 @@ async fn list_assets_carries_mtime_per_entry() {
         );
     }
 
-    // Sub-listing on a populated directory: same field present
-    // on the file entry.
+    // Sub-listing on a populated directory via the unified
+    // wildcard form (the previous `?path=` query on the root
+    // listing was dropped as redundant with `/assets/{*path}`).
     let resp = call(
         &r,
         Method::GET,
-        &format!("/api/v1/workspace/{ws}/assets?path=datasets/cls"),
+        &format!("/api/v1/workspace/{ws}/assets/datasets/cls"),
         None,
     )
     .await;
@@ -544,6 +553,323 @@ async fn assets_byte_stream_unchanged_when_no_query_params() {
     assert_eq!(received, body);
 }
 
+/// `?byte_offset= / ?byte_limit=` slice a regular file to the
+/// requested byte range.  Pinned because the slice surface is
+/// the path random-access binary clients (e.g. WAV seek) rely
+/// on; a regression here breaks every player that loads
+/// fragments instead of the whole file.
+#[tokio::test]
+async fn assets_byte_range_returns_slice_with_offset_and_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    let ws = create_workspace(&r, "main").await;
+    let body: Vec<u8> = (0..256u32).map(|i| (i & 0xff) as u8).collect();
+    let resp = upload(&r, &ws, "datasets/cls/payload.bin", &body).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Slice [10, 30) -> 20 bytes.
+    let resp = call(
+        &r,
+        Method::GET,
+        &format!(
+            "/api/v1/workspace/{ws}/assets/datasets/cls/payload.bin?byte_offset=10&byte_limit=20",
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cl = resp
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    assert_eq!(cl, Some(20), "Content-Length reflects slice size");
+    let received = body_bytes(resp).await;
+    assert_eq!(received, body[10..30]);
+}
+
+/// `?byte_offset=` alone streams from the offset to EOF.  Mirror
+/// of the `?byte_limit=`-only test below; both must work without
+/// the partner param.
+#[tokio::test]
+async fn assets_byte_range_offset_only_streams_to_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    let ws = create_workspace(&r, "main").await;
+    let body: Vec<u8> = (0..100u32).map(|i| (i & 0xff) as u8).collect();
+    let _ = upload(&r, &ws, "datasets/cls/payload.bin", &body).await;
+
+    let resp = call(
+        &r,
+        Method::GET,
+        &format!("/api/v1/workspace/{ws}/assets/datasets/cls/payload.bin?byte_offset=70"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let received = body_bytes(resp).await;
+    assert_eq!(received, body[70..]);
+}
+
+/// `?byte_limit=` alone streams the first N bytes (offset
+/// defaults to 0).
+#[tokio::test]
+async fn assets_byte_range_limit_only_streams_from_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    let ws = create_workspace(&r, "main").await;
+    let body: Vec<u8> = (0..100u32).map(|i| (i & 0xff) as u8).collect();
+    let _ = upload(&r, &ws, "datasets/cls/payload.bin", &body).await;
+
+    let resp = call(
+        &r,
+        Method::GET,
+        &format!("/api/v1/workspace/{ws}/assets/datasets/cls/payload.bin?byte_limit=15"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let received = body_bytes(resp).await;
+    assert_eq!(received, body[..15]);
+}
+
+/// `?byte_limit=0` is a valid degenerate slice -- the client
+/// asks for zero bytes and gets a 200 OK with `Content-Length:
+/// 0`.  Pinned because the boundary `take(0)` must terminate
+/// the stream cleanly without burning a full file open + EOF
+/// read; a regression here would either 400 (over-strict) or
+/// stream the full file (under-strict).
+#[tokio::test]
+async fn assets_byte_range_limit_zero_returns_empty_slice() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    let ws = create_workspace(&r, "main").await;
+    let body: Vec<u8> = (0..50u32).map(|i| (i & 0xff) as u8).collect();
+    let _ = upload(&r, &ws, "datasets/cls/payload.bin", &body).await;
+
+    let resp = call(
+        &r,
+        Method::GET,
+        &format!("/api/v1/workspace/{ws}/assets/datasets/cls/payload.bin?byte_limit=0"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cl = resp
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    assert_eq!(cl, Some(0), "byte_limit=0 advertises Content-Length: 0");
+    let received = body_bytes(resp).await;
+    assert!(received.is_empty(), "byte_limit=0 yields zero bytes");
+}
+
+/// `byte_offset + byte_limit` past EOF clamps silently to the
+/// remainder; the response carries however many bytes existed.
+/// The slice is "best-effort": the client gets the bytes it asked
+/// for or fewer, never an error.
+#[tokio::test]
+async fn assets_byte_range_clamps_oversized_limit_to_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    let ws = create_workspace(&r, "main").await;
+    let body: Vec<u8> = (0..50u32).map(|i| (i & 0xff) as u8).collect();
+    let _ = upload(&r, &ws, "datasets/cls/payload.bin", &body).await;
+
+    // Ask for 1000 bytes starting at offset 40 -- file is 50
+    // bytes long, so the slice clamps to the last 10.
+    let resp = call(
+        &r,
+        Method::GET,
+        &format!(
+            "/api/v1/workspace/{ws}/assets/datasets/cls/payload.bin?byte_offset=40&byte_limit=1000",
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cl = resp
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    assert_eq!(cl, Some(10), "clamped Content-Length");
+    let received = body_bytes(resp).await;
+    assert_eq!(received, body[40..]);
+}
+
+/// `byte_offset == file_size` is a valid, edge-case slice
+/// requesting zero bytes from EOF.  Pinned because the boundary
+/// is tighter than `byte_offset > file_size` (the latter is
+/// 400); operators that calculate offsets and arrive at EOF
+/// exactly should not get a spurious error.
+#[tokio::test]
+async fn assets_byte_range_offset_at_eof_returns_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    let ws = create_workspace(&r, "main").await;
+    let body = b"hello";
+    let _ = upload(&r, &ws, "datasets/cls/payload.bin", body).await;
+
+    let resp = call(
+        &r,
+        Method::GET,
+        &format!(
+            "/api/v1/workspace/{ws}/assets/datasets/cls/payload.bin?byte_offset={}",
+            body.len(),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let received = body_bytes(resp).await;
+    assert!(received.is_empty(), "offset at EOF yields zero bytes");
+}
+
+/// `byte_offset > file_size` returns 400 `bad_request` -- the
+/// slice surface refuses to silently yield nothing for an offset
+/// the operator clearly mis-computed.
+#[tokio::test]
+async fn assets_byte_range_offset_past_eof_returns_400() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    let ws = create_workspace(&r, "main").await;
+    let _ = upload(&r, &ws, "datasets/cls/payload.bin", b"hi").await;
+
+    let resp = call(
+        &r,
+        Method::GET,
+        &format!("/api/v1/workspace/{ws}/assets/datasets/cls/payload.bin?byte_offset=999"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = json_body(resp).await;
+    assert_eq!(v["code"], "bad_request");
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("byte_offset"),
+        "diagnostic must name the gate; got {err}",
+    );
+}
+
+/// Byte-range slicing also works on `.jsonl` files.  The file
+/// extension does not gate the byte-stream surface; the gate is
+/// on the query namespace (raw bytes vs JSONL events).  Operators
+/// that want the parsed event shape ask for `?after_seq=` / `?limit=`
+/// instead; clients that need a raw chunk of the JSONL backstop
+/// (e.g. for log forwarding) ask for `?byte_offset=` / `?byte_limit=`.
+#[tokio::test]
+async fn assets_byte_range_works_on_jsonl_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    let ws = create_workspace(&r, "main").await;
+    let ws_id = acoustics_lab::common::ids::WorkspaceId::parse(&ws).unwrap();
+    let workspace_dir = dir
+        .path()
+        .join("workspaces")
+        .join("workspaces")
+        .join(ws_id.to_string());
+    let log_dir = workspace_dir.join("converter_logs");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let job_id = acoustics_lab::common::ids::JobId::new();
+    let log_path = log_dir.join(format!("{job_id}.jsonl"));
+    let raw = b"{\"seq\":1}\n{\"seq\":2}\n{\"seq\":3}\n";
+    std::fs::write(&log_path, raw).unwrap();
+
+    let resp = call(
+        &r,
+        Method::GET,
+        &format!(
+            "/api/v1/workspace/{ws}/assets/converter_logs/{job_id}.jsonl?byte_offset=10&byte_limit=10",
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let received = body_bytes(resp).await;
+    assert_eq!(received, &raw[10..20]);
+}
+
+/// Mixing the byte-range and JSONL-page query namespaces returns
+/// 400.  The diagnostic must name both axes so the client can
+/// see which combination it triggered.
+#[tokio::test]
+async fn assets_byte_range_rejects_with_jsonl_paging_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    let ws = create_workspace(&r, "main").await;
+    let ws_id = acoustics_lab::common::ids::WorkspaceId::parse(&ws).unwrap();
+    let workspace_dir = dir
+        .path()
+        .join("workspaces")
+        .join("workspaces")
+        .join(ws_id.to_string());
+    let log_dir = workspace_dir.join("converter_logs");
+    std::fs::create_dir_all(&log_dir).unwrap();
+    let job_id = acoustics_lab::common::ids::JobId::new();
+    std::fs::write(
+        log_dir.join(format!("{job_id}.jsonl")),
+        b"{\"seq\":1}\n{\"seq\":2}\n",
+    )
+    .unwrap();
+
+    // byte_offset + after_seq -> 400.
+    let resp = call(
+        &r,
+        Method::GET,
+        &format!(
+            "/api/v1/workspace/{ws}/assets/converter_logs/{job_id}.jsonl?byte_offset=0&after_seq=0",
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = json_body(resp).await;
+    let err = v["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("byte_offset") && err.contains("after_seq"),
+        "diagnostic must name both axes; got {err}",
+    );
+
+    // byte_limit + limit -> 400 (limit's JSONL-paging meaning
+    // collides with byte-slice ceiling).
+    let resp = call(
+        &r,
+        Method::GET,
+        &format!(
+            "/api/v1/workspace/{ws}/assets/converter_logs/{job_id}.jsonl?byte_limit=4&limit=2",
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Byte-range params on a directory return 400 -- the slice
+/// surface is file-only.  Mirrors the `?after_seq=` rejection
+/// shape so dir-listing requests with an accidental byte param
+/// fail loudly rather than silently fall through.
+#[tokio::test]
+async fn assets_byte_range_rejects_on_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    let ws = create_workspace(&r, "main").await;
+    let _ = upload(&r, &ws, "datasets/cls/sample.bin", b"x").await;
+
+    let resp = call(
+        &r,
+        Method::GET,
+        &format!("/api/v1/workspace/{ws}/assets/datasets/cls?byte_offset=0&byte_limit=1"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v: serde_json::Value = json_body(resp).await;
+    assert_eq!(v["code"], "bad_request");
+}
+
 /// `?after_seq=` on a directory 400s with the same diagnostic
 /// pattern the `.jsonl` gate uses.  Without this branch a
 /// directory-listing call with an accidental `?after_seq=` would
@@ -569,13 +895,15 @@ async fn assets_jsonl_page_rejects_on_directory() {
     assert_eq!(v["code"], "bad_request");
 }
 
-/// `DELETE /assets/training_logs/<id>.jsonl` routes to the
-/// sync-wipe branch and returns the unlink count.  Per-file log
-/// delete reaches the unified surface and gets back the canonical
-/// `{ "removed": N }` shape — no `job_id` because the wipe
-/// completes on the request thread.
+/// `DELETE /assets/training_logs/<id>.jsonl` routes through the
+/// async tombstone+stage+drain machinery -- the response is
+/// `202 Accepted` + `{ job_id }`, the file is staged into
+/// `<workspace>/.tmp/delete-training-logs-<job_id>/payload`,
+/// and the background drain unlinks the staged bytes.  Per-file
+/// log delete is now consistent with the dataset/converter
+/// async path; no more "200 + removed: N" sync shape.
 #[tokio::test]
-async fn delete_assets_training_log_file_returns_removed_count() {
+async fn delete_assets_training_log_file_returns_async_job_id() {
     let dir = tempfile::tempdir().unwrap();
     let r = router_v1_nested(fresh_app_state(dir.path()));
     let ws = create_workspace(&r, "main").await;
@@ -588,8 +916,9 @@ async fn delete_assets_training_log_file_returns_removed_count() {
     let log_dir = workspace_dir.join("training_logs");
     std::fs::create_dir_all(&log_dir).unwrap();
     let job_id = acoustics_lab::common::ids::JobId::new();
+    let log_path = log_dir.join(format!("{job_id}.jsonl"));
     std::fs::write(
-        log_dir.join(format!("{job_id}.jsonl")),
+        &log_path,
         r#"{"seq":1,"at":"2026-05-07T12:00:00Z","message":"hi"}"#,
     )
     .unwrap();
@@ -601,16 +930,49 @@ async fn delete_assets_training_log_file_returns_removed_count() {
         None,
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let v: serde_json::Value = json_body(resp).await;
-    assert_eq!(v["removed"].as_u64(), Some(1));
-    assert!(v.get("job_id").is_none(), "sync wipe carries no job_id");
+    let returned_job = v["job_id"].as_str().expect("job_id present on async wipe");
+    assert!(!returned_job.is_empty());
+    assert!(
+        v.get("removed").is_none(),
+        "async log delete carries no `removed` field",
+    );
+
+    // Eventual: poll the per-job tombstone JSON under `.tmp/`
+    // (cleared by `finalize_staged_delete` after drain
+    // completes).  Polling the renamed-away `log_path` would
+    // be a no-op -- the synchronous rename under the workspace
+    // mutex removes it BEFORE the 202 response returns, so the
+    // path is already absent by the time the test starts
+    // polling; only the per-job tombstone reflects drain
+    // completion.
+    let tombstone_path = workspace_dir
+        .join(".tmp")
+        .join(format!("delete-training-logs-{returned_job}.json"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tombstone_path.exists() {
+        if Instant::now() > deadline {
+            panic!(
+                "training-logs delete tombstone {} still present 5 s after delete",
+                tombstone_path.display(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !log_path.exists(),
+        "single-file rename moved the jsonl out of log_dir",
+    );
 }
 
-/// `DELETE /assets/converter_logs` (whole-dir) wipes every
-/// `.jsonl` file in the dir and reports the total.
+/// `DELETE /assets/converter_logs` (whole-dir) routes through
+/// the async path: 202 + job_id + background drain.  The empty
+/// `converter_logs/` dir is recreated so subsequent producer
+/// runs find the canonical structural shape; staged jsonls are
+/// drained off-mutex.
 #[tokio::test]
-async fn delete_assets_converter_logs_whole_dir_returns_total_removed() {
+async fn delete_assets_converter_logs_whole_dir_returns_async_job_id() {
     let dir = tempfile::tempdir().unwrap();
     let r = router_v1_nested(fresh_app_state(dir.path()));
     let ws = create_workspace(&r, "main").await;
@@ -622,13 +984,12 @@ async fn delete_assets_converter_logs_whole_dir_returns_total_removed() {
         .join(ws_id.to_string());
     let log_dir = workspace_dir.join("converter_logs");
     std::fs::create_dir_all(&log_dir).unwrap();
+    let mut jsonl_paths = Vec::new();
     for n in 0..3 {
         let job_id = acoustics_lab::common::ids::JobId::new();
-        std::fs::write(
-            log_dir.join(format!("{job_id}.jsonl")),
-            format!(r#"{{"seq":{n},"at":"2026-05-07T12:00:00Z"}}"#),
-        )
-        .unwrap();
+        let p = log_dir.join(format!("{job_id}.jsonl"));
+        std::fs::write(&p, format!(r#"{{"seq":{n},"at":"2026-05-07T12:00:00Z"}}"#)).unwrap();
+        jsonl_paths.push(p);
     }
 
     let resp = call(
@@ -638,9 +999,84 @@ async fn delete_assets_converter_logs_whole_dir_returns_total_removed() {
         None,
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let v: serde_json::Value = json_body(resp).await;
-    assert_eq!(v["removed"].as_u64(), Some(3));
+    let returned_job = v["job_id"].as_str().expect("job_id on whole-tree wipe");
+    assert!(!returned_job.is_empty());
+
+    // Eventual: poll the per-job tombstone JSON for absence
+    // (cleared by `finalize_staged_delete` after drain
+    // completes).  Polling the original `jsonl_paths` is a
+    // no-op: the whole-tree rename moved the entire log dir
+    // under staging BEFORE the 202 response returned, so the
+    // original child paths are already absent.  The tombstone
+    // alone reflects drain progress.
+    let tombstone_path = workspace_dir
+        .join(".tmp")
+        .join(format!("delete-converter-logs-{returned_job}.json"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while tombstone_path.exists() {
+        if Instant::now() > deadline {
+            panic!(
+                "converter-logs delete tombstone {} still present 5 s after delete",
+                tombstone_path.display(),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Whole-tree wipe recreates the empty log dir for the
+    // canonical workspace structural shape; the original
+    // children are gone.
+    assert!(log_dir.exists(), "empty converter_logs/ recreated");
+    assert!(log_dir.is_dir());
+    for p in &jsonl_paths {
+        assert!(!p.exists(), "{} drained", p.display());
+    }
+}
+
+/// Whole-tree wipe of an empty `training_logs/` (the freshly-
+/// created shape -- no producer has run yet) returns 202 +
+/// job_id.  Pinned because workspace creation lays log dirs
+/// down empty; a fresh workspace's "clear logs" must succeed
+/// idempotently rather than 404.
+#[tokio::test]
+async fn delete_assets_training_logs_whole_dir_succeeds_on_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    let ws = create_workspace(&r, "main").await;
+
+    let resp = call(
+        &r,
+        Method::DELETE,
+        &format!("/api/v1/workspace/{ws}/assets/training_logs"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let v: serde_json::Value = json_body(resp).await;
+    assert!(v["job_id"].as_str().is_some());
+}
+
+/// Single-file log delete of a missing `.jsonl` returns 404.
+/// Mirror of the dataset/converter sub-path semantic; with the
+/// async migration we no longer have a sync "removed: 0"
+/// fast-path, so operators that need idempotent "remove this
+/// log file" check 404 explicitly.
+#[tokio::test]
+async fn delete_assets_training_log_file_missing_returns_404() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    let ws = create_workspace(&r, "main").await;
+    let phantom = acoustics_lab::common::ids::JobId::new();
+
+    let resp = call(
+        &r,
+        Method::DELETE,
+        &format!("/api/v1/workspace/{ws}/assets/training_logs/{phantom}.jsonl"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 /// Whole-tree wipe of `datasets/` via `DELETE /assets/datasets`

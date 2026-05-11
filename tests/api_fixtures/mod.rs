@@ -68,53 +68,32 @@ pub async fn call(router: &Router, method: Method, path: &str, body: Option<&str
     router.clone().oneshot(req).await.expect("oneshot")
 }
 
-/// Build the multipart-form body for `POST /workspace/{id}/upload`
-/// in the `{path, file}` field shape the route's `axum::Multipart`
-/// handler expects.  `path` becomes the `path` text field; `payload`
-/// becomes the `file` field's bytes; `filename` is the
-/// `Content-Disposition: filename=...` of the `file` field (used by
-/// some tests as a tag, ignored by the server).  `boundary` is the
-/// raw boundary string (the caller's `Content-Type` header must
-/// match `multipart/form-data; boundary={boundary}`).
-pub fn build_upload_body(path: &str, filename: &str, payload: &[u8], boundary: &str) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(
-        format!(
-            "--{boundary}\r\n\
-             Content-Disposition: form-data; name=\"path\"\r\n\r\n\
-             {path}\r\n\
-             --{boundary}\r\n\
-             Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
-             Content-Type: application/octet-stream\r\n\r\n"
-        )
-        .as_bytes(),
-    );
-    buf.extend_from_slice(payload);
-    buf.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    buf
-}
-
-/// `POST /api/v1/workspace/{ws}/upload` with a multipart body
-/// carrying `{path, file}` (the route's expected field shape).
-/// `path` is the workspace-relative target; `payload` is the
-/// raw bytes for the `file` field; the multipart `filename`
-/// part defaults to a `"stub.bin"` tag (the route ignores it).
+/// `PUT /api/v1/workspace/{ws}/assets/{path}` with the raw bytes
+/// as the request body.  `path` is the workspace-relative target
+/// appended to the URL via the route's `{*path}` wildcard; each
+/// component is percent-encoded so characters that are invalid in
+/// a URI (backslash, NUL, CR/LF, non-ASCII) survive the
+/// `Request::builder().uri()` parse and reach the daemon for the
+/// `AssetPath::parse` rejection that the path-traversal test
+/// suite asserts on.  `/` separators between components are
+/// preserved verbatim so the wildcard captures the multi-segment
+/// tail.
 ///
-/// Tests that need a custom multipart boundary (e.g. assertions
-/// on per-shard boundary handling) should drop down to
-/// [`build_upload_body`] + a hand-built `Request` instead of
-/// going through this helper.
+/// The asset surface is unified under `/assets/{*path}` for read
+/// (GET), write (PUT), and delete (DELETE) so this helper drives
+/// the same URI family as the sibling [`call`]-based GET / DELETE
+/// helpers.
 pub async fn upload(router: &Router, ws: &str, path: &str, payload: &[u8]) -> Response {
-    const UPLOAD_BOUNDARY: &str = "----acoustics-lab-tests";
-    let body = build_upload_body(path, "stub.bin", payload, UPLOAD_BOUNDARY);
+    let encoded: String = path
+        .split('/')
+        .map(|seg| urlencoding::encode(seg).into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
     let req = Request::builder()
-        .method(Method::POST)
-        .uri(format!("/api/v1/workspace/{ws}/upload"))
-        .header(
-            header::CONTENT_TYPE,
-            format!("multipart/form-data; boundary={UPLOAD_BOUNDARY}"),
-        )
-        .body(Body::from(body))
+        .method(Method::PUT)
+        .uri(format!("/api/v1/workspace/{ws}/assets/{encoded}"))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(payload.to_vec()))
         .expect("build req");
     router.clone().oneshot(req).await.expect("oneshot")
 }

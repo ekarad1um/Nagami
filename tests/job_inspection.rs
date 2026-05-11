@@ -303,7 +303,9 @@ async fn delete_training_logs_refuses_while_train_active_and_succeeds_after() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     // Terminal -> reference released.
     handle.succeed(None);
-    // DELETE succeeds and reports removed > 0.
+    // DELETE now succeeds with 202 + job_id; the staged drain
+    // runs off-mutex and the staged jsonl is unlinked
+    // eventually.
     let resp = call(
         &h.router,
         Method::DELETE,
@@ -311,17 +313,43 @@ async fn delete_training_logs_refuses_while_train_active_and_succeeds_after() {
         None,
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let v: serde_json::Value = json_body(resp).await;
-    assert!(v["removed"].as_u64().unwrap_or(0) >= 1);
-    // Files should be gone.
+    let returned_job = v["job_id"]
+        .as_str()
+        .expect("async log delete returns job_id");
+
+    // Eventual: drain + finalize unlinks the per-job tombstone.
+    // The original `log_dir` is recreated empty BEFORE the 202
+    // response returns (under the workspace mutex), so polling
+    // log_dir is a no-op; the tombstone is the canonical "drain
+    // still in flight" marker.
+    let tombstone_path = workspace_dir
+        .join(".tmp")
+        .join(format!("delete-training-logs-{returned_job}.json"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tombstone_path.exists() {
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "training-logs delete tombstone {} still present 5 s after delete",
+                tombstone_path.display(),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // Empty `training_logs/` is recreated for the canonical
+    // workspace structural shape; child entries are gone.
+    assert!(
+        log_dir.is_dir(),
+        "empty training_logs/ recreated after whole-tree wipe",
+    );
     let entries: Vec<_> = std::fs::read_dir(&log_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .collect();
     assert!(
         entries.is_empty(),
-        "expected empty log dir; got {entries:?}"
+        "drained training_logs/ has no children; got {entries:?}",
     );
 }
 
@@ -504,6 +532,8 @@ async fn delete_converter_logs_refuses_while_convert_active_and_succeeds_after()
 
     // Terminal -> reference released.
     handle.succeed(None);
+    // DELETE now succeeds with 202 + job_id; mirror the
+    // training-logs assertions for the converter side.
     let resp = call(
         &h.router,
         Method::DELETE,
@@ -511,14 +541,37 @@ async fn delete_converter_logs_refuses_while_convert_active_and_succeeds_after()
         None,
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let v: serde_json::Value = json_body(resp).await;
-    assert!(v["removed"].as_u64().unwrap_or(0) >= 1);
+    let returned_job = v["job_id"]
+        .as_str()
+        .expect("async log delete returns job_id");
+
+    // Eventual: drain + finalize unlinks the per-job tombstone.
+    // See the training-logs companion test for why log_dir
+    // polling is a no-op here.
+    let tombstone_path = workspace_dir
+        .join(".tmp")
+        .join(format!("delete-converter-logs-{returned_job}.json"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tombstone_path.exists() {
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "converter-logs delete tombstone {} still present 5 s after delete",
+                tombstone_path.display(),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(log_dir.is_dir(), "empty converter_logs/ recreated");
     let entries: Vec<_> = std::fs::read_dir(&log_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .collect();
-    assert!(entries.is_empty(), "log dir empty; got {entries:?}");
+    assert!(
+        entries.is_empty(),
+        "drained converter_logs/ has no children; got {entries:?}",
+    );
 }
 
 /// `JobResult::Convert` surfaces on the `/jobs/{job_id}`

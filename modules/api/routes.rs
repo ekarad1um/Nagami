@@ -48,9 +48,9 @@ pub mod inference;
 pub mod jobs;
 // JSONL log reads + wipes live on the unified `/assets/{*path}`
 // surface (see [`dataset`]): paging on `?after_seq=&limit=` for
-// `GET`s; sync wipe under `training_logs[/...]` /
-// `converter_logs[/...]` for `DELETE`s, gated against the active
-// producer.
+// `GET`s; async tombstone+stage+drain wipe under
+// `training_logs[/...]` / `converter_logs[/...]` for `DELETE`s,
+// pre-checked against the active producer (Train / Convert).
 pub mod mic;
 pub mod status;
 pub mod training;

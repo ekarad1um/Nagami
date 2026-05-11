@@ -16,11 +16,13 @@
 //! ## Workspace & Assets
 //!
 //! `POST/GET/DELETE /api/v1/workspace[/:id[/...]]`, plus the
-//! multipart `upload` endpoint with a 256 MiB body limit so users
-//! can post full classifier bundles.  Training endpoints under the
-//! workspace start/list/status/cancel in-process fine-tune jobs;
-//! converter endpoints under the workspace extract heads from
-//! uploaded TFJS bundles.
+//! unified asset surface
+//! `GET/PUT/DELETE /api/v1/workspace/{id}/assets/{*path}` with a
+//! 256 MiB body limit on `PUT` so users can upload full
+//! classifier bundles.  Training endpoints under the workspace
+//! start/list/status/cancel in-process fine-tune jobs; converter
+//! endpoints under the workspace extract heads from uploaded
+//! TFJS bundles.
 //!
 //! ## Converter
 //!
