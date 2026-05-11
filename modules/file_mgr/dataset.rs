@@ -1500,23 +1500,31 @@ mod tests {
     }
 
     /// Whole-tree wipe of empty `training_logs/` / `converter_logs/`
-    /// (the freshly-created workspace shape) returns a successful
-    /// async outcome -- the staging machinery handles the empty
-    /// payload gracefully (drain is a no-op, finalize cleans up
-    /// the tombstone).  This keeps the operator's "clear all
-    /// logs" pattern idempotent across fresh-and-aged workspaces.
+    /// returns a successful async outcome -- the staging machinery
+    /// handles the empty payload gracefully (drain is a no-op,
+    /// finalize cleans up the tombstone).  This keeps the
+    /// operator's "clear all logs" pattern idempotent across
+    /// fresh-and-aged workspaces.
+    ///
+    /// Per-workspace log dirs are created lazily by the first
+    /// producer; this test materializes them explicitly to
+    /// exercise the "exists but empty" path (the "missing
+    /// directory" case is covered by a sibling test).
     #[test]
     fn start_workspace_asset_delete_log_whole_tree_succeeds_on_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = fresh_mgr(tmp.path().to_path_buf());
         let ws = new_workspace(&mgr, "main");
+        let ws_dir = mgr.workspace_dir(&ws);
         for path in ["training_logs", "converter_logs"] {
+            std::fs::create_dir_all(ws_dir.join(path))
+                .unwrap_or_else(|e| panic!("mkdir `{path}` failed: {e}"));
             let p = AssetPath::parse(path).unwrap();
             let _job = mgr
                 .start_workspace_asset_delete(&ws, &p)
                 .unwrap_or_else(|e| panic!("whole-tree empty wipe of `{path}` failed: {e:?}"));
             // Recreated empty dir survives.
-            let dir = mgr.workspace_dir(&ws).join(path);
+            let dir = ws_dir.join(path);
             assert!(dir.exists(), "{path}/ recreated after whole-tree wipe");
         }
     }

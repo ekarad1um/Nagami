@@ -378,6 +378,10 @@ async fn delete_head_via_workspace_mgr_round_trip() {
     // Mirrors what `publish_trained_head` produces; this test
     // exercises `delete_head` independently so a stale cache on
     // the create-side `WorkspaceMgr` does not shadow our writes.
+    // `heads/` is created lazily by the production publisher
+    // (head_rotation.rs); pre-create it here since this test
+    // skips that path.
+    std::fs::create_dir_all(workspace_dir.join("heads")).unwrap();
     let h1 = HeadId::new();
     let h2 = HeadId::new();
     for &h in &[h1, h2] {

@@ -12,7 +12,7 @@ use crate::audio_io::mic_arbitrator::{
 };
 use crate::audio_io::mock::Waveform;
 use crate::common::ids::MicId;
-use crate::config::domain::StreamCfg;
+use crate::config::domain::{FileCfg, StreamCfg, TrainingDefaults};
 use crate::config::error::{ConfigError, parse_err, read_err, write_err};
 use crate::inference::BackboneCatalogue;
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,14 @@ impl DefaultHeadRef {
 ///   Startup-only: not hot-reloaded and not API-mutable.
 /// * [`HeadLaunchConfig`] -- optional explicit file pair for the
 ///   deployment-bundled default classifier head.
+/// * [`TrainingDefaults`] -- default training hyperparameters
+///   reported as starting values; never read on a hot path and no
+///   API surface mutates them, so they live launch-side rather
+///   than in the user-pref TOML.
+/// * [`FileCfg`] -- file-service admission caps consumed once at
+///   boot to construct `file_mgr::AdmissionCfg`.  Not hot-reloaded
+///   (the constructed `FsServiceImpl` caches the caps), so it
+///   belongs to the launch layer.
 ///
 /// Future fields (host id, hardware-specific tuning constants, etc.)
 /// can land here without disturbing the user-pref TOML's reload
@@ -108,6 +116,21 @@ pub struct LaunchConfig {
     /// simply boot without bundled-default recovery.
     #[serde(default)]
     pub head: HeadLaunchConfig,
+    /// Default training hyperparameters.  Loaded once at boot;
+    /// per-job invocations override on a request-by-request basis,
+    /// so the launch layer is the right home (the user-pref TOML
+    /// never read this back at runtime).  `#[serde(default)]` so
+    /// pre-migration launch TOMLs without a `[training_defaults]`
+    /// block still load cleanly.
+    #[serde(default)]
+    pub training_defaults: TrainingDefaults,
+    /// File-service admission caps.  Consumed once at boot to
+    /// build the immutable `AdmissionCfg` handed to `FsServiceImpl`;
+    /// no runtime mutator re-reads it.  `#[serde(default)]` keeps
+    /// pre-migration launch TOMLs booting without an explicit
+    /// `[file]` block.
+    #[serde(default)]
+    pub file: FileCfg,
 }
 
 impl LaunchConfig {
@@ -138,6 +161,8 @@ impl LaunchConfig {
             backbone: BackboneCatalogue::default(),
             stream: StreamCfg::default(),
             head: HeadLaunchConfig::default(),
+            training_defaults: TrainingDefaults::default(),
+            file: FileCfg::default(),
         }
     }
 
@@ -167,6 +192,22 @@ impl LaunchConfig {
         cfg.head.validate().map_err(|err| ConfigError::Invalid {
             path: path.display().to_string(),
             msg: format!("launch head: {err}"),
+        })?;
+        // training_defaults / file validate at boot so a typo
+        // (epochs = 0, max_upload_bytes = 0) surfaces in the
+        // operator's systemd log rather than at first POST /train
+        // / first upload.  Both used to live in the user-pref TOML
+        // but were never read on a hot path or mutated by any API
+        // route; the launch layer is the natural home.
+        cfg.training_defaults
+            .validate()
+            .map_err(|err| ConfigError::Invalid {
+                path: path.display().to_string(),
+                msg: format!("launch training_defaults: {err}"),
+            })?;
+        cfg.file.validate().map_err(|err| ConfigError::Invalid {
+            path: path.display().to_string(),
+            msg: format!("launch file: {err}"),
         })?;
         Ok(cfg)
     }

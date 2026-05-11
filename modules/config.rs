@@ -49,10 +49,9 @@
 //!
 //! | Type | Kind | Why |
 //! |---|---|---|
-//! | [`Config`] | Schema DTO | Top-level TOML mapping; `Serialize + Deserialize`; one-to-one with `<workspace>/config.toml`. |
-//! | [`LaunchConfig`] | Schema DTO | Boot-time TOML; mic catalogue + backbone catalogue + stream listener settings + default-head file pair. |
-//! | [`TrainingDefaults`], [`FileCfg`] | Schema DTO | Sub-tables in `Config`; pure schema, all `Serialize + Deserialize`. |
-//! | [`StreamCfg`] | Schema DTO | Sub-table in `LaunchConfig`; startup-only, never hot-reloaded. |
+//! | [`Config`] | Schema DTO | Top-level TOML mapping; `Serialize + Deserialize`; one-to-one with `<workspace>/config.toml`.  Carries only the fields that are hot-reloadable AND API-mutable (mic policy + inference cadence). |
+//! | [`LaunchConfig`] | Schema DTO | Boot-time TOML; mic catalogue + backbone catalogue + stream listener settings + default-head file pair + training defaults + file caps. |
+//! | [`TrainingDefaults`], [`FileCfg`], [`StreamCfg`] | Schema DTO | Sub-tables in `LaunchConfig`; pure schema, all `Serialize + Deserialize`; startup-only, never hot-reloaded. |
 //! | [`crate::audio_io::mic_arbitrator::MicPolicy`] / `MicSelection` / `ChannelSelection` (re-exported through `Config.mic`) | Schema DTO (cross-module) | Owned by `audio_io` but lives in the TOML; cross-validated against `LaunchConfig.mic`. |
 //! | [`crate::inference::InferenceCfg`] (re-exported through `Config.inference`) | Schema DTO (cross-module) | Inference cadence; same dual-ownership pattern. |
 //! | [`ConfigError`] | Diagnostic type | Internal failure shape mapped to HTTP statuses via `Categorized`. |
@@ -148,8 +147,17 @@ use std::path::Path;
 /// signature isn't repeated at every passing point.
 type ReloadCallback = dyn Fn(&Config) -> Result<(), ConfigValidationError> + Send + Sync;
 
-/// Top-level config.  Loaded once from TOML; mutated through
-/// `ConfigCell::mutate`.
+/// Top-level user-preference config.  Loaded once from
+/// `<workspace>/config.toml`; mutated through `ConfigCell::mutate`
+/// (API routes) and via the hot-reload watcher (operator edits).
+///
+/// Carries only fields that are BOTH hot-reloadable AND
+/// API-mutable.  Boot-time constants (mic catalogue, stream binds,
+/// training defaults, file-service caps, etc.) live in
+/// [`LaunchConfig`] instead.  The workspace root is operator-
+/// supplied via the daemon's `--workspace` CLI flag and is not
+/// persisted in this TOML -- a stored copy would only ever drift
+/// from the CLI on the next boot.
 ///
 /// `deny_unknown_fields` enforces the redesign §10 migration
 /// contract: a legacy `[head_active]` block (or any other
@@ -165,20 +173,11 @@ pub struct Config {
     /// against the launch-time [`LaunchConfig::mic`] catalogue,
     /// which is immutable for the daemon's lifetime.
     pub mic: MicPolicy,
+    /// Inference cadence (hop samples + top-k).  Mutable at
+    /// runtime via `POST /inference` and via hot-reload.  The
+    /// engine reads the live ArcSwap on every iteration so edits
+    /// take effect within one frame.
     pub inference: InferenceCfg,
-    /// Defaults to sane values when loading pre-training
-    /// config files that do not yet contain this table.
-    #[serde(default)]
-    pub training_defaults: TrainingDefaults,
-    pub workspace_root: PathBuf,
-    /// File-service admission caps.  Defaults
-    /// (256 MiB / 4 concurrent) match the workspace-redesign §9
-    /// storage table; operators on dev hosts can lift the
-    /// per-upload cap via the `[file]` block.  `serde(default)`
-    /// keeps config files booting without an explicit `[file]`
-    /// table.
-    #[serde(default)]
-    pub file: FileCfg,
 }
 
 impl Config {
@@ -201,18 +200,6 @@ impl Config {
         self.inference
             .validate()
             .map_err(ConfigValidationError::Inference)?;
-        // Gate operator-supplied admission caps at
-        // boot.  Zero on either field would refuse every upload; the
-        // resulting daemon would look healthy but reject 100 % of
-        // upload traffic -- strictly worse than refusing to boot.
-        self.file.validate().map_err(ConfigValidationError::File)?;
-        // training_defaults must validate at boot and on
-        // hot-reload so a typo (e.g. epochs = 0) surfaces here,
-        // not on the first `POST /train`.  `TrainingConfig::
-        // validate` re-checks per-job for defence in depth.
-        self.training_defaults
-            .validate()
-            .map_err(ConfigValidationError::TrainingDefaults)?;
         Ok(())
     }
 
@@ -221,25 +208,21 @@ impl Config {
     /// manifest (which provisions the synthetic mock candidate so
     /// `mic.policy = FirstAvailable + Auto` resolves against
     /// something on the first boot).
-    pub fn default_for(workspace_root: PathBuf) -> Self {
-        // The user-pref TOML now ships only the policy; the
-        // catalogue (which mics + channels exist) lives in the
-        // launch-time [`LaunchConfig`] file.  Default policy =
-        // FirstAvailable + Auto, which works against any
-        // single-candidate launch catalogue (including the
-        // first-boot synthetic mock that `LaunchConfig::default_for`
-        // provisions).  The active head is now persisted under
-        // `<workspace_root>/active/` (per redesign §2); the
-        // legacy `head_active` TOML contract is removed.
+    ///
+    /// The user-pref TOML now ships only the policy + inference
+    /// cadence; the catalogue (which mics + channels exist),
+    /// training defaults, file-service caps, and stream binds all
+    /// live in the launch-time [`LaunchConfig`] file.  The active
+    /// head is persisted under `<workspace_root>/active/` (per
+    /// redesign §2); the legacy `head_active` TOML contract is
+    /// removed.
+    pub fn default_for() -> Self {
         Self {
             mic: MicPolicy {
                 mic: MicSelection::FirstAvailable,
                 channel: ChannelSelection::Auto,
             },
             inference: InferenceCfg::default(),
-            training_defaults: TrainingDefaults::default(),
-            file: FileCfg::default(),
-            workspace_root,
         }
     }
 }
@@ -829,7 +812,7 @@ mod tests {
     /// live in `LaunchConfig` now, so this can validate without
     /// test-side socket path patching.
     fn fresh_default() -> Config {
-        Config::default_for(PathBuf::from("/tmp/acoustics_lab_test_workspaces"))
+        Config::default_for()
     }
 
     fn fresh_stream() -> StreamCfg {
@@ -936,7 +919,11 @@ mod tests {
 
         // Inference (delegated) -- zero hop, already covered by
         // `load_rejects_invalid_inference_cfg`; ensure the aggregate
-        // walker reaches inference too.
+        // walker reaches inference too.  Training-defaults and the
+        // file-service caps moved to `LaunchConfig` during the
+        // launch/user-pref split; their validators are exercised
+        // via `launch_load_rejects_invalid_training_defaults` /
+        // `launch_load_rejects_invalid_file_cfg` below.
         let mut cfg = fresh_default();
         cfg.inference.hop_samples = 0;
         let err = cfg
@@ -944,18 +931,6 @@ mod tests {
             .expect_err("zero hop must reject")
             .to_string();
         assert!(err.contains("inference"), "{err}");
-
-        // training_defaults -- aggregate walker must reach
-        // them.  Zero on any of the three numeric fields is
-        // explicitly rejected (covered in detail by
-        // `training_defaults_validator_*` below).
-        let mut cfg = fresh_default();
-        cfg.training_defaults.epochs = 0;
-        let err = cfg
-            .validate()
-            .expect_err("zero epochs must reject")
-            .to_string();
-        assert!(err.contains("training_defaults"), "{err}");
     }
 
     /// Production default `tcp_bind` is loopback.  The daemon
@@ -1198,19 +1173,21 @@ mod tests {
             .expect("default training_defaults must validate");
     }
 
-    /// `Config::validate` rejects an invalid
-    /// `[training_defaults]` at TOML load time (i.e. inside
-    /// `ConfigCell::load`), the same boundary at which
-    /// inference / file caps already reject.
+    /// `LaunchConfig::load` rejects an invalid
+    /// `[training_defaults]` block (e.g. `epochs = 0`) at boot.
+    /// Training defaults moved from the hot user-pref TOML to the
+    /// launch manifest during the split; this pins the boot-time
+    /// gate so a typo surfaces in systemd logs rather than at the
+    /// first `POST /train`.
     #[test]
-    fn load_rejects_invalid_training_defaults() {
+    fn launch_load_rejects_invalid_training_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        let mut cfg = fresh_default();
-        cfg.training_defaults.epochs = 0;
-        let text = toml::to_string_pretty(&cfg).expect("ser");
+        let path = dir.path().join("launch.toml");
+        let mut launch = fresh_launch_for_load(dir.path());
+        launch.training_defaults.epochs = 0;
+        let text = toml::to_string_pretty(&launch).expect("ser");
         std::fs::write(&path, text).expect("write");
-        let err = ConfigCell::load(&path).expect_err("zero epochs must reject");
+        let err = LaunchConfig::load(&path).expect_err("zero epochs must reject");
         assert!(
             matches!(err, ConfigError::Invalid { .. }),
             "expected ConfigError::Invalid, got {err:?}",
@@ -1435,6 +1412,11 @@ mod tests {
             PathBuf::from("misc/share/acousticsd.sock"),
             "bundled launch.toml must own local dev stream binds",
         );
+        // training_defaults + file caps moved to LaunchConfig during
+        // the launch/user-pref split; pin the bundled values so a
+        // future drift surfaces in CI rather than as a runtime change.
+        assert_eq!(launch.training_defaults, TrainingDefaults::default());
+        assert_eq!(launch.file, FileCfg::default());
     }
 
     /// A launch.toml without `[[backbone.candidates]]` (older /
@@ -1517,48 +1499,57 @@ mod tests {
         }
     }
 
-    /// `[file]` block is operator-tunable.  The
-    /// validator rejects zeros (would brick uploads), and the
-    /// `[file]` section round-trips through TOML.
+    /// `LaunchConfig::load` gates the `[file]` admission caps at
+    /// boot: zero on either field would brick uploads on a daemon
+    /// that otherwise looks healthy.  The `[file]` block moved from
+    /// the user-pref TOML to the launch manifest during the split.
     #[test]
-    fn file_cfg_validator_rejects_zeros() {
-        let mut cfg = fresh_default();
-        cfg.file.max_upload_bytes = 0;
-        let err = cfg
-            .validate()
-            .expect_err("zero max_upload_bytes must reject")
-            .to_string();
-        assert!(err.contains("file"), "{err}");
+    fn launch_load_rejects_invalid_file_cfg() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("launch.toml");
+        let mut launch = fresh_launch_for_load(dir.path());
+        launch.file.max_upload_bytes = 0;
+        let text = toml::to_string_pretty(&launch).expect("ser");
+        std::fs::write(&path, text).expect("write");
+        let err = LaunchConfig::load(&path).expect_err("zero max_upload_bytes must reject");
+        assert!(
+            matches!(err, ConfigError::Invalid { .. }),
+            "expected ConfigError::Invalid, got {err:?}",
+        );
+        if let ConfigError::Invalid { msg, .. } = err {
+            assert!(
+                msg.contains("file") && msg.contains("max_upload_bytes"),
+                "diagnostic should name the offending field: {msg}",
+            );
+        }
 
-        let mut cfg = fresh_default();
-        cfg.file.max_concurrent_uploads = 0;
-        let err = cfg
-            .validate()
-            .expect_err("zero max_concurrent_uploads must reject")
-            .to_string();
-        assert!(err.contains("file"), "{err}");
+        let mut launch = fresh_launch_for_load(dir.path());
+        launch.file.max_concurrent_uploads = 0;
+        let text = toml::to_string_pretty(&launch).expect("ser");
+        std::fs::write(&path, text).expect("write");
+        let err = LaunchConfig::load(&path).expect_err("zero max_concurrent_uploads must reject");
+        assert!(
+            matches!(err, ConfigError::Invalid { .. }),
+            "expected ConfigError::Invalid, got {err:?}",
+        );
     }
 
-    /// Config files have no `[file]`
-    /// section.  The `#[serde(default)]` on `Config::file` must keep
-    /// them booting with the on-device defaults rather than failing
-    /// serde's missing-field check.
+    /// Launch TOMLs without a `[file]` block load with the
+    /// on-device defaults; `#[serde(default)]` on the field keeps
+    /// pre-migration files booting.  Pinned values guard against a
+    /// silent loosening of the upload cap.
     #[test]
-    fn legacy_config_without_file_block_loads_defaults() {
-        let cfg = fresh_default();
-        let mut value = toml::Value::try_from(&cfg).expect("config to toml value");
+    fn legacy_launch_without_file_block_loads_defaults() {
+        let launch = LaunchConfig::default_for();
+        let mut value = toml::Value::try_from(&launch).expect("launch to toml value");
         value
             .as_table_mut()
-            .expect("config is a table")
+            .expect("launch is a table")
             .remove("file");
-        let text = toml::to_string_pretty(&value).expect("serialize legacy config");
+        let text = toml::to_string_pretty(&value).expect("serialize legacy launch");
 
-        let parsed: Config = toml::from_str(&text).expect("parse legacy config");
+        let parsed: LaunchConfig = toml::from_str(&text).expect("parse legacy launch");
         assert_eq!(parsed.file, FileCfg::default());
-        // Defaults are the production constants; pin them here
-        // so a future loosening of the default surfaces in CI rather
-        // than silently widening the upload cap on every operator's
-        // box.
         assert_eq!(parsed.file.max_upload_bytes, 256 * 1024 * 1024);
         // Workspace-redesign §9 storage-table default; bumped
         // from 2 to 4 in the redesign for better bulk-load
@@ -1567,20 +1558,20 @@ mod tests {
         assert_eq!(parsed.file.max_concurrent_uploads, 4);
     }
 
-    /// Added `training_defaults`; older config files must
-    /// continue to boot instead of failing serde's missing-field
-    /// check.  This keeps daemon upgrades non-breaking.
+    /// Launch TOMLs without a `[training_defaults]` block load
+    /// with the on-device defaults; `#[serde(default)]` keeps the
+    /// upgrade non-breaking.
     #[test]
-    fn legacy_config_without_training_defaults_loads_defaults() {
-        let cfg = fresh_default();
-        let mut value = toml::Value::try_from(&cfg).expect("config to toml value");
+    fn legacy_launch_without_training_defaults_loads_defaults() {
+        let launch = LaunchConfig::default_for();
+        let mut value = toml::Value::try_from(&launch).expect("launch to toml value");
         value
             .as_table_mut()
-            .expect("config is a table")
+            .expect("launch is a table")
             .remove("training_defaults");
-        let text = toml::to_string_pretty(&value).expect("serialize legacy config");
+        let text = toml::to_string_pretty(&value).expect("serialize legacy launch");
 
-        let parsed: Config = toml::from_str(&text).expect("parse legacy config");
+        let parsed: LaunchConfig = toml::from_str(&text).expect("parse legacy launch");
         assert_eq!(parsed.training_defaults, TrainingDefaults::default());
     }
 

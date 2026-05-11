@@ -321,7 +321,7 @@ mod tests {
 
         let tmpdir = tempfile::tempdir().expect("tempdir");
         let cfg_path = tmpdir.path().join("config.toml");
-        let initial_cfg = crate::config::Config::default_for(tmpdir.path().join("workspaces"));
+        let initial_cfg = crate::config::Config::default_for();
         let initial_policy = initial_cfg.mic.clone();
         let cfg_cell = Arc::new(
             crate::config::ConfigCell::from_value(initial_cfg, cfg_path)

@@ -21,7 +21,7 @@
 //! need a non-default `default_head` override the field
 //! after construction (it's `pub`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
@@ -129,6 +129,19 @@ impl LagSource for StubLagSource {
     }
 }
 
+/// Resolve the on-disk per-workspace directory under the
+/// fixture's `FsServiceImpl` root.  [`fresh_app_state`] roots
+/// the FsService at `<dir>/workspaces/`, so the canonical
+/// per-workspace dir lands at `<dir>/workspaces/workspaces/<id>/`
+/// (one `workspaces` for the FsService root, one for the
+/// `WORKSPACES_DIR_NAME` inside it).  Centralising the doubled
+/// join here insulates tests from the fixture's internal
+/// rooting choice -- changing the FsService root becomes a
+/// single-site edit instead of a sweep across every consumer.
+pub fn fixture_workspace_dir(dir: &Path, ws_id: impl AsRef<Path>) -> PathBuf {
+    dir.join("workspaces").join("workspaces").join(ws_id)
+}
+
 /// Build an `AppState` rooted at `dir` with the canonical test
 /// wiring: a freshly-persisted default `Config`, the launch
 /// catalogue's `default-mock` candidate, a
@@ -142,7 +155,7 @@ pub fn fresh_app_state(dir: &Path) -> AppState {
     let cfg_path = dir.join("config.toml");
     let workspace_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspace_root).expect("workspace root");
-    let cfg = Config::default_for(workspace_root.clone());
+    let cfg = Config::default_for();
     let config = Arc::new(ConfigCell::from_value(cfg.clone(), cfg_path).expect("validate"));
     config.persist().expect("persist initial");
     // Mirror the daemon's boot wiring: launch catalogue ships a

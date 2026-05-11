@@ -212,12 +212,15 @@ the pipeline stays healthy.
 
 ## Operator-tunable caps
 
-Operator-tunable resource budgets:
+Operator-tunable resource budgets.  All TOML blocks below live in
+the launch manifest (`--config`); they are read once at boot and
+not hot-reloaded.
 
 | Cap | TOML location | Default | Effect |
 |---|---|---|---|
-| `max_upload_bytes` | `[file]` | 256 MiB | per-request hard ceiling on upload bytes |
-| `max_concurrent_uploads` | `[file]` | 4 | global in-flight upload semaphore |
+| `max_upload_bytes` | `launch.toml` `[file]` | 256 MiB | per-request hard ceiling on upload bytes |
+| `max_concurrent_uploads` | `launch.toml` `[file]` | 4 | global in-flight upload semaphore |
+| `epochs` / `batch_size` / `learning_rate_e6` | `launch.toml` `[training_defaults]` | 32 / 16 / 100 | defaults reported via the training API; per-job invocations override |
 | `max_workspace_core_bytes` | (constant) | 64 KiB | hard cap on `workspace.json` body size |
 | `max_train_jobs` | (constant) | 1 | unfinished train jobs daemon-wide |
 | `max_convert_jobs` | (constant) | 1 | concurrent convert jobs |
@@ -229,7 +232,7 @@ Operator-tunable resource budgets:
 
 Caps marked "(constant)" are compile-time constants today; if
 operator tuning becomes necessary, lift them into the
-appropriate TOML block (e.g. `[file]` for storage caps,
+appropriate launch-TOML block (e.g. `[file]` for storage caps,
 `[jobs]` for the JobRegistry block).
 
 ## Bundled-default head file pair
@@ -270,6 +273,17 @@ Operators upgrading from any earlier daemon MUST wipe
 daemon's first boot recreates the layout and materializes the
 bundled-default active generation from
 `[head.default]` in the launch config.
+
+The launch / user-pref split is a structural change: anything
+that is not actually mutated at runtime (training defaults, file
+admission caps, workspace_root, the mic catalogue, stream binds,
+the bundled-default head pair) lives in the launch TOML; the
+workspace `config.toml` now only carries the mic policy and
+inference cadence.  When upgrading, either delete
+`<workspace_root>/config.toml` and let first-boot recreate it,
+or hand-edit it to drop the retired `workspace_root`,
+`[training_defaults]`, and `[file]` keys.  Move the latter two
+into the launch TOML if you previously customized them.
 
 ## Deploy (Linux SBC)
 

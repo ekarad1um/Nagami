@@ -123,8 +123,12 @@ fn install_from_path_renames_and_commits() {
     let (dir, fs) = fresh_fs_service();
     let id = create_legacy_fs(&fs, "ws");
 
-    // Stage a tempfile in the workspace's `.tmp/`.
+    // Stage a tempfile in the workspace's `.tmp/`.  The
+    // production uploader self-mkdirs `.tmp/` on first write;
+    // this test stages directly, so we materialize the dir
+    // ourselves to mirror that contract.
     let tmp_dir = fs.workspace_tmpdir(&id);
+    std::fs::create_dir_all(&tmp_dir).expect("mkdir workspace .tmp");
     let mut tmp = tempfile::NamedTempFile::new_in(&tmp_dir).expect("tempfile");
     use std::io::Write;
     tmp.write_all(b"hello").expect("write");
@@ -149,12 +153,23 @@ fn install_from_path_renames_and_commits() {
 
 #[test]
 fn create_workspace_writes_redesign_layout() {
-    // Workspace creation lays down only the current on-disk
-    // shape; the legacy `weights/` / `labels/` / `metadata.json`
-    // surface is retired.
+    // Workspace creation lays down `workspace.json` + an empty
+    // `heads.json` under `<workspace>/`; every leaf subdirectory
+    // (`datasets/`, `converters/`, `heads/`, `training_logs/`,
+    // `converter_logs/`, `.tmp/`) is created lazily by the
+    // first writer that touches it.  The legacy `weights/` /
+    // `labels/` / `metadata.json` surface remains retired.
     let (_dir, mgr) = fresh_root();
     let id = mgr.create("first").expect("create");
     let ws = mgr.root().join("workspaces").join(id.to_string());
+    assert!(ws.is_dir(), "workspace dir itself must exist");
+    assert!(ws.join("workspace.json").is_file());
+    assert!(ws.join("heads.json").is_file());
+    // No leaf subdir is materialized eagerly; the lazy mkdir
+    // happens in the writer (uploader, training, converter,
+    // head_rotation, staging).  Pin the empty-on-create shape
+    // so a future regression of the lazy-mkdir contract surfaces
+    // in CI rather than as a silent disk-layout shift.
     for sub in [
         "datasets",
         "converters",
@@ -163,7 +178,10 @@ fn create_workspace_writes_redesign_layout() {
         ".tmp",
         "heads",
     ] {
-        assert!(ws.join(sub).is_dir(), "missing subdir {sub}");
+        assert!(
+            !ws.join(sub).exists(),
+            "subdir {sub} must NOT exist before first writer; create_with_tags is lazy",
+        );
     }
     // Legacy surfaces must NOT be created automatically.
     assert!(
@@ -175,8 +193,6 @@ fn create_workspace_writes_redesign_layout() {
         "weights/ should not be created",
     );
     assert!(!ws.join("labels").exists(), "labels/ should not be created",);
-    assert!(ws.join("workspace.json").is_file());
-    assert!(ws.join("heads.json").is_file());
 }
 
 /// `create` writes `workspace.json` + an empty `heads.json` and
@@ -908,13 +924,15 @@ async fn upload_rejects_unicode_filename_pre_rename() {
 fn install_from_path_rejects_unicode_filename() {
     let (_dir, mgr) = fresh_root();
     let id = create_legacy(&mgr, "uni-install");
-    let tmp = tempfile::NamedTempFile::new_in(
-        mgr.root()
-            .join("workspaces")
-            .join(id.to_string())
-            .join(".tmp"),
-    )
-    .expect("tempfile");
+    // `.tmp/` is created lazily by production writers; this test
+    // stages directly, so mkdir to mirror the uploader contract.
+    let staging = mgr
+        .root()
+        .join("workspaces")
+        .join(id.to_string())
+        .join(".tmp");
+    std::fs::create_dir_all(&staging).expect("mkdir workspace .tmp");
+    let tmp = tempfile::NamedTempFile::new_in(&staging).expect("tempfile");
     let err = mgr
         .install_from_path(&id, AssetKind::HeadLabels, "naïve.txt", tmp.path())
         .expect_err("Unicode filename must reject");

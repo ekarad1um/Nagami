@@ -29,3 +29,12 @@ path = "misc/backbones/backbone.mpk"
 [head.default]
 path = "misc/heads/default/head.mpk"
 labels_path = "misc/heads/default/labels.txt"
+
+[training_defaults]
+epochs = 32
+batch_size = 16
+learning_rate_e6 = 100
+
+[file]
+max_upload_bytes = 268435456
+max_concurrent_uploads = 4

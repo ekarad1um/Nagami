@@ -288,13 +288,14 @@ async fn async_main(args: Cli) -> Result<()> {
     //
     // Layer 1: launch config (immutable; operator-supplied via
     // `--config`).  Read once; edits ignored until restart.  Holds
-    // the mic catalogue, backbone catalogue, stream binds, and
-    // bundled-default head file pair.
+    // the mic catalogue, backbone catalogue, stream binds,
+    // bundled-default head file pair, training defaults, and file-
+    // service admission caps.
     //
     // Layer 2: user-preference config (hot-reloadable + API-mutable;
-    // lives at `<workspace>/config.toml`).  Holds the mic policy
-    // (which mic + channel to use right now), inference cadence,
-    // training defaults, file caps.
+    // lives at `<workspace>/config.toml`).  Holds only the fields
+    // actually mutated at runtime: the mic policy (which mic +
+    // channel to use right now) and the inference cadence.
     //
     // Cross-validation between layers happens at every boundary:
     // here at boot, in the `watch_with` callback on hot-reload of
@@ -303,10 +304,13 @@ async fn async_main(args: Cli) -> Result<()> {
     // Workspace root is operator-supplied via `--workspace` and is
     // the single source of truth for every mutable byte the daemon
     // owns (config.toml, backbone/, workspaces/, active/, logs/,
-    // var/run/).  Ensure it exists before any loader touches it.
+    // var/run/).  It is NOT persisted in the user-pref TOML -- a
+    // stored copy would only ever drift from the CLI on the next
+    // boot.  Ensure it exists before any loader touches it.
     std::fs::create_dir_all(&args.workspace)
         .with_context(|| format!("create workspace dir {}", args.workspace.display()))?;
-    let user_config_path = args.workspace.join("config.toml");
+    let workspace_root = args.workspace.clone();
+    let user_config_path = workspace_root.join("config.toml");
     if paths_may_alias(&user_config_path, &args.config) {
         anyhow::bail!(
             "--config (launch TOML) must not point at <workspace>/config.toml \
@@ -320,7 +324,7 @@ async fn async_main(args: Cli) -> Result<()> {
     // pointer.  The cell is internally Arc-shaped already; the
     // outer Arc adds one ref-bump per clone but enables the
     // dyn-coercion at the API boundary without extra allocations.
-    let config = Arc::new(load_or_init_config(&user_config_path, &args.workspace)?);
+    let config = Arc::new(load_or_init_config(&user_config_path)?);
     let snap = config.snapshot();
     let stream = launch.stream.clone();
     let default_head = launch.head.default.clone();
@@ -349,7 +353,7 @@ async fn async_main(args: Cli) -> Result<()> {
     // MARK: 3. Tracing
     // `create_dir_all` is idempotent, so an existence pre-check would
     // only race the actual create; just call it unconditionally.
-    let log_dir = snap.workspace_root.join("logs");
+    let log_dir = workspace_root.join("logs");
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("create log dir {}", log_dir.display()))?;
     // Plaintext rolling log.  This deploy is not under systemd or
@@ -688,7 +692,7 @@ async fn async_main(args: Cli) -> Result<()> {
     // the loop is explicitly aborted by `Drop for Inner` when
     // the last clone drops at process exit.
     monitor.start_sampler(
-        Some(snap.workspace_root.clone()),
+        Some(workspace_root.clone()),
         std::time::Duration::from_millis(500),
     );
 
@@ -915,13 +919,10 @@ async fn async_main(args: Cli) -> Result<()> {
     // the `inference` heartbeat below; `boot_recovery_report` is
     // taken once into `JobRegistry::record_boot_recovery` further
     // down (consumed via `Option::take`).
-    let (mut boot_recovery_report, boot_recovery_unhealthy) = run_boot_recovery(
-        &snap.workspace_root,
-        default_head.as_ref(),
-        &workspace_metrics,
-    );
+    let (mut boot_recovery_report, boot_recovery_unhealthy) =
+        run_boot_recovery(&workspace_root, default_head.as_ref(), &workspace_metrics);
 
-    let mut head = synthetic_head_for_dev(&snap)?;
+    let mut head = synthetic_head_for_dev()?;
     // One subsystem entry per topology.  boot_inference re-uses this
     // sender for the live engine heartbeat pump (when running);
     // the skip/err arms reuse it for periodic refresh.  Avoids the
@@ -948,12 +949,12 @@ async fn async_main(args: Cli) -> Result<()> {
 
     let want_inference = !args.no_inference()
         && boot_recovery_unhealthy.is_none()
-        && head_files_present(&snap)
+        && head_files_present(&workspace_root)
         && !launch.backbone.is_empty();
     let inference_fut = async {
         if want_inference {
             boot_inference(
-                &snap,
+                &workspace_root,
                 launch.backbone.clone(),
                 &audio_buf,
                 inference_hb.clone(),
@@ -1211,16 +1212,16 @@ async fn async_main(args: Cli) -> Result<()> {
     // (`create_dir_all(&args.workspace)`) and `run_boot_recovery`'s
     // `ensure_root_layout` materialized the canonical sub-tree;
     // no further mkdir needed here.
-    let workspace_root = snap.workspace_root.clone();
     // Admission caps come from the operator-tunable `[file]`
-    // block in `Config`; defaults are 256 MiB per upload + 4
-    // concurrent uploads.  `FileCfg` carries `max_concurrent_uploads:
-    // usize` for ergonomic TOML; convert to the `u32` shape
-    // that `crate::file_mgr::AdmissionCfg` expects via
-    // saturating cast at the boundary.
+    // block in the launch TOML; defaults are 256 MiB per upload
+    // + 4 concurrent uploads.  `FileCfg` carries
+    // `max_concurrent_uploads: usize` for ergonomic TOML; convert
+    // to the `u32` shape that `crate::file_mgr::AdmissionCfg`
+    // expects via saturating cast at the boundary.
     let admission = AdmissionCfg {
-        max_upload_bytes: snap.file.max_upload_bytes,
-        max_concurrent_uploads: u32::try_from(snap.file.max_concurrent_uploads).unwrap_or(u32::MAX),
+        max_upload_bytes: launch.file.max_upload_bytes,
+        max_concurrent_uploads: u32::try_from(launch.file.max_concurrent_uploads)
+            .unwrap_or(u32::MAX),
     };
     // Build the cross-cutting `JobRegistry` first so the
     // workspace-side admission paths (upload, dataset delete,
@@ -1237,7 +1238,7 @@ async fn async_main(args: Cli) -> Result<()> {
         jobs_registry.record_boot_recovery(report);
     }
     let files: Arc<dyn FsService> = Arc::new(FsServiceImpl::with_admission_and_jobs(
-        workspace_root,
+        workspace_root.clone(),
         admission,
         jobs_registry.clone(),
     ));
@@ -1332,6 +1333,116 @@ async fn async_main(args: Cli) -> Result<()> {
                             reaped = n,
                             "training: pruned finished job entries older than 1 h",
                         );
+                    }
+                }
+            }),
+        );
+    }
+
+    // Storage reaper: hourly sweep of `.tmp/` orphans across
+    // `<root>/.tmp/`, `<root>/active/.tmp/`, and every
+    // `<workspace>/.tmp/`, plus age-based pruning of per-workspace
+    // `training_logs/` + `converter_logs/`.  Closes two gaps the
+    // boot-time `recover_all` cannot cover:
+    //
+    // 1. A daemon that crashed hard (kill -9, OOM, power loss)
+    //    leaves orphan tempfiles / staging dirs.  Boot recovery
+    //    sweeps them on the *next* start; the storage reaper
+    //    covers the case where the daemon kept running but a
+    //    subsystem leaked (today only theoretical -- every
+    //    production write path uses RAII -- but the reaper is
+    //    the safety net for any future regression).
+    // 2. Per-workspace job logs (`<job>.jsonl` under
+    //    `training_logs/` / `converter_logs/`) have no built-in
+    //    retention.  A busy operator's workspace would accumulate
+    //    one entry per job indefinitely.  30 d is generous enough
+    //    that operators reviewing a recent job still see it; a
+    //    follow-up can promote both thresholds to the launch TOML
+    //    if operators ask.
+    //
+    // The thresholds are conservative on purpose: 24 h on
+    // `.tmp/` is orders of magnitude above any legitimate
+    // in-flight operation (uploads finish in seconds), so the
+    // sweep can never race a producer.  30 d on logs keeps a
+    // month of training-job history per workspace.
+    //
+    // `<root>/logs/acousticsd.log.*` is NOT swept here -- the
+    // `tracing_appender::rolling` daily rotation with
+    // `max_log_files(7)` already prunes it; routing it through
+    // this reaper would double the pruning logic without
+    // changing the steady-state behaviour.
+    {
+        const STORAGE_REAP_INTERVAL: Duration = Duration::from_secs(3600);
+        const TMP_AGE_THRESHOLD: Duration = Duration::from_secs(24 * 3600);
+        const LOG_AGE_THRESHOLD: Duration = Duration::from_secs(30 * 24 * 3600);
+        let workspace_root_for_reap = workspace_root.clone();
+        let shutdown_for_storage = shutdown.clone();
+        let metrics_for_storage = workspace_metrics.clone();
+        drain_registry.register_bg(
+            "storage_reaper",
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(STORAGE_REAP_INTERVAL);
+                // Skip behaviour: as with `training_reaper`, a
+                // backlog burst after a runtime stall would be
+                // harmful (every tick walks the FS).
+                interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                interval.tick().await;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_for_storage.cancelled() => break,
+                        _ = interval.tick() => {}
+                    }
+                    let cfg = crate::file_mgr::SweepConfig {
+                        tmp_age: TMP_AGE_THRESHOLD,
+                        log_age: LOG_AGE_THRESHOLD,
+                    };
+                    let root = workspace_root_for_reap.clone();
+                    let metrics = metrics_for_storage.clone();
+                    // Blocking I/O -- read_dir + remove syscalls
+                    // round-trip the kernel.  Run on the
+                    // spawn_blocking pool so the async runtime
+                    // worker stays free for hot-path requests.
+                    // `JoinError` only fires on task panic;
+                    // logging the panic via the existing tracing
+                    // surface preserves the operator's "did the
+                    // reaper survive?" diagnostic.
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        crate::file_mgr::sweep_once(&root, &cfg)
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(report)) => {
+                            metrics.record_storage_sweep(
+                                report.tmp_orphans_reaped,
+                                report.log_files_pruned,
+                                report.failures,
+                            );
+                            if report.did_work() || report.failures > 0 {
+                                tracing::info!(
+                                    target: "acoustics",
+                                    tmp_orphans_reaped = report.tmp_orphans_reaped,
+                                    log_files_pruned = report.log_files_pruned,
+                                    workspaces_scanned = report.workspaces_scanned,
+                                    failures = report.failures,
+                                    "storage reaper sweep completed",
+                                );
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                target: "acoustics",
+                                err = %e,
+                                "storage reaper sweep failed",
+                            );
+                        }
+                        Err(je) => {
+                            tracing::error!(
+                                target: "acoustics",
+                                err = %je,
+                                "storage reaper blocking task panicked",
+                            );
+                        }
                     }
                 }
             }),
@@ -1469,7 +1580,6 @@ async fn async_main(args: Cli) -> Result<()> {
             &monitor,
             &shutdown,
             Duration::from_secs(args.check_seconds()),
-            &snap,
         )
         .await;
         if res.is_err() { 1 } else { 0 }
@@ -1579,34 +1689,15 @@ where
 }
 
 /// Load `<workspace>/config.toml` (the user-pref TOML), or write
-/// defaults on first boot.  `workspace_root` is the operator-supplied
-/// `--workspace` value: the user-config's `workspace_root` field is
-/// authoritatively overwritten with this value so a stale on-disk
-/// path (operator moved the workspace, dev moved the repo) cannot
-/// contradict the daemon's runtime view.
-fn load_or_init_config(
-    path: &std::path::Path,
-    workspace_root: &std::path::Path,
-) -> Result<ConfigCell> {
+/// defaults on first boot.  The workspace root is operator-
+/// supplied via `--workspace` and lives in the daemon's runtime
+/// state -- not in this TOML.  An older config file that still
+/// carries a `workspace_root` key will fail `deny_unknown_fields`
+/// on load; operators upgrading the daemon either let first-boot
+/// re-materialize the file or strip the retired key by hand.
+fn load_or_init_config(path: &std::path::Path) -> Result<ConfigCell> {
     if path.exists() {
-        let cell =
-            ConfigCell::load(path).with_context(|| format!("load config {}", path.display()))?;
-        // CLI is the source of truth for the workspace root.  If
-        // the on-disk value differs (operator moved the tree, dev
-        // copied a config across hosts), rewrite to match.  No-op
-        // when already aligned (the mutate writes only on change).
-        let on_disk_root = cell.snapshot().workspace_root.clone();
-        if on_disk_root != workspace_root {
-            tracing::warn!(
-                target: "acoustics",
-                on_disk = %on_disk_root.display(),
-                cli = %workspace_root.display(),
-                "config.toml workspace_root differs from --workspace; rewriting to match CLI",
-            );
-            cell.mutate(|c| c.workspace_root = workspace_root.to_path_buf())
-                .context("override stale workspace_root in config.toml")?;
-        }
-        Ok(cell)
+        ConfigCell::load(path).with_context(|| format!("load config {}", path.display()))
     } else {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -1615,7 +1706,7 @@ fn load_or_init_config(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create config parent dir {}", parent.display()))?;
         }
-        let cfg = Config::default_for(workspace_root.to_path_buf());
+        let cfg = Config::default_for();
         let h = ConfigCell::from_value(cfg, path.to_path_buf())
             .context("first-boot default config failed validation")?;
         h.persist().context("persist initial config")?;
@@ -1683,8 +1774,8 @@ fn paths_may_alias(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// True iff `<workspace_root>/active/current.json` exists +
 /// parses + the pointed generation's manifest validates.
 /// Replaces the legacy `cfg.head_active.*.exists()` gate.
-fn head_files_present(cfg: &Config) -> bool {
-    matches!(resolve_active_head_paths(cfg), Ok(Some(_)))
+fn head_files_present(workspace_root: &std::path::Path) -> bool {
+    matches!(resolve_active_head_paths(workspace_root), Ok(Some(_)))
 }
 
 /// Run the boot-time sweep (`ensure_root_layout` + `recover_all`)
@@ -1859,10 +1950,10 @@ fn run_boot_recovery(
 /// this helper covers the common single-failure case so a torn
 /// current.json doesn't take inference offline.
 fn resolve_active_head_paths(
-    cfg: &Config,
+    workspace_root: &std::path::Path,
 ) -> Result<Option<(PathBuf, PathBuf, PathBuf, crate::common::ids::HeadId)>> {
     use crate::file_mgr::schema as fm_schema;
-    let root = &cfg.workspace_root;
+    let root = workspace_root;
     let pointer_path = fm_schema::active_current_path(root);
     if !pointer_path.exists() {
         return Ok(None);
@@ -2024,7 +2115,7 @@ fn hash_hex(bytes: &[u8]) -> String {
 /// than an operator-actionable failure -- surfaced via `anyhow!`
 /// rather than `expect` so the diagnostic chains cleanly into
 /// the boot Result without aborting the runtime.
-fn synthetic_head_for_dev(_cfg: &Config) -> Result<HotHead> {
+fn synthetic_head_for_dev() -> Result<HotHead> {
     let inner = crate::inference::HeadInner {
         weight: vec![0.0; crate::common::dims::BackboneFeatureDim::USIZE * 2],
         bias: vec![0.0; 2],
@@ -2042,8 +2133,9 @@ fn synthetic_head_for_dev(_cfg: &Config) -> Result<HotHead> {
 /// Build + spawn the inference engine and its heartbeat-pump task.
 ///
 /// Inputs:
-///   * `cfg` / `backbone_catalogue` -- head paths from the user-pref
-///     `Config`, candidate list from the immutable `LaunchConfig`.
+///   * `workspace_root` / `backbone_catalogue` -- the active head
+///     under `<workspace_root>/active/`, plus the candidate list
+///     from the immutable `LaunchConfig`.
 ///   * `inference_cfg` -- shared ArcSwap so API mutations of cadence
 ///     propagate to the engine without restart.
 ///   * `status_tx` -- the daemon's single `inference` heartbeat
@@ -2069,7 +2161,7 @@ fn synthetic_head_for_dev(_cfg: &Config) -> Result<HotHead> {
 // call site cleaner.
 #[allow(clippy::too_many_arguments)]
 async fn boot_inference(
-    cfg: &Config,
+    workspace_root: &std::path::Path,
     backbone_catalogue: crate::inference::BackboneCatalogue,
     audio_buf: &AudioBuffer,
     status_tx: tokio::sync::watch::Sender<crate::status::Heartbeat>,
@@ -2096,7 +2188,7 @@ async fn boot_inference(
     // generation; resolve again here so the head + labels paths
     // come straight from the on-disk source of truth (the legacy
     // `cfg.head_active.*` TOML contract is retired).
-    let (_gen_dir, head_mpk, labels_path, head_id) = resolve_active_head_paths(cfg)
+    let (_gen_dir, head_mpk, labels_path, head_id) = resolve_active_head_paths(workspace_root)
         .with_context(|| "resolve active head paths for boot")?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -2527,7 +2619,6 @@ async fn run_check_mode(
     monitor: &StatusMonitor,
     shutdown: &CancellationToken,
     duration: Duration,
-    cfg: &Config,
 ) -> Result<()> {
     tokio::select! {
         biased;
@@ -2539,9 +2630,6 @@ async fn run_check_mode(
     // `snapshot` is wait-free; the workspace path
     // was captured by `start_sampler` at boot.
     let snap = monitor.snapshot(crate::status::BroadcastLagSnapshot::default());
-    // Suppress unused-arg lint while keeping the field accessible
-    // for future reads (e.g. on-demand disk-free probing).
-    let _ = cfg;
     let json = serde_json::to_string_pretty(&snap).unwrap_or_else(|_| "{}".into());
     println!("{json}");
 

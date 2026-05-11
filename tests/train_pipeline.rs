@@ -60,8 +60,15 @@ impl LagSource for StubLagSource {
 /// sufficient for the producer-admission assertions in this
 /// file.  No head record is committed on failure.
 fn fresh_router(dir: &Path) -> Router {
-    let workspace_root = dir.join("workspaces");
-    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    // `FsServiceImpl` roots at `dir` (not `dir/workspaces`) so
+    // the producer's backbone resolution can find the stub at
+    // `dir/backbone/backbone.mpk` below.  Per-workspace dirs
+    // land at `dir/workspaces/<id>/`.  Production paths
+    // (uploader, training, converter, head_rotation, staging)
+    // self-mkdir the per-workspace subtree on first write, so
+    // pre-creating `dir/workspaces/` here is purely defensive
+    // -- the test still passes without it.
+    std::fs::create_dir_all(dir.join("workspaces")).expect("workspace root");
 
     // Stub backbone fixture under <root>/backbone/.  The
     // producer admission gate stats it; the trainer's
@@ -75,7 +82,7 @@ fn fresh_router(dir: &Path) -> Router {
         .expect("write backbone stub");
 
     let cfg_path = dir.join("config.toml");
-    let cfg = Config::default_for(workspace_root.clone());
+    let cfg = Config::default_for();
     let config = Arc::new(ConfigCell::from_value(cfg.clone(), cfg_path).expect("validate"));
     config.persist().expect("persist initial");
     let launch = LaunchConfig::default_for();

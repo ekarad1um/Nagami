@@ -38,7 +38,7 @@ use axum::Router;
 use axum::http::{Method, StatusCode};
 
 mod api_fixtures;
-use api_fixtures::{call, create_workspace, json_body, upload};
+use api_fixtures::{call, create_workspace, fixture_workspace_dir, json_body, upload};
 
 /// Process-wide serialization gate.  The converter semaphore
 /// (`crate::converter::CONVERT_SEMAPHORE`) is a `OnceLock` static
@@ -73,7 +73,7 @@ fn fresh_router(dir: &Path) -> (Router, Arc<dyn FsService>) {
     std::fs::create_dir_all(&workspace_root).expect("workspace root");
 
     let cfg_path = dir.join("config.toml");
-    let cfg = Config::default_for(workspace_root.clone());
+    let cfg = Config::default_for();
     let config = Arc::new(ConfigCell::from_value(cfg.clone(), cfg_path).expect("validate"));
     config.persist().expect("persist initial");
     let launch = LaunchConfig::default_for();
@@ -261,9 +261,7 @@ async fn convert_producer_returns_head_id_and_job_id() {
     assert_eq!(heads[0]["head_id"], head_id);
 
     // The JSONL log file exists at the documented path.
-    let workspace_root = dir.path().join("workspaces").join("workspaces");
-    let log_path = workspace_root
-        .join(&ws)
+    let log_path = fixture_workspace_dir(dir.path(), &ws)
         .join("converter_logs")
         .join(format!("{job_id}.jsonl"));
     assert!(

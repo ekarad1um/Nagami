@@ -107,6 +107,12 @@ prost-build = "=0.14.3"
 criterion = { workspace = true }
 toml = { workspace = true }
 tokio-tungstenite = "=0.29.0"
+# `filetime` is already in the dep graph via `tempfile`'s
+# transitive deps; expose it for the storage-reaper unit tests
+# that backdate fixture mtime past the sweep threshold.  Test-only
+# (production code uses `SystemTime::now()` against on-disk
+# mtime, never sets it).
+filetime = "=0.2.27"
 # `process` is a test-only feature (daemon-lifecycle tests spawn the
 # binary as a subprocess via `tokio::process::Command`); not needed
 # in the production daemon, so it's pinned to dev-deps rather than

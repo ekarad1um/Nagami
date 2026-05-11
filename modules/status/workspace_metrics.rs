@@ -127,6 +127,25 @@ pub struct WorkspaceMetricsSnapshot {
     /// operators correlate `workspaces_scanned` < expected with
     /// the typed reason without grep-ing the daemon log.
     pub boot_workspace_recovery_failures_total: u64,
+    /// Cumulative `.tmp/` orphans reaped by the runtime
+    /// `storage_reaper` background task.  Distinct from
+    /// `boot_orphans_swept_total` (boot-time sweep): this
+    /// counter captures the steady-state runtime hygiene path
+    /// that closes the "daemon kept running after a hard crash"
+    /// gap the boot sweep cannot.  See
+    /// [`crate::file_mgr::storage_reaper`].
+    pub tmp_orphans_reaped_total: u64,
+    /// Cumulative per-workspace `*.jsonl` files pruned by the
+    /// runtime `storage_reaper`.  Bounds the long-tail growth
+    /// of `<workspace>/training_logs/` +
+    /// `<workspace>/converter_logs/` on operators who never
+    /// issue `DELETE /workspace/{id}/assets/{tree}` manually.
+    pub log_files_pruned_total: u64,
+    /// Cumulative per-workspace failures observed by the
+    /// runtime `storage_reaper`.  Mirrors the boot-time
+    /// recovery counter shape; lets operators correlate
+    /// "reaper logging warnings" without grep.
+    pub storage_reaper_failures_total: u64,
 }
 
 // MARK: WorkspaceMetrics
@@ -148,6 +167,9 @@ pub struct WorkspaceMetrics {
     sse_clients_current: AtomicI64,
     boot_orphans_swept_total: AtomicU64,
     boot_workspace_recovery_failures_total: AtomicU64,
+    tmp_orphans_reaped_total: AtomicU64,
+    log_files_pruned_total: AtomicU64,
+    storage_reaper_failures_total: AtomicU64,
     /// Bounded ring of recent `workspace.json` write
     /// durations (microseconds).  Capacity:
     /// [`WRITE_DURATION_RING_DEPTH`].
@@ -188,6 +210,11 @@ impl WorkspaceMetrics {
             boot_orphans_swept_total: self.boot_orphans_swept_total.load(Ordering::Relaxed),
             boot_workspace_recovery_failures_total: self
                 .boot_workspace_recovery_failures_total
+                .load(Ordering::Relaxed),
+            tmp_orphans_reaped_total: self.tmp_orphans_reaped_total.load(Ordering::Relaxed),
+            log_files_pruned_total: self.log_files_pruned_total.load(Ordering::Relaxed),
+            storage_reaper_failures_total: self
+                .storage_reaper_failures_total
                 .load(Ordering::Relaxed),
         }
     }
@@ -288,6 +315,26 @@ impl WorkspaceMetrics {
     pub fn record_boot_workspace_recovery_failures(&self, n: u64) {
         self.boot_workspace_recovery_failures_total
             .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Record one runtime sweep pass from the
+    /// `file_mgr::storage_reaper` background task.  Accepts bare
+    /// counters (not the report struct) so the layer-graph edge
+    /// `status -> file_mgr` stays out of the dependency tree;
+    /// the daemon's wiring site unpacks the fields and forwards
+    /// them through here.
+    pub fn record_storage_sweep(
+        &self,
+        tmp_orphans_reaped: u64,
+        log_files_pruned: u64,
+        failures: u64,
+    ) {
+        self.tmp_orphans_reaped_total
+            .fetch_add(tmp_orphans_reaped, Ordering::Relaxed);
+        self.log_files_pruned_total
+            .fetch_add(log_files_pruned, Ordering::Relaxed);
+        self.storage_reaper_failures_total
+            .fetch_add(failures, Ordering::Relaxed);
     }
 }
 
@@ -551,6 +598,25 @@ mod tests {
         m.record_boot_workspace_recovery_failures(0);
         m.record_boot_workspace_recovery_failures(3);
         assert_eq!(m.snapshot().boot_workspace_recovery_failures_total, 5);
+    }
+
+    /// `record_storage_sweep` accumulates each of the three
+    /// counters independently across multiple sweep passes.
+    /// Pins the positional arg order (`tmp_orphans_reaped`,
+    /// `log_files_pruned`, `failures`) so a future
+    /// swap of two same-typed arguments surfaces as a counter
+    /// mismatch in CI rather than as silently miscounted metrics
+    /// in production.
+    #[test]
+    fn record_storage_sweep_accumulates() {
+        let m = WorkspaceMetrics::new();
+        m.record_storage_sweep(3, 5, 1);
+        m.record_storage_sweep(2, 0, 0);
+        m.record_storage_sweep(0, 0, 4);
+        let s = m.snapshot();
+        assert_eq!(s.tmp_orphans_reaped_total, 5);
+        assert_eq!(s.log_files_pruned_total, 5);
+        assert_eq!(s.storage_reaper_failures_total, 5);
     }
 
     #[test]

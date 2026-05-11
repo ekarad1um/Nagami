@@ -132,27 +132,37 @@ The daemon owns the entire workspace tree under
 scan / reconcile API); operators either let the daemon mutate
 through its API or wipe and recreate.
 
+Every subdirectory inside the tree is **created lazily by the
+writer that first touches it** -- only `<workspace_root>/` and
+`<workspace_root>/logs/` are materialized at boot.  A fresh
+workspace is just `workspace.json` + `heads.json`; the leaf
+subdirs (`datasets/`, `converters/`, `heads/`,
+`training_logs/`, `converter_logs/`, `.tmp/`) appear when their
+respective producer first runs.  The same lazy-mkdir rule
+applies at the root level: `.tmp/`, `active/`, and the
+operator-managed `backbone/` only appear once needed.
+
 ```
 <workspace_root>/
     config.toml                                   -- mutable user-pref config; auto-created if missing
-    backbone/
+    backbone/                                     -- operator-managed backbone drop; lazy
         backbone.mpk                              -- shared default; deployment-managed
         backbone.meta.json                        -- {sha256, n_features}
-    workspaces/<workspace_id>/
+    workspaces/<workspace_id>/                    -- created on workspace create
         workspace.json                            -- hot core metadata (WorkspaceCore)
         heads.json                                -- compact 2-slot head index (HeadIndex)
-        datasets/                                 -- daemon-owned dataset tree (nested folders allowed)
+        datasets/                                 -- lazy: created on first dataset upload
             <path>/<file>
-        converters/                               -- daemon-owned converter input tree (nested folders allowed)
+        converters/                               -- lazy: created on first converter run
             <path>/<file>
-        heads/                                    -- max 2 trained heads
+        heads/                                    -- lazy: created on first head publish (max 2)
             <head_id>.mpk                         -- raw weights (Burn .mpk)
             <head_id>.json                        -- per-head manifest (HeadManifest)
-        training_logs/<job_id>.jsonl              -- append-only train job events
-        converter_logs/<job_id>.jsonl             -- append-only convert job events
-        .tmp/                                     -- per-request staging for atomic rename + delete-assets-* / delete-converters-* tombstones
-    .tmp/                                         -- root staging for async workspace deletes
-    active/
+        training_logs/<job_id>.jsonl              -- lazy: created on first train job
+        converter_logs/<job_id>.jsonl             -- lazy: created on first convert job
+        .tmp/                                     -- lazy: created on first upload / delete staging
+    .tmp/                                         -- lazy: created on first workspace delete
+    active/                                       -- lazy: created on first head activation
         current.json                              -- {activation_id}; atomic active generation pointer
         generations/                              -- retain current + previous generation only
             <activation_id>/
@@ -162,19 +172,64 @@ through its API or wipe and recreate.
         .tmp/                                     -- activation staging
     var/run/
         acoustics_lab.sock                        -- default UDS listener (configurable in launch TOML)
-    logs/
+    logs/                                         -- eager: created at boot for tracing-appender
         acousticsd.log                            -- daily rotated; 7-file retention
 ```
 
-`config.toml` is the hot-reloadable user-preference TOML
-(mic policy, inference cadence, training defaults, file caps).
-The daemon writes a default body on first boot and watches the
-file for operator edits at runtime; it lives inside the
-workspace tree so a single `--workspace <PATH>` argument is
-sufficient to locate everything mutable the daemon owns.
+### Background storage hygiene
 
-`backbone/` is loaded at boot from a deployment-bundled file.
-Operators do not upload backbones via the API.
+A `storage_reaper` background task (every 1 h; see
+[`modules/file_mgr/storage_reaper.rs`](../modules/file_mgr/storage_reaper.rs))
+keeps the lazy tree bounded:
+
+- Reaps `.tmp/` entries (files or dir subtrees) whose mtime is
+  older than 24 h across `<root>/.tmp/`, `<root>/active/.tmp/`,
+  and every `<workspace>/.tmp/`.  Covers the "daemon kept
+  running after a hard crash" gap that boot recovery cannot
+  reach.
+- Prunes per-workspace `training_logs/*.jsonl` and
+  `converter_logs/*.jsonl` older than 30 d so a long-lived
+  workspace does not grow unbounded.
+- Leaves `<root>/logs/acousticsd.log.*` untouched -- the
+  `tracing-appender::rolling::Rotation::DAILY` policy with
+  `max_log_files(7)` already prunes it.
+
+Counters surface via `GET /api/v1/status` under
+`workspace_metrics.tmp_orphans_reaped_total`,
+`log_files_pruned_total`, `storage_reaper_failures_total`.
+
+`config.toml` is the hot-reloadable user-preference TOML
+(mic policy + inference cadence -- the only fields actually
+mutated at runtime).  Boot-time constants (training defaults,
+file admission caps, stream binds, the mic catalogue, etc.)
+live in the launch TOML.  The daemon writes a default body on
+first boot and watches the file for operator edits at runtime;
+it lives inside the workspace tree so a single
+`--workspace <PATH>` argument is sufficient to locate everything
+mutable the daemon owns.
+
+`<workspace_root>/backbone/backbone.mpk` is the trainer's
+backbone artefact, checked by `POST /workspace/{id}/train` at
+job-launch time.  The daemon does not auto-create the
+directory or populate the file -- operators (or deployment
+scripts) place a `.mpk` there before training jobs run, and
+no API route accepts an upload.  This path is distinct from
+the inference engine's `[backbone.candidates]` (configured in
+the launch TOML and pointing OUTSIDE the workspace tree); a
+deployment may share the file via symlink or use two distinct
+artefacts.
+
+The trainer treats this file as **frozen, read-only**: it
+loads the weights into RAM at job start (no long-lived fd, no
+mmap) and writes only to `<workspace>/heads/<head_id>.{mpk,json}`.
+Combined with the daemon-wide `max_train_jobs = 1` single-flight
+admission (1-permit `tokio::sync::Semaphore` in
+[`training::JobRegistry`](../modules/training.rs)), this means the
+file is safe to read concurrently with operator hot-swap via
+`cp`: an in-flight job continues against its cached bytes, and
+the next job picks up the new file at its own job-start read.
+The storage reaper never touches this path either ([sweep scope
+is `.tmp/` + per-workspace job logs only](../modules/file_mgr/storage_reaper.rs)).
 
 The launch-time TOML (mic catalogue, backbone catalogue, stream
 binds, `[head.default]`) is operator-supplied via `--config <PATH>`

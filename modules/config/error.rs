@@ -9,24 +9,22 @@ use thiserror::Error;
 /// Per-section validation failure for [`crate::config::Config`].
 ///
 /// Wraps the freeform `String` from each hot-reloadable leaf
-/// validator (`TrainingDefaults::validate`, `FileCfg::validate`,
-/// etc.) under a typed discriminator so the hot-reload callback
-/// (and any future telemetry surface) can match on category instead
-/// of regex-parsing log text.  `Display` renders as
-/// `"<section>: <leaf>"`.
+/// validator (`InferenceCfg::validate`, etc.) under a typed
+/// discriminator so the hot-reload callback (and any future
+/// telemetry surface) can match on category instead of regex-parsing
+/// log text.  `Display` renders as `"<section>: <leaf>"`.
+///
+/// Boot-only validators (`TrainingDefaults::validate`,
+/// `FileCfg::validate`, `StreamCfg::validate`) are reached via the
+/// launch loader (`LaunchConfig::load`); their `String` errors
+/// flow into `ConfigError::Invalid` directly and do not pass
+/// through this enum, since they cannot fire on hot-reload.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ConfigValidationError {
     /// `Config.inference` (`InferenceCfg::validate`) rejected.
     #[error("inference: {0}")]
     Inference(String),
-    /// `Config.file` (`FileCfg::validate`) rejected.
-    #[error("file: {0}")]
-    File(String),
-    /// `Config.training_defaults` (`TrainingDefaults::validate`)
-    /// rejected.
-    #[error("training_defaults: {0}")]
-    TrainingDefaults(String),
     /// User-supplied [`crate::config::ConfigCell::watch_with`]
     /// callback rejected the reload (typically the daemon's
     /// cross-validation against the immutable launch catalogue).

@@ -31,7 +31,7 @@ fn fresh_state(dir: &std::path::Path) -> AppState {
     let cfg_path = dir.join("config.toml");
     let workspace_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspace_root).expect("workspace root");
-    let cfg = Config::default_for(workspace_root.clone());
+    let cfg = Config::default_for();
     let config = Arc::new(ConfigCell::from_value(cfg.clone(), cfg_path).expect("validate"));
     config.persist().expect("persist initial");
     // Mirror the daemon's boot wiring: launch catalogue ships a

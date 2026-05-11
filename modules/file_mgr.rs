@@ -115,6 +115,10 @@ pub mod active_head_writer;
 // daemon-owned orphans, repair `head_count`, verify the active
 // generation.  Runs once before the api goes live.
 pub mod recovery;
+// Runtime storage hygiene: periodic `.tmp/` orphan sweep +
+// per-workspace log retention.  Wired into the daemon's
+// background-task registry alongside the training reaper.
+pub mod storage_reaper;
 mod uploader;
 
 // Process-wide hook registry letting the daemon publish into
@@ -179,6 +183,7 @@ pub use staging::{
     STAGED_PAYLOAD_NAME, StagedDelete, WORKSPACE_TOMBSTONE_PREFIX, drain_staged_payload,
     finalize_staged_delete, read_tombstone, stage_payload, write_tombstone,
 };
+pub use storage_reaper::{SweepConfig, SweepReport, sweep_once};
 pub use time_util::now_rfc3339;
 pub use uploader::AdmissionCfg;
 pub use validate::validate_asset_name;

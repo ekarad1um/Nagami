@@ -21,7 +21,9 @@ use axum::http::{Method, StatusCode, header};
 use axum::response::Response;
 
 mod api_fixtures;
-use api_fixtures::{call, create_workspace, fresh_app_state, json_body, upload};
+use api_fixtures::{
+    call, create_workspace, fixture_workspace_dir, fresh_app_state, json_body, upload,
+};
 
 async fn body_bytes(resp: Response) -> Vec<u8> {
     to_bytes(resp.into_body(), 1 << 22)
@@ -49,11 +51,13 @@ async fn dataset_happy_path_upload_list_get_delete() {
     assert_eq!(v["sha256"].as_str().unwrap().len(), 64);
 
     // GET /assets lists workspace-root direct children.  A fresh
-    // workspace has `workspace.json` + `heads.json` plus the
-    // daemon subdirectories (`datasets/`, `converters/`,
-    // `heads/`, `training_logs/`, `converter_logs/`); after the
-    // upload above, `datasets/` exists with the sample inside.
-    // `.tmp/` is excluded by the listing.
+    // workspace has only `workspace.json` + `heads.json` on disk;
+    // every leaf subdir (`datasets/`, `converters/`, `heads/`,
+    // `training_logs/`, `converter_logs/`, `.tmp/`) is created
+    // lazily by the writer that touches it.  After the upload
+    // above, `datasets/` exists with the sample inside; the
+    // converter / log dirs remain absent until a producer runs.
+    // `.tmp/` is excluded by the listing regardless.
     let resp = call(
         &r,
         Method::GET,
@@ -66,7 +70,10 @@ async fn dataset_happy_path_upload_list_get_delete() {
     let entries = v["entries"].as_array().unwrap();
     let names: Vec<&str> = entries.iter().filter_map(|e| e["name"].as_str()).collect();
     assert!(names.contains(&"datasets"), "datasets/ in {names:?}");
-    assert!(names.contains(&"converters"), "converters/ in {names:?}");
+    assert!(
+        !names.contains(&"converters"),
+        "converters/ must be absent until a converter has run: {names:?}",
+    );
     assert!(
         !names.contains(&".tmp"),
         ".tmp/ must be excluded from listings: {names:?}"
@@ -437,16 +444,9 @@ async fn assets_jsonl_page_round_trips_on_jsonl_file() {
     // Synthesise a converter_logs JSONL directly on disk.  The
     // converter producer writes here in production
     // (`ConvertJobLog` in modules/converter.rs); for the wire
-    // shape pin we don't need a real run.  Workspace layout is
-    // `<fs_service_root>/workspaces/<id>/` -- `fresh_app_state`
-    // sets the FsService root to `<tempdir>/workspaces`, so the
-    // workspace dir is the doubled-`workspaces` join below.
+    // shape pin we don't need a real run.
     let ws_id = acoustics_lab::common::ids::WorkspaceId::parse(&ws).unwrap();
-    let workspace_dir = dir
-        .path()
-        .join("workspaces")
-        .join("workspaces")
-        .join(ws_id.to_string());
+    let workspace_dir = fixture_workspace_dir(dir.path(), ws_id.to_string());
     let log_dir = workspace_dir.join("converter_logs");
     std::fs::create_dir_all(&log_dir).unwrap();
     let job_id = acoustics_lab::common::ids::JobId::new();
@@ -766,11 +766,7 @@ async fn assets_byte_range_works_on_jsonl_file() {
     let r = router_v1_nested(fresh_app_state(dir.path()));
     let ws = create_workspace(&r, "main").await;
     let ws_id = acoustics_lab::common::ids::WorkspaceId::parse(&ws).unwrap();
-    let workspace_dir = dir
-        .path()
-        .join("workspaces")
-        .join("workspaces")
-        .join(ws_id.to_string());
+    let workspace_dir = fixture_workspace_dir(dir.path(), ws_id.to_string());
     let log_dir = workspace_dir.join("converter_logs");
     std::fs::create_dir_all(&log_dir).unwrap();
     let job_id = acoustics_lab::common::ids::JobId::new();
@@ -801,11 +797,7 @@ async fn assets_byte_range_rejects_with_jsonl_paging_params() {
     let r = router_v1_nested(fresh_app_state(dir.path()));
     let ws = create_workspace(&r, "main").await;
     let ws_id = acoustics_lab::common::ids::WorkspaceId::parse(&ws).unwrap();
-    let workspace_dir = dir
-        .path()
-        .join("workspaces")
-        .join("workspaces")
-        .join(ws_id.to_string());
+    let workspace_dir = fixture_workspace_dir(dir.path(), ws_id.to_string());
     let log_dir = workspace_dir.join("converter_logs");
     std::fs::create_dir_all(&log_dir).unwrap();
     let job_id = acoustics_lab::common::ids::JobId::new();
@@ -908,11 +900,7 @@ async fn delete_assets_training_log_file_returns_async_job_id() {
     let r = router_v1_nested(fresh_app_state(dir.path()));
     let ws = create_workspace(&r, "main").await;
     let ws_id = acoustics_lab::common::ids::WorkspaceId::parse(&ws).unwrap();
-    let workspace_dir = dir
-        .path()
-        .join("workspaces")
-        .join("workspaces")
-        .join(ws_id.to_string());
+    let workspace_dir = fixture_workspace_dir(dir.path(), ws_id.to_string());
     let log_dir = workspace_dir.join("training_logs");
     std::fs::create_dir_all(&log_dir).unwrap();
     let job_id = acoustics_lab::common::ids::JobId::new();
@@ -977,11 +965,7 @@ async fn delete_assets_converter_logs_whole_dir_returns_async_job_id() {
     let r = router_v1_nested(fresh_app_state(dir.path()));
     let ws = create_workspace(&r, "main").await;
     let ws_id = acoustics_lab::common::ids::WorkspaceId::parse(&ws).unwrap();
-    let workspace_dir = dir
-        .path()
-        .join("workspaces")
-        .join("workspaces")
-        .join(ws_id.to_string());
+    let workspace_dir = fixture_workspace_dir(dir.path(), ws_id.to_string());
     let log_dir = workspace_dir.join("converter_logs");
     std::fs::create_dir_all(&log_dir).unwrap();
     let mut jsonl_paths = Vec::new();
@@ -1034,16 +1018,23 @@ async fn delete_assets_converter_logs_whole_dir_returns_async_job_id() {
     }
 }
 
-/// Whole-tree wipe of an empty `training_logs/` (the freshly-
-/// created shape -- no producer has run yet) returns 202 +
-/// job_id.  Pinned because workspace creation lays log dirs
-/// down empty; a fresh workspace's "clear logs" must succeed
-/// idempotently rather than 404.
+/// Whole-tree wipe of an existing-but-empty `training_logs/`
+/// returns 202 + job_id.  Per-workspace log dirs are created
+/// lazily by the first producer run; this test materializes
+/// the empty dir explicitly to exercise the "exists but empty"
+/// idempotent-clear path.  The "never created" case is covered
+/// by the doc note on `start_async_log_delete` (404, since the
+/// target doesn't exist) and `delete_assets_training_logs_absent_returns_404`.
 #[tokio::test]
 async fn delete_assets_training_logs_whole_dir_succeeds_on_empty() {
     let dir = tempfile::tempdir().unwrap();
     let r = router_v1_nested(fresh_app_state(dir.path()));
     let ws = create_workspace(&r, "main").await;
+
+    // Materialize the empty dir to mirror the post-producer
+    // shape; lazy mkdir is otherwise the default.
+    let ws_path = fixture_workspace_dir(dir.path(), &ws).join("training_logs");
+    std::fs::create_dir_all(&ws_path).expect("mkdir training_logs");
 
     let resp = call(
         &r,
@@ -1055,6 +1046,28 @@ async fn delete_assets_training_logs_whole_dir_succeeds_on_empty() {
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let v: serde_json::Value = json_body(resp).await;
     assert!(v["job_id"].as_str().is_some());
+}
+
+/// Whole-tree wipe of a never-created `training_logs/` returns
+/// 404.  Per-workspace log dirs are lazy: the first
+/// train/convert producer materializes them, and "clear logs"
+/// on a workspace that has never trained surfaces as
+/// NOT_FOUND so an operator's idempotent clear pattern can
+/// distinguish "no logs to clear" from a successful purge.
+#[tokio::test]
+async fn delete_assets_training_logs_absent_returns_404() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = router_v1_nested(fresh_app_state(dir.path()));
+    let ws = create_workspace(&r, "main").await;
+
+    let resp = call(
+        &r,
+        Method::DELETE,
+        &format!("/api/v1/workspace/{ws}/assets/training_logs"),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 /// Single-file log delete of a missing `.jsonl` returns 404.

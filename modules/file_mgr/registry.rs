@@ -18,8 +18,7 @@ use crate::file_mgr::WorkspaceMgr;
 use crate::file_mgr::cache::WorkspaceCacheCell;
 use crate::file_mgr::error::{FileError, io_err};
 use crate::file_mgr::schema::{
-    ACTIVE_DIR_NAME, BACKBONE_DIR_NAME, ROOT_TMP_DIR_NAME, WORKSPACES_DIR_NAME, root_tmp_dir,
-    workspace_dir_for, workspaces_dir, write_head_index, write_workspace_core,
+    root_tmp_dir, workspace_dir_for, workspaces_dir, write_head_index, write_workspace_core,
 };
 use crate::file_mgr::staging::{
     DEFAULT_DELETE_BATCH_ENTRIES, DeleteTombstone, DrainResult, StagedDelete, drain_staged_payload,
@@ -126,28 +125,29 @@ fn validate_workspace_tags(tags: &[String]) -> Result<Vec<String>, FileError> {
 }
 
 impl WorkspaceMgr {
-    /// Idempotently create the root layout
-    /// (`workspaces/`, `.tmp/`, `active/`, `backbone/`) under
-    /// `self.root`.  Daemon first-boot calls this before any
-    /// other lifecycle work; subsequent calls are no-ops.
+    /// Idempotently ensure `self.root` exists.  Subdirectories
+    /// (`workspaces/`, `.tmp/`, `active/`, the optional
+    /// `backbone/` operator drop) are materialized on demand by
+    /// the writers that actually use them -- the per-workspace
+    /// create path, the staging tombstone writer, the upload
+    /// streamer, the active-head writer, etc.  Eagerly creating
+    /// every leaf at boot left empty subtrees on every fresh
+    /// install and obscured which subsystem actually owns each
+    /// path; the lazy shape pushes ownership down to the writer
+    /// (which then routes its mkdir through `create_dir_all`
+    /// alongside the file write that needs it).
     pub fn ensure_root_layout(&self) -> Result<(), FileError> {
         std::fs::create_dir_all(&self.root).map_err(|e| io_err(self.root.display(), e))?;
-        for sub in [
-            WORKSPACES_DIR_NAME,
-            ROOT_TMP_DIR_NAME,
-            ACTIVE_DIR_NAME,
-            BACKBONE_DIR_NAME,
-        ] {
-            let p = self.root.join(sub);
-            std::fs::create_dir_all(&p).map_err(|e| io_err(p.display(), e))?;
-        }
         Ok(())
     }
 
     /// Create a new workspace under `<root>/workspaces/<id>/`.
-    /// Generates a fresh UUID, builds the directory tree, writes
-    /// `workspace.json` + `heads.json`, and seeds the eager
-    /// cache.
+    /// Generates a fresh UUID, writes `heads.json` and then
+    /// `workspace.json`, and seeds the eager cache.  Leaf
+    /// subdirectories (`datasets/`, `converters/`, `heads/`,
+    /// `training_logs/`, `converter_logs/`, `.tmp/`) are NOT
+    /// materialized here -- each producer's writer creates its
+    /// own parent on first touch.
     ///
     /// # Concurrency
     ///
@@ -158,14 +158,13 @@ impl WorkspaceMgr {
     ///
     /// # Crash consistency
     ///
-    /// Every subdirectory + `heads.json` lands BEFORE
-    /// `workspace.json`.  A crash before the final
-    /// `write_workspace_core` leaves a directory without a
-    /// `workspace.json` -- boot recovery treats that as an
-    /// incomplete create and `list_workspaces` skips it.
-    /// Workspace dir, `<root>/workspaces/`, and `<root>/` are
-    /// fsynced in turn so the new directory entry reaches
-    /// stable storage.
+    /// `heads.json` lands BEFORE `workspace.json`.  A crash
+    /// before the final `write_workspace_core` leaves a
+    /// directory without a `workspace.json` -- boot recovery
+    /// treats that as an incomplete create and `list_workspaces`
+    /// skips it.  The workspace dir, `<root>/workspaces/`, and
+    /// `<root>/` are fsynced in turn so the new directory entry
+    /// reaches stable storage.
     pub fn create(&self, name: &str) -> Result<WorkspaceId, FileError> {
         self.create_with_tags(name, &[])
     }
@@ -182,29 +181,23 @@ impl WorkspaceMgr {
         // the guard.
         let _registry_guard = self.registry_lock.lock();
         self.ensure_workspace_name_available(name, None)?;
-        // Make sure the parent `<root>/workspaces/` exists.
-        // The daemon's first-boot path calls `ensure_root_layout`
-        // before any `create`, but tests / direct callers may
-        // skip it; `create_dir_all` is idempotent.
+        // Make sure the workspace's parent `<root>/workspaces/`
+        // AND the workspace's own root exist.  `ensure_root_layout`
+        // only materializes `<root>/` now; the lazy mkdir for the
+        // per-workspace leaves (`datasets/`, `converters/`,
+        // `heads/`, `training_logs/`, `converter_logs/`, `.tmp/`)
+        // is the responsibility of the writers that touch them
+        // (uploader, training, converter, head_rotation, staging),
+        // each of which already calls `create_dir_all` ahead of
+        // its writes.  `<workspace>/` itself must still be
+        // materialized eagerly because `write_head_index` +
+        // `write_workspace_core` immediately atomic-write into it.
         let workspaces_root = workspaces_dir(&self.root);
         std::fs::create_dir_all(&workspaces_root)
             .map_err(|e| io_err(workspaces_root.display(), e))?;
         let id = WorkspaceId::new();
         let ws = self.workspace_dir(&id);
-        // The legacy `weights/` / `labels/` / `metadata.json`
-        // surface is retired; both producers (train + convert)
-        // publish only into `heads/` + `heads.json`.  Workspace
-        // creation lays down only the current on-disk shape.
-        for sub in [
-            "datasets",
-            "converters",
-            "heads",
-            "training_logs",
-            "converter_logs",
-            ".tmp",
-        ] {
-            std::fs::create_dir_all(ws.join(sub)).map_err(|e| io_err(ws.join(sub).display(), e))?;
-        }
+        std::fs::create_dir_all(&ws).map_err(|e| io_err(ws.display(), e))?;
         let now = now_rfc3339();
         // Empty head index lands BEFORE the workspace core so a
         // crash between the two leaves a directory without a
