@@ -24,31 +24,31 @@
 //! coalesces are lost - but it is correct without per-path dataflow
 //! and never silently miscompiles.
 //!
-//! # Known limitation: partial writes to aggregate locals
+//! # Partial writes to aggregate locals
 //!
-//! Both `Statement::Store` and `Statement::CooperativeStore.data.pointer`
-//! arms classify ANY pointer that resolves through `resolve_ptr_to_local`
-//! as a Store touch, including pointers that walk through `Access` /
-//! `AccessIndex` chains into a single field / element of an aggregate
-//! local.  Such a Store only writes part of the slot - other
-//! elements still hold whatever the prior local (under coalescing)
-//! left behind, instead of the zero-init value the WGSL spec
-//! promises for `var x: T;` declarations.  An observable miscompile
-//! requires (a) a partial write to a coalesce-eligible aggregate,
-//! followed by (b) a read of an element the user never wrote on
-//! that path, expecting the WGSL zero-init guarantee.
+//! Aggregate locals (`vec`, `mat`, `array`, `struct`) can be
+//! partially written via `Access` / `AccessIndex` chains -
+//! `v.x = ...;` writes one component, `arr[0] = ...;` writes one
+//! element, leaving the rest at WGSL's promised zero-init.  Without
+//! per-element tracking, coalescing such a local with a prior local
+//! L would leak L's residue into the unwritten bytes.  The
+//! [`ElementInit`] state attached to each local tracks which
+//! elements have been written by which kind of Store; the gate
+//! at every Load site then refuses to coalesce locals reading
+//! elements that are not provably written on every reaching path.
+//! Two patterns interplay:
 //!
-//! Tightening the model to mark Access-chained Stores as Loads
-//! (conservatively flagging the local unsafe) would close the
-//! hazard but at material cost: idiomatic WGSL initialises
-//! `var v: vec3<f32>;` via the partial-write sequence `v.x = ...; v.y
-//! = ...; v.z = ...;` and most aggregates in real shader code follow
-//! the same pattern, fully overriding the slot before any read.  A
-//! correct refinement needs element-level dataflow ("every byte
-//! written before any byte read on every path"), which is out of
-//! scope for the current pass.  Documented here so a future fix is
-//! both informed and bounded; the gap is identical to and inherited
-//! from baseline behaviour, so no regression vs the corpus.
+//! - **Fully covered by partial Stores** (safe): `v.x=...; v.y=...;
+//!   v.z=...; let p=v;` - three bits set, full coverage, Load safe.
+//! - **Partial Store + uncovered Read** (unsafe): `arr[0]=...; let
+//!   v=arr[2];` - bit 0 set, reading bit 2 - Load fails coverage,
+//!   `coalesce_safe = false`.
+//!
+//! Control flow merges by intersection (`If` arms only contribute
+//! guarantees that hold on BOTH paths).  `Switch` and `Loop` stay
+//! conservative - their writes never propagate, accepting some
+//! missed optimisations to avoid mis-classifying case-fallthrough
+//! or early-`break` paths.
 
 use std::collections::{HashMap, HashSet};
 
@@ -68,17 +68,16 @@ pub struct CoalescingPass;
 /// `coalesce_safe` reflects a per-control-flow-scope correctness
 /// gate: it stays `true` iff in *every* block scope where the local
 /// is touched, the first touch within that scope is a write
-/// (`Statement::Store` or `CooperativeStore` destination).  A non-
-/// Store first touch in any scope means at least one runtime
-/// execution of that scope reads the slot before writing to it -
-/// either via zero-init on the first entry or via a loop back-edge
-/// on later iterations - and coalescing the local would replace
-/// those expected bytes with whatever a prior coalesced local left
-/// behind.  Important: a DFS source-order check is *not* sufficient,
-/// because `if c { x = ...; } else { let y = x; }` has DFS first
-/// touch = Store (in `accept`) but the `reject` branch still reads
-/// zero-init `x` at runtime; per-block tracking catches that as
-/// well as the loop-carried-read case.
+/// (`Statement::Store` or `CooperativeStore` destination), AND every
+/// Read of the local resolves to an element provably written before
+/// that Read on every reaching path.  Either gate failing means at
+/// least one runtime execution reads the slot's pre-coalesce
+/// contents - the prior local's residue instead of either
+/// zero-init or the local's own writes - so the local cannot be
+/// safely coalesced.  Element-coverage tracking (see [`ElementInit`]
+/// and [`ElementSpec`]) provides the second gate; without it, the
+/// pre-existing partial-write hazard for aggregates - `arr[0] = 1;
+/// let v = arr[2];` - would slip through.
 #[derive(Debug, Clone, Copy)]
 struct LocalUse {
     ty: naga::Handle<naga::Type>,
@@ -87,6 +86,193 @@ struct LocalUse {
     used: bool,
     init_is_none: bool,
     coalesce_safe: bool,
+}
+
+/// Upper bound on the number of elements / members / columns we
+/// track per aggregate local.  Aggregates larger than this are
+/// treated as "untrackable" - any partial Store of them still
+/// updates `ElementInit::any_indeterminate_write`, and any
+/// subsequent Read flags `coalesce_safe = false`.  Sixty-four
+/// elements covers every WGSL vector, matrix, the typical struct,
+/// and arrays up to length 64; longer arrays fall back to the
+/// conservative path.
+const MAX_TRACKED_ELEMENTS: u32 = 64;
+
+/// Which part of an aggregate local a pointer-expression chain
+/// touches.  Computed by [`resolve_local_and_element`].
+#[derive(Debug, Clone, Copy)]
+enum ElementSpec {
+    /// Direct pointer to the LocalVariable expression - the
+    /// statement touches the entire local.  For a Store this is a
+    /// full overwrite; for a Load it reads every byte.
+    Full,
+    /// `AccessIndex(LocalVariable(L), i)` with a one-level chain -
+    /// touches element / member / column `i`.  Indices `>=`
+    /// [`MAX_TRACKED_ELEMENTS`] degrade to [`ElementSpec::Dynamic`]
+    /// inside [`ElementInit`]'s update logic.
+    Index(u32),
+    /// Either an `Access` with a runtime-computed index, or a
+    /// nested AccessIndex into a sub-aggregate (which we don't
+    /// resolve to a single element id).  Treated conservatively:
+    /// reads require full coverage; writes don't contribute to
+    /// per-element coverage.
+    Dynamic,
+}
+
+/// Per-aggregate element-initialization summary.  Used to detect
+/// partial-Store-then-uncovered-Read patterns the per-block first-
+/// touch gate alone cannot see (because the first touch in scope
+/// IS a Store - just a partial one - so the Load that follows is
+/// not the "first touch" yet still observes uninitialised bytes).
+#[derive(Debug, Clone, Copy)]
+struct ElementInit {
+    /// Number of distinct elements / members / columns in the
+    /// local's type; `0` when the type is untrackable (runtime-
+    /// sized array, override-sized array, opaque type, aggregate
+    /// larger than [`MAX_TRACKED_ELEMENTS`], etc.).  An
+    /// `element_count` of `0` makes [`Self::is_fully_covered`]
+    /// require an explicit full Store - matching the conservative
+    /// behaviour we want for shapes we cannot prove coverage for.
+    element_count: u32,
+    /// Bitset of element indices explicitly written so far, where
+    /// bit `i` corresponds to a top-level `Store` whose pointer was
+    /// `AccessIndex(LocalVariable(L), i)` for `i < MAX_TRACKED_ELEMENTS`.
+    elements_written: u64,
+    /// `true` once a direct `Store(LocalVariable(L), value)` has
+    /// fired - the entire slot is unconditionally written from this
+    /// point.  Subsumes all per-element bits.
+    fully_written: bool,
+}
+
+impl ElementInit {
+    fn new(element_count: u32) -> Self {
+        Self {
+            element_count,
+            elements_written: 0,
+            fully_written: false,
+        }
+    }
+
+    /// `true` iff every byte of the local is provably written.
+    /// Used for full Loads and dynamic-index Loads.
+    fn is_fully_covered(&self) -> bool {
+        if self.fully_written {
+            return true;
+        }
+        if self.element_count == 0 || self.element_count > MAX_TRACKED_ELEMENTS {
+            return false;
+        }
+        let mask = if self.element_count == 64 {
+            !0u64
+        } else {
+            (1u64 << self.element_count) - 1
+        };
+        (self.elements_written & mask) == mask
+    }
+
+    /// `true` iff element `idx` is provably written.  Used for
+    /// constant-index Loads.  Out-of-range indices fall back to
+    /// requiring full coverage.
+    fn covers_element(&self, idx: u32) -> bool {
+        if self.fully_written {
+            return true;
+        }
+        if idx >= MAX_TRACKED_ELEMENTS {
+            return false;
+        }
+        (self.elements_written & (1u64 << idx)) != 0
+    }
+
+    /// Merge by intersection - only bits / flags set in BOTH
+    /// inputs survive.  Used when joining the two arms of an `If`
+    /// at the merge point: a local is provably initialised post-If
+    /// only if both branches wrote it.
+    fn intersect(self, other: Self) -> Self {
+        Self {
+            element_count: self.element_count.max(other.element_count),
+            elements_written: self.elements_written & other.elements_written,
+            fully_written: self.fully_written && other.fully_written,
+        }
+    }
+
+    /// `true` iff this state carries any information worth
+    /// persisting in the parent block's `local_init` map.  Used to
+    /// avoid storing empty entries.
+    fn is_empty(self) -> bool {
+        !self.fully_written && self.elements_written == 0
+    }
+}
+
+/// Number of elements / members / columns in `ty`, capped at
+/// `MAX_TRACKED_ELEMENTS + 1` (so `is_fully_covered` correctly
+/// rejects larger arrays).  Returns `0` for types whose internal
+/// structure we cannot enumerate (pointers, images, samplers,
+/// runtime- / override-sized arrays, atomic types, etc.).
+fn element_count_for_type(ty: naga::Handle<naga::Type>, types: &naga::UniqueArena<naga::Type>) -> u32 {
+    match types[ty].inner {
+        naga::TypeInner::Scalar(_) => 1,
+        naga::TypeInner::Vector { size, .. } => size as u32,
+        naga::TypeInner::Matrix { columns, rows, .. } => (columns as u32) * (rows as u32),
+        naga::TypeInner::Array {
+            size: naga::ArraySize::Constant(n),
+            ..
+        } => {
+            let n = n.get();
+            if n > MAX_TRACKED_ELEMENTS {
+                MAX_TRACKED_ELEMENTS + 1
+            } else {
+                n
+            }
+        }
+        naga::TypeInner::Struct { ref members, .. } => {
+            let n = members.len() as u32;
+            if n > MAX_TRACKED_ELEMENTS {
+                MAX_TRACKED_ELEMENTS + 1
+            } else {
+                n
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Walk a pointer-expression chain back to its root `LocalVariable`
+/// AND classify which part of the local the chain targets.  This is
+/// the element-aware sibling of [`resolve_ptr_to_local`].
+///
+/// One-level constant chains (`AccessIndex(LocalVariable(L), i)`)
+/// give [`ElementSpec::Index`]; runtime-indexed `Access` chains and
+/// nested aggregate paths collapse to [`ElementSpec::Dynamic`] -
+/// the analysis treats them as "we don't know which element", so
+/// they don't contribute to per-element coverage and any subsequent
+/// Read requires full coverage.
+fn resolve_local_and_element(
+    expr: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+) -> Option<(naga::Handle<naga::LocalVariable>, ElementSpec)> {
+    match expressions[expr] {
+        naga::Expression::LocalVariable(lh) => Some((lh, ElementSpec::Full)),
+        naga::Expression::AccessIndex { base, index } => {
+            let (local, parent) = resolve_local_and_element(base, expressions)?;
+            // Only a single-level `AccessIndex` directly off a
+            // `LocalVariable` can be tracked as a specific element
+            // index.  Anything further (`AccessIndex(AccessIndex(L,
+            // 0), 1)`) is a nested aggregate; we cannot describe
+            // "L's slot, element-of-element-0, sub-element-1" with
+            // our flat bitset, so collapse to `Dynamic`.
+            let spec = if matches!(parent, ElementSpec::Full) {
+                ElementSpec::Index(index)
+            } else {
+                ElementSpec::Dynamic
+            };
+            Some((local, spec))
+        }
+        naga::Expression::Access { base, .. } => {
+            let (local, _) = resolve_local_and_element(base, expressions)?;
+            Some((local, ElementSpec::Dynamic))
+        }
+        _ => None,
+    }
 }
 
 /// A "lane" is the liveness window currently attached to a
@@ -117,10 +303,10 @@ impl Pass for CoalescingPass {
         let mut changed = 0usize;
 
         for (_, function) in module.functions.iter_mut() {
-            changed += coalesce_function_locals(function);
+            changed += coalesce_function_locals(function, &module.types);
         }
         for entry in module.entry_points.iter_mut() {
-            changed += coalesce_function_locals(&mut entry.function);
+            changed += coalesce_function_locals(&mut entry.function, &module.types);
         }
 
         Ok(changed > 0)
@@ -130,12 +316,15 @@ impl Pass for CoalescingPass {
 /// Rewrite every `LocalVariable` expression in `function` to use the
 /// coalesced representative.  Returns the number of expression
 /// references rewritten (used by the caller as a change flag).
-fn coalesce_function_locals(function: &mut naga::Function) -> usize {
+fn coalesce_function_locals(
+    function: &mut naga::Function,
+    types: &naga::UniqueArena<naga::Type>,
+) -> usize {
     if function.local_variables.is_empty() {
         return 0;
     }
 
-    let usage = collect_local_usage(function);
+    let usage = collect_local_usage(function, types);
     let alias = build_alias_map(&usage);
     if alias.is_empty() {
         return 0;
@@ -159,12 +348,14 @@ fn coalesce_function_locals(function: &mut naga::Function) -> usize {
     changed
 }
 
-/// Build the per-local [`LocalUse`] table.  Maps every `Load`
-/// expression to its root `LocalVariable` so the subsequent DFS can
-/// attribute reads to the correct handle without re-resolving pointer
-/// chains at each use site.
+/// Build the per-local [`LocalUse`] table.  Pre-resolves every
+/// `Load` expression to `(root_local, element_spec)` so the DFS
+/// below never re-walks pointer chains, and pre-computes each
+/// local's element count from `types` so the element-coverage
+/// analysis has constant-time access during the scan.
 fn collect_local_usage(
     function: &naga::Function,
+    types: &naga::UniqueArena<naga::Type>,
 ) -> HashMap<naga::Handle<naga::LocalVariable>, LocalUse> {
     let mut usage = function
         .local_variables
@@ -178,48 +369,59 @@ fn collect_local_usage(
                     last: 0,
                     used: false,
                     init_is_none: local.init.is_none(),
-                    // Default true; clamped to `false` the first time
-                    // any block scope (function body, If arm, Switch
-                    // case body, Loop body, Loop continuing, or any
-                    // nested `Statement::Block`) observes a touch of
-                    // this local whose action is anything other than
-                    // a top-level `Store` to it.  Per-block (not
-                    // DFS-source-order) tracking is required to close
-                    // both the loop-carried hazard and the if/else
-                    // first-load hazard.
+                    // Default true; clamped to `false` the first
+                    // time any block scope first-touches this
+                    // local as a non-Store action OR a Load is
+                    // observed for an element that has not been
+                    // provably written on every reaching path.
                     coalesce_safe: true,
                 },
             )
         })
         .collect::<HashMap<_, _>>();
 
-    // Pre-resolve every `Load` to its root local so the DFS below
-    // does not repeat the pointer walk per use.
-    let mut load_to_local: HashMap<
+    // Pre-resolve every `Load` to `(root_local, element_spec)` so
+    // the DFS attributes reads to the correct handle without
+    // repeating the pointer walk, AND knows which element of an
+    // aggregate the read targets so element-coverage analysis
+    // can fire at the use site.
+    let mut load_to_local_and_element: HashMap<
         naga::Handle<naga::Expression>,
-        naga::Handle<naga::LocalVariable>,
+        (naga::Handle<naga::LocalVariable>, ElementSpec),
     > = HashMap::new();
     for (eh, expr) in function.expressions.iter() {
         if let naga::Expression::Load { pointer } = *expr
-            && let Some(local) = resolve_ptr_to_local(pointer, &function.expressions)
+            && let Some(pair) = resolve_local_and_element(pointer, &function.expressions)
         {
-            load_to_local.insert(eh, local);
+            load_to_local_and_element.insert(eh, pair);
         }
+    }
+
+    // Element counts indexed by local handle so the scan does not
+    // re-walk type arenas per touch.
+    let mut local_element_count: HashMap<naga::Handle<naga::LocalVariable>, u32> = HashMap::new();
+    for (handle, local) in function.local_variables.iter() {
+        local_element_count.insert(handle, element_count_for_type(local.ty, types));
     }
 
     // DFS the statement tree with monotonic positions; each local
     // records its minimum `first` and maximum `last` across every
-    // access to approximate its live range.  The returned
-    // unconditional-writes set is unused at the function-body
-    // level (there is no enclosing scope to propagate to), so
-    // discard it explicitly.
+    // access to approximate its live range.  `local_init` is the
+    // entry-state for element-coverage tracking; we start empty
+    // at the function body (no writes yet) and pass `&mut` so
+    // each recursive call can update it.  The returned writes /
+    // post-state are unused at function-body scope (there is no
+    // enclosing scope to propagate to).
     let mut pos = 0usize;
+    let mut local_init: HashMap<naga::Handle<naga::LocalVariable>, ElementInit> = HashMap::new();
     let _ = scan_block_usage(
         &function.body,
         &function.expressions,
-        &load_to_local,
+        &load_to_local_and_element,
+        &local_element_count,
         &mut pos,
         &mut usage,
+        &mut local_init,
     );
 
     usage
@@ -311,9 +513,14 @@ fn mark_block_first(
 fn scan_block_usage(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    load_to_local: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::LocalVariable>>,
+    load_to_local_and_element: &HashMap<
+        naga::Handle<naga::Expression>,
+        (naga::Handle<naga::LocalVariable>, ElementSpec),
+    >,
+    local_element_count: &HashMap<naga::Handle<naga::LocalVariable>, u32>,
     pos: &mut usize,
     usage: &mut HashMap<naga::Handle<naga::LocalVariable>, LocalUse>,
+    local_init: &mut HashMap<naga::Handle<naga::LocalVariable>, ElementInit>,
 ) -> HashSet<naga::Handle<naga::LocalVariable>> {
     // Per-block first-touch ledger.  Reset (by virtue of being a fresh
     // local on every recursive entry) at every control-flow scope:
@@ -336,6 +543,9 @@ fn scan_block_usage(
     // and contains no early `break`/`Return`).
     let mut block_writes: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
 
+    // Helper closure-equivalents are expanded inline below to keep
+    // the borrow checker happy with `local_init`'s `&mut`.
+
     for stmt in block {
         let current = *pos;
         *pos += 1;
@@ -343,31 +553,74 @@ fn scan_block_usage(
             naga::Statement::Emit(range) => {
                 // `Emit` carries `Load` expressions, which are reads;
                 // a Load is never the kind of write that overrides the
-                // shared slot's prior value.
+                // shared slot's prior value.  In addition to the
+                // first-touch gate, check element coverage: a Load of
+                // an element that hasn't been provably written on
+                // every reaching path observes the slot's
+                // pre-coalesce contents (zero-init in the user's
+                // mental model, prior local's residue after a
+                // coalesce).
                 for h in range.clone() {
-                    if let Some(&local) = load_to_local.get(&h) {
+                    if let Some(&(local, spec)) = load_to_local_and_element.get(&h) {
                         mark_used(usage, local, current);
                         mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
+                        // Coverage check; uncovered Reads make
+                        // coalescing observably wrong.
+                        if !load_covers(local_init.get(&local), spec) {
+                            if let Some(info) = usage.get_mut(&local) {
+                                info.coalesce_safe = false;
+                            }
+                        }
                     }
                 }
             }
             naga::Statement::Store { pointer, .. } => {
-                // Top-level `Store` to a local overrides the slot; the
-                // pre-existing slot contents are irrelevant for the
-                // store's outcome, so this counts as a Store first
-                // touch and contributes to the block's unconditional-
-                // writes set.
-                if let Some(local) = resolve_ptr_to_local(*pointer, expressions) {
+                // Top-level `Store` to a local.  Update the
+                // element-coverage state; only a direct
+                // `LocalVariable` pointer fully overrides the slot
+                // (and thereby contributes to the unconditional-
+                // writes set and to the first-touch gate as a Store).
+                // Access-chained Stores write one element / member /
+                // column at a time; they leave the other bytes with
+                // whatever the slot held, so a coalesce with a prior
+                // local would leak that local's residue into the
+                // unwritten parts.
+                if let Some((local, spec)) = resolve_local_and_element(*pointer, expressions) {
                     mark_used(usage, local, current);
+                    let element_count = local_element_count.get(&local).copied().unwrap_or(0);
+                    let init = local_init
+                        .entry(local)
+                        .or_insert_with(|| ElementInit::new(element_count));
+                    let is_full_store = update_init_for_store(init, spec);
+                    // The first-touch gate gets `is_store = true`
+                    // for BOTH full and partial Stores: a partial
+                    // Store still ACTIVELY touches the slot (it is
+                    // not the "first action in scope is a Load that
+                    // sees zero-init / loop-carry" case the gate
+                    // exists to catch).  Whether the partial Store
+                    // is safe is decided by the per-element coverage
+                    // check at the subsequent Load - that is the
+                    // gate that detects "read of an unwritten
+                    // element after a partial Store".  Marking the
+                    // first-touch as Load here would over-restrict
+                    // the very common pattern of fully initialising
+                    // a vector via three swizzle Stores
+                    // (`v.x=...; v.y=...; v.z=...;`) before reading.
                     mark_block_first(usage, &mut block_seen, local, /*is_store=*/ true);
-                    block_writes.insert(local);
+                    // Only full Stores contribute to the
+                    // unconditional-writes propagation: a partial
+                    // Store doesn't unconditionally claim the slot.
+                    if is_full_store {
+                        block_writes.insert(local);
+                    }
                 }
             }
             naga::Statement::Call { arguments, .. } => {
                 // The callee may load through the pointer before
                 // storing (or never store at all); the slot's prior
                 // value can reach the callee.  Conservative: treat as
-                // a read.
+                // a read.  This is independent of element tracking
+                // (the callee can read or write any bytes).
                 for &arg in arguments {
                     if let Some(local) = resolve_ptr_to_local(arg, expressions) {
                         mark_used(usage, local, current);
@@ -411,46 +664,75 @@ fn scan_block_usage(
                 //   resolve to `CooperativeMatrix`; if the IR routes
                 //   that through a `LocalVariable(_)` expression, the
                 //   matrix is loaded out of that local - a READ.
+                //   Check element coverage just like an Emit'd Load.
                 // - `data.pointer` is the destination POINTER.  Per
                 //   `naga/valid/function.rs:1681` its address space
                 //   must include `STORE`, and `AddressSpace::Function`
                 //   does (LOAD | STORE per `proc/mod.rs:214`), so a
                 //   function-local is a legitimate destination.  The
-                //   matrix value is WRITTEN into that local's slot.
-                //
-                // Tracking `data.pointer` extends the destination
-                // local's live range through the cooperative store so
-                // the coalescer cannot assign another local into its
-                // slot in between.  Without this, a later local whose
-                // direct tracked range starts after the destination's
-                // direct tracked range but before the cooperative
-                // store would be silently coalesced; the cooperative
-                // store would then clobber the coalesced local's
-                // value, and a subsequent read would see the matrix
-                // bytes instead.  The unit test
-                // `cooperative_store_data_pointer_extends_destination_local_live_range`
-                // pins this exact hazard.
-                if let Some(local) = resolve_ptr_to_local(*target, expressions) {
+                //   matrix value is WRITTEN into that local's slot;
+                //   update element-coverage like a regular Store.
+                if let Some((local, spec)) = resolve_local_and_element(*target, expressions) {
                     mark_used(usage, local, current);
                     mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
+                    if !load_covers(local_init.get(&local), spec) {
+                        if let Some(info) = usage.get_mut(&local) {
+                            info.coalesce_safe = false;
+                        }
+                    }
                 }
-                if let Some(local) = resolve_ptr_to_local(data.pointer, expressions) {
+                if let Some((local, spec)) = resolve_local_and_element(data.pointer, expressions) {
                     mark_used(usage, local, current);
-                    // `is_store = true`: the cooperative store
-                    // unconditionally overwrites the local's slot, so
-                    // a subsequent read sees a guaranteed-written
-                    // value.  This also lets the local participate in
-                    // the unconditional-writes propagation a parent
-                    // scope performs after recursing into this block.
+                    let element_count = local_element_count.get(&local).copied().unwrap_or(0);
+                    let init = local_init
+                        .entry(local)
+                        .or_insert_with(|| ElementInit::new(element_count));
+                    let is_full_store = update_init_for_store(init, spec);
+                    // Same `is_store = true` rationale as the
+                    // regular `Store` arm: the first-touch gate
+                    // treats this as a Store touch (no flag);
+                    // element-coverage at the subsequent Load is
+                    // what fires for partial-write hazards.
                     mark_block_first(usage, &mut block_seen, local, /*is_store=*/ true);
-                    block_writes.insert(local);
+                    if is_full_store {
+                        block_writes.insert(local);
+                    }
                 }
             }
             naga::Statement::If { accept, reject, .. } => {
-                let accept_writes =
-                    scan_block_usage(accept, expressions, load_to_local, pos, usage);
-                let reject_writes =
-                    scan_block_usage(reject, expressions, load_to_local, pos, usage);
+                // Snapshot the entry-state of `local_init` so we can
+                // run each arm against a fresh copy, then merge the
+                // two arms' post-states by intersection.  Only
+                // initialisation guarantees that hold on BOTH paths
+                // are post-If safe; if accept writes `v.x` and reject
+                // writes `v.y`, neither bit survives the intersection
+                // and a post-If `let p = v` is correctly flagged
+                // uncovered.
+                let entry_init = local_init.clone();
+                let accept_writes = scan_block_usage(
+                    accept,
+                    expressions,
+                    load_to_local_and_element,
+                    local_element_count,
+                    pos,
+                    usage,
+                    local_init,
+                );
+                let accept_init = std::mem::replace(local_init, entry_init.clone());
+                let reject_writes = scan_block_usage(
+                    reject,
+                    expressions,
+                    load_to_local_and_element,
+                    local_element_count,
+                    pos,
+                    usage,
+                    local_init,
+                );
+                let reject_init = std::mem::replace(local_init, entry_init);
+
+                let newly_fully_covered =
+                    merge_inits_into(local_init, accept_init, reject_init);
+
                 // Locals written on every path through the If
                 // (intersection of both arms) are unconditionally
                 // written by the If as a whole.  Propagate them into
@@ -462,35 +744,92 @@ fn scan_block_usage(
                     mark_block_first(usage, &mut block_seen, local, /*is_store=*/ true);
                     block_writes.insert(local);
                 }
+                // Aggregates whose partial Stores on EVERY arm
+                // happened to cover all elements (and thus became
+                // post-If fully-covered via merge) are also
+                // unconditional-writes from the parent's view: their
+                // slot is fully claimed by the If.  Treat them
+                // identically to direct full Stores for the
+                // first-touch gate, otherwise the parent's
+                // subsequent Load would be mis-flagged as
+                // "first-touch is Load".
+                for local in newly_fully_covered {
+                    mark_block_first(usage, &mut block_seen, local, /*is_store=*/ true);
+                    block_writes.insert(local);
+                }
             }
             naga::Statement::Switch { cases, .. } => {
+                // Switch deliberately stays conservative: each case
+                // runs against the entry-state, results are discarded
+                // (no merge, no propagation).  A precise analysis
+                // would intersect every case's post-state (and require
+                // `Default` + no fall-through), but the risk of
+                // misclassifying an arm outweighs the missed
+                // optimisation.
+                let entry_init = local_init.clone();
                 for case in cases {
-                    let _ = scan_block_usage(&case.body, expressions, load_to_local, pos, usage);
+                    *local_init = entry_init.clone();
+                    let _ = scan_block_usage(
+                        &case.body,
+                        expressions,
+                        load_to_local_and_element,
+                        local_element_count,
+                        pos,
+                        usage,
+                        local_init,
+                    );
                 }
-                // Switch propagation is intentionally skipped: a
-                // correct version requires per-case write tracking,
-                // a `Default` check, and `fall_through` chain
-                // analysis - all of which can silently degrade if
-                // any single guard misclassifies an arm.  Skipping
-                // only costs missed optimisations.
+                *local_init = entry_init;
             }
             naga::Statement::Loop {
                 body, continuing, ..
             } => {
-                let _ = scan_block_usage(body, expressions, load_to_local, pos, usage);
-                let _ = scan_block_usage(continuing, expressions, load_to_local, pos, usage);
-                // Loop propagation is also skipped: although the body
-                // executes at least once when reachable, an early
-                // `break` / `Return` before a body Store would bypass
-                // it.  Terminator-aware analysis would lift this; we
-                // accept the missed optimisation for safety.
+                // Loop body's writes do NOT propagate to the parent
+                // scope's init state.  Even when reachable, an early
+                // `break` / `Return` inside the body bypasses later
+                // writes; without terminator-aware analysis we cannot
+                // claim post-loop coverage.  Restore entry-state
+                // after each recursion to keep the parent's view
+                // unchanged.
+                let entry_init = local_init.clone();
+                let _ = scan_block_usage(
+                    body,
+                    expressions,
+                    load_to_local_and_element,
+                    local_element_count,
+                    pos,
+                    usage,
+                    local_init,
+                );
+                *local_init = entry_init.clone();
+                let _ = scan_block_usage(
+                    continuing,
+                    expressions,
+                    load_to_local_and_element,
+                    local_element_count,
+                    pos,
+                    usage,
+                    local_init,
+                );
+                *local_init = entry_init;
             }
             naga::Statement::Block(inner) => {
-                let inner_writes =
-                    scan_block_usage(inner, expressions, load_to_local, pos, usage);
                 // A plain `Statement::Block` is a flat passthrough at
-                // the IR level: an unconditional write inside it is
-                // also unconditional from the parent's perspective.
+                // the IR level: writes inside happen on the parent
+                // path and their element-coverage carries forward.
+                // Pass `local_init` straight through (no snapshot, no
+                // merge) so coverage flows naturally.  An
+                // unconditional Store inside the inner block remains
+                // unconditional from the parent's perspective.
+                let inner_writes = scan_block_usage(
+                    inner,
+                    expressions,
+                    load_to_local_and_element,
+                    local_element_count,
+                    pos,
+                    usage,
+                    local_init,
+                );
                 for &local in &inner_writes {
                     mark_block_first(usage, &mut block_seen, local, /*is_store=*/ true);
                     block_writes.insert(local);
@@ -501,6 +840,101 @@ fn scan_block_usage(
     }
 
     block_writes
+}
+
+/// Apply an [`ElementSpec`]-classified Store to a local's
+/// [`ElementInit`].  Returns `true` iff the Store is a direct
+/// `LocalVariable` (full overwrite) so the caller can route
+/// first-touch / unconditional-write bookkeeping accordingly.
+fn update_init_for_store(init: &mut ElementInit, spec: ElementSpec) -> bool {
+    match spec {
+        ElementSpec::Full => {
+            init.fully_written = true;
+            true
+        }
+        ElementSpec::Index(i) if i < MAX_TRACKED_ELEMENTS => {
+            init.elements_written |= 1u64 << i;
+            false
+        }
+        // Out-of-range constant index or runtime / nested Access:
+        // we cannot localise the write to a specific bit, so it
+        // contributes nothing to coverage and is treated as a
+        // partial Store from the gate's perspective.
+        ElementSpec::Index(_) | ElementSpec::Dynamic => false,
+    }
+}
+
+/// Coverage check for a Load given the local's running
+/// [`ElementInit`].  `None` means the local was never written in
+/// this scope - any Load is uncovered.
+fn load_covers(init: Option<&ElementInit>, spec: ElementSpec) -> bool {
+    let Some(init) = init else { return false };
+    match spec {
+        ElementSpec::Full => init.is_fully_covered(),
+        ElementSpec::Index(idx) => init.covers_element(idx),
+        // Dynamic-index Read could touch any element; require full
+        // coverage to be sure.
+        ElementSpec::Dynamic => init.is_fully_covered(),
+    }
+}
+
+/// Merge two arm post-states into the parent's `local_init` at the
+/// If's merge point: a local is provably initialised post-If only
+/// if the same guarantees hold on BOTH paths.  Locals touched on
+/// only one path drop out of the parent's init view (they keep
+/// whatever entry-state was in `local_init` BEFORE this merge call,
+/// since the caller already reset to entry-state by `mem::replace`).
+///
+/// Returns the set of locals that became fully-covered via this
+/// merge but were NOT fully-covered in the pre-If entry state.
+/// The caller treats those as Store-first touches in the parent's
+/// `block_seen` ledger, so a subsequent post-If Load is not
+/// mis-flagged as the parent's first touch.
+fn merge_inits_into(
+    local_init: &mut HashMap<naga::Handle<naga::LocalVariable>, ElementInit>,
+    accept: HashMap<naga::Handle<naga::LocalVariable>, ElementInit>,
+    reject: HashMap<naga::Handle<naga::LocalVariable>, ElementInit>,
+) -> HashSet<naga::Handle<naga::LocalVariable>> {
+    let mut newly_fully_covered: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
+    // Only locals appearing in BOTH arms can contribute new
+    // guarantees; a write on one arm only is not a post-If
+    // guarantee, so we skip those locals entirely (their parent
+    // state is whatever was there before the If, which is the
+    // correct conservative answer).
+    for (local, a) in accept {
+        if let Some(b) = reject.get(&local).copied() {
+            let merged = a.intersect(b);
+            if merged.is_empty() {
+                // Intersection produced no new knowledge; keep the
+                // parent's pre-If entry as-is.
+                continue;
+            }
+            let was_fully_covered = local_init
+                .get(&local)
+                .map(|i| i.is_fully_covered())
+                .unwrap_or(false);
+            // Combine with parent's pre-If entry: the post-If state
+            // is at least as informative as the pre-If state, with
+            // the intersection added.  Use union-of-bits to combine.
+            local_init
+                .entry(local)
+                .and_modify(|existing| {
+                    existing.elements_written |= merged.elements_written;
+                    existing.fully_written |= merged.fully_written;
+                    existing.element_count = existing.element_count.max(merged.element_count);
+                })
+                .or_insert(merged);
+            if !was_fully_covered
+                && local_init
+                    .get(&local)
+                    .map(|i| i.is_fully_covered())
+                    .unwrap_or(false)
+            {
+                newly_fully_covered.insert(local);
+            }
+        }
+    }
+    newly_fully_covered
 }
 
 /// Pack disjoint live ranges into type-keyed lanes and emit an alias
@@ -955,6 +1389,166 @@ fn fs_main(@location(0) cond: f32) -> @location(0) vec4f {
     }
 
     #[test]
+    fn no_coalesce_partial_write_followed_by_uncovered_element_read() {
+        // Regression for the partial-write-to-aggregate hazard.  An
+        // aggregate local that is partially written (e.g.
+        // `arr[0] = 1.0;`) leaves the other elements at WGSL's
+        // promised zero-init.  Coalescing such a local with a prior
+        // local L that wrote actual bytes into the shared slot would
+        // substitute L's residue for those zero-init reads - a silent
+        // miscompile.  The element-coverage analysis in
+        // `scan_block_usage` flags the local `coalesce_safe = false`
+        // the moment a Load of an uncovered element appears.
+        //
+        // L (fully overwritten) precedes arr (only one element
+        // written).  Reading `arr[2]` afterwards expects 0.0 per
+        // WGSL spec; if `arr` were coalesced into L's slot it would
+        // read L[2]'s last value instead.
+        let source = r#"
+@fragment
+fn fs_main() -> @location(0) vec4f {
+    var l_full: array<f32, 4>;
+    l_full = array<f32, 4>(10.0, 20.0, 30.0, 40.0);
+    let l_sum = l_full[0] + l_full[1] + l_full[2] + l_full[3];
+
+    var arr: array<f32, 4>;
+    arr[0] = 1.0;
+    let v = arr[2];
+    return vec4f(l_sum + v, 0.0, 0.0, 1.0);
+}
+"#;
+        let (_, module) = run_pass(source);
+        // `arr` must retain its own distinct LocalVariable handle:
+        // it was only partially written (element 0), so reading
+        // `arr[2]` requires the WGSL zero-init guarantee that
+        // coalescing with `l_full`'s slot would silently break.
+        assert_eq!(
+            distinct_local_handles_referenced(&module),
+            2,
+            "aggregate `arr` partially-written via `arr[0] = ...` then \
+             read via `arr[2]` must not share a slot with `l_full`, \
+             whose fully-written bytes would leak into the supposed \
+             zero-init read"
+        );
+    }
+
+    #[test]
+    fn coalesces_aggregate_fully_initialised_via_partial_writes() {
+        // Companion positive: when every element of an aggregate is
+        // explicitly written before any Read, the slot is fully
+        // claimed by the local and coalescing with a same-typed
+        // prior local is safe even though the writes were partial.
+        // Three partial Stores (`arr[0]`, `arr[1]`, `arr[2]`) plus
+        // a direct `arr[3]` cover all four bits in `elements_written`;
+        // `is_fully_covered` then returns true and the Load is not
+        // flagged.
+        let source = r#"
+@fragment
+fn fs_main() -> @location(0) vec4f {
+    var first: array<f32, 4>;
+    first[0] = 10.0;
+    first[1] = 20.0;
+    first[2] = 30.0;
+    first[3] = 40.0;
+    let s1 = first[0] + first[1] + first[2] + first[3];
+
+    var second: array<f32, 4>;
+    second[0] = 1.0;
+    second[1] = 2.0;
+    second[2] = 3.0;
+    second[3] = 4.0;
+    let s2 = second[0] + second[1] + second[2] + second[3];
+
+    return vec4f(s1 + s2, 0.0, 0.0, 1.0);
+}
+"#;
+        let (_, module) = run_pass(source);
+        // `first` and `second` have disjoint live ranges and both
+        // are FULLY covered by their respective four element-writes.
+        // The coalescer should merge them into one slot, leaving
+        // exactly one distinct LocalVariable handle referenced.
+        assert_eq!(
+            distinct_local_handles_referenced(&module),
+            1,
+            "aggregate fully covered by per-element Stores should be \
+             treated as fully initialised - element-coverage analysis \
+             must allow coalescing of `first` and `second` here"
+        );
+    }
+
+    #[test]
+    fn no_coalesce_partial_write_in_only_one_if_arm_then_full_read() {
+        // CF variant of the partial-write hazard.  If `accept`
+        // writes `arr[0]` and `reject` writes `arr[1]`, the post-If
+        // element-coverage is the intersection of `{0}` and `{1}` -
+        // the empty set.  A subsequent full Load of `arr` is then
+        // uncovered (no element provably written on every path),
+        // and coalescing with a prior fully-written local would
+        // leak that local's residue into the uncovered elements.
+        let source = r#"
+@fragment
+fn fs_main(@location(0) cond: f32) -> @location(0) vec4f {
+    var l_full: vec2<f32>;
+    l_full = vec2<f32>(10.0, 20.0);
+    let l_sum = l_full.x + l_full.y;
+
+    var v: vec2<f32>;
+    if cond > 0.5 {
+        v.x = 1.0;
+    } else {
+        v.y = 2.0;
+    }
+    let p = v.x + v.y;
+    return vec4f(l_sum + p, 0.0, 0.0, 1.0);
+}
+"#;
+        let (_, module) = run_pass(source);
+        assert_eq!(
+            distinct_local_handles_referenced(&module),
+            2,
+            "If with heterogeneous partial-writes in each arm must not \
+             allow coalescing of `v` with `l_full`: the intersection \
+             of `{{x}}` and `{{y}}` is empty, so the post-If read of \
+             `v` is uncovered and would observe leaked bytes"
+        );
+    }
+
+    #[test]
+    fn coalesces_aggregate_fully_initialised_in_both_if_arms() {
+        // CF positive: when BOTH arms of an If fully cover the
+        // aggregate, the merge by intersection still yields full
+        // coverage, so the post-If read is safe and coalescing
+        // proceeds.
+        let source = r#"
+@fragment
+fn fs_main(@location(0) cond: f32) -> @location(0) vec4f {
+    var first: vec2<f32>;
+    first = vec2<f32>(10.0, 20.0);
+    let s1 = first.x + first.y;
+
+    var second: vec2<f32>;
+    if cond > 0.5 {
+        second.x = 1.0;
+        second.y = 2.0;
+    } else {
+        second.x = 3.0;
+        second.y = 4.0;
+    }
+    let p = second.x + second.y;
+    return vec4f(s1 + p, 0.0, 0.0, 1.0);
+}
+"#;
+        let (_, module) = run_pass(source);
+        assert_eq!(
+            distinct_local_handles_referenced(&module),
+            1,
+            "both-arms full-coverage via partial writes should merge \
+             via intersection to full coverage, leaving `second` \
+             eligible to coalesce with `first`"
+        );
+    }
+
+    #[test]
     fn trace_ray_payload_extends_local_live_range() {
         // Construct a function with two locals (a, b) where `a` is used
         // as a TraceRay payload between their usages.  Without tracking
@@ -1095,7 +1689,7 @@ fn fs_main(@location(0) cond: f32) -> @location(0) vec4f {
         );
         function.body = body;
 
-        let usage = collect_local_usage(&function);
+        let usage = collect_local_usage(&function, &module.types);
         let info_a = usage[&local_a];
         let info_b = usage[&local_b];
 
@@ -1252,7 +1846,7 @@ fn fs_main(@location(0) cond: f32) -> @location(0) vec4f {
         );
         function.body = body;
 
-        let usage = collect_local_usage(&function);
+        let usage = collect_local_usage(&function, &module.types);
         let info_a = usage[&local_a];
         let info_b = usage[&local_b];
 
@@ -1453,7 +2047,7 @@ fn fs_main(@location(0) cond: f32) -> @location(0) vec4f {
         );
         function.body = body;
 
-        let usage = collect_local_usage(&function);
+        let usage = collect_local_usage(&function, &module.types);
         let info_dest = usage[&local_dest];
         let info_other = usage[&local_other];
 
