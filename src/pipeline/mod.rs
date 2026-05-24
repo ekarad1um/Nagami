@@ -196,26 +196,27 @@ fn run_ir_passes_with(
                             e
                         )));
                     }
-                    if let Some(b) = backup.take() {
-                        eprintln!(
-                            "warning: validation failed after pass '{}', rolling back: {}",
-                            pass.name(),
-                            e
-                        );
-                        *module = b;
-                        // `current_info` (if seeded) still matches the
-                        // restored backup since it was last refreshed
-                        // against the pre-pass state, so re-validation
-                        // is unnecessary.
-                        validation_ok = false;
-                        rolled_back = true;
-                    } else {
-                        return Err(Error::Validation(format!(
-                            "pass '{}' produced invalid IR: {}",
-                            pass.name(),
-                            e
-                        )));
-                    }
+                    // We took the !needs_text_validation branch above
+                    // when seeding `backup`, so it is always `Some` on
+                    // this branch.  The `expect` documents the
+                    // invariant rather than introducing a runtime
+                    // fallback that would also have to return an Err.
+                    let b = backup.take().expect(
+                        "backup must be Some when validate_each_pass is off; \
+                         see pre-pass backup gate above",
+                    );
+                    eprintln!(
+                        "warning: validation failed after pass '{}', rolling back: {}",
+                        pass.name(),
+                        e
+                    );
+                    *module = b;
+                    // `current_info` (if seeded) still matches the
+                    // restored backup since it was last refreshed
+                    // against the pre-pass state, so re-validation
+                    // is unnecessary.
+                    validation_ok = false;
+                    rolled_back = true;
                 }
             }
 

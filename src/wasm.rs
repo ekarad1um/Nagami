@@ -36,13 +36,33 @@ fn get_f64(obj: &JsValue, key: &str) -> Option<f64> {
     get_opt(obj, key)?.as_f64()
 }
 
-/// Read `obj[key]` as an array of strings, dropping non-string entries
-/// silently.  Returning `None` only on a missing/non-array field keeps
-/// downstream code free of "present but empty vs absent" forks.
-fn get_string_array(obj: &JsValue, key: &str) -> Option<Vec<String>> {
-    let val = get_opt(obj, key)?;
-    let arr: js_sys::Array = val.dyn_into().ok()?;
-    Some(arr.iter().filter_map(|v| v.as_string()).collect())
+/// Read `obj[key]` as an array of strings.  Returns `Ok(None)` when
+/// the field is missing or not an array (callers default to "no
+/// override"), `Err` when the array contains a non-string element so
+/// the caller cannot silently misinterpret bad input.  Previously the
+/// helper dropped non-string entries silently, which let
+/// `preserveSymbols: ["main", 42]` slip through as just `["main"]` -
+/// the caller's preserve-list then lacked an entry the user thought
+/// they had set, producing surprising renames.
+fn get_string_array(obj: &JsValue, key: &str) -> Result<Option<Vec<String>>, JsError> {
+    let Some(val) = get_opt(obj, key) else {
+        return Ok(None);
+    };
+    let arr: js_sys::Array = val
+        .dyn_into()
+        .map_err(|_| JsError::new(&format!("\"{key}\" must be an array of strings")))?;
+    let mut out = Vec::with_capacity(arr.length() as usize);
+    for (index, entry) in arr.iter().enumerate() {
+        match entry.as_string() {
+            Some(s) => out.push(s),
+            None => {
+                return Err(JsError::new(&format!(
+                    "\"{key}\"[{index}] must be a string"
+                )));
+            }
+        }
+    }
+    Ok(Some(out))
 }
 
 /// Decode a JS number as a `u8`, rejecting NaN, negatives, overflow,
@@ -94,7 +114,7 @@ fn parse_config(config: JsValue) -> Result<Config, JsError> {
             other => return Err(JsError::new(&format!("unknown profile: \"{other}\""))),
         };
     }
-    if let Some(symbols) = get_string_array(&config, "preserveSymbols") {
+    if let Some(symbols) = get_string_array(&config, "preserveSymbols")? {
         cfg.preserve_symbols = symbols;
     }
     if let Some(mangle) = get_bool(&config, "mangle") {

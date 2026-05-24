@@ -256,6 +256,18 @@ fn split_directives(source: &str) -> (&str, &str) {
 // MARK: Public entry points
 
 /// Result of a full minification pipeline run.
+///
+/// `#[non_exhaustive]` so we can add fields (timing, diagnostics, etc.)
+/// in future releases without a major version bump.  Two consequences
+/// for external callers (existing `2026.4.x` consumers may need a
+/// small migration):
+///
+/// - Pattern-match with a rest binding: `let Output { source, report, .. } = run(...)?;`
+/// - You cannot construct this struct directly from outside the crate;
+///   obtain values via [`run`].  This is intentional - the contract
+///   between source-bytes accounting and per-pass timings/diagnostics
+///   lives inside [`run`] and is not safe to bypass.
+#[non_exhaustive]
 pub struct Output {
     /// The minified WGSL source string.
     pub source: String,
@@ -358,16 +370,44 @@ const KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS: &[&str] = &[
     "subgroups enable-extension is not yet supported",
 ];
 
-/// `true` when `err` matches any of [`UNSUPPORTED_EXTENSION_PATTERNS`].
+/// `true` when `err` is a parse error whose message matches any of
+/// [`UNSUPPORTED_EXTENSION_PATTERNS`].
+///
+/// Restricted to [`Error::Parse`] on purpose: the patterns are
+/// substring matches against naga's rendered diagnostic, which can
+/// appear inside user-controlled source quoted by a validation or
+/// emit error.  Without the variant guard the caller's
+/// "extension we cannot parse -> return input unchanged" branch can
+/// silently swallow a real validation or emit failure.
 fn is_unsupported_extension_parse_error(err: &Error) -> bool {
+    if !matches!(err, Error::Parse(_)) {
+        return false;
+    }
     let msg = err.to_string();
     UNSUPPORTED_EXTENSION_PATTERNS
         .iter()
         .any(|p| msg.contains(p))
 }
 
-/// `true` when `err` matches any of [`KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS`].
+/// `true` when `err` is a `Parse` or `Validation` error whose message
+/// matches any of [`KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS`].
+///
+/// Both variants are accepted because `io::validate_wgsl_text`
+/// internally calls `parse_wgsl` (which wraps any front-end failure
+/// in `Error::Parse`) and then `validate_module_with_source` (which
+/// wraps validator failures in `Error::Validation`); naga's text
+/// front-end can report a not-yet-supported `enable` directive
+/// through either path depending on whether the failure surfaces at
+/// tokenisation or at semantic validation.
+///
+/// Scoped to `Parse | Validation` to refuse matching against unrelated
+/// `Emit`/`Io`/`Config` errors whose body happens to quote the same
+/// phrasing - otherwise the caller would silently bypass the
+/// "fall back to naga emitter" guard on a real downstream failure.
 fn is_known_text_validation_limitation(err: &Error) -> bool {
+    if !matches!(err, Error::Parse(_) | Error::Validation(_)) {
+        return false;
+    }
     let msg = err.to_string();
     KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS
         .iter()
@@ -396,17 +436,30 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     // Resolve the preamble: parse it to collect external names, then
     // splice its body after both sets of hoisted directives.  Empty or
     // whitespace-only preambles collapse to the no-preamble path so
-    // downstream code has a single predicate to check.
+    // downstream code has a single predicate to check.  Computed once
+    // and reused both at parse time below and at re-validation time
+    // after generator emission - `preprocess_source_for_naga` is a
+    // pure function of its input, so memoising the result avoids a
+    // second O(preamble) scan/allocation for free.
     let effective_preamble = config.preamble.as_deref().filter(|s| !s.trim().is_empty());
+    let normalized_preamble: Option<String> =
+        effective_preamble.map(preprocess_source_for_naga);
     let (preamble_names, full_source);
-    if let Some(preamble) = effective_preamble {
-        let preamble_module = io::parse_wgsl_with_path(preamble, "<preamble>")?;
+    if let Some(normalized_preamble) = normalized_preamble.as_deref() {
+        // Run the same `wgpu_*` stripping / `enable f16;` injection
+        // against the preamble that the user source already gets.
+        // Without this, a preamble that uses `f16` (or carries a
+        // `wgpu_binding_array` directive that naga rejects) would
+        // crash at parse time while the same text in the source body
+        // would silently succeed - an asymmetry that surprised callers
+        // and prevented preambles from sharing source-style content.
+        let preamble_module = io::parse_wgsl_with_path(normalized_preamble, "<preamble>")?;
         preamble_names = collect_module_names(&preamble_module);
         // Directives must precede declarations (see `split_directives`),
         // so extract both sides' leading directives and prepend them
         // before the preamble body.
         let (source_directives, source_body) = split_directives(&normalized_source);
-        let (preamble_directives, preamble_body) = split_directives(preamble);
+        let (preamble_directives, preamble_body) = split_directives(normalized_preamble);
         full_source =
             format!("{source_directives}{preamble_directives}{preamble_body}\n{source_body}");
     } else {
@@ -474,9 +527,16 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                 // With a preamble active the emitted source is
                 // incomplete on its own; validate by re-prepending the
                 // preamble with directives properly hoisted.
-                let validation_result = if let Some(preamble) = effective_preamble {
+                let validation_result = if let Some(normalized_preamble) =
+                    normalized_preamble.as_deref()
+                {
+                    // Reuse the same normalised preamble computed
+                    // up-front so the re-prepended text exactly matches
+                    // what naga parsed; this avoids both redundant
+                    // work and any chance of drift if the preprocess
+                    // function ever became non-deterministic.
                     let (emit_directives, emit_body) = split_directives(&emitted.source);
-                    let (pre_directives, pre_body) = split_directives(preamble);
+                    let (pre_directives, pre_body) = split_directives(normalized_preamble);
                     let combined =
                         format!("{emit_directives}{pre_directives}{pre_body}\n{emit_body}");
                     io::validate_wgsl_text(&combined)
@@ -1288,10 +1348,15 @@ mod tests {
     fn preprocess_does_not_duplicate_enable_f16_with_extra_whitespace() {
         let src = "enable  f16;\nfn f() -> f16 { return 0h; }\n";
         let out = preprocess_source_for_naga(src);
+        // The output must carry exactly the directive that was already
+        // present in the source: one occurrence of `enable...f16;` plus
+        // one occurrence of the `f16` return type in the function
+        // signature.  The `enable` count locks against accidental
+        // injection of a second normalised `enable f16;`.
         assert_eq!(
-            out.matches("f16;").count(),
-            out.matches("f16;").count(),
-            "sanity"
+            out.matches("enable").count(),
+            1,
+            "must not inject a second `enable` directive when the source already enables f16: {out}"
         );
         assert!(
             !out.contains("enable f16;\nenable  f16;"),
@@ -1333,6 +1398,49 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_extension_patterns_only_match_parse_errors() {
+        // Regression: substring patterns must not match against the
+        // rendered message of a non-`Parse` error variant, since a
+        // validator/emit failure quoting the same phrasing (or even an
+        // I/O error path containing the offending source) would
+        // previously short-circuit `run` into the "return input
+        // unchanged" branch and silently swallow a real failure.
+        for ctor in [
+            Error::Validation as fn(String) -> Error,
+            Error::Emit as fn(String) -> Error,
+            Error::Io as fn(String) -> Error,
+            Error::Config as fn(String) -> Error,
+        ] {
+            let err = ctor("error: enable extension is not enabled".to_string());
+            assert!(
+                !is_unsupported_extension_parse_error(&err),
+                "non-Parse error variants must not be treated as \
+                 unsupported-extension even when the message matches: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_text_validation_limitation_only_matches_parse_or_validation() {
+        // Same defensive policy as above for the subgroups-limitation
+        // matcher: only `Parse` and `Validation` may opt into the
+        // round-trip-validation bypass; `Emit` and `Io` errors quoting
+        // the same phrasing must be reported normally.
+        for ctor in [
+            Error::Emit as fn(String) -> Error,
+            Error::Io as fn(String) -> Error,
+            Error::Config as fn(String) -> Error,
+        ] {
+            let err = ctor("error: `subgroups` enable-extension is not yet supported".to_string());
+            assert!(
+                !is_known_text_validation_limitation(&err),
+                "non-Parse/Validation error variants must not opt into the \
+                 subgroup text-validation bypass: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn known_text_validation_limitation_matches_subgroup_phrasings() {
         let samples = [
             "error: `subgroups` enable-extension is not yet supported",
@@ -1343,6 +1451,28 @@ mod tests {
             assert!(
                 is_known_text_validation_limitation(&err),
                 "subgroup limitation phrasing should be recognized: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_text_validation_limitation_matches_validation_variant_too() {
+        // The matcher is intentionally scoped to `Parse | Validation`
+        // because `io::validate_wgsl_text` internally calls both
+        // `parse_wgsl` (Parse errors) and `validate_module_with_source`
+        // (Validation errors); naga can report a not-yet-supported
+        // `enable` directive through either path.  This regression pins
+        // the Validation branch so a future tightening to "Parse only"
+        // fails loudly here.
+        let samples = [
+            "error: `subgroups` enable-extension is not yet supported",
+            "error: subgroups enable-extension is not yet supported",
+        ];
+        for s in samples {
+            let err = Error::Validation(s.to_string());
+            assert!(
+                is_known_text_validation_limitation(&err),
+                "subgroup limitation phrasing must also be recognized when wrapped as Validation: {s}"
             );
         }
     }

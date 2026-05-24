@@ -134,8 +134,14 @@ fn desugar_short_circuit(
                         },
                         naga::Span::default(),
                     );
-                    hoist_emits(accept, &mut rebuilt);
-                    hoist_emits(reject, &mut rebuilt);
+                    // `single_store_info` requires both branches to
+                    // contain exactly one `Store` statement (no `Emit`s,
+                    // no nested control flow), so `accept`/`reject`
+                    // carry no expressions worth preserving here -
+                    // drop both blocks.  The new `Emit` + `Store` above
+                    // already represents the entire post-fold body.
+                    drop(accept);
+                    drop(reject);
                     rebuilt.push(
                         naga::Statement::Emit(naga::Range::new_from_bounds(binary, binary)),
                         span,
@@ -166,8 +172,14 @@ fn desugar_short_circuit(
                         },
                         naga::Span::default(),
                     );
-                    hoist_emits(accept, &mut rebuilt);
-                    hoist_emits(reject, &mut rebuilt);
+                    // `single_store_info` requires both branches to
+                    // contain exactly one `Store` statement (no `Emit`s,
+                    // no nested control flow), so `accept`/`reject`
+                    // carry no expressions worth preserving here -
+                    // drop both blocks.  The new `Emit` + `Store` above
+                    // already represents the entire post-fold body.
+                    drop(accept);
+                    drop(reject);
                     rebuilt.push(
                         naga::Statement::Emit(naga::Range::new_from_bounds(binary, binary)),
                         span,
@@ -203,21 +215,37 @@ fn desugar_short_circuit(
     changed
 }
 
-/// Return the pointer and value of a block's sole `Store`, ignoring
-/// intermediate `Emit` statements.  Yields `None` when the block has
-/// zero stores, more than one, or any statement other than
-/// Emit/Store.  The desugaring below uses this to recognise the
-/// single-assign arm of the lowered short-circuit patterns.
+/// Return the pointer and value of a block whose sole statement is a
+/// single `Store`.  Yields `None` when the block contains any `Emit`,
+/// has zero stores, more than one store, or any other statement.
+/// The desugaring caller uses this to recognise the single-assign
+/// arm of the lowered short-circuit patterns AND to guarantee that
+/// no expensive intermediate computation is moved out of the branch.
 fn single_store_info(
     block: &naga::Block,
 ) -> Option<(
     naga::Handle<naga::Expression>,
     naga::Handle<naga::Expression>,
 )> {
+    // Reject branches that carry any `Emit` range.  An `Emit`
+    // represents intermediate-expression evaluation (e.g., a load, a
+    // binary op, an array index), and the short-circuit re-sugar
+    // would *hoist* every such `Emit` out of the branch in
+    // `hoist_emits`.  Once hoisted, the computation runs
+    // unconditionally - even when WGSL's `&&` / `||` would
+    // short-circuit at runtime.  For the conditional-load case
+    // (`if c { d = arr[i]; } else { d = false; }`) hoisting the
+    // `arr[i]` load makes it observable on every iteration, which is
+    // both wasteful and (for `i` out of bounds) potentially observable
+    // through implementation-defined out-of-range behaviour.  We
+    // therefore restrict the pattern to branches that store a
+    // declarative-only value (literal, FunctionArgument, LocalVariable
+    // ref, GlobalVariable ref, Constant, ZeroValue, ...) where no
+    // `Emit` is required inside the branch in the first place.
     let mut result = None;
     for stmt in block.iter() {
         match stmt {
-            naga::Statement::Emit(_) => continue,
+            naga::Statement::Emit(_) => return None,
             naga::Statement::Store { pointer, value } => {
                 if result.is_some() {
                     return None;
@@ -283,18 +311,6 @@ fn unwrap_logical_not(
         Some(*inner)
     } else {
         None
-    }
-}
-
-/// Move every `Emit` statement from `source` into `target` in source
-/// order, discarding non-`Emit` statements.  Used when a branch is
-/// being folded away but its `Emit` ranges still need to survive so
-/// downstream expressions remain reachable.
-fn hoist_emits(source: naga::Block, target: &mut naga::Block) {
-    for (stmt, sp) in source.span_into_iter() {
-        if let naga::Statement::Emit(_) = &stmt {
-            target.push(stmt, sp);
-        }
     }
 }
 
@@ -2031,6 +2047,42 @@ fn f(a: bool, b: bool) -> bool {
                 "if should be desugared by short-circuit pass"
             );
         }
+    }
+
+    #[test]
+    fn short_circuit_preserves_branch_with_emit_in_value() {
+        // The accept branch stores a computed expression
+        // (`array[idx]` requires an `Emit` inside the branch to load
+        // the array entry).  Re-sugaring into `d = a && array[idx]`
+        // would hoist that load into the outer scope, defeating the
+        // short-circuit: when `a` is false the load now runs anyway,
+        // observable through implementation-defined out-of-bounds
+        // behaviour at runtime.  The guard in `single_store_info`
+        // forces the `If` to remain.
+        let src = r#"
+fn f(a: bool, idx: u32) -> bool {
+    let arr = array<bool, 4>(true, false, true, false);
+    var d: bool;
+    if a { d = arr[idx]; } else { d = false; }
+    return d;
+}
+@fragment fn fs() -> @location(0) vec4f { return vec4f(f32(f(true, 0u))); }
+"#;
+        let (_changed, module) = run_pass(src);
+        // The `f` function must still contain at least one `If`
+        // statement: the conditional `arr[idx]` evaluation cannot be
+        // hoisted safely, so the desugar pattern must not fire.
+        let f_function = module
+            .functions
+            .iter()
+            .find(|(_, func)| func.name.as_deref() == Some("f"))
+            .map(|(_, func)| func)
+            .expect("function `f` should survive the pass");
+        assert!(
+            count_ifs(&f_function.body) >= 1,
+            "If with a non-trivial (Emit-required) store value must NOT be desugared \
+             into `&&` because hoisting the Emit would defeat short-circuit semantics"
+        );
     }
 
     // Empty construct elimination for Switch: all cases empty.

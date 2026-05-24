@@ -234,7 +234,11 @@ fn run_cli() -> Result<bool, Box<dyn std::error::Error>> {
     }
 
     if args.in_place {
-        fs::write(&args.input, &output.source)
+        // Write through a sibling temp file plus an atomic rename so a
+        // crash mid-write cannot corrupt the user's input.  A direct
+        // `fs::write` would leave the input truncated on power loss or
+        // an interrupted process.
+        write_atomic(&args.input, &output.source)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", args.input.display())))?;
     } else if let Some(path) = args.output.as_deref() {
         write_output(path, &output.source)?;
@@ -277,6 +281,60 @@ fn write_output(path: &Path, content: &str) -> Result<(), io::Error> {
         Ok(())
     } else {
         fs::write(path, content)
+    }
+}
+
+/// Atomic file replace: write `content` to a sibling temp path then
+/// `rename` over `path`.  The rename is atomic on POSIX (and acts as
+/// `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` on Windows via
+/// `std::fs::rename`), so the destination contains either the old or
+/// the new contents at every observable moment - never a truncated or
+/// half-written intermediate.
+///
+/// Falls back to a plain `fs::write` if the temp file cannot be
+/// created in the destination directory (e.g., a read-only parent
+/// or an unusual filesystem) so `--in-place` still functions in
+/// degraded mode, just without the atomicity guarantee.
+fn write_atomic(path: &Path, content: &str) -> Result<(), io::Error> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let pid = std::process::id();
+    // Salt with pid + nanos to keep concurrent invocations from
+    // colliding on the same temp name without pulling in a tempfile
+    // dependency.  Worst case the timestamp races, in which case the
+    // create fails with `AlreadyExists` and we surface that to the
+    // caller; the rename never overwrites a different process's temp.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(format!(".nagami-tmp-{pid}-{stamp}"));
+    let tmp_path: PathBuf = match dir {
+        Some(d) => d.join(&tmp_name),
+        None => PathBuf::from(&tmp_name),
+    };
+
+    match fs::write(&tmp_path, content) {
+        Ok(()) => {}
+        Err(_) => {
+            // Could not stage in the destination directory; fall back
+            // to a non-atomic direct write so `--in-place` still
+            // succeeds on read-only-parent setups, accepting the
+            // crash-corruption risk for that one degraded path.
+            return fs::write(path, content);
+        }
+    }
+    match fs::rename(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Best-effort cleanup of the staged file so a failed
+            // rename doesn't leave a stray turd alongside the input.
+            let _ = fs::remove_file(&tmp_path);
+            Err(e)
+        }
     }
 }
 

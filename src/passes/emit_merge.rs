@@ -54,13 +54,17 @@ fn merge_emits_in_block(block: &mut naga::Block) -> bool {
 
     for (statement, span) in original.span_into_iter() {
         if let naga::Statement::Emit(ref range) = statement {
-            let handles: Vec<_> = range.clone().collect();
-            if handles.is_empty() {
+            // The merge logic only needs the first and last handle in
+            // the range; iterating into a `Vec` to discard the middle
+            // is pure waste on hot Emit-heavy blocks.  `iter.next()` /
+            // `iter.last()` walk the range exactly once between them
+            // (next consumes the first; last consumes the remaining
+            // tail), with no intermediate allocation.
+            let mut iter = range.clone();
+            let Some(first) = iter.next() else {
                 continue;
-            }
-
-            let first = handles[0];
-            let last = handles[handles.len() - 1];
+            };
+            let last = iter.last().unwrap_or(first);
 
             if let Some((pf, pl, ps, pc)) = pending {
                 if first.index() == pl.index() + 1 {

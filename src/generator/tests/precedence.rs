@@ -153,3 +153,75 @@ fn bitwise_xor_additive_child_inside_comparison_keeps_parens() {
     );
     assert_valid_wgsl(&out);
 }
+
+// MARK: Non-chainable equality / inequality parenthesisation
+
+#[test]
+fn equality_does_not_chain_left_child() {
+    // `(a == b) == c` is not a valid WGSL expression because `==`/`!=`
+    // operands must syntactically resolve to a strictly lower-precedence
+    // form (WGSL §8.5).  Emitting `a==b==c` would be unparseable.
+    let out = compact("fn f(a:i32,b:i32,c:i32)->bool{return (a==b)==(c==a);}");
+    assert!(
+        out.contains("(a==b)"),
+        "left == child of == must stay parenthesised: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn inequality_does_not_chain_right_child() {
+    // Same constraint as `==`: `a != (b != c)` must preserve the inner
+    // parens.  The right child shares the parent precedence and would
+    // already require parens for normal left-assoc rules; this test
+    // also confirms `!=` is included in the non-chainable branch.
+    // Types chosen so the inner `b != c` yields a bool that the outer
+    // `!=` compares against a bool LHS - otherwise validation rejects
+    // the IR before the emitter is exercised.
+    let out = compact("fn f(a:bool,b:i32,c:i32)->bool{return a!=(b!=c);}");
+    assert!(
+        out.contains("a!=(b!=c)") || out.contains("a != (b != c)"),
+        "right != child of != must stay parenthesised: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+// MARK: Minified token-merge disambiguation
+
+#[test]
+fn divide_followed_by_pointer_deref_does_not_form_block_comment() {
+    // `Binary(Divide, _, Load { pointer: FunctionArgument(ptr) })`
+    // renders the RHS via `emit_lvalue`, which dereferences a
+    // pointer-typed function argument with a leading `*`.  In compact
+    // mode the previous emission produced `... /*p`, which the WGSL
+    // lexer sees as the start of a block comment instead of "divide by
+    // the pointee".  The fix in `assemble_binary` must push a
+    // disambiguating space when `op` ends with `/` and the RHS begins
+    // with `*`.
+    let src = r#"
+        fn divide(p: ptr<function, f32>) -> f32 { return 1.0 / *p; }
+        fn caller() -> f32 { var x: f32 = 5.0; return divide(&x); }
+    "#;
+    let out = compact(src);
+    assert!(
+        !out.contains("/*"),
+        "compact output must not contain the `/*` trigraph (would start a block comment): {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn equality_with_relational_child_does_not_need_extra_parens() {
+    // WGSL relational operators (`<`, `<=`, `>`, `>=`) bind more
+    // tightly than equality, so `a<b==c` already parses as
+    // `(a<b)==c`.  The non-chainable rule for `==`/`!=` exists to
+    // prevent same-precedence chaining, not to force parens around
+    // strictly-higher-precedence children.  This regression pins
+    // that the emitter still drops these (redundant) parens.
+    let out = compact("fn f(a:i32,b:i32,c:bool)->bool{return (a<b)==c;}");
+    assert!(
+        !out.contains("(a<b)") && !out.contains("(a < b)"),
+        "relational child of equality should drop the redundant parens: {out}"
+    );
+    assert_valid_wgsl(&out);
+}

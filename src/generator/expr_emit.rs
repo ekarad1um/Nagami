@@ -2014,13 +2014,20 @@ fn child_needs_parens(
         return child_prec < PREC_UNARY;
     }
 
-    // WGSL relational operators are non-chainable.
+    // WGSL relational and equality operators are non-chainable: their
+    // operands must syntactically resolve to a strictly lower-precedence
+    // expression on either side, so a same-precedence child must be
+    // parenthesised regardless of associativity.  This covers
+    // `(a == b) == c` (operands of `==`/`!=` must be `relational_expression`,
+    // per WGSL §8.5) as well as the relational quartet.
     if matches!(
         parent_op,
         naga::BinaryOperator::Less
             | naga::BinaryOperator::LessEqual
             | naga::BinaryOperator::Greater
             | naga::BinaryOperator::GreaterEqual
+            | naga::BinaryOperator::Equal
+            | naga::BinaryOperator::NotEqual
     ) {
         return child_prec <= parent_prec;
     }
@@ -2073,11 +2080,15 @@ fn assemble_binary(
     if !sp.is_empty() {
         s.push_str(sp);
     } else if !wrap_r {
-        // Disambiguate `a--b` and `a//b` which WGSL would parse as
-        // decrement / line-comment.
+        // Disambiguate against three WGSL trigraphs the WGSL lexer would
+        // otherwise misread:
+        //   `--`  -> decrement (e.g. `a - -b` minified to `a--b`)
+        //   `//`  -> line comment start (impossible from valid IR but
+        //            guarded for symmetry)
+        //   `/*`  -> block comment start (e.g. `a / *p` where `*p` is a
+        //            pointer dereference rendered by `emit_lvalue`).
         if let (Some(&oc), Some(&rc)) = (op_str.as_bytes().last(), rs.as_bytes().first())
-            && oc == rc
-            && (oc == b'-' || oc == b'/')
+            && ((oc == rc && (oc == b'-' || oc == b'/')) || (oc == b'/' && rc == b'*'))
         {
             s.push(' ');
         }

@@ -823,8 +823,25 @@ impl<'a> Generator<'a> {
             tok_for_sep,
             indent_unit,
         ) = if options.beautify {
-            // Pre-compute single indent unit from a large static buffer, 16 spaces.
-            const SPACES: &str = "                ";
+            // Pre-compute single indent unit from a 32-byte static
+            // buffer.  Indentation past 32 is silently clamped; the
+            // upper bound covers every realistic style (most callers
+            // use 2 or 4 spaces).  Switching to a dynamic allocation
+            // would force `indent_unit: &'static str` on the Generator
+            // to become an owned `String`, rippling through every
+            // emission helper that captures the slice - the perf cost
+            // of those allocations is not worth the rare case of
+            // `indent > 32`.  If the slice is too short for the
+            // requested indent, debug-assert so misconfigurations are
+            // caught in tests rather than producing under-indented
+            // output silently in release.
+            const SPACES: &str = "                                ";
+            debug_assert!(
+                (options.indent as usize) <= SPACES.len(),
+                "indent={} exceeds the {}-byte static buffer; output will be silently clamped",
+                options.indent,
+                SPACES.len(),
+            );
             let unit = &SPACES[..(options.indent as usize).min(SPACES.len())];
             (
                 ", ",
@@ -862,10 +879,16 @@ impl<'a> Generator<'a> {
         };
 
         let mut layouter = naga::proc::Layouter::default();
-        // Ignore layout errors here; the module passed validation so
-        // all types are well-formed.  If a truly exotic type sneaks
-        // through, generate_struct will simply treat its natural size
-        // as 0 and always emit the explicit @size attribute.
+        // Layout failure is non-fatal: the module already passed
+        // naga validation, so its types are structurally sound; an
+        // error from the layouter just means it could not compute a
+        // numeric size/alignment for one of them (e.g., a runtime-
+        // sized array tail).  `generate_struct` tolerates missing
+        // layout entries by falling back to an explicit `@size`
+        // attribute on the affected member.  Surfacing the error here
+        // would require threading `Result` through every call site
+        // of `Generator::new`, which is not justified for a fallback
+        // that already produces correct (if less compact) output.
         let _ = layouter.update(module.to_ctx());
 
         let live_constants = compute_live_constants(module, &options.preserve_symbols);

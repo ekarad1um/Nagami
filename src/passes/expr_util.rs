@@ -590,20 +590,38 @@ pub fn rebuild_emit_ranges_after_removal(
 /// level, so callers MUST flatten before applying the map to the arena,
 /// otherwise dangling references survive.
 ///
-/// # Panics
+/// # Cycles
 ///
-/// Loops forever on a cyclic map.  Every current caller produces an
-/// acyclic map by construction; maintaining that property is the
-/// caller's responsibility.
+/// Every current caller produces an acyclic map by construction.  As a
+/// defence in depth against a future caller that violates that
+/// invariant, the inner walk is bounded by the map size: at most `N`
+/// hops can occur in an acyclic chain over `N` entries, so a longer walk
+/// proves a cycle.  On detection the function debug-asserts and exits
+/// the chain at the entry where the cycle was reached, leaving the rest
+/// of the map untouched - a debug build fails loudly, release builds
+/// degrade to a single-level resolution rather than hanging the
+/// pipeline.
 pub fn flatten_replacement_chains<H>(replacements: &mut std::collections::HashMap<H, H>)
 where
     H: Copy + Eq + std::hash::Hash,
 {
     let keys: Vec<H> = replacements.keys().copied().collect();
+    let max_hops = replacements.len();
     for key in keys {
         let mut target = replacements[&key];
+        let mut hops = 0usize;
         while let Some(&next) = replacements.get(&target) {
+            if hops >= max_hops {
+                debug_assert!(
+                    false,
+                    "flatten_replacement_chains: cycle detected \
+                     (chain exceeded {max_hops} hops); upstream pass produced a cyclic \
+                     replacement map"
+                );
+                break;
+            }
             target = next;
+            hops += 1;
         }
         replacements.insert(key, target);
     }
@@ -795,5 +813,46 @@ mod tests {
         flatten_replacement_chains(&mut m);
         assert_eq!(m[&1], 10);
         assert_eq!(m[&2], 20);
+    }
+
+    #[test]
+    fn flatten_replacement_chains_terminates_on_cycles() {
+        // Defensive guard: every current caller produces an acyclic
+        // map by construction, but if a future caller violates that
+        // invariant the pipeline must not hang.  In debug builds the
+        // bounded walk also debug-asserts; we use the release branch
+        // semantics here so the test passes in both profiles.
+        //
+        // The map below encodes the cycle `1 -> 2 -> 1`.  Without the
+        // bound the inner `while let Some(&next) = ...` would loop
+        // forever; with it, the function returns in at most `len`
+        // iterations per key and leaves the map in a consistent state.
+        let mut m: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        m.insert(1, 2);
+        m.insert(2, 1);
+
+        // Release builds skip the debug_assert; in debug builds the
+        // assert triggers a panic.  Both outcomes are acceptable, but
+        // the function must NOT hang.  Catch any debug panic so the
+        // test passes in both profiles.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            flatten_replacement_chains(&mut m);
+        }));
+        let _ = result;
+    }
+
+    #[test]
+    fn flatten_replacement_chains_terminates_on_three_node_cycle() {
+        // Same defence in depth as the two-node cycle above, but with
+        // `1 -> 2 -> 3 -> 1` so the hop count must reach 3 before the
+        // guard kicks in.
+        let mut m: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        m.insert(1, 2);
+        m.insert(2, 3);
+        m.insert(3, 1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            flatten_replacement_chains(&mut m);
+        }));
+        let _ = result;
     }
 }

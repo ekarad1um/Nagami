@@ -156,6 +156,16 @@ fn rename_function(
         local.name = Some(next);
     }
 
+    // Clear `named_expressions` whenever the function carries any -
+    // even if no identifier was renamed in this invocation - and
+    // report that as a change.  The "report as change" piece looks
+    // like a perf wart (it costs one extra convergence sweep on
+    // shaders that name expressions but rename nothing else), but
+    // experimentally it is load-bearing: in real-world shaders the
+    // extra sweep gives downstream passes a chance to observe IR that
+    // was settled only in this sweep's earlier passes (e.g. DCE
+    // catches an orphaned global that became unreachable once an
+    // upstream `_ = expr` phony-assignment-style load was eliminated).
     if !function.named_expressions.is_empty() {
         function.named_expressions.clear();
         changed = true;
@@ -624,5 +634,42 @@ fn fs_main() -> @location(0) vec4f {
         let names1 = collect_declaration_names(&module1);
         let names2 = collect_declaration_names(&module2);
         assert_eq!(names1, names2, "names must be identical across runs");
+    }
+
+    #[test]
+    fn clears_named_expressions_and_reports_change_even_when_nothing_renamed() {
+        // INVERSE regression: a tempting "perf" fix gated this clear
+        // on `changed > 0` so a preserve-all pass would not report a
+        // change.  Real-world test corpus
+        // (data/extra-test4/bug/{tint/1737, chromium/1449474}.wgsl,
+        // data/extra-test3/glsl-fma.frag.wgsl) showed the convergence
+        // loop exits one sweep too early in that mode and downstream
+        // DCE never gets a chance to remove orphaned globals.  This
+        // test pins the "always clear and report changed" behaviour
+        // so a future maintainer who notices the apparent redundancy
+        // does not silently re-introduce the regression.
+        let source = r#"
+@fragment
+fn fs_main() -> @location(0) vec4f {
+    let y = 1.0;
+    return vec4f(y, 0.0, 0.0, 1.0);
+}
+"#;
+        let preserve = ["fs_main", "y"];
+        let (changed, module) = run_pass_with_mangle(source, &preserve, true);
+        assert!(
+            changed,
+            "rename must report `changed = true` when it clears `named_expressions`, \
+             even if no identifier was renamed - downstream convergence depends on it"
+        );
+        let entry = module
+            .entry_points
+            .first()
+            .expect("entry point should exist");
+        assert!(
+            entry.function.named_expressions.is_empty(),
+            "named_expressions must be cleared so the WGSL emitter does not pick up \
+             stale bindings on the next sweep"
+        );
     }
 }

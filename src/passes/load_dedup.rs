@@ -1069,6 +1069,19 @@ fn collect_redundant_loads(
                 }
             }
             naga::Statement::Block(inner) => {
+                // `Statement::Block` introduces a nested WGSL `{ ... }`
+                // scope.  Any expression first appended (via an `Emit`
+                // statement inside `inner`) is bound inside that scope
+                // by naga's WGSL writer and is not in lexical scope
+                // outside the closing brace.  Without the highwater
+                // filter, a post-block read forwarded to an in-block
+                // value would emit as "let _outer = _inner;" where
+                // `_inner` is out of scope - the backend would reject
+                // the round-trip.  Apply the same checkpoint +
+                // arena-highwater pattern used for `If`/`Switch`.
+                let cp_pre_block = cache.checkpoint();
+                let arena_len_pre_block = expressions.len();
+
                 collect_redundant_loads(
                     inner,
                     expressions,
@@ -1079,12 +1092,45 @@ fn collect_redundant_loads(
                     in_loop,
                     modified_out,
                 );
+
+                // Snapshot post-block cache state, filtered to entries
+                // whose value handle survives outside the block scope
+                // (pre-block index, or a `needs_pre_emit` expression
+                // that is in scope everywhere by construction).
+                let carry: Vec<(PointerKey, naga::Handle<naga::Expression>)> = cache
+                    .as_map()
+                    .iter()
+                    .filter(|(_, v)| {
+                        v.index() < arena_len_pre_block || expressions[**v].needs_pre_emit()
+                    })
+                    .map(|(k, &v)| (k.clone(), v))
+                    .collect();
+                // Roll back to drop the in-scope-only entries, then
+                // re-insert the ones that are safe to carry forward.
+                cache.rollback_to(cp_pre_block);
+                for (k, v) in carry {
+                    cache.insert(k, v);
+                }
             }
             naga::Statement::If { accept, reject, .. } => {
                 // Snapshot pre-if state; each branch is explored and then
                 // rolled back so the outer scope sees only the permanent
                 // invalidations we apply after both branches finish.
                 let cp_pre_if = cache.checkpoint();
+                // Snapshot the expression-arena highwater mark so the
+                // meet phase can refuse to carry forwarding entries
+                // whose value handle was emitted only inside the
+                // branch.  Naga's expression arena is append-only and
+                // indices are dense, so handles strictly less than
+                // `arena_len_pre_if` already existed before the if and
+                // are reachable on every post-if path.  A handle that
+                // appeared during the branch may be referenced from a
+                // `naga::Statement::Emit` inside that branch only -
+                // forwarding a later read to such a handle on the
+                // *other* path lands on an expression the backend
+                // never let-binds, producing "use before definition"
+                // when re-emitted as WGSL.
+                let arena_len_pre_if = expressions.len();
 
                 // Each branch's recursion populates its own modified set.
                 // Combining them upfront via separate `collect_modified_locals`
@@ -1115,10 +1161,25 @@ fn collect_redundant_loads(
                 // loads cache-miss instead of being forwarded.  The
                 // size win from skipping a full-tree walk per branch
                 // is judged worth the trade.
+                //
+                // Additionally filter the forwarding *target* so any
+                // expression first appended inside the branch (whether
+                // via Store seeding, Load canonicalisation, or any
+                // other in-branch production) is dropped: post-if
+                // reads must only resolve to expressions that exist
+                // on every path.  The exception is `needs_pre_emit`
+                // expressions (Literal, Constant, Override, ZeroValue,
+                // FunctionArgument, GlobalVariable, LocalVariable) -
+                // naga considers these implicitly emitted at function
+                // entry, so they are in scope everywhere regardless
+                // of where in the arena they were first appended.
                 let mut meet: HashMap<PointerKey, naga::Handle<naga::Expression>> = cache
                     .as_map()
                     .iter()
                     .filter(|(k, _)| pointer_key_involves_any_local(k, &accept_modified))
+                    .filter(|(_, v)| {
+                        v.index() < arena_len_pre_if || expressions[**v].needs_pre_emit()
+                    })
                     .map(|(k, &v)| (k.clone(), v))
                     .collect();
                 cache.rollback_to(cp_pre_if);
@@ -1178,6 +1239,12 @@ fn collect_redundant_loads(
             }
             naga::Statement::Switch { cases, .. } => {
                 let cp_pre_switch = cache.checkpoint();
+                // Same arena-highwater guard as the `If` arm: only
+                // forwarding targets that existed before the switch
+                // are reachable on every post-switch path.  A value
+                // handle introduced inside one case cannot legitimately
+                // be reached from outside the switch.
+                let arena_len_pre_switch = expressions.len();
 
                 // Meet-over-branches is only sound for switches that
                 // execute *exactly one* case on every path.  That
@@ -1189,7 +1256,10 @@ fn collect_redundant_loads(
                     .iter()
                     .any(|c| matches!(c.value, naga::SwitchValue::Default));
                 let any_fallthrough = cases.iter().any(|c| c.fall_through);
-                let meet_applicable = has_default && !any_fallthrough && !cases.is_empty();
+                // `has_default` already implies `!cases.is_empty()`, so
+                // the explicit non-empty check was redundant; dropped
+                // along with this refactor.
+                let meet_applicable = has_default && !any_fallthrough;
 
                 let mut total_modified: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
                 let mut meet: Option<HashMap<PointerKey, naga::Handle<naga::Expression>>> = None;
@@ -1212,12 +1282,19 @@ fn collect_redundant_loads(
                                 // local is modified by this case
                                 // (analogous under-restriction to the
                                 // `If` arm; later cases narrow further
-                                // via in-place retain).
+                                // via in-place retain).  Filter on
+                                // the arena-highwater + `needs_pre_emit`
+                                // gate so the meet only carries values
+                                // reachable on every post-switch path.
                                 let initial: HashMap<_, _> = cache
                                     .as_map()
                                     .iter()
                                     .filter(|(k, _)| {
                                         pointer_key_involves_any_local(k, &case_modified)
+                                    })
+                                    .filter(|(_, v)| {
+                                        v.index() < arena_len_pre_switch
+                                            || expressions[**v].needs_pre_emit()
                                     })
                                     .map(|(k, &v)| (k.clone(), v))
                                     .collect();
@@ -1225,6 +1302,12 @@ fn collect_redundant_loads(
                             }
                             Some(m) => {
                                 // Subsequent cases: intersect in place.
+                                // The arena-highwater check is omitted
+                                // here because every entry surviving
+                                // the first-case filter already
+                                // satisfies it; re-checking is wasted
+                                // work (entries cannot acquire a higher
+                                // arena index after the fact).
                                 m.retain(|k, v| cache.get(k) == Some(v));
                             }
                         }

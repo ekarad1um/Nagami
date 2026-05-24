@@ -94,7 +94,11 @@ fn fold_global_expressions(module: &mut naga::Module) -> usize {
     let mut literal_cache = build_literal_cache(&module.global_expressions);
     let vector_type_cache = build_vector_type_cache(&module.types);
 
+    // Shared cycle-tracker reused across every global handle (see the
+    // identical optimisation in `fold_local_expressions`).
+    let mut visiting = HashSet::new();
     for handle in handles {
+        visiting.clear();
         // Try composite-aware resolution first (covers vectors, swizzle, etc.).
         let value = {
             let ctx = GlobalConstFoldContext {
@@ -102,7 +106,6 @@ fn fold_global_expressions(module: &mut naga::Module) -> usize {
                 types: &module.types,
                 const_inits: &const_inits,
             };
-            let mut visiting = HashSet::new();
             resolve_const_value(handle, &ctx, &mut visiting)
         };
 
@@ -159,8 +162,9 @@ fn build_constant_literal_cache(
     };
 
     let mut out = HashMap::new();
+    let mut visiting = HashSet::new();
     for (ch, c) in module.constants.iter() {
-        let mut visiting = HashSet::new();
+        visiting.clear();
         if let Some(lit) = resolve_literal(c.init, &context, &mut visiting) {
             out.insert(ch, lit);
         }
@@ -180,7 +184,8 @@ fn fold_local_expressions(
     const_literals: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
     types: &naga::UniqueArena<naga::Type>,
 ) -> (HashSet<naga::Handle<naga::Expression>>, usize) {
-    let handles = arena.iter().map(|(h, _)| h).collect::<Vec<_>>();
+    let mut handles = Vec::with_capacity(arena.len());
+    handles.extend(arena.iter().map(|(h, _)| h));
     let mut folded = HashSet::new();
 
     // O(N) one-time setup for O(1) materialize_vector lookups (E2).
@@ -190,14 +195,20 @@ fn fold_local_expressions(
     let mut literal_cache = build_literal_cache(arena);
     let vector_type_cache = build_vector_type_cache(types);
 
+    // Reuse a single `visiting` HashSet across every handle.  The cycle
+    // tracker only needs to be empty at the start of each
+    // `resolve_const_value` call, not freshly allocated - `clear()`
+    // keeps the bucket capacity around and avoids N allocations on
+    // large function arenas.
+    let mut visiting = HashSet::new();
     for handle in handles.iter().copied() {
+        visiting.clear();
         let value = {
             let ctx = LocalConstFoldContext {
                 arena: &*arena,
                 types,
                 const_literals,
             };
-            let mut visiting = HashSet::new();
             resolve_const_value(handle, &ctx, &mut visiting)
         };
 
@@ -1318,9 +1329,15 @@ fn eval_math_scalar(
         },
         M::Fract => match arg {
             // WGSL fract(e) = e - floor(e), NOT Rust's fract().
-            L::F32(v) => Some(L::F32(v - v.floor())),
-            L::F64(v) => Some(L::F64(v - v.floor())),
-            L::AbstractFloat(v) => Some(L::AbstractFloat(v - v.floor())),
+            // For very large |v|, `v - v.floor()` can degenerate
+            // (`floor` saturates near the boundary, the subtraction
+            // overflows / loses precision, or both), producing a
+            // non-finite result that must not be folded into the
+            // emitted literal.  Gate via the same `finite_*` helpers
+            // the other math wrappers use.
+            L::F32(v) => finite_f32(v - v.floor()),
+            L::F64(v) => finite_f64(v - v.floor()),
+            L::AbstractFloat(v) => finite_af(v - v.floor()),
             _ => None,
         },
 
@@ -1691,12 +1708,21 @@ fn needs_emit(expr: &naga::Expression) -> bool {
 }
 
 fn is_zero(arena: &naga::Arena<naga::Expression>, h: naga::Handle<naga::Expression>) -> bool {
+    // The `F16` check uses `to_bits() & 0x7FFF == 0` (mask off the
+    // sign bit) so both positive and negative zero match the same
+    // way `v == 0.0` does for the wider floats.  This keeps the
+    // identity rules (`x + 0`, `x * 1`) firing on `f16` shaders -
+    // before, `is_zero` had no F16 arm at all, so half-precision
+    // arithmetic silently skipped strength reduction.
     matches!(
         arena[h],
         naga::Expression::Literal(naga::Literal::F32(v)) if v == 0.0
     ) || matches!(
         arena[h],
         naga::Expression::Literal(naga::Literal::F64(v)) if v == 0.0
+    ) || matches!(
+        arena[h],
+        naga::Expression::Literal(naga::Literal::F16(v)) if v.to_bits() & 0x7FFF == 0
     ) || matches!(
         arena[h],
         naga::Expression::Literal(
@@ -1713,12 +1739,17 @@ fn is_zero(arena: &naga::Arena<naga::Expression>, h: naga::Handle<naga::Expressi
 }
 
 fn is_one(arena: &naga::Arena<naga::Expression>, h: naga::Handle<naga::Expression>) -> bool {
+    // `0x3C00` is the IEEE 754 binary16 bit pattern for `+1.0`.
+    // (Negative one would be `0xBC00` and is irrelevant for `is_one`.)
     matches!(
         arena[h],
         naga::Expression::Literal(naga::Literal::F32(v)) if v == 1.0
     ) || matches!(
         arena[h],
         naga::Expression::Literal(naga::Literal::F64(v)) if v == 1.0
+    ) || matches!(
+        arena[h],
+        naga::Expression::Literal(naga::Literal::F16(v)) if v.to_bits() == 0x3C00
     ) || matches!(
         arena[h],
         naga::Expression::Literal(
@@ -2706,6 +2737,67 @@ fn fs_main() -> @location(0) vec4f {
                 &a.arena
             ),
             None
+        );
+    }
+
+    #[test]
+    fn identity_fires_on_f16_zero_and_one() {
+        // Regression: `is_zero` / `is_one` had no F16 arm, so the
+        // strength-reduction rules silently skipped half-precision
+        // arithmetic.  These tests pin that `x + 0h`, `x - 0h`,
+        // `0h + x`, `x * 1h`, `1h * x`, and `x / 1h` all collapse to
+        // `x` for F16 operands, matching the parity already in place
+        // for F32/F64/AbstractFloat.
+        use half::f16;
+        let mut arena = naga::Arena::new();
+        let zero_f16 = arena.append(
+            naga::Expression::Literal(naga::Literal::F16(f16::from_f32(0.0))),
+            Default::default(),
+        );
+        let neg_zero_f16 = arena.append(
+            naga::Expression::Literal(naga::Literal::F16(f16::from_f32(-0.0))),
+            Default::default(),
+        );
+        let one_f16 = arena.append(
+            naga::Expression::Literal(naga::Literal::F16(f16::from_f32(1.0))),
+            Default::default(),
+        );
+        let param = arena.append(naga::Expression::FunctionArgument(0), Default::default());
+
+        // x + 0h -> x
+        assert_eq!(
+            check_identity_operand(naga::BinaryOperator::Add, param, zero_f16, &arena),
+            Some(param)
+        );
+        // 0h + x -> x  (commutative)
+        assert_eq!(
+            check_identity_operand(naga::BinaryOperator::Add, zero_f16, param, &arena),
+            Some(param)
+        );
+        // x + -0h -> x  (negative zero also matches via bit-pattern mask)
+        assert_eq!(
+            check_identity_operand(naga::BinaryOperator::Add, param, neg_zero_f16, &arena),
+            Some(param)
+        );
+        // x - 0h -> x
+        assert_eq!(
+            check_identity_operand(naga::BinaryOperator::Subtract, param, zero_f16, &arena),
+            Some(param)
+        );
+        // x * 1h -> x
+        assert_eq!(
+            check_identity_operand(naga::BinaryOperator::Multiply, param, one_f16, &arena),
+            Some(param)
+        );
+        // 1h * x -> x  (commutative)
+        assert_eq!(
+            check_identity_operand(naga::BinaryOperator::Multiply, one_f16, param, &arena),
+            Some(param)
+        );
+        // x / 1h -> x
+        assert_eq!(
+            check_identity_operand(naga::BinaryOperator::Divide, param, one_f16, &arena),
+            Some(param)
         );
     }
 
@@ -4672,6 +4764,31 @@ fn fs_main() -> @location(0) vec4f {
             ),
             Some(naga::Literal::F32(2.0))
         );
+    }
+
+    #[test]
+    fn math_fract_huge_value_does_not_emit_non_finite() {
+        // Regression: `v - v.floor()` for very-large finite `v` can
+        // produce NaN/Inf when `v.floor()` saturates near the float
+        // range boundary or when the subtraction underflows precision.
+        // The fold must refuse such cases via the `finite_*` guard so
+        // the emitted literal is always representable WGSL.
+        for v in [f32::MAX, f32::MIN, -f32::MAX, 1.0e38_f32] {
+            let result = eval_math_scalar(
+                naga::MathFunction::Fract,
+                naga::Literal::F32(v),
+                None,
+                None,
+            );
+            match result {
+                None => {}
+                Some(naga::Literal::F32(out)) => assert!(
+                    out.is_finite(),
+                    "fract({v}) folded to non-finite {out}; finite_f32 guard must reject"
+                ),
+                Some(other) => panic!("expected None or F32, got {other:?}"),
+            }
+        }
     }
 
     #[test]
