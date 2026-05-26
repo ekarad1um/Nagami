@@ -1,7 +1,7 @@
 {
   "name": "nagami-playground",
   "private": true,
-  "version": "2026.4.59",
+  "version": "2026.4.61",
   "type": "module",
   "description": "Web playground for Nagami - IR-level WGSL shader minifier with DCE, folding, inlining, and mangling, powered by WebAssembly.",
   "license": "MIT",
