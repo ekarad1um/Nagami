@@ -272,7 +272,26 @@ impl<'a> Generator<'a> {
             }
             S::Switch { selector, cases } => {
                 self.out.push_str("switch ");
-                self.out.push_str(&self.emit_expr(*selector, ctx)?);
+                // Switch case labels carry an explicit type suffix
+                // (`0u` for `SwitchValue::U32`, bare `0` for `I32`);
+                // the selector must match.  If the selector is itself
+                // a `Literal::U32(0)` (rare but legal naga IR), the
+                // generic `emit_expr` path goes through the bare-
+                // literal gate and emits `0`, producing `switch 0 {
+                // case 0u: ... }` which naga rejects on selector /
+                // case-value type mismatch.  Force the typed form
+                // when the selector is an uncached literal to keep
+                // emit consistent with the case labels.
+                if !ctx.expr_names.contains_key(selector)
+                    && let naga::Expression::Literal(lit) = ctx.func.expressions[*selector]
+                {
+                    self.out.push_str(&super::syntax::literal_to_wgsl(
+                        lit,
+                        self.options.max_precision,
+                    ));
+                } else {
+                    self.out.push_str(&self.emit_expr(*selector, ctx)?);
+                }
                 self.open_brace();
                 let mut new_case = true;
                 for case in cases {
@@ -371,7 +390,25 @@ impl<'a> Generator<'a> {
             S::Store { pointer, value } => {
                 if let Some(atomic_scalar) = self.atomic_scalar_for_expr(*pointer, ctx) {
                     let sep = self.comma_sep();
-                    self.out.push_str("atomicStore(&");
+                    // `atomicStore` requires `ptr<>`.  In WGSL text
+                    // scope, `var<>` identifiers (and access chains
+                    // rooted at them) are refs that need `&` to become
+                    // ptrs, but a function parameter declared `ptr<...>`
+                    // is already a ptr value - emitting `&p` against it
+                    // is a type error.  Same gate as call-arg lowering.
+                    let pointer_is_already_ptr = matches!(
+                        ctx.func.expressions[*pointer],
+                        naga::Expression::FunctionArgument(idx)
+                        if matches!(
+                            self.module.types[ctx.func.arguments[idx as usize].ty].inner,
+                            naga::TypeInner::Pointer { .. }
+                        )
+                    );
+                    if pointer_is_already_ptr {
+                        self.out.push_str("atomicStore(");
+                    } else {
+                        self.out.push_str("atomicStore(&");
+                    }
                     self.out.push_str(&self.emit_expr(*pointer, ctx)?);
                     self.out.push_str(sep);
                     self.out
@@ -659,10 +696,108 @@ impl<'a> Generator<'a> {
                     self.out.push_str(");");
                 }
             },
-            _ => {
+            // Ray-query intrinsics.  Each function takes the ray-query
+            // local through a pointer (`&q`); WGSL expects this exact
+            // shape per the `wgpu_ray_query` enable extension.  All
+            // arms are listed explicitly so a future naga release that
+            // grows a new ray-query function variant produces a compile
+            // error here instead of silently bypassing emission.
+            S::RayQuery { query, fun } => {
+                // INVARIANT: naga's function validator restricts the
+                // `query` field to `Expression::LocalVariable(_)` and
+                // rejects anything else with `InvalidRayQueryExpression`
+                // (verified against naga 29.0.3
+                // `src/valid/function.rs`).  That guarantees
+                // `emit_expr(query)` returns a bare local-variable
+                // identifier - no parens, no path accesses, no
+                // pre-existing pointer - so prepending `&` to form
+                // the WGSL `&q` address-of operand is always
+                // syntactically correct and semantically aligned with
+                // the spec for `rayQueryInitialize`/etc.
+                //
+                // If a future naga release relaxes this restriction
+                // (e.g. allows `Access`/`AccessIndex` chains rooted
+                // at a local, or function-argument pointers), this
+                // arm needs to branch on the Expression variant:
+                // pointer-typed function arguments must be emitted
+                // verbatim (no `&`); LocalVariable/Access/AccessIndex
+                // chains keep the current `&` prefix.  The debug
+                // assertion below trips loudly on a build that
+                // unexpectedly produces a different variant so the
+                // upgrade signal isn't silent.
+                debug_assert!(
+                    matches!(
+                        ctx.func.expressions[*query],
+                        naga::Expression::LocalVariable(_)
+                    ),
+                    "Statement::RayQuery.query must be a LocalVariable per \
+                     naga's validator; got {:?}",
+                    ctx.func.expressions[*query]
+                );
+                let query_text = self.emit_expr(*query, ctx)?;
+                match fun {
+                    naga::RayQueryFunction::Initialize {
+                        acceleration_structure,
+                        descriptor,
+                    } => {
+                        let sep = self.comma_sep();
+                        self.out.push_str("rayQueryInitialize(&");
+                        self.out.push_str(&query_text);
+                        self.out.push_str(sep);
+                        self.out
+                            .push_str(&self.emit_expr(*acceleration_structure, ctx)?);
+                        self.out.push_str(sep);
+                        self.out.push_str(&self.emit_expr(*descriptor, ctx)?);
+                        self.out.push_str(");");
+                    }
+                    naga::RayQueryFunction::Proceed { result } => {
+                        let name = ctx.next_expr_name();
+                        self.out.push_str("let ");
+                        self.out.push_str(&name);
+                        self.push_assign();
+                        self.out.push_str("rayQueryProceed(&");
+                        self.out.push_str(&query_text);
+                        self.out.push_str(");");
+                        ctx.expr_names.insert(*result, name);
+                    }
+                    naga::RayQueryFunction::GenerateIntersection { hit_t } => {
+                        let sep = self.comma_sep();
+                        self.out.push_str("rayQueryGenerateIntersection(&");
+                        self.out.push_str(&query_text);
+                        self.out.push_str(sep);
+                        self.out.push_str(&self.emit_expr(*hit_t, ctx)?);
+                        self.out.push_str(");");
+                    }
+                    naga::RayQueryFunction::ConfirmIntersection => {
+                        self.out.push_str("rayQueryConfirmIntersection(&");
+                        self.out.push_str(&query_text);
+                        self.out.push_str(");");
+                    }
+                    naga::RayQueryFunction::Terminate => {
+                        self.out.push_str("rayQueryTerminate(&");
+                        self.out.push_str(&query_text);
+                        self.out.push_str(");");
+                    }
+                }
+            }
+            // Cooperative-matrix store.  Naga's own WGSL backend
+            // panics on this statement (verified against naga 29.0.3),
+            // so we cannot rely on the pipeline's naga-emitter fallback.
+            // The canonical WGSL surface for cooperative matrix ops
+            // is still evolving; until the spec stabilises and naga
+            // ships a backend, return a structured Emit error so the
+            // failure is visible (and so `--preamble`-active runs
+            // surface the missing support to the caller rather than
+            // attempting a fallback that would itself crash).
+            S::CooperativeStore { .. } => {
                 return Err(Error::Emit(format!(
-                    "unsupported statement in function '{}': {:?}",
-                    ctx.display_name, stmt,
+                    "cooperative-matrix store emission is not yet supported in '{}'; \
+                     the `cooperative_matrix<...>` type renderer is also missing \
+                     (see `generator::syntax::type_inner_name`) - both gaps must be \
+                     closed together when the WGSL cooperative-matrix extension \
+                     stabilises.  naga's own WGSL backend does not emit this \
+                     statement either, so the pipeline cannot fall back",
+                    ctx.display_name,
                 )));
             }
         }

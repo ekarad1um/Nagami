@@ -1,4 +1,5 @@
-//! Dead-branch elimination.  Three cooperating phases:
+//! Dead-branch elimination.  Three primary phases plus several
+//! structural simplifications folded into the constant-condition pass:
 //!
 //! 1. Short-circuit re-sugaring folds the `if/else store false`
 //!    patterns naga's WGSL frontend emits for `&&` and `||` back into
@@ -7,17 +8,65 @@
 //! 2. Redundant `else`-store elimination removes writes that assign
 //!    the same known literal already present in the variable on the
 //!    opposite branch, shrinking unbalanced two-arm ifs into one arm.
-//! 3. Constant-condition branch elimination strips `if (true)` /
-//!    `if (false)` arms so subsequent passes see straight-line code.
+//! 3. Constant-condition / structural cleanup (`eliminate_dead_branches`)
+//!    strips `if (true)` / `if (false)` arms AND performs several
+//!    cooperative simplifications in the same walk:
+//!    * empty-If / empty-Switch / empty-Block elision,
+//!    * else-block elision when the accept branch unconditionally
+//!      terminates (return / break / continue / kill),
+//!    * dead code after a terminating statement,
+//!    * `loop { ... break if true; }` unwrap when no bare break/continue
+//!      would mis-target after unwrapping,
+//!    * `break if false` dropped (loop never terminates via that branch),
+//!    * single-default-case Switch splicing.
 //!
 //! Phase order is load-bearing: short-circuit patterns rely on the
 //! untransformed frontend output, so re-sugaring must run before the
 //! later phases mutate the statement shape.
+//!
+//! The "branch flipping" optimisation listed in the project README
+//! (`if c {} else { x; }` -> `if !c { x; }`) is NOT implemented here;
+//! it lives at emit time in `generator::stmt_emit` (search for
+//! "flip the condition").
 
 use std::collections::{HashMap, HashSet};
 
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
+
+/// `true` when `expr` is a "value-only declarative" expression: one
+/// that names a value in the function's permanent scope (Literal,
+/// Constant, Override, ZeroValue, FunctionArgument, GlobalVariable,
+/// LocalVariable) and carries no implicit `let` binding scoped to a
+/// statement.  Tightens `expression_needs_emit` for the short-circuit
+/// re-sugar invariant: `!expression_needs_emit` would also pass for
+/// `CallResult`/`AtomicResult`/etc., which `single_store_info` already
+/// excludes for orthogonal reasons (the originating Call would be a
+/// second statement in the branch), but mirroring the assertion to
+/// the documented declarative-only invariant survives future
+/// relaxations of `single_store_info` that might no longer guarantee
+/// the exclusion.
+fn is_value_only_declarative(expr: &naga::Expression) -> bool {
+    let result = matches!(
+        expr,
+        naga::Expression::Literal(_)
+            | naga::Expression::Constant(_)
+            | naga::Expression::Override(_)
+            | naga::Expression::ZeroValue(_)
+            | naga::Expression::FunctionArgument(_)
+            | naga::Expression::GlobalVariable(_)
+            | naga::Expression::LocalVariable(_)
+    );
+    // Invariant: this set is a subset of `!expression_needs_emit`.
+    // A variant added here that needs an Emit slot would silently
+    // break the short-circuit re-sugar.
+    debug_assert!(
+        !result || !super::expr_util::expression_needs_emit(expr),
+        "is_value_only_declarative classified {expr:?} as declarative but \
+         expression_needs_emit reports it requires an Emit slot",
+    );
+    result
+}
 
 use super::load_dedup::{collect_modified_locals, get_stored_local, is_zero_literal};
 use super::scoped_map::ScopedMap;
@@ -45,15 +94,19 @@ impl Pass for DeadBranchPass {
             // store phase destroys the lowered patterns.
             changed += desugar_short_circuit(&mut function.body, &mut function.expressions);
             changed += eliminate_redundant_else_stores_in_function(function, &const_lits);
-            changed += eliminate_dead_branches(&mut function.body, &function.expressions);
+            changed +=
+                eliminate_dead_branches(&mut function.body, &function.expressions, &const_lits);
         }
         for entry in module.entry_points.iter_mut() {
             changed +=
                 desugar_short_circuit(&mut entry.function.body, &mut entry.function.expressions);
             changed +=
                 eliminate_redundant_else_stores_in_function(&mut entry.function, &const_lits);
-            changed +=
-                eliminate_dead_branches(&mut entry.function.body, &entry.function.expressions);
+            changed += eliminate_dead_branches(
+                &mut entry.function.body,
+                &entry.function.expressions,
+                &const_lits,
+            );
         }
 
         Ok(changed > 0)
@@ -90,7 +143,10 @@ fn desugar_short_circuit(
     let mut changed = 0usize;
 
     for (mut statement, span) in original.span_into_iter() {
-        // Step 1: recurse into nested blocks.
+        // Step 1: recurse into nested blocks.  Leaf statements are
+        // enumerated explicitly so a future naga release adding a
+        // new block-bearing variant breaks the build here instead
+        // of silently bypassing recursion.
         match &mut statement {
             naga::Statement::Block(inner) => {
                 changed += desugar_short_circuit(inner, expressions);
@@ -110,7 +166,25 @@ fn desugar_short_circuit(
                 changed += desugar_short_circuit(body, expressions);
                 changed += desugar_short_circuit(continuing, expressions);
             }
-            _ => {}
+            naga::Statement::Emit(_)
+            | naga::Statement::Store { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Call { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
         }
 
         // Step 2: check for short-circuit patterns.
@@ -120,11 +194,32 @@ fn desugar_short_circuit(
                 accept,
                 reject,
             } => {
-                // Pattern 1 (&&): if (cond) { d = val; } else { d = false; }
+                // Pattern 1 (&&): `if (cond) { d = val; } else { d = false; }`
+                // -> `d = cond && val;`
+                //
+                // Scope invariant: the rewritten Binary lives in the
+                // parent block, so both `val_a` and `condition` must
+                // already be in scope there.
+                //   * `condition`: a WGSL `if` evaluates its condition
+                //     before entering either branch, so its `Emit`
+                //     dominates the If and lives in the parent block.
+                //   * `val_a`: `single_store_info` rejects any branch
+                //     with an `Emit`, leaving `val_a` declarative
+                //     (Literal/Constant/Override/ZeroValue/
+                //     FunctionArgument/{Global,Local}Variable - all
+                //     "in scope everywhere").  The explicit
+                //     `is_value_only_declarative` guard mirrors that
+                //     invariant: a malformed IR where the producing
+                //     statement for a `CallResult`/`AtomicResult` was
+                //     removed but the result expression handle survived
+                //     would otherwise pass `single_store_info` (bare
+                //     Store) and the resugared Binary would reference
+                //     an out-of-scope handle.
                 if let (Some((ptr_a, val_a)), Some((ptr_r, val_r))) =
                     (single_store_info(&accept), single_store_info(&reject))
                     && same_local_pointer(ptr_a, ptr_r, expressions)
                     && is_bool_false(expressions, val_r)
+                    && is_value_only_declarative(&expressions[val_a])
                 {
                     let binary = expressions.append(
                         naga::Expression::Binary {
@@ -157,12 +252,20 @@ fn desugar_short_circuit(
                     continue;
                 }
 
-                // Pattern 2 (||): if (!cond) { d = val; } else { d = true; }
+                // Pattern 2 (||): `if (!cond) { d = val; } else { d = true; }`
+                // -> `d = !cond || val;` (rewritten as `inner_cond || val`).
+                //
+                // Same scope and `is_value_only_declarative` invariants
+                // as pattern 1.  `inner_cond` (the operand of the
+                // LogicalNot) is in scope transitively: the LogicalNot's
+                // Emit dominates the If, and the LogicalNot can only
+                // reference operands whose Emit dominates IT.
                 if let Some(inner_cond) = unwrap_logical_not(condition, expressions)
                     && let (Some((ptr_a, val_a)), Some((ptr_r, val_r))) =
                         (single_store_info(&accept), single_store_info(&reject))
                     && same_local_pointer(ptr_a, ptr_r, expressions)
                     && is_bool_true(expressions, val_r)
+                    && is_value_only_declarative(&expressions[val_a])
                 {
                     let binary = expressions.append(
                         naga::Expression::Binary {
@@ -323,6 +426,7 @@ fn unwrap_logical_not(
 fn eliminate_dead_branches(
     block: &mut naga::Block,
     expressions: &naga::Arena<naga::Expression>,
+    const_lits: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
 ) -> usize {
     let original = std::mem::take(block);
     let mut rebuilt = naga::Block::with_capacity(original.len());
@@ -333,42 +437,70 @@ fn eliminate_dead_branches(
     for (mut statement, span) in original.span_into_iter() {
         processed += 1;
 
-        // Step 1: recurse into nested blocks first
+        // Step 1: recurse into nested blocks first.  Leaf statements
+        // are enumerated explicitly so a future naga release adding
+        // a new block-bearing variant breaks the build instead of
+        // silently bypassing recursion.
         match &mut statement {
             naga::Statement::Block(inner) => {
-                changed += eliminate_dead_branches(inner, expressions);
+                changed += eliminate_dead_branches(inner, expressions, const_lits);
             }
             naga::Statement::If { accept, reject, .. } => {
-                changed += eliminate_dead_branches(accept, expressions);
-                changed += eliminate_dead_branches(reject, expressions);
+                changed += eliminate_dead_branches(accept, expressions, const_lits);
+                changed += eliminate_dead_branches(reject, expressions, const_lits);
             }
             naga::Statement::Switch { cases, .. } => {
                 for case in cases.iter_mut() {
-                    changed += eliminate_dead_branches(&mut case.body, expressions);
+                    changed += eliminate_dead_branches(&mut case.body, expressions, const_lits);
                 }
             }
             naga::Statement::Loop {
                 body, continuing, ..
             } => {
-                changed += eliminate_dead_branches(body, expressions);
-                changed += eliminate_dead_branches(continuing, expressions);
+                changed += eliminate_dead_branches(body, expressions, const_lits);
+                changed += eliminate_dead_branches(continuing, expressions, const_lits);
             }
-            _ => {}
+            naga::Statement::Emit(_)
+            | naga::Statement::Store { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Call { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
         }
 
-        // Step 2: check for constant conditions
+        // Step 2: structural simplification - fold constant
+        // If/Switch conditions, drain empty branches, unwrap
+        // degenerate Switch, drop `break if true/false`, elide
+        // empty nested Blocks.  See the per-arm comments below.
         match statement {
             // If with constant boolean condition
             naga::Statement::If {
                 condition,
                 accept,
                 reject,
-            } => match &expressions[condition] {
-                naga::Expression::Literal(naga::Literal::Bool(true)) => {
+            } => match resolve_to_literal(expressions, condition, const_lits) {
+                // `resolve_to_literal` also folds an
+                // `Expression::Constant(c)` whose init is a bool
+                // literal, so a branch on a named `const X: bool = ...;`
+                // is eliminated even before const_fold inlines it.
+                Some(naga::Literal::Bool(true)) => {
                     splice_block(&mut rebuilt, accept);
                     changed += 1;
                 }
-                naga::Expression::Literal(naga::Literal::Bool(false)) => {
+                Some(naga::Literal::Bool(false)) => {
                     splice_block(&mut rebuilt, reject);
                     changed += 1;
                 }
@@ -378,11 +510,15 @@ fn eliminate_dead_branches(
                     if accept.is_empty() && reject.is_empty() {
                         changed += 1;
                     } else if !reject.is_empty() && block_definitely_terminates(&accept) {
-                        // Else block elision (CFG flattening): when the
-                        // accept block unconditionally terminates
-                        // (return/break/continue), the reject block is
-                        // structurally unnecessary.  Hoist its statements
-                        // after the If and clear the reject block.
+                        // Else-elision: `if c { return; } else { x; }` ->
+                        // `if c { return; } x;` drops the `else{}`
+                        // scaffolding.  Still fires when reject ALSO
+                        // terminates with a different value-bearing
+                        // return - the saved scaffolding outweighs the
+                        // dead-but-conditional `if c { return v1; }`.
+                        // Only symmetric value-less returns make the
+                        // trailing return redundant; we don't collapse
+                        // that case.
                         let hoisted = reject;
                         rebuilt.push(
                             naga::Statement::If {
@@ -409,7 +545,7 @@ fn eliminate_dead_branches(
 
             // Switch with constant integer selector
             naga::Statement::Switch { selector, cases } => {
-                if let Some(value) = resolve_switch_value(selector, expressions) {
+                if let Some(value) = resolve_switch_value(selector, expressions, const_lits) {
                     match find_matching_case_index(&cases, value) {
                         Some(start_idx) if !case_body_has_bare_break(&cases, start_idx) => {
                             let body = collect_case_body(cases, start_idx);
@@ -449,13 +585,16 @@ fn eliminate_dead_branches(
                 }
             }
 
-            // Loop with constant break_if
+            // Loop with constant break_if.  Routed through
+            // `resolve_to_literal` so `break if NAMED_CONST` folds
+            // without waiting for `const_fold` to inline the
+            // constant - matches the If / Switch arms above.
             naga::Statement::Loop {
                 body,
                 continuing,
                 break_if: Some(bi),
-            } => match &expressions[bi] {
-                naga::Expression::Literal(naga::Literal::Bool(true)) => {
+            } => match resolve_to_literal(expressions, bi, const_lits) {
+                Some(naga::Literal::Bool(true)) => {
                     // `break if true` -> loop executes body + continuing once.
                     // Only safe when body/continuing have no bare Break/Continue
                     // that would target this loop (those would mis-target after
@@ -478,7 +617,7 @@ fn eliminate_dead_branches(
                         );
                     }
                 }
-                naga::Expression::Literal(naga::Literal::Bool(false)) => {
+                Some(naga::Literal::Bool(false)) => {
                     // `break if false` -> never breaks via break_if; drop it.
                     rebuilt.push(
                         naga::Statement::Loop {
@@ -502,7 +641,26 @@ fn eliminate_dead_branches(
                 }
             },
 
-            // Everything else: keep as-is
+            // Drop nested `Block(inner)` if recursion emptied it;
+            // mirrors the empty-If / empty-Switch eliminations
+            // above.  Without this an upstream fold that drains
+            // the body leaves a vacuous `{}` in the output.
+            naga::Statement::Block(inner) if inner.is_empty() => {
+                changed += 1;
+            }
+
+            // Non-empty Block: kept verbatim.  Explicit arm (vs
+            // catch-all) so a reader can see the empty-Block
+            // elision above doesn't accidentally swallow live blocks.
+            naga::Statement::Block(inner) => {
+                rebuilt.push(naga::Statement::Block(inner), span);
+            }
+
+            // Catch-all on a transform rewriter (not a walker): the
+            // safe default for an unknown statement variant is
+            // "preserve unchanged".  A future naga variant that
+            // warrants a dedicated transform must be added above; if
+            // none does, this keeps the pass sound.
             other => {
                 rebuilt.push(other, span);
             }
@@ -510,7 +668,7 @@ fn eliminate_dead_branches(
 
         // Step 3: if the last statement in `rebuilt` definitely terminates,
         // all remaining statements in the original block are dead.
-        if rebuilt.iter().last().is_some_and(definitely_terminates) {
+        if rebuilt.last().is_some_and(definitely_terminates) {
             let dead = total - processed;
             changed += dead;
             break;
@@ -547,16 +705,23 @@ fn definitely_terminates(stmt: &naga::Statement) -> bool {
         naga::Statement::Loop { body, .. } => {
             block_definitely_terminates(body) && !contains_bare_loop_control(body)
         }
-        // A switch only terminates the outer block when every non-fall-through
-        // case exits *beyond* the switch (Return/Kill/Continue) and a Default
-        // case exists.  A bare Break in a case exits the switch only -
-        // execution resumes after the switch - so Break is NOT sufficient.
-        // See case_body_terminates_beyond_switch.
+        // A switch terminates the outer block iff every non-
+        // fall-through case exits *beyond* the switch
+        // (Return/Kill/Continue), a Default case exists, AND the
+        // last case does NOT have `fall_through: true`.  A bare
+        // Break exits the switch only (resumes after it), so it
+        // does not qualify; see [`case_body_terminates_beyond_switch`].
+        // The last-case fall-through guard catches IR rebuilt by
+        // inlining / CSE - naga's frontend never emits this shape,
+        // but the rebuilders could; without the guard those switches
+        // mis-classify as terminating.
         naga::Statement::Switch { cases, .. } => {
+            let last_falls_through = cases.iter().last().is_some_and(|c| c.fall_through);
             cases
                 .iter()
                 .all(|c| c.fall_through || case_body_terminates_beyond_switch(&c.body))
                 && cases.iter().any(|c| c.value == naga::SwitchValue::Default)
+                && !last_falls_through
         }
         _ => false,
     }
@@ -564,7 +729,7 @@ fn definitely_terminates(stmt: &naga::Statement) -> bool {
 
 /// Returns `true` when the last statement of `block` definitely terminates.
 fn block_definitely_terminates(block: &naga::Block) -> bool {
-    block.iter().last().is_some_and(definitely_terminates)
+    block.last().is_some_and(definitely_terminates)
 }
 /// Returns `true` when a statement inside a switch case terminates control
 /// flow *beyond* the switch itself (i.e., exits the function or enclosing
@@ -576,7 +741,7 @@ fn block_definitely_terminates(block: &naga::Block) -> bool {
 /// `Continue` inside a switch-case-body-inside-a-loop does jump past the
 /// switch to the loop's continuing block, so it IS a beyond-switch terminator.
 fn case_body_terminates_beyond_switch(block: &naga::Block) -> bool {
-    block.iter().last().is_some_and(|stmt| match stmt {
+    block.last().is_some_and(|stmt| match stmt {
         naga::Statement::Return { .. } | naga::Statement::Kill | naga::Statement::Continue => true,
         // Break in a switch case exits the switch only.
         naga::Statement::Break => false,
@@ -592,25 +757,41 @@ fn case_body_terminates_beyond_switch(block: &naga::Block) -> bool {
         naga::Statement::Loop { body, .. } => {
             block_definitely_terminates(body) && !contains_bare_loop_control(body)
         }
-        // A nested switch only terminates beyond if all its cases do so.
+        // A nested switch only terminates beyond if all its cases do
+        // so AND the last case does not fall through.  See the
+        // identical reasoning on `definitely_terminates`'s Switch
+        // arm: a `fall_through: true` last case means execution
+        // falls past the (nonexistent) next case and out of the
+        // switch, which is Break-equivalent and therefore does NOT
+        // terminate beyond.  Without this gate, a nested switch
+        // wrapped in another switch case (or a function body using
+        // this predicate transitively) would mis-classify and let
+        // upstream dead-code elimination drop statements that
+        // execution can actually reach.
         naga::Statement::Switch { cases, .. } => {
+            let last_falls_through = cases.last().is_some_and(|c| c.fall_through);
             cases
                 .iter()
                 .all(|c| c.fall_through || case_body_terminates_beyond_switch(&c.body))
                 && cases.iter().any(|c| c.value == naga::SwitchValue::Default)
+                && !last_falls_through
         }
         _ => false,
     })
 }
 
 /// Try to resolve a switch selector expression to a concrete `SwitchValue`.
+///
+/// Consults `const_lits` so a selector that is `Expression::Constant(c)`
+/// (a named constant whose init is an integer literal) is also resolved.
 fn resolve_switch_value(
     handle: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
+    const_lits: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
 ) -> Option<naga::SwitchValue> {
-    match &expressions[handle] {
-        naga::Expression::Literal(naga::Literal::I32(v)) => Some(naga::SwitchValue::I32(*v)),
-        naga::Expression::Literal(naga::Literal::U32(v)) => Some(naga::SwitchValue::U32(*v)),
+    match resolve_to_literal(expressions, handle, const_lits)? {
+        naga::Literal::I32(v) => Some(naga::SwitchValue::I32(v)),
+        naga::Literal::U32(v) => Some(naga::SwitchValue::U32(v)),
         _ => None,
     }
 }
@@ -692,7 +873,28 @@ fn contains_bare_loop_control(block: &naga::Block) -> bool {
             }
             // Do NOT recurse into Loop - it captures both Break and Continue.
             naga::Statement::Loop { .. } => {}
-            _ => {}
+            // Leaf statements that cannot carry a bare Break / Continue
+            // and have no nested blocks.  Enumerated explicitly so a
+            // future naga release adding a new block-bearing variant
+            // breaks the build here instead of silently bypassing
+            // the loop-control detection.
+            naga::Statement::Emit(_)
+            | naga::Statement::Store { .. }
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Call { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
         }
     }
     false
@@ -726,7 +928,29 @@ fn contains_bare_continue(block: &naga::Block) -> bool {
             }
             // Loop captures Continue - do not recurse.
             naga::Statement::Loop { .. } => {}
-            _ => {}
+            // Leaf statements that cannot carry a bare Continue and
+            // have no nested blocks.  Enumerated explicitly so a
+            // future naga release adding a new block-bearing variant
+            // breaks the build here instead of silently missing a
+            // Continue that targets the enclosing loop.
+            naga::Statement::Emit(_)
+            | naga::Statement::Store { .. }
+            | naga::Statement::Break
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Call { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
         }
     }
     false
@@ -753,7 +977,29 @@ fn contains_bare_break(block: &naga::Block) -> bool {
             }
             // Both Loop and Switch capture Break - do not recurse.
             naga::Statement::Loop { .. } | naga::Statement::Switch { .. } => {}
-            _ => {}
+            // Leaf statements that cannot carry a bare Break and have
+            // no nested blocks.  Enumerated explicitly so a future
+            // naga release adding a new block-bearing variant breaks
+            // the build here instead of silently missing a Break
+            // that targets the enclosing Switch / Loop.
+            naga::Statement::Emit(_)
+            | naga::Statement::Store { .. }
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Call { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
         }
     }
     false
@@ -883,19 +1129,15 @@ fn eliminate_redundant_else_stores(
                 accept,
                 reject,
             } => {
-                // Scoped undo-log approach, semantically equivalent to the
-                // former clone-per-branch approach:
-                //   1. Snapshot the pre-if state.
-                //   2. Apply accept-branch condition narrowing; recurse.
-                //   3. Roll back recursion's mutations to get the accept
-                //      entry state, run the redundancy check.
-                //   4. Roll back to the pre-if state.
-                //   5. Apply reject-branch condition narrowing; recurse.
-                //   6. Roll back recursion's mutations to get the reject
-                //      entry state, run the redundancy check.
-                //   7. Roll back fully, then permanently remove any locals
-                //      modified in either branch (these removals are logged
-                //      for any outer scope's rollback).
+                // Per-branch scoped undo-log walk:
+                //   1. Snapshot pre-if state.
+                //   2. Apply accept-narrowing, recurse, roll back the
+                //      recursion's mutations to the post-narrowing
+                //      state, then run the redundancy check.
+                //   3. Roll back to pre-if state, repeat for reject.
+                //   4. Roll back fully, then permanently drop any
+                //      locals modified in either branch (logged for an
+                //      outer scope's rollback).
                 let cp_pre_if = known_values.checkpoint();
 
                 // Accept phase
@@ -1047,13 +1289,36 @@ fn eliminate_redundant_else_stores(
                 }
             }
 
-            naga::Statement::CooperativeStore { target, .. } => {
-                if let Some(lh) = get_stored_local(expressions, *target) {
+            naga::Statement::CooperativeStore { data, .. } => {
+                // `CooperativeStore { target, data }`: `data.pointer` is
+                // the validator-required STORE-space write destination;
+                // `target` is the matrix value being read.  Invalidate
+                // the local rooted at the write side.
+                if let Some(lh) = get_stored_local(expressions, data.pointer) {
                     known_values.remove(&lh);
                 }
             }
 
-            _ => {}
+            // Statements that neither modify known-value tracking nor
+            // contain nested blocks - enumerated explicitly so a
+            // future naga release adding a new pointer-bearing variant
+            // breaks the build here instead of silently leaving a
+            // known_values entry stale across the new statement type.
+            // `Emit` is in this group: it declares expressions but
+            // does not modify locals directly (only Stores do).
+            naga::Statement::Emit(_)
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. } => {}
         }
     }
 
@@ -1156,7 +1421,14 @@ fn expr_matches_known(
     }
 }
 
-/// Try to resolve an expression to a concrete `naga::Literal`.
+/// Resolve an expression to a concrete `naga::Literal`, or `None`
+/// when the value isn't known at compile time.
+///
+/// `Override` is omitted on purpose: its init is only a *default*
+/// that the pipeline can replace at draw time, so folding through it
+/// would let dead_branch erase code based on a value that changes
+/// post-compile.  `Constant` resolves through `const_lits`, which
+/// already filters out abstract literals upstream.
 fn resolve_to_literal(
     expressions: &naga::Arena<naga::Expression>,
     handle: naga::Handle<naga::Expression>,
@@ -1432,6 +1704,80 @@ fn fs(@location(0) v: f32) -> @location(0) vec4f {
 "#;
         let (changed, _) = run_pass(src);
         assert!(!changed);
+    }
+
+    // The constant-condition branch arm must also resolve
+    // `Expression::Constant(c)` whose init is a bool literal, not just
+    // raw `Literal::Bool` - otherwise a branch on a named `const X:
+    // bool = false;` slips past until const_fold has inlined it.
+    #[test]
+    fn eliminates_branch_with_const_bool_condition() {
+        let src = r#"
+const ENABLE_FEATURE: bool = false;
+
+@fragment
+fn fs() -> @location(0) vec4f {
+    if ENABLE_FEATURE {
+        return vec4f(1.0, 0.0, 0.0, 1.0);
+    }
+    return vec4f(0.0);
+}
+"#;
+        let (changed, module) = run_pass(src);
+        assert!(
+            changed,
+            "branch on const false-bool should be statically eliminated"
+        );
+        // The entry point's body should have no If statements; the
+        // dead `if ENABLE_FEATURE { ... }` branch should be removed.
+        let ep_body = &module.entry_points[0].function.body;
+        assert_eq!(
+            count_ifs(ep_body),
+            0,
+            "if/else on a const-bool selector must be eliminated"
+        );
+    }
+
+    #[test]
+    fn eliminates_switch_with_const_int_selector() {
+        let src = r#"
+const SELECTOR: i32 = 1;
+
+@fragment
+fn fs() -> @location(0) vec4f {
+    var v = 0.0;
+    switch SELECTOR {
+        case 0: { v = 1.0; }
+        case 1: { v = 2.0; }
+        default: { v = 3.0; }
+    }
+    return vec4f(v);
+}
+"#;
+        let (changed, module) = run_pass(src);
+        assert!(
+            changed,
+            "switch on const integer should be statically resolved"
+        );
+        // Walk the entry point looking for any Switch statement; there
+        // shouldn't be one (the matching case has been spliced in).
+        fn has_switch(block: &naga::Block) -> bool {
+            block.iter().any(|s| match s {
+                naga::Statement::Switch { .. } => true,
+                naga::Statement::Block(b) => has_switch(b),
+                naga::Statement::If { accept, reject, .. } => {
+                    has_switch(accept) || has_switch(reject)
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => has_switch(body) || has_switch(continuing),
+                _ => false,
+            })
+        }
+        assert!(
+            !has_switch(&module.entry_points[0].function.body),
+            "switch on const-int selector must be resolved away"
+        );
     }
 
     // Function (not just entry point)
@@ -2250,6 +2596,133 @@ fn fs(@location(0) v: f32) -> @location(0) vec4f {
         assert!(!changed, "no change when reject is already empty");
     }
 
+    /// Else-elision fires even when both arms terminate with
+    /// value-bearing returns - the saved `else{...}` scaffolding
+    /// outweighs the residual `if c { return v1; }`.  Gating on
+    /// `!reject.terminates` made the corpus strictly larger on
+    /// real shaders (e.g. `bug/tint/922.wgsl` lost 196 bytes); the
+    /// only collapse the elision misses is symmetric `return;` arms,
+    /// which we don't fold anyway.
+    #[test]
+    fn else_elision_fires_when_both_arms_return_values() {
+        let src = r#"
+@fragment
+fn fs(@location(0) v: f32) -> @location(0) vec4f {
+    if v > 0.5 { return vec4f(1.0); } else { return vec4f(0.0); }
+}
+"#;
+        let (changed, module) = run_pass(src);
+        assert!(
+            changed,
+            "else-elision should fire even when both arms terminate \
+             (value-bearing returns still save the `else{{}}` overhead)"
+        );
+        let body = &module.entry_points[0].function.body;
+        assert_eq!(
+            count_non_empty_rejects(body),
+            0,
+            "reject block must be hoisted out even when it terminates - \
+             the resulting `if c {{ return v1; }} return v2;` is shorter \
+             than `if c {{ return v1; }} else {{ return v2; }}`"
+        );
+    }
+
+    /// Nested `Block(empty)` (either authored `{ }` or one drained
+    /// by an upstream fold) must be dropped after recursion; otherwise
+    /// a vacuous `{}` leaks into the output.
+    #[test]
+    fn empty_nested_block_is_dropped() {
+        // WGSL source has no syntax for a bare nested `{ }` inside
+        // a function body, so build the IR directly.
+        let mut module = naga::Module::default();
+        let f32_ty = module.types.insert(
+            naga::Type {
+                name: None,
+                inner: naga::TypeInner::Scalar(naga::Scalar::F32),
+            },
+            naga::Span::UNDEFINED,
+        );
+        let bool_ty = module.types.insert(
+            naga::Type {
+                name: None,
+                inner: naga::TypeInner::Scalar(naga::Scalar::BOOL),
+            },
+            naga::Span::UNDEFINED,
+        );
+        let _ = f32_ty; // silence unused if naga ever changes the API
+
+        let mut func = naga::Function::default();
+        func.arguments.push(naga::FunctionArgument {
+            name: Some("c".to_string()),
+            ty: bool_ty,
+            binding: None,
+        });
+        let cond = func
+            .expressions
+            .append(naga::Expression::FunctionArgument(0), naga::Span::UNDEFINED);
+        // The accept block holds a single Block(empty) - exactly the
+        // shape the elision targets.
+        let mut accept = naga::Block::new();
+        accept.push(
+            naga::Statement::Block(naga::Block::new()),
+            naga::Span::UNDEFINED,
+        );
+        func.body.push(
+            naga::Statement::If {
+                condition: cond,
+                accept,
+                reject: naga::Block::new(),
+            },
+            naga::Span::UNDEFINED,
+        );
+        module.functions.append(func, naga::Span::UNDEFINED);
+
+        // Pre-condition: the hand-built input must satisfy naga's
+        // validator.  Without this, a stricter future validator would
+        // silently turn this into an invalid-IR exercise.
+        crate::io::validate_module(&module)
+            .expect("hand-built input must satisfy naga's validator");
+
+        let mut pass = DeadBranchPass;
+        let config = Config::default();
+        let ctx = PassContext {
+            config: &config,
+            trace_run_dir: None,
+        };
+        let changed = pass.run(&mut module, &ctx).expect("pass should run");
+        assert!(
+            changed,
+            "empty nested Block elision must report `changed = true`"
+        );
+
+        // Post-condition every IR pass must uphold.
+        crate::io::validate_module(&module).expect("module must remain valid after the elision");
+
+        // Walk the resulting body and verify no `Block(empty)` remains.
+        fn contains_empty_block(block: &naga::Block) -> bool {
+            block.iter().any(|stmt| match stmt {
+                naga::Statement::Block(inner) if inner.is_empty() => true,
+                naga::Statement::Block(inner) => contains_empty_block(inner),
+                naga::Statement::If { accept, reject, .. } => {
+                    contains_empty_block(accept) || contains_empty_block(reject)
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    cases.iter().any(|c| contains_empty_block(&c.body))
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => contains_empty_block(body) || contains_empty_block(continuing),
+                _ => false,
+            })
+        }
+
+        let (_, f) = module.functions.iter().next().unwrap();
+        assert!(
+            !contains_empty_block(&f.body),
+            "empty Block(_) statements must be elided after the pass"
+        );
+    }
+
     // MARK: Generalized redundant store elimination tests
 
     #[test]
@@ -2383,5 +2856,271 @@ fn f(a: bool) -> i32 {
             .filter(|s| matches!(s, naga::Statement::Store { .. }))
             .count();
         assert!(store_count >= 1, "stores after switch must not be removed");
+    }
+
+    // MARK: Switch fall-through edge in definitely_terminates
+    //
+    // Round-3 review flagged that the `definitely_terminates` fix
+    // for the case `cases.last().fall_through == true` had no
+    // regression test because the unsafe shape can't be produced via
+    // a WGSL source - naga's frontend never emits a final case with
+    // `fall_through: true`.  Hand-build the IR directly to assert
+    // the fix's behaviour.
+
+    /// Build a single-Default-case `Switch` whose body terminates.
+    /// Helper for the fall-through tests below.
+    fn build_terminating_default_switch(fall_through: bool) -> naga::Statement {
+        let mut body = naga::Block::new();
+        body.push(
+            naga::Statement::Return { value: None },
+            naga::Span::UNDEFINED,
+        );
+        naga::Statement::Switch {
+            // Selector handle is irrelevant - `definitely_terminates`
+            // looks only at the case structure.  We construct a fake
+            // expression arena just to obtain one Handle.
+            selector: {
+                let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
+                arena.append(
+                    naga::Expression::Literal(naga::Literal::U32(0)),
+                    naga::Span::UNDEFINED,
+                )
+            },
+            cases: vec![naga::SwitchCase {
+                value: naga::SwitchValue::Default,
+                body,
+                fall_through,
+            }],
+        }
+    }
+
+    #[test]
+    fn switch_with_default_terminator_and_no_fallthrough_definitely_terminates() {
+        let stmt = build_terminating_default_switch(/*fall_through=*/ false);
+        assert!(
+            definitely_terminates(&stmt),
+            "Default case with terminating body and no fall-through must terminate"
+        );
+    }
+
+    #[test]
+    fn switch_with_last_case_fallthrough_does_not_terminate() {
+        // The fall_through-on-last-case shape is the regression
+        // target: fall-through past the last case is Break-equivalent
+        // (execution resumes after the switch), so the switch as a
+        // whole does NOT terminate the outer block.  naga's WGSL
+        // frontend won't emit this shape, but the inliner / CSE
+        // could, and the previous version of `definitely_terminates`
+        // would have mis-classified it as terminating.
+        let stmt = build_terminating_default_switch(/*fall_through=*/ true);
+        assert!(
+            !definitely_terminates(&stmt),
+            "last-case fall-through must not classify the switch as terminating \
+             (fall-through past the last case is Break-equivalent and execution \
+             resumes after the switch)"
+        );
+    }
+
+    /// `break if NAMED_CONST` must fold the same sweep as `if
+    /// NAMED_CONST` / `switch NAMED_CONST` - all three flow through
+    /// `resolve_to_literal`.  Pre-fix the break_if arm only matched
+    /// raw `Expression::Literal`, so the fold lagged until
+    /// `const_fold` inlined the constant on a later sweep.
+    #[test]
+    fn break_if_with_named_const_true_unwraps_loop() {
+        let src = r#"
+            const STOP: bool = true;
+            fn f() -> i32 {
+                var i: i32 = 0;
+                loop {
+                    i = i + 1;
+                    continuing {
+                        break if STOP;
+                    }
+                }
+                return i;
+            }
+            @compute @workgroup_size(1) fn main() { _ = f(); }
+        "#;
+        let (changed, module) = run_pass(src);
+        assert!(
+            changed,
+            "break_if with a named-const-true selector must unwrap the loop"
+        );
+        // Confirm the loop is gone in the helper function.
+        let helper = module
+            .functions
+            .iter()
+            .find(|(_, f)| f.name.as_deref() == Some("f"))
+            .expect("helper function `f` survives the pass");
+        fn has_loop(block: &naga::Block) -> bool {
+            block.iter().any(|stmt| match stmt {
+                naga::Statement::Loop { .. } => true,
+                naga::Statement::Block(inner) => has_loop(inner),
+                naga::Statement::If { accept, reject, .. } => has_loop(accept) || has_loop(reject),
+                naga::Statement::Switch { cases, .. } => cases.iter().any(|c| has_loop(&c.body)),
+                _ => false,
+            })
+        }
+        assert!(
+            !has_loop(&helper.1.body),
+            "loop with `break if true` selector must have been unwrapped"
+        );
+    }
+
+    /// `break if true` must not unwrap a loop whose body has a bare
+    /// `break`/`continue` targeting that loop - unwrapping would
+    /// re-target the bare statement at the surrounding scope.  The
+    /// `contains_bare_loop_control` guard must also fire on
+    /// named-const-true selectors, not just literal `true`.
+    #[test]
+    fn break_if_with_named_const_true_preserves_loop_with_bare_break() {
+        let src = r#"
+            const STOP: bool = true;
+            fn f(c: bool) -> i32 {
+                var i: i32 = 0;
+                loop {
+                    i = i + 1;
+                    if c {
+                        break;
+                    }
+                    continuing {
+                        break if STOP;
+                    }
+                }
+                return i;
+            }
+            @compute @workgroup_size(1) fn main() { _ = f(true); }
+        "#;
+        let (_, module) = run_pass(src);
+        fn has_loop(block: &naga::Block) -> bool {
+            block.iter().any(|stmt| match stmt {
+                naga::Statement::Loop { .. } => true,
+                naga::Statement::Block(inner) => has_loop(inner),
+                naga::Statement::If { accept, reject, .. } => has_loop(accept) || has_loop(reject),
+                naga::Statement::Switch { cases, .. } => cases.iter().any(|c| has_loop(&c.body)),
+                _ => false,
+            })
+        }
+        let helper = module
+            .functions
+            .iter()
+            .find(|(_, f)| f.name.as_deref() == Some("f"))
+            .expect("helper function `f` survives the pass");
+        assert!(
+            has_loop(&helper.1.body),
+            "loop with bare `break` in body must NOT be unwrapped even when \
+             `break if STOP` selects a named-const-true (the bare break would \
+             mis-target the surrounding scope after splice)"
+        );
+    }
+
+    /// Counterpart: a `const NEVER: bool = false;` selector must
+    /// rewrite the loop's `break_if` to `None` (the loop is
+    /// non-terminating via that path but otherwise preserved).
+    #[test]
+    fn break_if_with_named_const_false_drops_break_if() {
+        let src = r#"
+            const NEVER: bool = false;
+            fn f() -> i32 {
+                var i: i32 = 0;
+                loop {
+                    i = i + 1;
+                    if i > 10 {
+                        break;
+                    }
+                    continuing {
+                        break if NEVER;
+                    }
+                }
+                return i;
+            }
+            @compute @workgroup_size(1) fn main() { _ = f(); }
+        "#;
+        let (changed, module) = run_pass(src);
+        assert!(
+            changed,
+            "break_if with a named-const-false selector must be dropped"
+        );
+        // Confirm the surviving loop has no break_if.
+        fn first_loop_break_if(
+            block: &naga::Block,
+        ) -> Option<Option<naga::Handle<naga::Expression>>> {
+            for stmt in block.iter() {
+                match stmt {
+                    naga::Statement::Loop { break_if, .. } => return Some(*break_if),
+                    naga::Statement::Block(inner) => {
+                        if let Some(bi) = first_loop_break_if(inner) {
+                            return Some(bi);
+                        }
+                    }
+                    naga::Statement::If { accept, reject, .. } => {
+                        if let Some(bi) = first_loop_break_if(accept) {
+                            return Some(bi);
+                        }
+                        if let Some(bi) = first_loop_break_if(reject) {
+                            return Some(bi);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        let helper = module
+            .functions
+            .iter()
+            .find(|(_, f)| f.name.as_deref() == Some("f"))
+            .expect("helper function `f` survives the pass");
+        let bi = first_loop_break_if(&helper.1.body)
+            .expect("loop should survive (only the break_if is dropped)");
+        assert!(
+            bi.is_none(),
+            "break_if with a named-const-false selector must be rewritten to None"
+        );
+    }
+
+    /// Same fall-through gate must apply at the NESTED level via
+    /// `case_body_terminates_beyond_switch`.  Build an outer switch
+    /// whose default case body contains *another* switch whose last
+    /// case falls through.  The inner switch falls past its cases
+    /// (Break-equivalent), so the OUTER switch's default case body
+    /// does NOT terminate beyond the switch - it falls through to
+    /// whatever the outer block does after the switch.
+    ///
+    /// Pre-fix: `case_body_terminates_beyond_switch` missed the
+    /// `!last_falls_through` gate and would classify the outer
+    /// switch's case body as terminating, letting upstream callers
+    /// drop reachable statements after the outer switch.
+    #[test]
+    fn nested_switch_with_last_case_fallthrough_does_not_terminate_beyond() {
+        let inner = build_terminating_default_switch(/*fall_through=*/ true);
+        let mut outer_body = naga::Block::new();
+        outer_body.push(inner, naga::Span::UNDEFINED);
+        // The outer switch wraps the inner switch in its default case.
+        // If `case_body_terminates_beyond_switch` correctly applies
+        // the fall-through gate to nested switches, the outer switch
+        // should NOT be classified as terminating either.
+        let outer = naga::Statement::Switch {
+            selector: {
+                let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
+                arena.append(
+                    naga::Expression::Literal(naga::Literal::U32(0)),
+                    naga::Span::UNDEFINED,
+                )
+            },
+            cases: vec![naga::SwitchCase {
+                value: naga::SwitchValue::Default,
+                body: outer_body,
+                fall_through: false,
+            }],
+        };
+        assert!(
+            !definitely_terminates(&outer),
+            "nested switch whose inner switch has last-case fall-through must \
+             propagate that non-termination through \
+             `case_body_terminates_beyond_switch`, NOT classify the outer \
+             switch as terminating"
+        );
     }
 }

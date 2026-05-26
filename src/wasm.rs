@@ -5,6 +5,15 @@
 //! the pipeline runs unchanged, and [`crate::pipeline::Report`] is
 //! projected back to a plain JS object.  TypeScript declarations for
 //! the wire types live in the `TS_TYPES` block at the bottom of the file.
+//!
+//! Only useful when compiled for the wasm32 target: the `wasm-bindgen`
+//! ABI emits intrinsics that are linker errors on native.  `lib.rs`
+//! already gates this module behind `cfg(feature = "wasm")`, but
+//! belt-and-suspenders the same gate on `target_arch = "wasm32"`
+//! here so a user who toggles the feature on for a native build gets
+//! a graceful skip rather than the mysterious wasm-bindgen linker
+//! errors.
+#![cfg(target_arch = "wasm32")]
 
 use wasm_bindgen::prelude::*;
 
@@ -76,18 +85,30 @@ fn require_u8(v: f64, key: &str) -> Result<u8, JsError> {
     Ok(v as u8)
 }
 
-/// Decode a JS number as a `usize`, capped at `2^53`.
+/// Decode a JS number as a `usize`, capped at `min(2^53, usize::MAX)`.
 ///
 /// JavaScript numbers are IEEE-754 doubles and can represent integers
 /// exactly only up to 2^53; values past that threshold silently lose
-/// precision when cast to `usize`.  The cap is deliberately tighter
-/// than `usize::MAX` (which itself is not exactly representable as
-/// `f64`) so callers see a crisp error instead of a latent wrap.
+/// precision when cast to `usize`.  On wasm32 the platform `usize` is
+/// `u32`, so an additional cap at `usize::MAX` is required - without
+/// it, `v as usize` performs a saturating cast (Rust 1.45+) and any
+/// `u32::MAX < v <= 2^53` silently clamps to `u32::MAX` rather than
+/// erroring.  The cap chosen below picks whichever bound is tighter
+/// for the build target so callers always see a crisp error instead
+/// of a latent wrap or silent clamp.
 fn require_usize(v: f64, key: &str) -> Result<usize, JsError> {
-    const MAX_SAFE: f64 = (1u64 << 53) as f64; // 9_007_199_254_740_992
-    if v.is_nan() || !(0.0..=MAX_SAFE).contains(&v) || v.fract() != 0.0 {
+    const MAX_SAFE_F64: f64 = (1u64 << 53) as f64; // 9_007_199_254_740_992
+    // Compare in `u128` so the bound choice is exact: `usize::MAX as f64`
+    // rounds on native 64-bit (u64::MAX has no exact f64 representation),
+    // which would skew a direct f64 comparison.
+    let max = if (usize::MAX as u128) < (1u128 << 53) {
+        usize::MAX as f64
+    } else {
+        MAX_SAFE_F64
+    };
+    if v.is_nan() || !(0.0..=max).contains(&v) || v.fract() != 0.0 {
         return Err(JsError::new(&format!(
-            "\"{key}\" must be a non-negative integer, got {v}"
+            "\"{key}\" must be a non-negative integer in 0..={max}, got {v}"
         )));
     }
     Ok(v as usize)

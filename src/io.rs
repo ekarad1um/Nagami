@@ -25,8 +25,17 @@ pub fn parse_wgsl_with_path(source: &str, path: &str) -> Result<naga::Module, Er
 }
 
 /// Validate `module` with all validation flags and capabilities enabled.
-/// Use this when the caller has no original source text to annotate; the
-/// returned error carries naga's default string rendering.
+/// Use this when the caller has no original source text to annotate;
+/// the returned error carries naga's default string rendering.
+///
+/// `Capabilities::all()` is permissive on purpose: this validator
+/// runs after every pass to confirm IR-level structural soundness,
+/// not to certify backend compatibility.  A module that uses, e.g.,
+/// ray-query types validates here but may still be rejected by a
+/// downstream backend that lacks the matching capability bit.  The
+/// minifier's job is to preserve the IR's expressive surface; the
+/// caller is responsible for matching backend capabilities to the
+/// shader's actual feature use.
 pub fn validate_module(module: &naga::Module) -> Result<naga::valid::ModuleInfo, Error> {
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),

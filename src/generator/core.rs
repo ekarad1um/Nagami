@@ -118,6 +118,11 @@ pub(super) struct Generator<'a> {
     /// Pre-computed type layouts used when reconstructing `@size` and
     /// `@align` attributes on struct members.
     pub(super) layouter: naga::proc::Layouter,
+    /// `true` when `layouter` holds an entry for every type in the
+    /// arena.  Indexing it for a missing type panics, so emission
+    /// paths that depend on layout (e.g., `@align`/`@size`
+    /// reconstruction) must check this and refuse to emit on `false`.
+    pub(super) layouter_complete: bool,
     /// Cached per-function analyses: ref counts plus the live
     /// (in-`Emit`-range) bitmap, indexed `[0..N)` for regular
     /// functions and `[N..N+E)` for entry points.  Both halves are
@@ -365,10 +370,8 @@ fn collect_const_refs_in_global_expr(
 ) {
     use naga::Expression as E;
     match &module.global_expressions[expr_h] {
-        E::Constant(h) => {
-            if live.insert(*h) {
-                collect_const_refs_in_global_expr(module.constants[*h].init, module, live);
-            }
+        E::Constant(h) if live.insert(*h) => {
+            collect_const_refs_in_global_expr(module.constants[*h].init, module, live);
         }
         E::Compose { components, .. } => {
             for c in components {
@@ -691,37 +694,56 @@ impl<'a> Generator<'a> {
         let mut type_names = HashMap::new();
         let mut member_names = HashMap::new();
 
-        // Pre-compute the set of naga predeclared-type handles
-        // (AtomicCompareExchangeWeakResult, ModfResult, FrexpResult).
-        // Their struct names and member names must never be mangled: WGSL
-        // code accesses the members by canonical names (`.old_value`,
-        // `.exchanged`, `.fract`, `.whole`, `.exp`) and there is no struct
-        // declaration emitted for them, so a mangled accessor would produce
-        // invalid WGSL (e.g. "invalid field accessor 'B'").
-        let predeclared_type_handles: std::collections::HashSet<naga::Handle<naga::Type>> = module
-            .special_types
-            .predeclared_types
-            .values()
-            .copied()
+        // naga predeclared / special types must never have their
+        // struct or member names mangled: their members are accessed
+        // through canonical names (`.old_value`, `.exchanged`,
+        // `.fract`, `.whole`, `.exp`, `.kind`, `.t`,
+        // `.barycentrics`, ...) and `module_emit::generate_module`
+        // emits no declaration for them, so a mangled accessor
+        // produces invalid WGSL.  Mirror the exact set
+        // `module_emit::generate_module` skips at declaration time -
+        // `ray_desc`, `ray_intersection`, `ray_vertex_return`,
+        // `external_texture_params`,
+        // `external_texture_transfer_function`, plus every
+        // `predeclared_types` entry.
+        let predeclared_type_handles: std::collections::HashSet<naga::Handle<naga::Type>> = {
+            let st = &module.special_types;
+            let mut set: std::collections::HashSet<_> = [
+                st.ray_desc,
+                st.ray_intersection,
+                st.ray_vertex_return,
+                st.external_texture_params,
+                st.external_texture_transfer_function,
+            ]
+            .iter()
+            .filter_map(|h| *h)
             .collect();
+            set.extend(st.predeclared_types.values().copied());
+            set
+        };
 
         for (h, ty) in module.types.iter() {
             if let naga::TypeInner::Struct { members, .. } = &ty.inner {
                 // `RayDesc` is a WGSL predeclared type for the ray-tracing extension.
                 // Its member names must be preserved so that the constructor
                 // `RayDesc(flags, cull_mask, ...)` remains valid, and no struct
-                // declaration is emitted for it.
+                // declaration is emitted for it.  Now also covered by
+                // `predeclared_type_handles` above, but the name-based
+                // check is kept as a fallback for IRs where
+                // `special_types.ray_desc` is not populated.
                 let is_ray_descriptor = ty.name.as_deref() == Some("RayDesc");
 
-                // All naga-internal synthetic result structs (AtomicCmpExch,
-                // Modf, Frexp) live in `predeclared_types`.
+                // All naga special/predeclared structs (AtomicCmpExch,
+                // Modf, Frexp, RayDesc, RayIntersection, ...) live in
+                // the combined set above.
                 let is_predeclared = predeclared_type_handles.contains(&h);
 
                 if mangle {
                     // Keep predeclared struct type/member names stable.
                     // Their field accessors must match the canonical WGSL names:
                     // `.old_value`/`.exchanged` for atomicCompareExchangeWeak,
-                    // `.fract`/`.whole` for modf, `.fract`/`.exp` for frexp.
+                    // `.fract`/`.whole` for modf, `.fract`/`.exp` for frexp,
+                    // `.kind`/`.t`/`.barycentrics`/... for RayIntersection.
                     if is_predeclared || is_ray_descriptor {
                         type_names.insert(
                             h,
@@ -879,17 +901,13 @@ impl<'a> Generator<'a> {
         };
 
         let mut layouter = naga::proc::Layouter::default();
-        // Layout failure is non-fatal: the module already passed
-        // naga validation, so its types are structurally sound; an
-        // error from the layouter just means it could not compute a
-        // numeric size/alignment for one of them (e.g., a runtime-
-        // sized array tail).  `generate_struct` tolerates missing
-        // layout entries by falling back to an explicit `@size`
-        // attribute on the affected member.  Surfacing the error here
-        // would require threading `Result` through every call site
-        // of `Generator::new`, which is not justified for a fallback
-        // that already produces correct (if less compact) output.
-        let _ = layouter.update(module.to_ctx());
+        // `Layouter::update` returns on the first un-layoutable type and
+        // leaves every later type's slot unpopulated; indexing such a
+        // slot panics.  Capture success so downstream emission can bail
+        // gracefully on partial state.  Triggers in practice are rare
+        // (overflowingly-large arrays, type-arena cycles) but a rare
+        // panic is still a panic.
+        let layouter_complete = layouter.update(module.to_ctx()).is_ok();
 
         let live_constants = compute_live_constants(module, &options.preserve_symbols);
         let live_types = compute_live_types(module, &live_constants);
@@ -935,33 +953,46 @@ impl<'a> Generator<'a> {
             //   beautify: "alias <name> = <type>;\n" -> 6 + 3 + 2 = 11 fixed chars
             let fixed_overhead: usize = if options.beautify { 11 } else { 8 };
 
+            // `UniqueArena<Type>` deduplicates by the full `Type`
+            // (name included), so the same `TypeInner` can appear under
+            // multiple handles when the source mixes bare types with
+            // named aliases.  Group by inner once so the candidate loop
+            // is O(N) instead of O(N^2):
+            //   * `canonical[h]`           = arena-first handle in h's group.
+            //   * `group_ref_count[head]`  = sum of `ref_counts` over the group.
+            let mut canonical: HashMap<naga::Handle<naga::Type>, naga::Handle<naga::Type>> =
+                HashMap::with_capacity(module.types.len());
+            let mut inner_to_first: HashMap<&naga::TypeInner, naga::Handle<naga::Type>> =
+                HashMap::with_capacity(module.types.len());
+            for (h, ty) in module.types.iter() {
+                let first = *inner_to_first.entry(&ty.inner).or_insert(h);
+                canonical.insert(h, first);
+            }
+            let mut group_ref_count: HashMap<naga::Handle<naga::Type>, usize> =
+                HashMap::with_capacity(inner_to_first.len());
+            for (h, _) in module.types.iter() {
+                let first = canonical[&h];
+                *group_ref_count.entry(first).or_insert(0) +=
+                    ref_counts.get(&h).copied().unwrap_or(0);
+            }
+
             for (h, ty) in module.types.iter() {
                 // Structs already have short names in type_names.
                 if type_names.contains_key(&h) {
                     continue;
                 }
 
-                // If another handle with the same TypeInner already received
-                // an alias, reuse it (naga's UniqueArena may hold duplicate
-                // handles when the source mixes bare types with named aliases).
-                if let Some(existing) = module.types.iter().find_map(|(h2, ty2)| {
-                    (h2 != h && ty2.inner == ty.inner)
-                        .then(|| type_names.get(&h2).cloned())
-                        .flatten()
-                }) {
+                // If another handle in the same inner-equality group has
+                // already received an alias, reuse it.
+                let group_head = canonical[&h];
+                if h != group_head
+                    && let Some(existing) = type_names.get(&group_head).cloned()
+                {
                     type_names.insert(h, existing);
                     continue;
                 }
 
-                // Sum ref counts across ALL handles with the same TypeInner.
-                // naga may create multiple handles for identical inners when
-                // the source mixes bare types with named aliases.
-                let count: usize = module
-                    .types
-                    .iter()
-                    .filter(|(_, ty2)| ty2.inner == ty.inner)
-                    .map(|(h2, _)| ref_counts.get(&h2).copied().unwrap_or(0))
-                    .sum();
+                let count = group_ref_count.get(&group_head).copied().unwrap_or(0);
                 if count == 0 {
                     continue;
                 }
@@ -1016,6 +1047,7 @@ impl<'a> Generator<'a> {
             live_constants,
             live_types,
             layouter,
+            layouter_complete,
             ref_count_cache: Vec::new(),
             tok_separator,
             tok_assign,

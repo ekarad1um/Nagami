@@ -62,6 +62,53 @@ fn switch_u32_case_has_suffix() {
     assert_valid_wgsl(&out);
 }
 
+/// Regression: when the switch selector is itself a literal (rare
+/// but legal naga IR), the emitted selector must carry a type
+/// suffix that matches the case-label suffix.  Pre-fix the generic
+/// `emit_expr` path would emit a bare `0` for `Literal::U32(0)` while
+/// the case label emitted `0u`, producing `switch 0 { case 0u: ... }`
+/// which naga rejects on selector/case-value type mismatch.
+#[test]
+fn switch_with_literal_u32_selector_matches_case_suffix() {
+    let src = r#"
+            fn f() -> u32 {
+                var r = 0u;
+                switch 0u {
+                    case 0u: { r = 1u; }
+                    default: { r = 2u; }
+                }
+                return r;
+            }
+            @compute @workgroup_size(1) fn main() { _ = f(); }
+        "#;
+    let out = compact(src);
+    // The emitted selector must carry the `u` suffix.  If it emitted
+    // bare `switch 0`, naga's parser would reject the output on the
+    // round-trip check inside `assert_valid_wgsl`.
+    assert!(
+        out.contains("switch 0u"),
+        "literal-selector u32 switch must emit selector with `u` suffix: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn switch_with_literal_i32_selector_matches_case_suffix() {
+    let src = r#"
+            fn f() -> i32 {
+                var r = 0i;
+                switch 0i {
+                    case 0: { r = 1i; }
+                    default: { r = 2i; }
+                }
+                return r;
+            }
+            @compute @workgroup_size(1) fn main() { _ = f(); }
+        "#;
+    let out = compact(src);
+    assert_valid_wgsl(&out);
+}
+
 #[test]
 fn switch_coalesced_cases_roundtrip() {
     let src = r#"

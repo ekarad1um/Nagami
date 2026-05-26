@@ -69,8 +69,9 @@ struct Args {
 
     #[arg(
         long,
-        conflicts_with_all = ["output", "in_place"],
-        help = "Exit with status 1 if minification would change the input."
+        conflicts_with_all = ["output", "in_place", "trace", "trace_dir", "validate_each_pass"],
+        help = "Exit with status 1 if minification would change the input. \
+                Read-only - no output, trace, or validation side effects."
     )]
     check: bool,
 
@@ -189,6 +190,30 @@ fn run_cli() -> Result<bool, Box<dyn std::error::Error>> {
         .into());
     }
 
+    // Refuse `--in-place` against an input that is also the preamble:
+    // we would parse the user's source, strip the preamble's
+    // declarations from the output, then overwrite the same file with
+    // the preamble-less result - silently deleting the user's
+    // preamble decls.  Comparing canonicalised paths catches both
+    // exact matches and resolves `./foo.wgsl` vs `foo.wgsl`.
+    if args.in_place
+        && let Some(preamble_path) = args.preamble.as_ref()
+    {
+        let same = std::fs::canonicalize(&args.input).ok().and_then(|input_c| {
+            std::fs::canonicalize(preamble_path)
+                .ok()
+                .map(|pre_c| input_c == pre_c)
+        });
+        if same == Some(true) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--in-place cannot be used when --preamble points at the same file as input \
+                 (the rewrite would delete the preamble's declarations)",
+            )
+            .into());
+        }
+    }
+
     let input = read_input(&args.input)
         .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", args.input.display())))?;
 
@@ -291,10 +316,18 @@ fn write_output(path: &Path, content: &str) -> Result<(), io::Error> {
 /// the new contents at every observable moment - never a truncated or
 /// half-written intermediate.
 ///
-/// Falls back to a plain `fs::write` if the temp file cannot be
-/// created in the destination directory (e.g., a read-only parent
-/// or an unusual filesystem) so `--in-place` still functions in
-/// degraded mode, just without the atomicity guarantee.
+/// Errors during temp-file creation, write, or rename are surfaced
+/// to the caller verbatim - there is no non-atomic direct-write
+/// fallback.  A fallback would non-atomically overwrite the user's
+/// input on exactly the failures (ENOSPC mid-write, EACCES on the
+/// parent directory, ENOTSUP on the FS) the atomic write defends
+/// against, defeating the invariant.  Surfacing the error up front
+/// keeps the user's existing file intact.
+///
+/// Temp filenames are salted with pid + nanos and opened with
+/// `create_new`, so two concurrent invocations cannot share or
+/// silently clobber each other's staged content even if their
+/// timestamps collide.
 fn write_atomic(path: &Path, content: &str) -> Result<(), io::Error> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let file_name = path
@@ -303,9 +336,9 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), io::Error> {
     let pid = std::process::id();
     // Salt with pid + nanos to keep concurrent invocations from
     // colliding on the same temp name without pulling in a tempfile
-    // dependency.  Worst case the timestamp races, in which case the
-    // create fails with `AlreadyExists` and we surface that to the
-    // caller; the rename never overwrites a different process's temp.
+    // dependency.  `create_new` below guarantees we never overwrite
+    // an existing temp; on collision we surface `AlreadyExists` so
+    // the caller can retry or report.
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -317,25 +350,43 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), io::Error> {
         None => PathBuf::from(&tmp_name),
     };
 
-    match fs::write(&tmp_path, content) {
-        Ok(()) => {}
-        Err(_) => {
-            // Could not stage in the destination directory; fall back
-            // to a non-atomic direct write so `--in-place` still
-            // succeeds on read-only-parent setups, accepting the
-            // crash-corruption risk for that one degraded path.
-            return fs::write(path, content);
+    // Open with create_new so the open fails with `AlreadyExists` on
+    // collision rather than silently truncating another process's
+    // staged file.  Drop the file handle before rename so Windows
+    // can unlink the source.  The stage-and-rename block runs inside
+    // a closure so every error path (open / write_all / sync_all /
+    // rename) routes through the same best-effort cleanup of the
+    // staged temp file; otherwise a mid-write failure would leave a
+    // `.nagami-tmp-*` file alongside the input.
+    let result: io::Result<()> = (|| {
+        {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            file.write_all(content.as_bytes())?;
+            // Propagate `sync_all` errors so ENOSPC-at-flush is
+            // surfaced to the caller.  Page-cache writes succeed even
+            // when the underlying device is out of space; ENOSPC then
+            // shows up on `sync_all`, and if we swallow it the
+            // subsequent `rename` succeeds on a file whose contents
+            // never reached the disk - a power loss immediately after
+            // would leave the user with a renamed-but-torn file and
+            // no error signal.  On filesystems where `sync_all` is a
+            // no-op (most modern filesystems return success), this
+            // costs nothing; on filesystems where it spuriously
+            // fails, the user gets a clear durability error rather
+            // than silent data loss.
+            file.sync_all()?;
         }
+        fs::rename(&tmp_path, path)
+    })();
+    if result.is_err() {
+        // Best-effort cleanup; ignored if the temp was never
+        // created (open failed) or already moved (rename succeeded).
+        let _ = fs::remove_file(&tmp_path);
     }
-    match fs::rename(&tmp_path, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Best-effort cleanup of the staged file so a failed
-            // rename doesn't leave a stray turd alongside the input.
-            let _ = fs::remove_file(&tmp_path);
-            Err(e)
-        }
-    }
+    result
 }
 
 /// Print a human-readable byte-delta summary to stderr.  Handles the
@@ -369,5 +420,23 @@ fn print_summary(report: &nagami::pipeline::Report) {
             "Minified: {} -> {} bytes (grew by {} bytes, +{:.2}%, {} passes)",
             input, output, growth, pct, passes
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Run clap's internal `debug_assert` on the derived `Args`
+    /// command so arg-name drift in `conflicts_with` / `requires`
+    /// lists is caught at test time instead of at user-invocation
+    /// time.  Without this guard, renaming a field (e.g. `trace_dir`
+    /// -> `trace_dump_dir`) without updating every conflict list that
+    /// mentions it would compile fine and only panic when a user ran
+    /// `nagami --check --trace-dir /x`.
+    #[test]
+    fn args_command_definition_is_internally_consistent() {
+        Args::command().debug_assert();
     }
 }

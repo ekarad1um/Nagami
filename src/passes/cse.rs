@@ -68,7 +68,16 @@ enum CseKey {
     Swizzle {
         size: naga::VectorSize,
         vector: naga::Handle<naga::Expression>,
-        // Stored as `[u8; 4]` because `SwizzleComponent` lacks `Hash`.
+        // Stored as `[u8; 4]` because `SwizzleComponent` lacks `Hash`
+        // and there are only four lanes.  The `as u8` cast at the
+        // construction site is safe because naga's `SwizzleComponent`
+        // is `#[repr(u8)]` with discriminants 0..=3 (X / Y / Z / W)
+        // - verified against `naga::ir::SwizzleComponent` in naga
+        // 29.0.x.  The cast is therefore an identity on the
+        // discriminant byte.  If a future naga release adds a fifth
+        // discriminant we still fit in `u8`; any mismatch would
+        // surface as a CSE-key miss (different pattern -> different
+        // key) rather than a wrong-result fold.
         pattern: [u8; 4],
     },
     Unary {
@@ -417,23 +426,43 @@ fn collect_cse_replacements(
                 collect_cse_replacements(inner, expressions, cse_map, replacements);
             }
 
-            _ => {}
+            // Leaf statements: CSE only collects from `Emit` ranges
+            // (each expression handle is keyed and looked up there).
+            // Block-bearing variants recurse with scope-tracking.
+            // Everything else carries no Expression handles CSE
+            // dedupes - enumerated explicitly so a future naga
+            // release adding a new block-bearing variant breaks the
+            // build here and forces a scope-tracking decision.
+            naga::Statement::Store { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Call { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
         }
     }
 }
 
 // MARK: Fused fixup walk
 
-/// Single-pass fixup: rebuild every `Emit` range so the replaced
-/// handles drop out, splitting into contiguous sub-ranges around
-/// survivors and discarding emits that become empty, while also
-/// remapping statement-level expression handles to their canonical
-/// replacements.  Recurses into every control-flow sub-block once.
-///
-/// Mirrors `load_dedup::apply_to_block`.  Predates the fused shape
-/// used to exist as two separate walks (`apply_replacements_to_block`
-/// followed by `rebuild_emit_ranges_after_removal`); the single
-/// traversal saves one full statement-tree descent per function.
+/// Single-pass fixup: rebuild every `Emit` range so replaced handles
+/// drop out (splitting into contiguous sub-ranges around survivors,
+/// discarding emits that become empty) and remap statement-level
+/// expression handles to their canonical replacements.  Recurses into
+/// every control-flow sub-block once; mirrors [`super::load_dedup`]'s
+/// `apply_to_block`.
 fn apply_and_rebuild(
     block: &mut naga::Block,
     replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
@@ -488,7 +517,30 @@ fn apply_and_rebuild(
                 apply_and_rebuild(body, replacements);
                 apply_and_rebuild(continuing, replacements);
             }
-            _ => {}
+            // Leaf statements: `remap_statement_handles` below
+            // rewrites every Expression-handle these statements
+            // reference, but they have no nested blocks for the
+            // apply-and-rebuild walk to recurse through.
+            // Enumerated explicitly so a future naga release adding
+            // a new block-bearing variant breaks the build here.
+            naga::Statement::Store { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Call { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
         }
 
         // Remap statement-level expression handles to canonical

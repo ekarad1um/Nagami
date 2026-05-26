@@ -160,7 +160,8 @@ fn bitwise_xor_additive_child_inside_comparison_keeps_parens() {
 fn equality_does_not_chain_left_child() {
     // `(a == b) == c` is not a valid WGSL expression because `==`/`!=`
     // operands must syntactically resolve to a strictly lower-precedence
-    // form (WGSL §8.5).  Emitting `a==b==c` would be unparseable.
+    // form (https://www.w3.org/TR/WGSL/#composite-value-decomposition-expr).
+    // Emitting `a==b==c` would be unparseable.
     let out = compact("fn f(a:i32,b:i32,c:i32)->bool{return (a==b)==(c==a);}");
     assert!(
         out.contains("(a==b)"),

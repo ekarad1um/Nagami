@@ -53,6 +53,12 @@ pub trait Pass {
 /// precisely so this helper avoids re-validating for the before/after
 /// text emission paths; without it, trace and `validate_each_pass`
 /// builds would pay the validator cost twice per pass.
+///
+/// In `cfg(debug_assertions)` builds (which include `cargo test`),
+/// the helper re-validates `module` anyway as a drift guard - so
+/// debug-build emission costs the same as the redundant path that
+/// release intentionally avoids.  Release builds (where the perf
+/// gain matters) skip the check entirely.
 fn emit_wgsl_with_info(
     module: &naga::Module,
     info: &naga::valid::ModuleInfo,
@@ -60,7 +66,8 @@ fn emit_wgsl_with_info(
     // Debug-only drift guard: re-validate so a future caller that
     // forgets to refresh after mutating `module` sees a clean panic
     // here instead of a cryptic crash inside the backend.  Release
-    // builds skip the check entirely.
+    // builds skip the check entirely; see the doc-comment above for
+    // the debug-vs-release cost trade-off.
     #[cfg(debug_assertions)]
     {
         debug_assert!(
@@ -296,8 +303,28 @@ fn run_ir_passes_with(
         sweeps += 1;
         if !any_changed || sweeps >= MAX_PIPELINE_SWEEPS {
             if sweeps >= MAX_PIPELINE_SWEEPS && any_changed {
-                eprintln!("warning: pipeline did not converge after {MAX_PIPELINE_SWEEPS} sweeps");
                 report.converged = false;
+                // Persist the sweep count BEFORE the early-Err return
+                // so callers inspecting the report after the error
+                // (we take `&mut report`, the report state is
+                // observable on the Err path) see the actual
+                // sweep-count we ran for, not the `Report::new`
+                // default of 0.
+                report.sweeps = sweeps;
+                // Under `validate_each_pass` (CI mode) a non-converged
+                // pipeline is a regression to surface, not a warning to
+                // bury in stderr.  Escalate to a structured error so
+                // CI assertions catch it.  In the default (non-CI)
+                // mode keep the existing warning + partial-output
+                // behaviour - callers can inspect `report.converged`
+                // explicitly.
+                if config.trace.validate_each_pass {
+                    return Err(Error::Validation(format!(
+                        "pipeline did not converge after {MAX_PIPELINE_SWEEPS} sweeps; \
+                         a pass is producing oscillating IR"
+                    )));
+                }
+                eprintln!("warning: pipeline did not converge after {MAX_PIPELINE_SWEEPS} sweeps");
             }
             break;
         }

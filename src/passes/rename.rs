@@ -248,6 +248,41 @@ fn collect_reserved_names(
         collect_preserved_function_names(&entry.function, preserve, &mut reserved);
     }
 
+    // Always reserve every source struct type name and struct member
+    // name, regardless of `mangle`.  Two reasons:
+    //
+    // * Under `mangle = false` the generator emits source struct type
+    //   names verbatim (see `core.rs::type_names`).  If the rename
+    //   counter ever mints one of those names for a global / function
+    //   / local, the WGSL output contains two same-named symbols and
+    //   the user's struct becomes unreachable.  Round-trip validation
+    //   catches the bad output (see lib.rs fallback), but the bug
+    //   silently halves compaction quality.
+    //
+    // * Under `mangle = true` the generator independently re-mangles
+    //   struct type / member names via its own `used_names` set in
+    //   `core.rs`, so the source names are *not* the final WGSL names.
+    //   Reserving them is still harmless: the rename counter just
+    //   skips a few short names, and the generator's mangling decides
+    //   what each struct is ultimately called.  The cost of reserving
+    //   here is bounded by the number of source-named structs.
+    //
+    // Preserve-listed names in the type / member arenas are an extra
+    // case the generator never mangles regardless of `mangle`, so
+    // reserving unconditionally also covers them.
+    for (_, ty) in module.types.iter() {
+        if let Some(name) = ty.name.as_deref() {
+            reserved.insert(name.to_string());
+        }
+        if let naga::TypeInner::Struct { members, .. } = &ty.inner {
+            for m in members {
+                if let Some(name) = m.name.as_deref() {
+                    reserved.insert(name.to_string());
+                }
+            }
+        }
+    }
+
     reserved
 }
 
@@ -670,6 +705,74 @@ fn fs_main() -> @location(0) vec4f {
             entry.function.named_expressions.is_empty(),
             "named_expressions must be cleared so the WGSL emitter does not pick up \
              stale bindings on the next sweep"
+        );
+    }
+
+    // MARK: Struct-name reservation regression
+
+    /// Source struct type names must be reserved as the rename pass
+    /// mints fresh short identifiers - otherwise (with `mangle = false`,
+    /// where the generator keeps source struct names verbatim) the
+    /// pass can mint a local / global / function name that collides
+    /// with an existing struct name and the emitted WGSL ends up with
+    /// two same-named symbols.
+    #[test]
+    fn reserves_source_struct_type_names_without_mangle() {
+        // The struct is named single-character `A`; with enough
+        // unrenamed globals and a multi-arg function the rename
+        // counter would normally reach `A` quickly and clobber the
+        // type name.  We assert `A` appears in the reserved set.
+        let src = r#"
+struct A { x: f32, y: f32 }
+@group(0) @binding(0) var<uniform> g: A;
+fn h(p: f32, q: f32, r: f32) -> A {
+    var out: A;
+    out.x = p + q;
+    out.y = r + g.x;
+    return out;
+}
+@fragment fn m() -> @location(0) vec4f {
+    let v = h(1.0, 2.0, 3.0);
+    return vec4f(v.x, v.y, 0.0, 1.0);
+}
+"#;
+        let module = naga::front::wgsl::parse_str(src).expect("parses");
+        let preserve = HashSet::new();
+        let reserved = collect_reserved_names(&module, &preserve, /*mangle=*/ false);
+        assert!(
+            reserved.contains("A"),
+            "source struct type name must be in the reserved set so rename does not \
+             collide with it"
+        );
+        assert!(
+            reserved.contains("x") && reserved.contains("y"),
+            "source struct member names must be in the reserved set"
+        );
+    }
+
+    /// Same reservation must apply under `mangle = true`: even though
+    /// the generator independently re-mangles type / member names,
+    /// reserving them in the rename pass is safe and prevents short-
+    /// lived collisions that a future refactor could expose.
+    #[test]
+    fn reserves_source_struct_type_names_with_mangle() {
+        let src = r#"
+struct A { x: f32 }
+@group(0) @binding(0) var<uniform> g: A;
+@fragment fn m() -> @location(0) vec4f {
+    return vec4f(g.x);
+}
+"#;
+        let module = naga::front::wgsl::parse_str(src).expect("parses");
+        let preserve = HashSet::new();
+        let reserved = collect_reserved_names(&module, &preserve, /*mangle=*/ true);
+        assert!(
+            reserved.contains("A"),
+            "source struct type name must be reserved even under mangle"
+        );
+        assert!(
+            reserved.contains("x"),
+            "source struct member name must be reserved even under mangle"
         );
     }
 }

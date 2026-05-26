@@ -25,6 +25,12 @@ pub enum Profile {
 }
 
 /// Format used when dumping per-pass trace output.
+///
+/// Currently single-variant.  Kept as an enum (rather than collapsed
+/// to a unit-typed marker) so additional formats - JSON, naga-IR
+/// debug print, statistics CSV - can be added without breaking the
+/// public surface of [`TraceConfig`].  Consumers should always
+/// `match` on this exhaustively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TraceDumpFormat {
     /// Emit each per-pass dump as a `.wgsl` source file.

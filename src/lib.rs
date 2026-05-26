@@ -56,15 +56,20 @@ fn should_strip_enable_directive(line: &str) -> bool {
     )
 }
 
-/// Normalise `source` so naga's front-end accepts it.
-///
-/// Two adjustments happen here: `wgpu_*` enable directives that naga
-/// does not recognise are stripped, and `enable f16;` is injected when
-/// the source references the `f16` token without declaring the
-/// extension.  Both adjustments are invisible to callers of [`run`]
-/// because the emitted output is re-derived from the IR, not from this
-/// normalised text.
+/// Normalise `source` so naga's front-end accepts it.  Three
+/// adjustments, in order: lone-CR endings rewritten to LF (so
+/// `str::lines` sees every break), `wgpu_*` enable directives naga
+/// rejects are stripped, and `enable f16;` is injected when the
+/// source uses the `f16` token without declaring it.  Output is
+/// re-derived from the IR, so callers of [`run`] never observe these
+/// rewrites.
 fn preprocess_source_for_naga(source: &str) -> String {
+    // `str::lines` ignores lone `\r` (classic-Mac); the downstream
+    // per-line scans assume every break is visible, so normalise CR
+    // to LF first.
+    let normalized = normalize_line_endings(source);
+    let source = normalized.as_str();
+
     let mut had_changes = false;
     let mut stripped = String::with_capacity(source.len());
 
@@ -97,6 +102,45 @@ fn preprocess_source_for_naga(source: &str) -> String {
     }
 }
 
+/// Rewrite lone `\r` to `\n`; leave `\r\n` intact (`str::lines`
+/// handles it).  Returns the original string unchanged when no lone
+/// `\r` exists.
+//
+// UTF-8 safety: `0x0D` cannot appear inside a multi-byte sequence
+// (continuation bytes are `0x80..=0xBF`, lead bytes `0xC0..=0xFD`),
+// so byte-level `\r` matches always land on character boundaries -
+// the slicing below is guaranteed valid UTF-8.
+fn normalize_line_endings(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut needs_rewrite = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && bytes.get(i + 1) != Some(&b'\n') {
+            needs_rewrite = true;
+            break;
+        }
+        i += 1;
+    }
+    if !needs_rewrite {
+        return source.to_string();
+    }
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' && bytes.get(i + 1) != Some(&b'\n') {
+            out.push('\n');
+            i += 1;
+        } else {
+            let start = i;
+            while i < bytes.len() && !(bytes[i] == b'\r' && bytes.get(i + 1) != Some(&b'\n')) {
+                i += 1;
+            }
+            out.push_str(&source[start..i]);
+        }
+    }
+    out
+}
+
 /// `true` when `b` can appear inside a WGSL identifier (ASCII alphanumeric
 /// or underscore).  Used for whole-token matching in token detection.
 fn is_ident_char(b: u8) -> bool {
@@ -119,33 +163,32 @@ fn strip_wgsl_comments(source: &str) -> String {
             }
             continue;
         }
-        // Block comment.
-        //
-        // NOTE: This helper is a *detection-grade* scrubber used by
-        // token-level scanners such as `references_f16_token` and
-        // `has_enable_f16_directive` to hide commented-out code from
-        // regex-like matches.  It treats `/* ... */` as non-nesting,
-        // which is safe for detection because an identifier scan
-        // inside a would-be nested comment cannot produce a false
-        // positive worse than the outer comment itself.
-        //
-        // The WGSL spec *does* permit nested block comments.  Do NOT
-        // repurpose this helper to strip comments for code rewriting
-        // or re-emission; for that, route through the WGSL front-end
-        // or add a nesting-aware stripper.
+        // Block comment.  WGSL (https://www.w3.org/TR/WGSL/#comments)
+        // permits nesting; a non-nesting scrub would close at the
+        // inner `*/` and expose outer-comment `f16`/`enable` content
+        // to token scans.  Track depth.
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
             out.push(b' ');
             out.push(b' ');
             i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
-                i += 1;
+            let mut depth: u32 = 1;
+            while i + 1 < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    out.push(b' ');
+                    out.push(b' ');
+                    i += 2;
+                } else {
+                    out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
+                    i += 1;
+                }
             }
-            if i + 1 < bytes.len() {
-                out.push(b' ');
-                out.push(b' ');
-                i += 2;
-            } else {
+            if depth > 0 {
                 // Unterminated block comment; consume the remainder so
                 // the scrubbed output still matches the input byte count.
                 while i < bytes.len() {
@@ -251,6 +294,26 @@ fn split_directives(source: &str) -> (&str, &str) {
         }
     }
     (&source[..pos], &source[pos..])
+}
+
+/// Concatenate `fragments` so each non-empty fragment is followed by
+/// at least one `\n` before the next fragment starts.  Empty fragments
+/// are skipped so we never emit a stray blank line.  Used to splice
+/// directive blocks and preamble bodies safely when any fragment may
+/// or may not already carry a trailing newline.
+fn join_with_newline(fragments: &[&str]) -> String {
+    let cap: usize = fragments.iter().map(|f| f.len()).sum::<usize>() + fragments.len();
+    let mut out = String::with_capacity(cap);
+    for fragment in fragments {
+        if fragment.is_empty() {
+            continue;
+        }
+        out.push_str(fragment);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 // MARK: Public entry points
@@ -379,14 +442,23 @@ const KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS: &[&str] = &[
 /// emit error.  Without the variant guard the caller's
 /// "extension we cannot parse -> return input unchanged" branch can
 /// silently swallow a real validation or emit failure.
+///
+/// Additionally restricted to the first line of the rendered
+/// diagnostic.  naga's codespan output places the diagnostic message
+/// on line 1 (`error: <message>`) and quotes user source on the
+/// indented lines that follow.  Matching the full message would let
+/// a user shader containing the pattern text in a comment trigger
+/// the bailout when an UNRELATED parse error happens to render that
+/// comment as nearby context.
 fn is_unsupported_extension_parse_error(err: &Error) -> bool {
     if !matches!(err, Error::Parse(_)) {
         return false;
     }
     let msg = err.to_string();
+    let first_line = msg.lines().next().unwrap_or("");
     UNSUPPORTED_EXTENSION_PATTERNS
         .iter()
-        .any(|p| msg.contains(p))
+        .any(|p| first_line.contains(p))
 }
 
 /// `true` when `err` is a `Parse` or `Validation` error whose message
@@ -409,9 +481,16 @@ fn is_known_text_validation_limitation(err: &Error) -> bool {
         return false;
     }
     let msg = err.to_string();
+    // Same first-line restriction as `is_unsupported_extension_parse_error`:
+    // naga's diagnostic format places the message on line 1 and quotes user
+    // source on subsequent lines, so restricting the match here prevents a
+    // user shader carrying the pattern text in a comment from spuriously
+    // opting into the round-trip-validation bypass when an unrelated parse
+    // or validation error renders that comment as nearby context.
+    let first_line = msg.lines().next().unwrap_or("");
     KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS
         .iter()
-        .any(|p| msg.contains(p))
+        .any(|p| first_line.contains(p))
 }
 
 /// Minify a WGSL shader source string end-to-end.
@@ -442,8 +521,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     // pure function of its input, so memoising the result avoids a
     // second O(preamble) scan/allocation for free.
     let effective_preamble = config.preamble.as_deref().filter(|s| !s.trim().is_empty());
-    let normalized_preamble: Option<String> =
-        effective_preamble.map(preprocess_source_for_naga);
+    let normalized_preamble: Option<String> = effective_preamble.map(preprocess_source_for_naga);
     let (preamble_names, full_source);
     if let Some(normalized_preamble) = normalized_preamble.as_deref() {
         // Run the same `wgpu_*` stripping / `enable f16;` injection
@@ -457,11 +535,23 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         preamble_names = collect_module_names(&preamble_module);
         // Directives must precede declarations (see `split_directives`),
         // so extract both sides' leading directives and prepend them
-        // before the preamble body.
+        // before the preamble body.  `split_directives` returns each
+        // section as a borrowed slice that may or may not carry a
+        // trailing newline (e.g. a source whose entire content is
+        // `enable f16;` with no final newline returns `"enable f16;"`).
+        // Concatenating two such slices directly would glue the last
+        // directive of the first block onto the first directive of the
+        // next, producing a syntax error; `join_with_newline` ensures
+        // each non-empty fragment is `\n`-terminated before the next
+        // fragment begins.
         let (source_directives, source_body) = split_directives(&normalized_source);
         let (preamble_directives, preamble_body) = split_directives(normalized_preamble);
-        full_source =
-            format!("{source_directives}{preamble_directives}{preamble_body}\n{source_body}");
+        full_source = join_with_newline(&[
+            source_directives,
+            preamble_directives,
+            preamble_body,
+            source_body,
+        ]);
     } else {
         preamble_names = HashSet::new();
         full_source = normalized_source;
@@ -470,13 +560,29 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     let mut module = match io::parse_wgsl(&full_source) {
         Ok(m) => m,
         Err(e) if is_unsupported_extension_parse_error(&e) => {
-            // The shader uses an extension naga cannot parse (e.g.
-            // `wgpu_ray_query`).  Return the original source unchanged
-            // so the caller can still emit something runnable on
-            // backends that do understand the extension.
+            // Shader uses an extension naga can't parse (e.g.
+            // `wgpu_ray_query`).  Return the original source so the
+            // caller can still ship something runnable on backends
+            // that DO understand the extension.  The synthetic
+            // `unsupported_extension_bailout` PassReport lets
+            // downstream tooling distinguish bailout from "ran with
+            // no changes"; `validation_ok = true` is "no failure
+            // observed" (no IR ever built), set true so CI gates
+            // asserting `all validation_ok` don't fail spuriously.
+            let mut report = Report::new(source.len());
+            report.pass_reports.push(PassReport {
+                pass_name: "unsupported_extension_bailout".to_string(),
+                before_bytes: Some(source.len()),
+                after_bytes: Some(source.len()),
+                changed: false,
+                duration_us: 0,
+                validation_ok: true,
+                text_validation_ok: None,
+                rolled_back: false,
+            });
             return Ok(Output {
                 source: source.to_string(),
-                report: Report::new(source.len()),
+                report,
             });
         }
         Err(e) => return Err(e),
@@ -538,7 +644,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                     let (emit_directives, emit_body) = split_directives(&emitted.source);
                     let (pre_directives, pre_body) = split_directives(normalized_preamble);
                     let combined =
-                        format!("{emit_directives}{pre_directives}{pre_body}\n{emit_body}");
+                        join_with_newline(&[emit_directives, pre_directives, pre_body, emit_body]);
                     io::validate_wgsl_text(&combined)
                 } else {
                     io::validate_wgsl_text(&emitted.source)
@@ -568,11 +674,20 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                         emitted.duration_us,
                     )
                 } else if has_preamble {
-                    return Err(Error::Emit(
+                    // Naga-emitter fallback unsafe with a preamble -
+                    // its output carries the preamble's decls already,
+                    // and the caller will re-prepend them, duplicating.
+                    // Propagate the underlying validator message so
+                    // the user can diagnose; the original error was
+                    // dropped before this branch.
+                    let underlying = match validation_result {
+                        Err(e) => e.to_string(),
+                        Ok(()) => "(no underlying error)".to_string(),
+                    };
+                    return Err(Error::Emit(format!(
                         "generator output failed validation; \
-                         cannot fall back safely when a preamble is active"
-                            .to_string(),
-                    ));
+                         cannot fall back safely when a preamble is active: {underlying}",
+                    )));
                 } else {
                     if config.trace.enabled {
                         if let Err(e) = &validation_result {
@@ -1011,7 +1126,7 @@ mod tests {
         // Output alone is incomplete; validate with preamble re-prepended.
         let (emit_dirs, emit_body) = split_directives(&output.source);
         let (pre_dirs, pre_body) = split_directives(preamble);
-        let combined = format!("{emit_dirs}{pre_dirs}{pre_body}\n{emit_body}");
+        let combined = join_with_newline(&[emit_dirs, pre_dirs, pre_body, emit_body]);
         io::validate_wgsl_text(&combined).expect("output + preamble must be valid WGSL");
     }
 
@@ -1190,6 +1305,41 @@ mod tests {
         );
     }
 
+    /// When the source declares an extension naga cannot parse,
+    /// `run` returns the original input verbatim plus a synthetic
+    /// `unsupported_extension_bailout` PassReport so downstream
+    /// tooling can distinguish "ran the pipeline" from "bailed out".
+    /// `subgroups` is currently a parse-time error in naga 29
+    /// (matched by `UNSUPPORTED_EXTENSION_PATTERNS`); a future naga
+    /// release that lands subgroup support will need a different
+    /// trigger here.
+    #[test]
+    fn unsupported_extension_bailout_includes_synthetic_pass_report() {
+        let src = "enable subgroups;\n\
+                   @compute @workgroup_size(1) fn m() {}";
+        let output = run(src, &Config::default()).expect("bailout returns Ok with original source");
+        // The bailout path returns the ORIGINAL source verbatim
+        // (no pipeline run, no preprocessing pass).
+        assert_eq!(
+            output.source, src,
+            "bailout must return the original source unchanged"
+        );
+        let bailout = output
+            .report
+            .pass_reports
+            .iter()
+            .find(|p| p.pass_name == "unsupported_extension_bailout");
+        assert!(
+            bailout.is_some(),
+            "synthetic bailout pass report must be present so callers can detect the short-circuit"
+        );
+        let b = bailout.unwrap();
+        assert!(!b.changed);
+        assert!(!b.rolled_back);
+        assert_eq!(b.before_bytes, Some(src.len()));
+        assert_eq!(b.after_bytes, Some(src.len()));
+    }
+
     #[test]
     fn run_auto_enables_f16_when_used() {
         let src = r#"
@@ -1232,6 +1382,40 @@ mod tests {
         let (dirs, rest) = split_directives(src);
         assert_eq!(dirs, "diagnostic(off, derivative_uniformity);\n");
         assert_eq!(rest, "fn f() {}\n");
+    }
+
+    /// Regression: when `split_directives` returns a fragment that
+    /// lacks a trailing newline (e.g. a source whose last directive
+    /// is the final byte), splicing it directly in front of the
+    /// preamble's directives glued them together into one syntax
+    /// error.  `join_with_newline` must insert a separator.
+    #[test]
+    fn join_with_newline_inserts_separator_between_fragments() {
+        let joined = join_with_newline(&["enable f16;", "enable subgroups;\n", "fn body() {}\n"]);
+        assert_eq!(joined, "enable f16;\nenable subgroups;\nfn body() {}\n");
+    }
+
+    #[test]
+    fn join_with_newline_skips_empty_fragments() {
+        let joined = join_with_newline(&["enable f16;\n", "", "fn body() {}\n"]);
+        assert_eq!(joined, "enable f16;\nfn body() {}\n");
+    }
+
+    #[test]
+    fn join_with_newline_keeps_existing_trailing_newline() {
+        let joined = join_with_newline(&["enable f16;\n", "fn body() {}\n"]);
+        assert_eq!(joined, "enable f16;\nfn body() {}\n");
+    }
+
+    /// CRLF fragments survive `split_directives` (verified by
+    /// `split_directives_crlf_line_endings`), so the join helper must
+    /// preserve them unchanged.  `ends_with('\n')` matches the LF in
+    /// `\r\n`, so no extra newline is appended after a CRLF-ending
+    /// fragment.
+    #[test]
+    fn join_with_newline_preserves_crlf_fragments() {
+        let joined = join_with_newline(&["enable f16;\r\n", "fn body() {}\r\n"]);
+        assert_eq!(joined, "enable f16;\r\nfn body() {}\r\n");
     }
 
     #[test]
@@ -1296,6 +1480,54 @@ mod tests {
         assert!(!references_f16_token(
             "/* multiline\n   f16\n */\nvar x: i32;"
         ));
+    }
+
+    // Regression: WGSL (https://www.w3.org/TR/WGSL/#comments) permits
+    // nested block comments.  A non-nesting comment scrubber would close
+    // at the inner `*/` and expose the trailing `f16` content to the
+    // token scan; the depth-tracking implementation must absorb the inner
+    // pair and treat the whole region as commented.
+    #[test]
+    fn references_f16_token_ignores_nested_block_comments() {
+        assert!(!references_f16_token(
+            "/* outer /* inner */ f16 still in outer */ var x: i32;"
+        ));
+        assert!(!references_f16_token(
+            "/* /* /* deeply nested */ */ f16 inside */ var x: i32;"
+        ));
+        // A real f16 after a properly-closed nested comment still
+        // detects.
+        assert!(references_f16_token(
+            "/* nest /* inner */ done */ var x: f16 = 0h;"
+        ));
+    }
+
+    // Regression: classic-Mac (lone `\r`) line endings must be
+    // normalised before any `.lines()` scan, otherwise the
+    // `wgpu_*` directive strip and `enable f16;` detection fold the
+    // entire source into one line and silently fail.
+    #[test]
+    fn normalize_line_endings_handles_lone_cr() {
+        // Lone `\r` becomes `\n`.
+        assert_eq!(normalize_line_endings("a\rb\rc"), "a\nb\nc");
+        // `\r\n` stays intact (str::lines already handles it).
+        assert_eq!(normalize_line_endings("a\r\nb\r\nc"), "a\r\nb\r\nc");
+        // Mixed.
+        assert_eq!(normalize_line_endings("a\rb\r\nc\nd"), "a\nb\r\nc\nd");
+        // Source with no `\r` returns identical content.
+        assert_eq!(normalize_line_endings("a\nb\nc"), "a\nb\nc");
+        // Multi-byte UTF-8 around line endings preserved.
+        assert_eq!(normalize_line_endings("α\rβ\r\nγ"), "α\nβ\r\nγ");
+    }
+
+    #[test]
+    fn preprocess_strips_wgpu_directive_with_cr_only_endings() {
+        let src = "enable wgpu_binding_array;\r@fragment fn m() -> @location(0) vec4f { return vec4f(0); }";
+        let out = preprocess_source_for_naga(src);
+        assert!(
+            !out.contains("enable wgpu_binding_array;"),
+            "lone-CR-terminated wgpu_* directive must still be stripped: {out:?}"
+        );
     }
 
     #[test]
@@ -1394,6 +1626,35 @@ mod tests {
         assert!(
             !is_unsupported_extension_parse_error(&err),
             "unrelated parse errors must not be treated as unsupported-extension"
+        );
+    }
+
+    /// Regression: a parse error whose codespan snippet quotes a user
+    /// comment containing the unsupported-extension phrasing must NOT
+    /// trigger the bailout.  Pre-fix, substring matching against the
+    /// entire rendered message swallowed real failures whenever the
+    /// user happened to comment-mention an unsupported extension.
+    #[test]
+    fn unsupported_extension_patterns_ignore_quoted_source_lines() {
+        let rendered = "error: expected identifier, found `{`\n  \
+                        ┌─ wgsl:5:1\n  │\n5 │ // TODO: enable extension is not enabled \
+                        on our backend\n  │ ^^\n";
+        let err = Error::Parse(rendered.into());
+        assert!(
+            !is_unsupported_extension_parse_error(&err),
+            "pattern in a quoted source line must NOT trigger the bailout"
+        );
+
+        // Same shape for the subgroups text-validation limitation: a
+        // shader quoting the phrase in a comment, surfaced as context
+        // around an unrelated parse error, must not opt into the
+        // validation-bypass.
+        let rendered = "error: expected `;`\n  \
+                        ┌─ wgsl:3:1\n  │\n3 │ // subgroups enable-extension is not yet supported\n";
+        let err = Error::Parse(rendered.into());
+        assert!(
+            !is_known_text_validation_limitation(&err),
+            "pattern in a quoted source line must NOT trigger the validation bypass"
         );
     }
 

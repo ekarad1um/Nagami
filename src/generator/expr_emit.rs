@@ -14,7 +14,89 @@ use super::syntax::{
     type_inner_name, type_resolution_name,
 };
 
+/// `true` when emitting `literal` in its bare (suffix-less) form at a
+/// non-constructor, non-extracted-const position would re-parse as a
+/// different concrete type than the original.
+///
+/// WGSL's abstract-type coercion defaults `AbstractInt` to `i32` and
+/// `AbstractFloat` to `f32` when no enclosing context pins another
+/// type.  Every reachable top-level `Literal` in valid naga IR sits
+/// in a pinning context (Binary partner of known type, function-arg
+/// slot, return slot, Store target, constructor), and the abstract
+/// value coerces into that local `(kind, width)`.  So bare emission
+/// is sound for `I32`/`U32`/`F32`/`Bool` (the coercion target
+/// matches the original) and saves a suffix byte.
+///
+/// For `F16`/`F64`/`I64`/`U64` the abstract default does NOT match:
+/// * `F16` / `F64`: bare `0.5` parses as `AbstractFloat` ->
+///   default-f32, refusing to coerce into f16/f64 contexts.
+/// * `I64` / `U64`: bare `42` parses as `AbstractInt` -> default i32,
+///   not i64/u64; even in-range values conflict with the
+///   i64/u64-typed coercion target.
+///
+/// Counter-example: a NEW non-pinning context (e.g. a switch
+/// selector that is itself a `Literal::U32`) DOES break the safe-bare
+/// assumption for `U32`.  Switch dispatch in [`super::stmt_emit`]
+/// already special-cases literal selectors via [`literal_to_wgsl`]
+/// because the case label carries `u` while a bare selector would
+/// parse as AbstractInt -> i32.  Any new top-level Literal-bearing
+/// position must apply the same special-case OR hint the scalar kind
+/// through [`super::expr_emit::Generator::emit_expr_with_scalar_hint`].
+fn literal_needs_typed_form_outside_constructor(literal: naga::Literal) -> bool {
+    matches!(
+        literal,
+        naga::Literal::F16(_)
+            | naga::Literal::F64(_)
+            | naga::Literal::I64(_)
+            | naga::Literal::U64(_)
+    )
+}
+
+/// `true` when the literal numerically equals zero.  Both `+0.0` and
+/// `-0.0` qualify (IEEE `==` already conflates them; F16 is matched on
+/// bit-pattern because its `==` is not available without `half`).
+fn literal_is_zero(lit: naga::Literal) -> bool {
+    match lit {
+        naga::Literal::F16(v) => v.to_bits() == 0 || v.to_bits() == 0x8000,
+        naga::Literal::F32(v) => v == 0.0,
+        naga::Literal::F64(v) => v == 0.0,
+        naga::Literal::AbstractFloat(v) => v == 0.0,
+        naga::Literal::I32(v) => v == 0,
+        naga::Literal::U32(v) => v == 0,
+        naga::Literal::I64(v) => v == 0,
+        naga::Literal::U64(v) => v == 0,
+        naga::Literal::AbstractInt(v) => v == 0,
+        naga::Literal::Bool(v) => !v,
+    }
+}
+
 impl<'a> Generator<'a> {
+    /// `true` when `handle` resolves to a value that is statically
+    /// provably zero (literal zero, `ZeroValue`, or a constant whose
+    /// init is one of those).  Used by emission paths that must reject
+    /// IR with an unrepresentable non-zero argument - e.g.,
+    /// `textureSampleCompareLevel`, whose WGSL signature has no level
+    /// parameter and therefore can only encode level 0.
+    pub(super) fn expression_is_provable_zero(
+        &self,
+        handle: naga::Handle<naga::Expression>,
+        ctx: &super::core::FunctionCtx<'_, '_>,
+    ) -> bool {
+        match ctx.func.expressions[handle] {
+            naga::Expression::Literal(lit) => literal_is_zero(lit),
+            naga::Expression::ZeroValue(_) => true,
+            naga::Expression::Constant(c) => {
+                let constant = &self.module.constants[c];
+                match self.module.global_expressions[constant.init] {
+                    naga::Expression::Literal(lit) => literal_is_zero(lit),
+                    naga::Expression::ZeroValue(_) => true,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// Emit a `Call` expression (`name(arg0, arg1, ...)`).  Inserts
     /// an explicit `&` before pointer-typed arguments that WGSL would
     /// otherwise treat as references, skipping the `&` for forwarded
@@ -345,6 +427,14 @@ impl<'a> Generator<'a> {
                     let key = literal_extract_key(*lit, self.options.max_precision);
                     if let Some(name) = self.extracted_literals.get(&key) {
                         name.clone()
+                    } else if literal_needs_typed_form_outside_constructor(*lit) {
+                        // Bare form would re-parse as the wrong type
+                        // (see `literal_needs_typed_form_outside_constructor`).
+                        // Force the typed form here even though we are
+                        // not strictly inside one of the two sanctioned
+                        // bare-emit positions, because the bare form
+                        // changes the inferred concrete type.
+                        literal_to_wgsl(*lit, self.options.max_precision)
                     } else {
                         key.expr_text
                     }
@@ -364,11 +454,14 @@ impl<'a> Generator<'a> {
                         } else {
                             // Mirror the Literal arm: an unnamed constant
                             // whose init is a literal is emitted as the
-                            // literal text at every use site, so the same
-                            // shared-const substitution applies here.
+                            // literal text at every use site, so the
+                            // same shared-const substitution applies
+                            // here.  Same bare-emit safety gate.
                             let key = literal_extract_key(*lit, self.options.max_precision);
                             if let Some(name) = self.extracted_literals.get(&key) {
                                 name.clone()
+                            } else if literal_needs_typed_form_outside_constructor(*lit) {
+                                literal_to_wgsl(*lit, self.options.max_precision)
                             } else {
                                 self.emit_global_expr(c.init)?
                             }
@@ -574,11 +667,24 @@ impl<'a> Generator<'a> {
                             }
                         }
                         naga::SampleLevel::Exact(h) => {
-                            // textureSampleCompareLevel doesn't take a level
-                            // parameter - it's always level 0 implicitly.
                             if depth_ref.is_none() {
                                 s.push_str(sep);
                                 s.push_str(&self.emit_expr(*h, ctx)?);
+                            } else {
+                                // `textureSampleCompareLevel` always
+                                // samples at level 0; the WGSL signature
+                                // has no level slot.  naga's WGSL front
+                                // encodes that as `Exact(Literal(0))`,
+                                // so a provable zero is safe to drop -
+                                // any other value is unrepresentable
+                                // and must defer to the fallback emitter.
+                                if !self.expression_is_provable_zero(*h, ctx) {
+                                    return Err(Error::Emit(format!(
+                                        "textureSampleCompareLevel cannot represent a \
+                                         non-zero sample level in function '{}'",
+                                        ctx.display_name,
+                                    )));
+                                }
                             }
                         }
                         naga::SampleLevel::Bias(h) => {
@@ -733,13 +839,30 @@ impl<'a> Generator<'a> {
                 let wrap_l = child_needs_parens(eff_l, arena, *op, false, eff_lc);
                 let mut wrap_r = child_needs_parens(eff_r, arena, *op, true, eff_rc);
 
+                // Splat-elision drops the scalar out of its
+                // type-pinning constructor context.  Use `emit_expr`
+                // (not `emit_constructor_arg`): the latter's
+                // defensive comparison-wrap would double-paren
+                // operands (`vec3(a<b) * v` -> `((a<b)) * v`) and its
+                // bare-literal path would emit a literal whose
+                // abstract default might mismatch the vector operand's
+                // scalar type.  `child_needs_parens` (above) already
+                // handles precedence-driven parenthesisation.
+                //
+                // The literal-side mismatch is exactly the case
+                // [`literal_needs_typed_form_outside_constructor`]
+                // exists for: F16/F64/I64/U64 literals get typed
+                // suffixes (`0h`/`0lf`/`0li`/`0lu`) when emitted via
+                // `emit_expr`'s Literal arm.  Splat-elision is the
+                // primary site that creates the "outside a
+                // constructor" condition, so the two are interdependent.
                 let ls = if elide_l {
-                    self.emit_constructor_arg(left_scalar.unwrap(), ctx)?
+                    self.emit_expr(left_scalar.unwrap(), ctx)?
                 } else {
                     self.emit_expr(*left, ctx)?
                 };
                 let rs = if elide_r {
-                    let s = self.emit_constructor_arg(right_scalar.unwrap(), ctx)?;
+                    let s = self.emit_expr(right_scalar.unwrap(), ctx)?;
                     // Prevent ambiguous '--' token when subtracting a negative
                     // scalar in minified (no-space) mode.
                     if !wrap_r
@@ -876,6 +999,23 @@ impl<'a> Generator<'a> {
                     scalar: src_scalar,
                 } = src_inner
                 {
+                    // WGSL forbids `bitcast` on matrices: the
+                    // `bitcast<T>` operator is restricted to numeric
+                    // scalars and vectors of numeric scalars.  Naga
+                    // should never lower a matrix `As` with
+                    // `convert: None`, but if it does, refuse to emit
+                    // invalid WGSL - the pipeline can fall back to
+                    // naga's emitter (which would presumably also
+                    // refuse, but consistently).
+                    if convert.is_none() {
+                        return Err(Error::Emit(format!(
+                            "matrix bitcast (As {{ convert: None }}) is not representable in WGSL \
+                             in function '{}' (expr {}): source type {:?}",
+                            ctx.display_name,
+                            expr.index(),
+                            src_inner,
+                        )));
+                    }
                     let target_width = convert.unwrap_or(src_scalar.width);
                     let target_inner = naga::TypeInner::Matrix {
                         columns: *columns,
@@ -887,14 +1027,7 @@ impl<'a> Generator<'a> {
                     };
                     let target = self.type_name_for_inner(&target_inner)?;
                     let source = self.emit_expr(*expr, ctx)?;
-                    let mut s = if convert.is_some() {
-                        target
-                    } else {
-                        let mut s = String::from("bitcast<");
-                        s.push_str(&target);
-                        s.push('>');
-                        s
-                    };
+                    let mut s = target;
                     s.push('(');
                     s.push_str(&source);
                     s.push(')');
@@ -924,6 +1057,25 @@ impl<'a> Generator<'a> {
                         width: target_width,
                     }),
                 };
+                // WGSL (https://www.w3.org/TR/WGSL/#bit-reinterp-builtin-functions)
+                // limits `bitcast<T>` to numeric scalars and their vectors;
+                // `bool` and abstract scalars are explicitly excluded.
+                // Refuse before emission so the pipeline's fallback
+                // emitter handles the cast.
+                if convert.is_none()
+                    && matches!(
+                        kind,
+                        naga::ScalarKind::Bool
+                            | naga::ScalarKind::AbstractInt
+                            | naga::ScalarKind::AbstractFloat
+                    )
+                {
+                    return Err(Error::Emit(format!(
+                        "bitcast (As {{ convert: None }}) is not representable for \
+                         scalar kind {:?} in function '{}'",
+                        kind, ctx.display_name,
+                    )));
+                }
                 let target = self.type_name_for_inner(&target_inner)?;
                 let source = self.emit_expr(*expr, ctx)?;
                 let mut s = if convert.is_some() {
@@ -1224,6 +1376,16 @@ impl<'a> Generator<'a> {
                     scalar: src_scalar,
                 } = src_inner
                 {
+                    // WGSL forbids matrix bitcast; the function-local
+                    // arm enforces the same rule.
+                    if convert.is_none() {
+                        return Err(Error::Emit(format!(
+                            "matrix bitcast (As {{ convert: None }}) is not representable in WGSL \
+                             in global expression {}: source type {:?}",
+                            inner.index(),
+                            src_inner,
+                        )));
+                    }
                     let target_width = convert.unwrap_or(src_scalar.width);
                     let target_inner = naga::TypeInner::Matrix {
                         columns: *columns,
@@ -1235,14 +1397,7 @@ impl<'a> Generator<'a> {
                     };
                     let target = self.type_name_for_inner(&target_inner)?;
                     let source = self.emit_global_expr(*inner)?;
-                    let mut s = if convert.is_some() {
-                        target
-                    } else {
-                        let mut s = String::from("bitcast<");
-                        s.push_str(&target);
-                        s.push('>');
-                        s
-                    };
+                    let mut s = target;
                     s.push('(');
                     s.push_str(&source);
                     s.push(')');
@@ -1259,6 +1414,23 @@ impl<'a> Generator<'a> {
                             )));
                         }
                     };
+                    // Same `bitcast<T>` restriction as the function-local
+                    // arm: T must be a numeric scalar or vector of one.
+                    if convert.is_none()
+                        && matches!(
+                            kind,
+                            naga::ScalarKind::Bool
+                                | naga::ScalarKind::AbstractInt
+                                | naga::ScalarKind::AbstractFloat
+                        )
+                    {
+                        return Err(Error::Emit(format!(
+                            "bitcast (As {{ convert: None }}) is not representable for \
+                             scalar kind {:?} in global expression {}",
+                            kind,
+                            inner.index(),
+                        )));
+                    }
                     let target_width = convert.unwrap_or(src_width);
                     let target_inner = match vec_size {
                         Some(size) => naga::TypeInner::Vector {
@@ -1989,9 +2161,12 @@ fn child_needs_parens(
     };
     let parent_prec = binary_precedence(parent_op);
 
-    // Keep arithmetic children parenthesized under bitwise operators.
-    // This preserves explicit tree shape and avoids parser/type-inference
-    // ambiguities on patterns like `a^(b-1u)` when emitted in compact form.
+    // Bitwise operators (`&`/`|`/`^`) require `unary_expression` on
+    // both sides per WGSL's grammar (https://www.w3.org/TR/WGSL/#operator-precedence-associativity)
+    // so a bare additive child like `a^b-1u` is grammatically ill-formed
+    // even when precedence alone would group it correctly.
+    // Wrap such children unconditionally for strict-parser compatibility;
+    // naga's own parser is permissive but downstream consumers need not be.
     if matches!(
         parent_op,
         naga::BinaryOperator::And
@@ -2019,7 +2194,8 @@ fn child_needs_parens(
     // expression on either side, so a same-precedence child must be
     // parenthesised regardless of associativity.  This covers
     // `(a == b) == c` (operands of `==`/`!=` must be `relational_expression`,
-    // per WGSL §8.5) as well as the relational quartet.
+    // per WGSL (https://www.w3.org/TR/WGSL/#composite-value-decomposition-expr)
+    // as well as the relational quartet.
     if matches!(
         parent_op,
         naga::BinaryOperator::Less
@@ -2300,7 +2476,10 @@ pub(super) fn is_arithmetic_op(op: naga::BinaryOperator) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConcretizedAbstract, concretize_abstract_literal_via_inner};
+    use super::{
+        ConcretizedAbstract, concretize_abstract_literal_via_inner,
+        literal_needs_typed_form_outside_constructor,
+    };
     use naga::Literal as L;
 
     fn scalar_inner(kind: naga::ScalarKind, width: u8) -> naga::TypeInner {
@@ -2467,5 +2646,36 @@ mod tests {
             concretize_abstract_literal_via_inner(L::AbstractInt(7), &vec3f_inner),
             L::F32(7.0),
         );
+    }
+
+    // MARK: Typed-form gate for non-AbstractInt/AbstractFloat default
+    // types (F16 / F64 / I64 / U64).  These cases would silently
+    // re-type to f32 / i32 under WGSL's abstract-coercion default if
+    // emitted bare outside a constructor.
+
+    #[test]
+    fn typed_form_gate_flags_f16_f64_i64_u64() {
+        use naga::Literal as L;
+        assert!(literal_needs_typed_form_outside_constructor(L::F16(
+            half::f16::from_f32(0.5)
+        )));
+        assert!(literal_needs_typed_form_outside_constructor(L::F64(0.5)));
+        assert!(literal_needs_typed_form_outside_constructor(L::I64(7)));
+        assert!(literal_needs_typed_form_outside_constructor(L::U64(7)));
+    }
+
+    #[test]
+    fn typed_form_gate_passes_safe_types_through() {
+        use naga::Literal as L;
+        assert!(!literal_needs_typed_form_outside_constructor(L::I32(7)));
+        assert!(!literal_needs_typed_form_outside_constructor(L::U32(7)));
+        assert!(!literal_needs_typed_form_outside_constructor(L::F32(0.5)));
+        assert!(!literal_needs_typed_form_outside_constructor(L::Bool(true)));
+        assert!(!literal_needs_typed_form_outside_constructor(
+            L::AbstractInt(7)
+        ));
+        assert!(!literal_needs_typed_form_outside_constructor(
+            L::AbstractFloat(0.5)
+        ));
     }
 }

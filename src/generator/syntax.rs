@@ -367,11 +367,23 @@ pub(super) fn literal_extract_key(
     max_precision: Option<u8>,
 ) -> LiteralExtractKey {
     let expr_text = literal_to_wgsl_bare(literal, max_precision);
-    // U64 values >= 2^63 cannot be represented as AbstractInt and need the
-    // `lu`-suffixed typed form in the const declaration.  Everything else can
-    // use the expr_text directly as an abstract-typed const literal.
+    // The decl_text appears as the RHS of `const NAME = <decl_text>;`.
+    // WGSL's abstract-type concretisation defaults `AbstractInt -> i32`
+    // and `AbstractFloat -> f32`; for literals whose original concrete
+    // type is one of those defaults (`I32`/`U32`/`F32`/`Bool`/abstract
+    // already), the bare form re-binds correctly at every use site.
+    // For literals whose abstract-default does NOT match the original
+    // type (`F16`/`F64`/`I64`/`U64`), force the typed form so the
+    // const carries the original type and abstract-coercion at use
+    // sites cannot down-cast (`AbstractFloat -> f32` in an f16 context
+    // is illegal; `AbstractInt -> i32` in an i64 context loses range).
+    // This mirrors the gate used in `expr_emit::literal_needs_typed_form_outside_constructor`.
     let decl_text = match literal {
         naga::Literal::U64(v) if v > i64::MAX as u64 => literal_to_wgsl(literal, max_precision),
+        naga::Literal::F16(_)
+        | naga::Literal::F64(_)
+        | naga::Literal::I64(_)
+        | naga::Literal::U64(_) => literal_to_wgsl(literal, max_precision),
         _ => expr_text.clone(),
     };
     LiteralExtractKey {
@@ -423,6 +435,12 @@ fn scalar_short_suffix(kind: naga::ScalarKind, width: u8) -> Option<&'static str
 /// Return the zero literal for the given scalar type (`0`, `0u`,
 /// `0.`, `0f`, `false`, and so on) so callers can splat concrete-typed
 /// zeros without re-deriving the suffix logic.
+///
+/// `AbstractInt`/`AbstractFloat` resolve to `0` / `0.0` respectively;
+/// in valid naga IR they should be concretised before reaching the
+/// emitter, but the explicit arms here keep round-trip behaviour
+/// well-defined (and prevent a future variant from silently falling
+/// through to a bare `0` that re-parses as `AbstractInt`).
 pub(super) fn scalar_zero(kind: naga::ScalarKind, width: u8) -> &'static str {
     match (kind, width) {
         (naga::ScalarKind::Bool, _) => "false",
@@ -433,6 +451,12 @@ pub(super) fn scalar_zero(kind: naga::ScalarKind, width: u8) -> &'static str {
         (naga::ScalarKind::Float, 2) => "0h",
         (naga::ScalarKind::Float, 4) => "0f",
         (naga::ScalarKind::Float, 8) => "0lf",
+        (naga::ScalarKind::AbstractInt, _) => "0",
+        (naga::ScalarKind::AbstractFloat, _) => "0.0",
+        // Unknown (kind, width) combinations should not occur in valid
+        // naga IR (the validator rejects non-canonical widths).  Fall
+        // back to bare `0` rather than panicking; any downstream parse
+        // failure surfaces through the round-trip validator.
         _ => "0",
     }
 }
@@ -633,7 +657,15 @@ pub(super) fn address_space(space: naga::AddressSpace) -> &'static str {
 }
 
 /// Map [`naga::StorageAccess`] flags to the WGSL access-mode keyword
-/// (`read`, `read_write`, `write`).
+/// (`read`, `read_write`, `write`, `atomic`).
+///
+/// `atomic` is a WGSL access mode for atomic storage textures
+/// (`texture_storage_2d<r32uint, atomic>`).  Naga's IR sets the
+/// `ATOMIC` flag on those texture bindings and the frontend rejects
+/// any other access mode for a texture that participates in atomic
+/// ops - so the flag must take precedence here.  For non-texture
+/// storage (`var<storage, ...>`) `ATOMIC` is never set, so the
+/// branch is exclusive to texture bindings in practice.
 pub(super) fn storage_access(access: naga::StorageAccess) -> &'static str {
     if access.contains(naga::StorageAccess::ATOMIC) {
         return "atomic";

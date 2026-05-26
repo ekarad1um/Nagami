@@ -183,11 +183,24 @@ impl ElementInit {
         (self.elements_written & (1u64 << idx)) != 0
     }
 
-    /// Merge by intersection - only bits / flags set in BOTH
-    /// inputs survive.  Used when joining the two arms of an `If`
-    /// at the merge point: a local is provably initialised post-If
-    /// only if both branches wrote it.
+    /// Merge by intersection at an If-arm merge point: a local is
+    /// post-If initialised only if BOTH branches wrote it.
+    ///
+    /// `element_count` uses `max(a, b)` rather than asserting
+    /// equality - the inputs describe the same local so the counts
+    /// are equal by construction.  The `.max` is a no-op defence
+    /// against future drift; the debug-assert catches the actual
+    /// drift case.
     fn intersect(self, other: Self) -> Self {
+        debug_assert!(
+            self.element_count == other.element_count
+                || self.element_count == 0
+                || other.element_count == 0,
+            "intersect of two ElementInits for the same local must agree on element_count \
+             (got {} vs {})",
+            self.element_count,
+            other.element_count,
+        );
         Self {
             element_count: self.element_count.max(other.element_count),
             elements_written: self.elements_written & other.elements_written,
@@ -208,7 +221,10 @@ impl ElementInit {
 /// rejects larger arrays).  Returns `0` for types whose internal
 /// structure we cannot enumerate (pointers, images, samplers,
 /// runtime- / override-sized arrays, atomic types, etc.).
-fn element_count_for_type(ty: naga::Handle<naga::Type>, types: &naga::UniqueArena<naga::Type>) -> u32 {
+fn element_count_for_type(
+    ty: naga::Handle<naga::Type>,
+    types: &naga::UniqueArena<naga::Type>,
+) -> u32 {
     match types[ty].inner {
         naga::TypeInner::Scalar(_) => 1,
         naga::TypeInner::Vector { size, .. } => size as u32,
@@ -259,7 +275,15 @@ fn resolve_local_and_element(
             // index.  Anything further (`AccessIndex(AccessIndex(L,
             // 0), 1)`) is a nested aggregate; we cannot describe
             // "L's slot, element-of-element-0, sub-element-1" with
-            // our flat bitset, so collapse to `Dynamic`.
+            // our flat per-element bitset, so collapse to `Dynamic`.
+            //
+            // Consequence: locals whose type is a nested aggregate
+            // (struct of struct, array of struct, ...) only benefit
+            // from coalescing when ENTIRELY overwritten via a
+            // top-level `Store(LocalVariable(L), ...)`; per-element
+            // sub-field writes fall through to `Dynamic` and the
+            // local stays uncoalesced.  Flat aggregates (vec3, mat2x2,
+            // struct of scalars, array of scalars) are unaffected.
             let spec = if matches!(parent, ElementSpec::Full) {
                 ElementSpec::Index(index)
             } else {
@@ -385,23 +409,30 @@ fn collect_local_usage(
     // repeating the pointer walk, AND knows which element of an
     // aggregate the read targets so element-coverage analysis
     // can fire at the use site.
-    let mut load_to_local_and_element: HashMap<
-        naga::Handle<naga::Expression>,
-        (naga::Handle<naga::LocalVariable>, ElementSpec),
-    > = HashMap::new();
+    //
+    // Backed by `Vec<Option<_>>` indexed by `handle.index()` rather
+    // than a `HashMap`: naga arena handles are dense 0-based small
+    // integers, so direct indexing is hash-free and cache-friendly.
+    // The Vec is pre-sized to `expressions.len()` so no growth /
+    // reallocation occurs during the build loop.
+    let mut load_to_local_and_element: Vec<
+        Option<(naga::Handle<naga::LocalVariable>, ElementSpec)>,
+    > = vec![None; function.expressions.len()];
     for (eh, expr) in function.expressions.iter() {
         if let naga::Expression::Load { pointer } = *expr
             && let Some(pair) = resolve_local_and_element(pointer, &function.expressions)
         {
-            load_to_local_and_element.insert(eh, pair);
+            load_to_local_and_element[eh.index()] = Some(pair);
         }
     }
 
-    // Element counts indexed by local handle so the scan does not
-    // re-walk type arenas per touch.
-    let mut local_element_count: HashMap<naga::Handle<naga::LocalVariable>, u32> = HashMap::new();
+    // Element counts indexed by local handle.  Same Vec<Option<_>>
+    // rationale: local-variable handles are dense, so a plain Vec
+    // indexed by `handle.index()` beats the HashMap on lookups in
+    // the per-statement scan_block_usage walks.
+    let mut local_element_count: Vec<Option<u32>> = vec![None; function.local_variables.len()];
     for (handle, local) in function.local_variables.iter() {
-        local_element_count.insert(handle, element_count_for_type(local.ty, types));
+        local_element_count[handle.index()] = Some(element_count_for_type(local.ty, types));
     }
 
     // DFS the statement tree with monotonic positions; each local
@@ -484,10 +515,11 @@ fn mark_block_first(
     local: naga::Handle<naga::LocalVariable>,
     is_store: bool,
 ) {
-    if block_seen.insert(local) && !is_store {
-        if let Some(info) = usage.get_mut(&local) {
-            info.coalesce_safe = false;
-        }
+    if block_seen.insert(local)
+        && !is_store
+        && let Some(info) = usage.get_mut(&local)
+    {
+        info.coalesce_safe = false;
     }
 }
 
@@ -513,11 +545,8 @@ fn mark_block_first(
 fn scan_block_usage(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    load_to_local_and_element: &HashMap<
-        naga::Handle<naga::Expression>,
-        (naga::Handle<naga::LocalVariable>, ElementSpec),
-    >,
-    local_element_count: &HashMap<naga::Handle<naga::LocalVariable>, u32>,
+    load_to_local_and_element: &[Option<(naga::Handle<naga::LocalVariable>, ElementSpec)>],
+    local_element_count: &[Option<u32>],
     pos: &mut usize,
     usage: &mut HashMap<naga::Handle<naga::LocalVariable>, LocalUse>,
     local_init: &mut HashMap<naga::Handle<naga::LocalVariable>, ElementInit>,
@@ -561,15 +590,18 @@ fn scan_block_usage(
                 // mental model, prior local's residue after a
                 // coalesce).
                 for h in range.clone() {
-                    if let Some(&(local, spec)) = load_to_local_and_element.get(&h) {
+                    if let Some(&(local, spec)) = load_to_local_and_element
+                        .get(h.index())
+                        .and_then(|o| o.as_ref())
+                    {
                         mark_used(usage, local, current);
                         mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
                         // Coverage check; uncovered Reads make
                         // coalescing observably wrong.
-                        if !load_covers(local_init.get(&local), spec) {
-                            if let Some(info) = usage.get_mut(&local) {
-                                info.coalesce_safe = false;
-                            }
+                        if !load_covers(local_init.get(&local), spec)
+                            && let Some(info) = usage.get_mut(&local)
+                        {
+                            info.coalesce_safe = false;
                         }
                     }
                 }
@@ -587,7 +619,10 @@ fn scan_block_usage(
                 // unwritten parts.
                 if let Some((local, spec)) = resolve_local_and_element(*pointer, expressions) {
                     mark_used(usage, local, current);
-                    let element_count = local_element_count.get(&local).copied().unwrap_or(0);
+                    let element_count = local_element_count
+                        .get(local.index())
+                        .and_then(|o| *o)
+                        .unwrap_or(0);
                     let init = local_init
                         .entry(local)
                         .or_insert_with(|| ElementInit::new(element_count));
@@ -655,35 +690,35 @@ fn scan_block_usage(
                 }
             }
             naga::Statement::CooperativeStore { target, data } => {
-                // Both operands of a cooperative store can resolve to
-                // function-locals and BOTH must be tracked for
-                // correctness, with opposite read/write semantics:
+                // `target` must be a `CooperativeMatrix` value per
+                // naga's validator, but `resolve_local_and_element`
+                // descends only through pointer-typed chains
+                // (`LocalVariable`, `Access`, `AccessIndex` over a
+                // pointer-typed base), so it never matches on
+                // validator-clean IR.  Kept as defense-in-depth:
+                // over-extending a local's live range is safe;
+                // under-tracking would miscompile.  Real reads via
+                // `Load(LocalVariable)` are already caught by the
+                // `Emit` arm above.
                 //
-                // - `target` is the source matrix VALUE.  Per naga's
-                //   validator (`naga/valid/function.rs:1660`) it must
-                //   resolve to `CooperativeMatrix`; if the IR routes
-                //   that through a `LocalVariable(_)` expression, the
-                //   matrix is loaded out of that local - a READ.
-                //   Check element coverage just like an Emit'd Load.
-                // - `data.pointer` is the destination POINTER.  Per
-                //   `naga/valid/function.rs:1681` its address space
-                //   must include `STORE`, and `AddressSpace::Function`
-                //   does (LOAD | STORE per `proc/mod.rs:214`), so a
-                //   function-local is a legitimate destination.  The
-                //   matrix value is WRITTEN into that local's slot;
-                //   update element-coverage like a regular Store.
+                // `data.pointer` is the validated write destination
+                // (function-local is in scope for `STORE` access);
+                // treat as a regular Store touch.
                 if let Some((local, spec)) = resolve_local_and_element(*target, expressions) {
                     mark_used(usage, local, current);
                     mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
-                    if !load_covers(local_init.get(&local), spec) {
-                        if let Some(info) = usage.get_mut(&local) {
-                            info.coalesce_safe = false;
-                        }
+                    if !load_covers(local_init.get(&local), spec)
+                        && let Some(info) = usage.get_mut(&local)
+                    {
+                        info.coalesce_safe = false;
                     }
                 }
                 if let Some((local, spec)) = resolve_local_and_element(data.pointer, expressions) {
                     mark_used(usage, local, current);
-                    let element_count = local_element_count.get(&local).copied().unwrap_or(0);
+                    let element_count = local_element_count
+                        .get(local.index())
+                        .and_then(|o| *o)
+                        .unwrap_or(0);
                     let init = local_init
                         .entry(local)
                         .or_insert_with(|| ElementInit::new(element_count));
@@ -730,8 +765,7 @@ fn scan_block_usage(
                 );
                 let reject_init = std::mem::replace(local_init, entry_init);
 
-                let newly_fully_covered =
-                    merge_inits_into(local_init, accept_init, reject_init);
+                let newly_fully_covered = merge_inits_into(local_init, accept_init, reject_init);
 
                 // Locals written on every path through the If
                 // (intersection of both arms) are unconditionally
@@ -835,7 +869,44 @@ fn scan_block_usage(
                     block_writes.insert(local);
                 }
             }
-            _ => {}
+            // The remaining `Statement` variants are listed explicitly
+            // (no `_ => {}` catch-all) so a future naga release that
+            // adds a new pointer-bearing statement produces a compile
+            // error here, preventing it from silently bypassing the
+            // coalescing safety analysis.  Each arm documents why no
+            // explicit `mark_used` / `mark_block_first` call is needed.
+            //
+            // The variants below fall into two groups:
+            //   (a) Control-flow terminators and barriers that do not
+            //       touch any function-local through a pointer:
+            //       Break, Continue, Return, Kill, ControlBarrier,
+            //       MemoryBarrier.
+            //   (b) Statements that DO inspect a pointer expression or
+            //       expression operands, but those expressions are
+            //       evaluated via a preceding `Emit` range per naga's
+            //       IR model.  The `Emit` arm above already registers
+            //       every `Load(LocalVariable)` reached through those
+            //       operands, so liveness is correctly tracked without
+            //       per-statement re-inspection: WorkGroupUniformLoad,
+            //       SubgroupBallot, SubgroupCollectiveOperation,
+            //       SubgroupGather, ImageStore, ImageAtomic.
+            //
+            //       For WorkGroupUniformLoad specifically: WGSL
+            //       requires its `pointer` to resolve to a
+            //       `ptr<workgroup, T>`, so it never targets a
+            //       function-local; the Emit-arm coverage is sufficient.
+            naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. } => {}
         }
     }
 

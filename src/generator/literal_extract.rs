@@ -358,18 +358,23 @@ impl<'a> Generator<'a> {
         }
 
         // 3. Collect profitable candidates sorted by estimated savings.
-        //    `savings = K * (L - N) - (8 + N + D)` where `K` is the use
-        //    count, `L` the literal text length, `N` the bound name
-        //    length (estimated as 1 for the initial filter), and `D`
-        //    the declaration text length.  The `8 + N + D` term covers
-        //    `const N=D;` boilerplate.
+        //    `savings = K * (L - N) - (BOILERPLATE + N + D)` where `K`
+        //    is the use count, `L` the literal text length, `N` the
+        //    bound name length (estimated as 1 for the initial filter),
+        //    and `D` the declaration text length.  The boilerplate term
+        //    differs by output style:
+        //      compact:  `const N=D;`    = 6 + 1 + 1 = 8 fixed chars
+        //      beautify: `const N = D;\n` = 6 + 3 + 2 = 11 fixed chars
+        //    Mis-pricing in beautify mode wrongly accepts borderline
+        //    extractions that net-cost two bytes per use.
+        let boilerplate: isize = if self.options.beautify { 11 } else { 8 };
         let mut candidates: Vec<(isize, LiteralExtractKey, usize)> = literal_counts
             .into_iter()
             .filter_map(|(key, count)| {
                 let expr_len = key.expr_text.len() as isize;
                 let decl_len = key.decl_text.len() as isize;
                 let k = count as isize;
-                let est = k * (expr_len - 1) - (8 + 1 + decl_len);
+                let est = k * (expr_len - 1) - (boilerplate + 1 + decl_len);
                 if est > 0 {
                     Some((est, key, count))
                 } else {
@@ -377,22 +382,41 @@ impl<'a> Generator<'a> {
                 }
             })
             .collect();
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
+        // Sort descending by estimated savings.  HashMap iteration order
+        // is randomised per process (`std::collections::HashMap` uses a
+        // per-instance `RandomState`), so ties on the savings estimate
+        // would otherwise produce non-reproducible output across runs.
+        // Tie-break first on `expr_text`, then on `decl_text` - together
+        // they form the full `LiteralExtractKey`, giving a total order.
+        candidates.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| a.1.expr_text.cmp(&b.1.expr_text))
+                .then_with(|| a.1.decl_text.cmp(&b.1.decl_text))
+        });
 
         // 4. Greedily assign names, re-computing savings with the true
         //    name length once a concrete name has been picked; extracts
         //    are kept only when the corrected savings stay positive.
+        //
+        // When a candidate's actual-name savings turn negative, restore
+        // the counter so the rejected slot can be claimed by a later
+        // candidate whose savings are still net positive.  Without this
+        // rollback, every rejection silently consumes a short-name slot
+        // and pushes accepted-but-later candidates into longer names.
         let mut counter = 0usize;
         for (_, key, count) in candidates {
+            let counter_before = counter;
             let name = next_name_unique(&mut counter, &forbidden);
             let n = name.len() as isize;
             let expr_len = key.expr_text.len() as isize;
             let decl_len = key.decl_text.len() as isize;
             let k = count as isize;
-            let savings = k * (expr_len - n) - (8 + n + decl_len);
+            let savings = k * (expr_len - n) - (boilerplate + n + decl_len);
             if savings > 0 {
                 forbidden.insert(name.clone());
                 self.extracted_literals.insert(key, name);
+            } else {
+                counter = counter_before;
             }
         }
     }

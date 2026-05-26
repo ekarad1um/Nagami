@@ -69,8 +69,21 @@ impl<K: Eq + Hash + Clone, V: Clone> ScopedMap<K, V> {
 
     /// Replay undo entries in reverse until the log length equals
     /// `checkpoint`, restoring the map to its state at that point.
+    ///
+    /// # Panics
+    ///
+    /// Panics (debug and release) when `checkpoint > self.undo.len()`.
+    /// That precondition can only fail if `checkpoint` was not produced
+    /// by this instance's [`checkpoint`](Self::checkpoint), or if a
+    /// previous `rollback_to` already popped past it - both programmer
+    /// errors whose silent no-op would leave dataflow analysis acting
+    /// on a stale map.
     pub(crate) fn rollback_to(&mut self, checkpoint: usize) {
-        debug_assert!(checkpoint <= self.undo.len());
+        assert!(
+            checkpoint <= self.undo.len(),
+            "rollback_to(checkpoint={checkpoint}) exceeds undo log length {}",
+            self.undo.len(),
+        );
         while self.undo.len() > checkpoint {
             let (key, prev) = self.undo.pop().expect("len > checkpoint");
             match prev {

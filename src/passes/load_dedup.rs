@@ -21,6 +21,7 @@
 //! forwarded-and-dropped emits the dedup phase leaves behind.
 
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
@@ -81,6 +82,269 @@ enum PointerKey {
         naga::Handle<naga::LocalVariable>,
         naga::Handle<naga::Expression>,
     ),
+}
+
+// MARK: Expression scope index
+
+/// Per-function precomputed scope index built once by
+/// [`dedup_loads_in_function`].  Answers two recurring questions in O(1):
+///
+/// 1. **"Is expression handle `h` emitted inside block `B`'s subtree?"**
+///    Consumed by [`collect_redundant_loads`] at every Block / If /
+///    Switch boundary to drop cache entries whose value is `let`-bound
+///    inside the closing brace.  Implemented as an interval check
+///    (`enter <= handle_pos < exit`) so each probe is O(1); deeply
+///    nested IR would otherwise pay a per-probe subtree DFS, multiplied
+///    by up to 16 pipeline sweeps per minification.
+///
+/// 2. **"Is the live-load handle `h` at a later execution position than
+///    Store `s`?"**  Consumed by the `has_later_live_load` gate in
+///    [`dedup_loads_in_function`] to decide whether last-store inlining
+///    is safe.  The position numbering is shared with the
+///    subtree-membership view above so the build walk amortises both
+///    answers across one DFS.
+///
+/// # Layout
+///
+/// A single depth-first walk of `body` assigns every statement a
+/// monotonically-increasing `u32` position.  Three views derive from
+/// that numbering:
+///
+/// * `handle_pos[h.index()] = Some(pos)` for every expression handle
+///   introduced by a statement.  Two sources contribute:
+///
+///   - **Emit ranges**: every handle in a `Statement::Emit` range
+///     shares the position of the Emit statement (the whole range
+///     materialises atomically at execution time, so per-handle
+///     ordering inside the range is meaningless).
+///   - **Statement-bound result handles**: `Call.result`,
+///     `Atomic.result`, `WorkGroupUniformLoad.result`,
+///     `SubgroupBallot.result`, `SubgroupGather.result`,
+///     `SubgroupCollectiveOperation.result`, and
+///     `RayQueryFunction::Proceed.result`.  These are NOT in any
+///     Emit range but are still `let`-bound at the statement site by
+///     naga's WGSL writer, so they must participate in the
+///     subtree-membership check or the store-scope leak regressions
+///     reappear (see `block_scope_leak_regression_call_result_in_block`
+///     and the atomic counterpart).
+///
+///   `Vec<Option<u32>>` indexed by `handle.index()` avoids the per-probe
+///   hash on the hot membership check.  Arena handles are dense
+///   integers in `[0, expressions.len())`, so the indexing is exact.
+///
+///   Pre-emit expressions (`Literal`, `Constant`, `Override`,
+///   `ZeroValue`, `FunctionArgument`, `GlobalVariable`,
+///   `LocalVariable`) are NOT in this map - `handle_position` returns
+///   `None` for them, and [`is_in_subtree`](Self::is_in_subtree)
+///   returns `false` (membership predicate: "no recorded position
+///   inside the subtree's interval").  Callers that want pre-emit
+///   handles to survive a scope-narrowing filter combine the call
+///   with `expressions[h].needs_pre_emit()` so the pair correctly
+///   models "in scope everywhere" without conflating it with the
+///   in-subtree answer.
+///
+/// * `store_pos[(ptr, val)] = pos` for every `Store` statement.  When
+///   two distinct Stores share an identity (same pointer + same value
+///   handle, possible e.g. from store-seeding in different basic
+///   blocks), the MINIMUM position is kept - a Load between the
+///   earlier Store and the later one would otherwise fall through
+///   the gap and be misclassified as "no later live Load",
+///   incorrectly killing the earlier Store.  Min-aggregation makes
+///   `has_later_live_load` over-keep on identity collisions, which
+///   is the conservative direction.
+///
+/// * `block_interval[B] = (enter, exit)` is the half-open
+///   `[enter, exit)` range of positions consumed by every descendant
+///   statement of block `B` (the block's own statements plus all
+///   nested control-flow subtrees).  A handle `h` is "inside `B`'s
+///   subtree" iff `handle_pos[h.index()] in [enter, exit)`.  An
+///   empty block has `enter == exit`; no handle is in it.
+///
+/// # Safety: `*const naga::Block` as map key
+///
+/// `block_interval` is keyed by block address because blocks have no
+/// intrinsic numeric identifier in naga's IR.  Address stability is
+/// guaranteed by three invariants enforced jointly:
+///
+/// 1. All blocks live inside `naga::Function::body` and are reached
+///    via owning references - their addresses do not change unless
+///    the body is mutated.
+/// 2. The struct's `PhantomData<&'body naga::Block>` lifetime
+///    parameter ties its existence to an immutable borrow of `body`;
+///    the borrow checker rejects any concurrent mutation of the body
+///    for as long as the index is live.
+/// 3. The single production caller ([`dedup_loads_in_function`])
+///    drops the index before its mutation phase ([`apply_to_block`]
+///    etc.) begins.
+///
+/// Without invariant (2) a HashMap lookup against a moved block would
+/// silently return `None` (different address) and the `is_in_subtree`
+/// fallback would mis-classify the handle - sound but cache-poisoning.
+/// The PhantomData lifetime prevents that statically.
+struct ExpressionScopeIndex<'body> {
+    handle_pos: Vec<Option<u32>>,
+    store_pos: HashMap<StoreId, u32>,
+    block_interval: HashMap<*const naga::Block, (u32, u32)>,
+    _phantom: PhantomData<&'body naga::Block>,
+}
+
+impl<'body> ExpressionScopeIndex<'body> {
+    /// Build the index from a function body in a single DFS walk.
+    /// `expressions` is used solely to size the dense `handle_pos`
+    /// vector; the arena itself is not stored.
+    fn build(body: &'body naga::Block, expressions: &naga::Arena<naga::Expression>) -> Self {
+        let mut idx = ExpressionScopeIndex {
+            handle_pos: vec![None; expressions.len()],
+            store_pos: HashMap::new(),
+            block_interval: HashMap::new(),
+            _phantom: PhantomData,
+        };
+        let mut pos = 0u32;
+        idx.walk(body, &mut pos);
+        idx
+    }
+
+    /// Recursive DFS worker.  Records each statement's position,
+    /// populates `handle_pos` / `store_pos` for the variants that
+    /// contribute, and records the block's `[enter, exit)` interval
+    /// on exit.  The match is exhaustive (no `_ => {}` catch-all) so
+    /// a future naga release adding a new emit-handle-bearing or
+    /// block-bearing statement variant trips the build here instead
+    /// of silently slipping past this index's coverage.
+    fn walk(&mut self, block: &'body naga::Block, pos: &mut u32) {
+        let enter = *pos;
+        for stmt in block.iter() {
+            let here = *pos;
+            // `checked_add` so a release build still panics on
+            // overflow - wrapping back to 0 would re-issue used
+            // positions and corrupt both subtree-membership
+            // (`enter <= pos < exit`) and `store_pos < load_pos`
+            // ordering.  2^32 statements per function is a bug
+            // signal, not a workload cap.
+            *pos = pos
+                .checked_add(1)
+                .expect("ExpressionScopeIndex: more than 2^32 statements in a single function");
+            match stmt {
+                naga::Statement::Emit(range) => {
+                    for h in range.clone() {
+                        self.handle_pos[h.index()] = Some(here);
+                    }
+                }
+                naga::Statement::Store { pointer, value } => {
+                    self.store_pos
+                        .entry((*pointer, *value))
+                        .and_modify(|p| {
+                            if here < *p {
+                                *p = here;
+                            }
+                        })
+                        .or_insert(here);
+                }
+                naga::Statement::Call {
+                    result: Some(r), ..
+                }
+                | naga::Statement::Atomic {
+                    result: Some(r), ..
+                } => {
+                    self.handle_pos[r.index()] = Some(here);
+                }
+                naga::Statement::WorkGroupUniformLoad { result, .. }
+                | naga::Statement::SubgroupBallot { result, .. }
+                | naga::Statement::SubgroupGather { result, .. }
+                | naga::Statement::SubgroupCollectiveOperation { result, .. } => {
+                    self.handle_pos[result.index()] = Some(here);
+                }
+                naga::Statement::RayQuery { fun, .. } => {
+                    if let naga::RayQueryFunction::Proceed { result } = fun {
+                        self.handle_pos[result.index()] = Some(here);
+                    }
+                }
+                naga::Statement::Block(inner) => {
+                    self.walk(inner, pos);
+                }
+                naga::Statement::If { accept, reject, .. } => {
+                    self.walk(accept, pos);
+                    self.walk(reject, pos);
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    for case in cases {
+                        self.walk(&case.body, pos);
+                    }
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    self.walk(body, pos);
+                    self.walk(continuing, pos);
+                }
+                // Statements that introduce no expression handles
+                // (no Emit range, no result field, no Store identity)
+                // and contain no nested blocks.  Enumerated explicitly
+                // - a future naga variant that adds emit-handle
+                // semantics or carries a nested block would otherwise
+                // silently bypass this index.
+                naga::Statement::Call { result: None, .. }
+                | naga::Statement::Atomic { result: None, .. }
+                | naga::Statement::Break
+                | naga::Statement::Continue
+                | naga::Statement::Return { .. }
+                | naga::Statement::Kill
+                | naga::Statement::ControlBarrier(_)
+                | naga::Statement::MemoryBarrier(_)
+                | naga::Statement::ImageStore { .. }
+                | naga::Statement::ImageAtomic { .. }
+                | naga::Statement::RayPipelineFunction(_)
+                | naga::Statement::CooperativeStore { .. } => {}
+            }
+        }
+        self.block_interval
+            .insert(block as *const naga::Block, (enter, *pos));
+    }
+
+    /// DFS position of expression handle `h`, or `None` if `h` is a
+    /// pre-emit expression (`Literal`, `Constant`, `Override`,
+    /// `ZeroValue`, `FunctionArgument`, `GlobalVariable`,
+    /// `LocalVariable`) and therefore not bound by any statement.
+    fn handle_position(&self, h: naga::Handle<naga::Expression>) -> Option<u32> {
+        self.handle_pos.get(h.index()).copied().flatten()
+    }
+
+    /// Earliest DFS position of any `Store` with identity `id`, or
+    /// `None` if no such Store was encountered during the build walk.
+    fn store_position(&self, id: StoreId) -> Option<u32> {
+        self.store_pos.get(&id).copied()
+    }
+
+    /// `true` when handle `h` is introduced by a statement inside
+    /// `block`'s subtree (the block itself plus all nested children).
+    ///
+    /// Returns `false` for:
+    /// * Pre-emit handles (not bound by any statement; in scope
+    ///   everywhere - their `handle_position` is `None`).  Callers
+    ///   that need pre-emit handles to survive a scope-narrowing
+    ///   filter pair this with a separate `needs_pre_emit()` clause.
+    /// * Handles in the arena but not reached by the build walk
+    ///   (e.g. dead expressions left behind by an earlier pass).
+    fn is_in_subtree(&self, block: &naga::Block, h: naga::Handle<naga::Expression>) -> bool {
+        let key = block as *const naga::Block;
+        let Some(&(enter, exit)) = self.block_interval.get(&key) else {
+            // Block address not in the index - only possible if the
+            // body was mutated during the query, which the pass
+            // contract forbids.  Callers combine this with
+            // `needs_pre_emit()` as a KEEP filter, so `true` drops
+            // the cache entry (safe direction): `false` would
+            // forward a handle whose Emit range exits with the
+            // block and trip the validator on rollback.
+            debug_assert!(
+                false,
+                "ExpressionScopeIndex: block address not in index - \
+                 body mutated during query?"
+            );
+            return true;
+        };
+        self.handle_position(h)
+            .is_some_and(|p| p >= enter && p < exit)
+    }
 }
 
 // MARK: Dead-init removal
@@ -160,17 +424,10 @@ pub(crate) fn is_zero_literal(lit: &naga::Literal) -> bool {
     }
 }
 
-/// Scan the function body's top-level block and return locals whose init is
-/// provably dead - a whole-variable Store overwrites the local before any
-/// Load on the sequential execution path.
-///
-/// For control-flow sub-blocks (If / Switch / Loop / Block), any local that
-/// is loaded or modified inside is conservatively removed from tracking.
-/// Return the set of locals whose init is overwritten by a
-/// whole-variable `Store` before any surviving read on every path
-/// through the function body.  Inputs beyond the top-level block are
-/// intentionally conservative: branches and loops may or may not run,
-/// so an init is only considered dead when dominated at the top level.
+/// Locals whose init is provably overwritten before any read on the
+/// sequential top-level path.  Conservative for sub-blocks: any local
+/// loaded or modified inside an If / Switch / Loop / Block is dropped
+/// from tracking, since the branch may not run.
 fn find_dead_inits(
     body: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
@@ -255,20 +512,42 @@ fn find_dead_inits(
                     pending.remove(&local);
                 }
             }
-            naga::Statement::CooperativeStore { target, .. } => {
-                if let Some(local) = get_stored_local(expressions, *target) {
+            naga::Statement::CooperativeStore { data, .. } => {
+                // `data.pointer` is the destination of the matrix write
+                // (validator rejects non-`STORE`-space pointers).  `target`
+                // is the source matrix VALUE - reads through it are
+                // already tracked by the Emit/Load walking elsewhere.
+                if let Some(local) = get_stored_local(expressions, data.pointer) {
                     pending.remove(&local);
                 }
             }
-            // Return, Kill, Barrier, ImageStore, etc. don't touch locals.
-            _ => {}
+            // Statements that do not touch local-variable inits and
+            // do not contain nested blocks - enumerated explicitly
+            // so a future naga release adding a new pointer-bearing
+            // statement breaks the build here instead of silently
+            // letting an init survive past a Store-through-it.
+            naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. } => {}
         }
     }
     dead
 }
 
-/// Remove `pending` entries for any local that is loaded or modified inside
-/// the given sub-blocks.
+/// Remove `pending` entries for any local that is loaded OR modified
+/// inside the given sub-blocks.  Used by `find_dead_inits` to drop
+/// init-tracking for any local that might be observed (read) or
+/// mutated (write) on a path through a sub-block - either case means
+/// the init cannot be proved dead from a top-level scan.
 fn invalidate_involved(
     blocks: &[&naga::Block],
     expressions: &naga::Arena<naga::Expression>,
@@ -276,50 +555,109 @@ fn invalidate_involved(
 ) {
     let mut involved = HashSet::new();
     for block in blocks {
-        collect_modified_locals(block, expressions, &mut involved);
-        collect_loaded_locals_in_block(block, expressions, &mut involved);
+        collect_touched_locals(block, expressions, &mut involved);
     }
     for lh in &involved {
         pending.remove(lh);
     }
 }
 
-/// Collect local variables whose value is loaded within a block (recursively).
-fn collect_loaded_locals_in_block(
+/// Every local that is read OR written inside `block` (recursively),
+/// in a single walk.  Used by [`invalidate_involved`] where the union
+/// of reads and writes is what disqualifies a local from init-death
+/// tracking.  Distinct from [`collect_modified_locals`], which
+/// `dead_branch` calls for write-only analysis (its else-store
+/// equality check tolerates pure reads).
+fn collect_touched_locals(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    loaded: &mut HashSet<naga::Handle<naga::LocalVariable>>,
+    touched: &mut HashSet<naga::Handle<naga::LocalVariable>>,
 ) {
     for stmt in block {
         match stmt {
+            // Reads: Emit ranges carry Load expressions whose pointer
+            // chains back to a local.  The Emit range itself is
+            // visited once - the inner loop scans every handle in the
+            // range for a Load that targets a local.
             naga::Statement::Emit(range) => {
                 for h in range.clone() {
                     if let naga::Expression::Load { pointer } = &expressions[h]
                         && let Some(local) = get_stored_local(expressions, *pointer)
                     {
-                        loaded.insert(local);
+                        touched.insert(local);
                     }
                 }
             }
+            // Writes - same arm shape and pointer-root resolution as
+            // `collect_modified_locals`, kept in lockstep so a future
+            // naga variant adding a new pointer-writer triggers
+            // exhaustive-match failures in both places.
+            naga::Statement::Store { pointer, .. } | naga::Statement::Atomic { pointer, .. } => {
+                if let Some(lh) = get_stored_local(expressions, *pointer) {
+                    touched.insert(lh);
+                }
+            }
+            naga::Statement::Call { arguments, .. } => {
+                for &arg in arguments {
+                    if let Some(lh) = get_stored_local(expressions, arg) {
+                        touched.insert(lh);
+                    }
+                }
+            }
+            naga::Statement::RayPipelineFunction(fun) => {
+                let naga::RayPipelineFunction::TraceRay { payload, .. } = fun;
+                if let Some(lh) = get_stored_local(expressions, *payload) {
+                    touched.insert(lh);
+                }
+            }
+            naga::Statement::CooperativeStore { data, .. } => {
+                // Write side is `data.pointer`; `target` is the matrix
+                // VALUE (a read), already counted via Emit walking.
+                if let Some(lh) = get_stored_local(expressions, data.pointer) {
+                    touched.insert(lh);
+                }
+            }
+            naga::Statement::RayQuery { query, .. } => {
+                if let Some(lh) = get_stored_local(expressions, *query) {
+                    touched.insert(lh);
+                }
+            }
+            // Recurse into nested blocks.
             naga::Statement::If { accept, reject, .. } => {
-                collect_loaded_locals_in_block(accept, expressions, loaded);
-                collect_loaded_locals_in_block(reject, expressions, loaded);
+                collect_touched_locals(accept, expressions, touched);
+                collect_touched_locals(reject, expressions, touched);
             }
             naga::Statement::Switch { cases, .. } => {
                 for case in cases {
-                    collect_loaded_locals_in_block(&case.body, expressions, loaded);
+                    collect_touched_locals(&case.body, expressions, touched);
                 }
             }
             naga::Statement::Loop {
                 body, continuing, ..
             } => {
-                collect_loaded_locals_in_block(body, expressions, loaded);
-                collect_loaded_locals_in_block(continuing, expressions, loaded);
+                collect_touched_locals(body, expressions, touched);
+                collect_touched_locals(continuing, expressions, touched);
             }
             naga::Statement::Block(inner) => {
-                collect_loaded_locals_in_block(inner, expressions, loaded);
+                collect_touched_locals(inner, expressions, touched);
             }
-            _ => {}
+            // Statements that neither read a local through `Load`
+            // nor write a local through any pointer-bearing field,
+            // and contain no nested blocks.  Enumerated explicitly
+            // so a future naga variant breaks the build here rather
+            // than silently mis-classifying a touch.
+            naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. } => {}
         }
     }
 }
@@ -362,7 +700,31 @@ fn remove_dead_stores_in_block(
             naga::Statement::Block(inner) => {
                 changed |= remove_dead_stores_in_block(inner, expressions);
             }
-            _ => {}
+            // Leaf statements - the dead-Store linear scan below
+            // handles all non-block statements; recursion only fires
+            // for block-bearing variants.  Enumerated explicitly so a
+            // future naga release adding a new block-bearing variant
+            // breaks the build here instead of silently bypassing
+            // recursion.
+            naga::Statement::Emit(_)
+            | naga::Statement::Store { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Call { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
         }
     }
 
@@ -406,20 +768,40 @@ fn remove_dead_stores_in_block(
             // Statements that cannot reference a function-local pointer
             // (atomics target storage/workgroup, image ops target globals,
             // workgroup-uniform loads target workgroup, subgroup ops take
-            // value arguments only, cooperative store targets a cooperative
-            // matrix in workgroup memory).  These cannot make any pending
+            // value arguments only).  These cannot make any pending
             // function-local Store live, so they leave `pending_store`
-            // unchanged - more precise than the previous blanket clear.
+            // unchanged - more precise than a blanket clear.
             naga::Statement::ControlBarrier(_)
             | naga::Statement::MemoryBarrier(_)
             | naga::Statement::WorkGroupUniformLoad { .. }
             | naga::Statement::ImageStore { .. }
             | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Atomic { .. }
             | naga::Statement::SubgroupBallot { .. }
             | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
+            | naga::Statement::SubgroupCollectiveOperation { .. } => {}
+            // Atomic read-modify-writes through `pointer`.  WGSL forbids
+            // `atomic<T>` in function memory so a chain rooted at a
+            // function-local would be IR-malformed, but the precise-by-
+            // root-local invalidation keeps this site in lockstep with
+            // the cache walker - the two must agree on which locals a
+            // statement disturbs.
+            naga::Statement::Atomic { pointer, .. } => {
+                if let Some(local) = get_stored_local(expressions, *pointer) {
+                    pending_store.remove(&local);
+                }
+            }
+            // CooperativeStore: `data.pointer` is the write destination
+            // (validator-required STORE-space pointer).  When it roots at
+            // a function-local, the matrix write may be partial (matrix
+            // < local's full type), so a prior whole-variable pending
+            // Store is NOT cleanly overwritten - the unwritten bytes
+            // still observe the pending value, keeping it live.
+            // Conservatively remove the local from pending.
+            naga::Statement::CooperativeStore { data, .. } => {
+                if let Some(local) = get_stored_local(expressions, data.pointer) {
+                    pending_store.remove(&local);
+                }
+            }
             // Call: the only channel by which a function-local Store can be
             // observed across the call boundary is a `ptr<function, T>`
             // argument, which in naga IR is necessarily a chain of
@@ -441,13 +823,43 @@ fn remove_dead_stores_in_block(
                     pending_store.remove(&local);
                 }
             }
-            // Anything else (RayPipelineFunction with multiple pointer
-            // payload fields, Break / Continue control-flow boundaries,
-            // and the structural If / Switch / Loop / Block statements
-            // already recursed above) is conservatively cleared.
-            _ => {
+            // TraceRay's payload is the only pointer reachable through
+            // the call boundary, so only the local rooting `payload`
+            // can be observed.  Precise invalidation matches the cache
+            // walker; a blanket clear would needlessly kill unrelated
+            // pending Stores.
+            naga::Statement::RayPipelineFunction(fun) => {
+                let naga::RayPipelineFunction::TraceRay { payload, .. } = fun;
+                if let Some(local) = get_stored_local(expressions, *payload) {
+                    pending_store.remove(&local);
+                }
+            }
+            // Structural statements: If/Switch/Loop/Block were
+            // already recursed above; arriving here on the pending
+            // walk means we're at the top-level scan and need to
+            // conservatively clear pending across the control-flow
+            // boundary (the boundary may join paths that read F).
+            naga::Statement::If { .. }
+            | naga::Statement::Switch { .. }
+            | naga::Statement::Loop { .. }
+            | naga::Statement::Block(_) => {
                 pending_store.clear();
             }
+            // Break / Continue: clear pending - the control transfer
+            // ends the current basic block; a pending store followed
+            // by Break could still be observable by the Break target.
+            naga::Statement::Break | naga::Statement::Continue => {
+                pending_store.clear();
+            } // Statements explicitly enumerated above (Emit / Store /
+              // Atomic / RayQuery / Call / Return / Kill / barriers /
+              // image-store / image-atomic / workgroup-uniform-load /
+              // Subgroup{Ballot, Gather, CollectiveOperation} /
+              // CooperativeStore) are handled by their dedicated arms.
+              // This file enumerates every Statement variant explicitly
+              // (no `_ =>` catch-all) per the forward-compat contract
+              // established in 311f6a4: a future naga release adding a
+              // new variant trips the build here instead of silently
+              // taking the conservative-clear default.
         }
     }
 
@@ -494,9 +906,18 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         }
     }
 
+    // Build the per-function scope index once.  It powers both the
+    // O(1) "is handle emitted inside block subtree" probes consumed
+    // by `collect_redundant_loads` at every Block/If/Switch scope
+    // and the execution-position lookups consumed by the
+    // `has_later_live_load` gate further down.  See the doc-comment
+    // on `ExpressionScopeIndex` for layout and safety.
+    let scope_idx = ExpressionScopeIndex::build(&function.body, &function.expressions);
+
     collect_redundant_loads(
         &function.body,
         &function.expressions,
+        &scope_idx,
         &mut cache,
         &mut replacements,
         &mut all_loads,
@@ -533,6 +954,13 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         &mut partially_stored,
     );
 
+    // A local is "dead" when every Load (whole or partial) has been
+    // forwarded with a valid replacement; the surviving Stores are then
+    // dead writes whose value no reader observes.  Excluding `escaped`
+    // is mandatory (callee can read through the leaked ptr at any
+    // time); `partially_stored` does NOT need exclusion because the
+    // all-loads-replaced gate already covers every partial Load - any
+    // un-forwarded partial Load would block the entry here.
     let dead_locals: HashSet<naga::Handle<naga::LocalVariable>> = all_loads
         .iter()
         .filter(|(lh, loads)| {
@@ -597,7 +1025,7 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
 
     let mut dead_store_ids: HashSet<StoreId> = HashSet::new();
     for (&store_id, seeded_loads) in &loads_per_store {
-        let (store_ptr, store_val) = store_id;
+        let (store_ptr, _) = store_id;
         // The store must be a whole-variable store (LocalVariable pointer).
         if !matches!(
             function.expressions[store_ptr],
@@ -622,29 +1050,43 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         if !all_valid {
             continue;
         }
-        // Guard: a Store is only dead if there are no un-replaced loads
-        // of the variable with handles after the Store's value handle.
-        // Such loads could observe this Store's value through control flow
-        // paths not captured by the seeded-load cache (e.g. loop body
-        // loads after cache was cleared at loop entry).
+        // Guard: a Store is only dead when no un-replaced Load of the
+        // variable appears at a later statement position.  Such a
+        // Load could observe this Store through paths not captured by
+        // the seeded-load cache (e.g. a loop body's Load reaching the
+        // cleared cache).
         //
-        // INVARIANT (paired with cache-promotion in `collect_redundant_loads`):
-        //   the cache promotion at Emit(Load) **only** rebinds `cache[key]`
-        //   to the new Load handle when the existing canonical was *not* a
-        //   `Load` (i.e. it came from store-seeding or an init).  When the
-        //   canonical IS a `Load`, the producer's handle stays in the cache,
-        //   so subsequent forwarded Loads chain to a Load that *survives* in
-        //   the arena.  The `has_later_live_load` check below relies on that
-        //   producer-Load surviving (handle un-replaced by `replacements`)
-        //   to keep the producing Store alive; if cache-promotion ever started
-        //   replacing canonical-Loads with later Load handles, those producer
-        //   Loads would themselves end up in `replacements`, and this guard
-        //   would falsely classify the producing Store as dead - re-introducing
-        //   the meet-over-branches bug fixed in 2026-04-17 round 7.
-        //   See `collect_redundant_loads` (`if !matches!(canonical, Load) { cache.insert(...) }`).
+        // INVARIANT (paired with the cache-promotion gate at
+        // `Emit(Load)` in `collect_redundant_loads`): when the cache's
+        // canonical for a key IS a `Load`, the promotion must NOT
+        // rebind to the newer Load handle.  Producer-Loads must stay
+        // out of `replacements` so their Stores stay alive against
+        // this guard; rebinding would drag them in and silently mark
+        // the producer Store dead, re-introducing the 2026-04-17
+        // round-7 meet-over-branches bug.
+        //
+        // Two orderings combine:
+        // 1. `load_pos > store_pos` (statement DFS positions, source
+        //    of truth for execution order; arena order is unreliable
+        //    after `inlining` appends to the tail).
+        // 2. `r >= load_h` (arena index): an ineffective replacement
+        //    - the arena-walk apply step uses `r < handle` to block
+        //    forward references, so any `r >= load_h` leaves the Load
+        //    live regardless of program position.  Arena order is
+        //    correct for this comparison because the apply step
+        //    iterates in that order.
+        //
+        // Defensive: if the Store's position is missing (its
+        // `(ptr, val)` pair wasn't seen by the index build), keep it.
+        let Some(store_pos) = scope_idx.store_position(store_id) else {
+            continue;
+        };
         let has_later_live_load = all_loads.get(&local).is_some_and(|loads| {
             loads.iter().any(|&load_h| {
-                load_h > store_val && replacements.get(&load_h).is_none_or(|&r| r >= load_h)
+                scope_idx
+                    .handle_position(load_h)
+                    .is_some_and(|lp| lp > store_pos)
+                    && replacements.get(&load_h).is_none_or(|&r| r >= load_h)
             })
         });
         if has_later_live_load {
@@ -652,6 +1094,13 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         }
         dead_store_ids.insert(store_id);
     }
+
+    // The collection phase is complete; release the immutable borrow
+    // on `function.body` so the mutation phase below can take its
+    // `&mut`.  Without this drop, `apply_to_block(&mut function.body,
+    // ...)` would conflict with `scope_idx`'s `PhantomData<&'body
+    // Block>` borrow.
+    drop(scope_idx);
 
     // Undo: only undo candidates whose Store is NOT fully dead.
     for h in undo_candidates {
@@ -713,11 +1162,10 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
     true
 }
 
-/// Resolve the pointer expression to a `PointerKey` identifying the local memory location.
 /// Lower a pointer expression to a [`PointerKey`] by walking through
 /// `AccessIndex` and `Access` wrappers.  Returns `None` for pointers
-/// whose root is not a local (function argument pointers, globals,
-/// etc.), conservatively excluding them from forwarding.
+/// whose root is not a local (function-argument pointers, globals,
+/// etc.); such pointers are excluded from forwarding.
 fn get_pointer_key(
     expressions: &naga::Arena<naga::Expression>,
     pointer_handle: naga::Handle<naga::Expression>,
@@ -742,11 +1190,9 @@ fn get_pointer_key(
     }
 }
 
-/// Determine which local variable a store targets, for cache invalidation.
-/// Resolve `pointer` to the whole local it ultimately refers to, or
-/// `None` when the pointer targets a sub-element or a non-local.
-/// Exposed to `dead_branch` so both passes agree on what "stored the
-/// whole local" means.
+/// Resolve `pointer` to the root local it ultimately refers to, or
+/// `None` when the root is not a local.  Re-exported so `dead_branch`
+/// agrees with this pass on the "stored the whole local" predicate.
 pub(crate) fn get_stored_local(
     expressions: &naga::Arena<naga::Expression>,
     pointer_handle: naga::Handle<naga::Expression>,
@@ -760,13 +1206,22 @@ pub(crate) fn get_stored_local(
     }
 }
 
-/// Return `true` for expressions that are cheap to duplicate across
-/// multiple reference sites - they never create `let` bindings in the
-/// generator regardless of reference count.
-/// `true` when `expr` is cheap and pure enough that forwarding it to
-/// a later load never introduces observable recomputation or
-/// observable ordering changes.  Constrained to literal, constant,
-/// zero-value, and declarative references.
+/// `true` when `expr` is cheap to duplicate across multiple reference
+/// sites: declarative expressions (Literal / Constant / Override /
+/// ZeroValue / FunctionArgument / GlobalVariable / LocalVariable)
+/// and `Load`.
+///
+/// The declarative half never creates a `let` binding in the
+/// generator regardless of reference count.  `Load` is included
+/// because the surrounding undo-keep mechanism here is concerned
+/// with output size rather than re-execution: a `Load` forwarded
+/// to N sites is N references to the same already-Emit'd Load
+/// handle, not N new memory reads - it would only become N reads if
+/// the undo-keep logic eliminated the original Load's Emit, which it
+/// does not.  (Contrast with `const_fold::is_pure_to_clone` which
+/// rejects `Load` because the const-fold rewrite clones EXPRESSION
+/// CONTENT into a sibling arena slot, producing a second `Emit` for
+/// the same Load and thus a second memory access.)
 fn is_simple_for_forwarding(expr: &naga::Expression) -> bool {
     matches!(
         expr,
@@ -781,14 +1236,11 @@ fn is_simple_for_forwarding(expr: &naga::Expression) -> bool {
     )
 }
 
-/// Combined escape-set + partial-store scan.  Both sets are required
-/// exactly once per `dedup_loads_in_function` call, so they are folded
-/// into a single statement-tree traversal rather than two.
-/// Scan the function body to identify locals whose pointer escapes
-/// to a callee or that receive partial stores (field or indexed
-/// writes).  Such locals can never participate in full-variable
-/// forwarding because a later access might observe a side-effect the
-/// pass cannot see.
+/// Populate `escaped` (locals whose pointer is passed to a callee) and
+/// `partially_stored` (locals receiving field- or index-level writes)
+/// in a single statement-tree walk.  Locals in either set are
+/// disqualified from full-variable forwarding because a later access
+/// could observe an unmodelled side-effect.
 fn collect_escaped_and_partially_stored(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
@@ -817,9 +1269,17 @@ fn collect_escaped_and_partially_stored(
                     escaped.insert(local);
                 }
             }
-            naga::Statement::CooperativeStore { target, .. } => {
-                if let Some(local) = get_stored_local(expressions, *target) {
-                    escaped.insert(local);
+            naga::Statement::CooperativeStore { data, .. } => {
+                // `data.pointer` is the destination of the matrix write
+                // (validator requires STORE access).  When it roots at
+                // a function-local, the write is partial in general
+                // (matrix may not cover the local's full type), so the
+                // local must be classified as partially-stored: any
+                // preceding whole-variable Store has to be preserved.
+                // `target` is the source matrix VALUE; reads are
+                // tracked elsewhere via Emit/Load walking.
+                if let Some(local) = get_stored_local(expressions, data.pointer) {
+                    partially_stored.insert(local);
                 }
             }
             naga::Statement::RayQuery { query, .. } => {
@@ -865,17 +1325,36 @@ fn collect_escaped_and_partially_stored(
                     partially_stored,
                 );
             }
-            _ => {}
+            // Statements that neither escape a local through a pointer
+            // nor contain nested blocks - enumerated explicitly so a
+            // future naga release adding a new pointer-bearing variant
+            // breaks the build here instead of silently leaving a
+            // local mis-classified as un-escaped.
+            naga::Statement::Emit(_)
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. } => {}
         }
     }
 }
 
-/// Count total Store statements per local variable across the entire function body.
-#[cfg(test)]
 /// Count how many `Store` statements target each local across the
-/// entire function body.  The count feeds the last-store heuristic
-/// that decides whether an init-seeded load can be forwarded across
-/// a conditional store.
+/// entire function body.  Test-only helper - the production
+/// last-store-inlining path drives off `seeded_by_store` /
+/// `loads_per_store` from `dedup_loads_in_function`, not this count.
+/// Kept for direct assertions in `tests::*` cases that need to
+/// verify the post-pass IR's Store distribution.
+#[cfg(test)]
 fn count_local_stores(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
@@ -934,14 +1413,25 @@ fn count_stores_recursive(
     }
 }
 
-/// Walk blocks sequentially, identifying redundant Load expressions that can be
-/// replaced by an earlier Load from the same memory location.
+/// Core dominance-aware walker.  Identifies redundant `Load`
+/// expressions that can be forwarded to an earlier `Load` from the
+/// same memory location, and populates `replacements` with the
+/// `(duplicate_load_handle -> replacement_handle)` map by threading a
+/// `ScopedMap<PointerKey, cached_value>` through the statement tree,
+/// honouring branch dominance and invalidating entries on aliasing
+/// stores, calls, atomics, and similar.  Loop handlers drain the
+/// cache before the body runs because the iteration count is unknown
+/// at pass time.
 ///
 /// `seeded_by_store` records which Load handles received store-forwarded
 /// replacements.  The key is the Load handle; the value is the Store's
 /// `(pointer, value)` identity that seeded the cache entry.  This lets the
 /// undo phase decide per-Store whether all seeded loads are covered,
 /// enabling "last-store inlining".
+///
+/// `scope_idx` answers "is handle `h` emitted inside block `B`'s
+/// subtree" in O(1) at every Block / If / Switch scope-carry filter.
+/// See [`ExpressionScopeIndex`] for the layout and safety story.
 ///
 /// ## Scope-state persistence
 ///
@@ -977,16 +1467,10 @@ fn count_stores_recursive(
 /// previous separate full-tree walks via `collect_modified_locals`
 /// with a single combined pass per branch.
 #[allow(clippy::too_many_arguments)]
-/// Core dominance-aware walker.  Populates the redundancy map with
-/// `(duplicate_load_handle -> replacement_handle)` entries by
-/// threading a `ScopedMap<PointerKey, cached_value>` through the
-/// statement tree, honouring branch dominance and invalidating
-/// entries on aliasing stores, calls, atomics, and similar.  Loop
-/// handlers drain the cache before the body runs because the iteration
-/// count is unknown at pass time.
-fn collect_redundant_loads(
-    block: &naga::Block,
+fn collect_redundant_loads<'body>(
+    block: &'body naga::Block,
     expressions: &naga::Arena<naga::Expression>,
+    scope_idx: &ExpressionScopeIndex<'body>,
     cache: &mut ScopedMap<PointerKey, naga::Handle<naga::Expression>>,
     replacements: &mut HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
     all_loads: &mut HashMap<naga::Handle<naga::LocalVariable>, Vec<naga::Handle<naga::Expression>>>,
@@ -1016,24 +1500,23 @@ fn collect_redundant_loads(
                             if let Some(&store_id) = store_source.get(&key) {
                                 seeded_by_store.insert(handle, store_id);
                             }
-                            // When the canonical came from store seeding
-                            // (not a Load), also register this Load as
-                            // the canonical for subsequent Load-to-Load
-                            // dedup.  The undo phase may later revert
-                            // the store-forwarded replacement, but the
-                            // Load-to-Load chain remains valid.
+                            // Cache-promotion gate.  When the canonical
+                            // came from store-seeding or an init,
+                            // re-bind to this Load handle so subsequent
+                            // Load-to-Load forwarding chains through a
+                            // surviving Emit.
                             //
                             // INVARIANT (paired with `has_later_live_load`
-                            // in `dedup_loads_in_function`):
-                            //   when canonical IS a `Load`, do NOT rebind -
-                            //   the producer-Load's handle must remain the
-                            //   canonical so it stays out of `replacements`,
-                            //   keeping its producing Store alive against the
-                            //   `has_later_live_load` dead-store check.
-                            //   Removing this gate would mark perfectly-live
-                            //   stores dead across loop / branch boundaries
-                            //   where the cache may have been cleared and
-                            //   the producing Store is the only path-bridge.
+                            // in `dedup_loads_in_function`): when the
+                            // canonical IS already a `Load`, do NOT
+                            // rebind - the producer-Load's handle must
+                            // stay in the cache so it remains out of
+                            // `replacements`, keeping its producing
+                            // Store alive against the dead-store check.
+                            // Rebinding would drag the producer-Load
+                            // into `replacements` and silently kill
+                            // perfectly-live Stores across loop / branch
+                            // boundaries where the cache was cleared.
                             if !matches!(expressions[canonical], naga::Expression::Load { .. }) {
                                 cache.insert(key, handle);
                             }
@@ -1048,11 +1531,7 @@ fn collect_redundant_loads(
                     modified_out.insert(local);
                     // Invalidate ALL cache entries involving this local.
                     invalidate_cache_for_local(cache, local);
-                    store_source.retain(|key, _| match key {
-                        PointerKey::Local(l)
-                        | PointerKey::LocalField(l, _)
-                        | PointerKey::LocalDynamic(l, _) => *l != local,
-                    });
+                    invalidate_store_source_for_local(&mut store_source, local);
                     // Seed cache with the stored value so subsequent loads
                     // can be forwarded to the value expression directly.
                     // The undo phase in dedup_loads_in_function will later
@@ -1070,67 +1549,112 @@ fn collect_redundant_loads(
             }
             naga::Statement::Block(inner) => {
                 // `Statement::Block` introduces a nested WGSL `{ ... }`
-                // scope.  Any expression first appended (via an `Emit`
-                // statement inside `inner`) is bound inside that scope
-                // by naga's WGSL writer and is not in lexical scope
-                // outside the closing brace.  Without the highwater
-                // filter, a post-block read forwarded to an in-block
-                // value would emit as "let _outer = _inner;" where
-                // `_inner` is out of scope - the backend would reject
-                // the round-trip.  Apply the same checkpoint +
-                // arena-highwater pattern used for `If`/`Switch`.
+                // scope.  Two correctness concerns:
+                //
+                // 1. **Scope leak.**  Any expression bound by an
+                //    `Emit` (or statement-bound result handle) inside
+                //    `inner` is `let`-bound inside that scope by
+                //    naga's WGSL writer and is out of lexical scope
+                //    outside the closing brace.  Forwarding a
+                //    post-block read to such a handle would emit
+                //    `let _outer = _inner;` where `_inner` is out of
+                //    scope - the backend rejects the round-trip and
+                //    the pass silently rolls back.  Solved by the
+                //    `is_in_subtree` filter on `carry` below.  Pre-emit
+                //    values (`needs_pre_emit`: Literal, Constant,
+                //    Override, ZeroValue, FunctionArgument,
+                //    GlobalVariable, LocalVariable) are exempted -
+                //    naga considers them in scope everywhere.
+                //
+                // 2. **Stale-init carry.**  Rolling the cache back to
+                //    the pre-block checkpoint restores any entry that
+                //    existed before the block, including entries
+                //    seeded by an `init` value (e.g.
+                //    `Local(F) -> Literal(false)` from `var F = false`).
+                //    If `inner` writes to F, the pre-block init is
+                //    stale post-block: a subsequent `Load(F)` forwarded
+                //    to `Literal(false)` produces output that
+                //    overwrites F's accumulated state (e.g.
+                //    `F = false | X` instead of the source's
+                //    `F |= X`, dropping every earlier accumulation).
+                //    Solved by capturing modified-locals into a fresh
+                //    `block_modified` set and invalidating cache entries
+                //    for those locals AFTER rollback - mirrors the
+                //    If/Switch/Loop arms' invalidation step.
+                //
+                // `scope_idx.is_in_subtree` is O(1) per probe.  An
+                // arena-index highwater (`v.index() < arena_len_pre`)
+                // would be sound but a no-op: this pass never appends
+                // to the expression arena, so every handle trivially
+                // satisfies it.  Position-based membership is the only
+                // working check.
                 let cp_pre_block = cache.checkpoint();
-                let arena_len_pre_block = expressions.len();
 
+                // Fresh modified-locals set for THIS block, separate
+                // from `modified_out` so the invalidation step below
+                // only drops cache entries written inside the block
+                // (not entries written by sibling statements that
+                // share `modified_out` with us).
+                let mut block_modified = HashSet::new();
                 collect_redundant_loads(
                     inner,
                     expressions,
+                    scope_idx,
                     cache,
                     replacements,
                     all_loads,
                     seeded_by_store,
                     in_loop,
-                    modified_out,
+                    &mut block_modified,
                 );
 
-                // Snapshot post-block cache state, filtered to entries
-                // whose value handle survives outside the block scope
-                // (pre-block index, or a `needs_pre_emit` expression
-                // that is in scope everywhere by construction).
                 let carry: Vec<(PointerKey, naga::Handle<naga::Expression>)> = cache
                     .as_map()
                     .iter()
                     .filter(|(_, v)| {
-                        v.index() < arena_len_pre_block || expressions[**v].needs_pre_emit()
+                        !scope_idx.is_in_subtree(inner, **v) || expressions[**v].needs_pre_emit()
                     })
                     .map(|(k, &v)| (k.clone(), v))
                     .collect();
-                // Roll back to drop the in-scope-only entries, then
-                // re-insert the ones that are safe to carry forward.
                 cache.rollback_to(cp_pre_block);
+
+                // Drop pre-block entries for any local written inside
+                // `inner`.  Without this, an init-seeded entry (e.g.
+                // `Local(F) -> Literal(false)`) would survive the
+                // rollback and incorrectly forward a post-block
+                // `Load(F)` to the init value, dropping F's
+                // accumulated runtime state.
+                for local in &block_modified {
+                    invalidate_cache_for_local(cache, *local);
+                }
                 for (k, v) in carry {
                     cache.insert(k, v);
                 }
+
+                // Propagate block's writes up to the enclosing scope.
+                modified_out.extend(block_modified);
             }
             naga::Statement::If { accept, reject, .. } => {
                 // Snapshot pre-if state; each branch is explored and then
                 // rolled back so the outer scope sees only the permanent
                 // invalidations we apply after both branches finish.
                 let cp_pre_if = cache.checkpoint();
-                // Snapshot the expression-arena highwater mark so the
-                // meet phase can refuse to carry forwarding entries
-                // whose value handle was emitted only inside the
-                // branch.  Naga's expression arena is append-only and
-                // indices are dense, so handles strictly less than
-                // `arena_len_pre_if` already existed before the if and
-                // are reachable on every post-if path.  A handle that
-                // appeared during the branch may be referenced from a
-                // `naga::Statement::Emit` inside that branch only -
-                // forwarding a later read to such a handle on the
-                // *other* path lands on an expression the backend
-                // never let-binds, producing "use before definition"
-                // when re-emitted as WGSL.
-                let arena_len_pre_if = expressions.len();
+
+                // Filter at the meet step: forwarding to a handle
+                // emitted only inside a branch is unsound post-if -
+                // naga's WGSL writer `let`-binds inside the branch's
+                // brace, so the binding is out of scope on the other
+                // path and after the if.  `needs_pre_emit` expressions
+                // (Literal, Constant, Override, ZeroValue,
+                // FunctionArgument, GlobalVariable, LocalVariable)
+                // are not bound by Emit and remain in scope
+                // everywhere, so they bypass the filter at the use
+                // site.  Same arena-highwater reasoning as the
+                // `Block` arm above: position-based membership is
+                // the only check that actually fires.
+                let in_branches = |v: naga::Handle<naga::Expression>| {
+                    scope_idx.is_in_subtree(accept, v) || scope_idx.is_in_subtree(reject, v)
+                };
 
                 // Each branch's recursion populates its own modified set.
                 // Combining them upfront via separate `collect_modified_locals`
@@ -1141,6 +1665,7 @@ fn collect_redundant_loads(
                 collect_redundant_loads(
                     accept,
                     expressions,
+                    scope_idx,
                     cache,
                     replacements,
                     all_loads,
@@ -1161,25 +1686,11 @@ fn collect_redundant_loads(
                 // loads cache-miss instead of being forwarded.  The
                 // size win from skipping a full-tree walk per branch
                 // is judged worth the trade.
-                //
-                // Additionally filter the forwarding *target* so any
-                // expression first appended inside the branch (whether
-                // via Store seeding, Load canonicalisation, or any
-                // other in-branch production) is dropped: post-if
-                // reads must only resolve to expressions that exist
-                // on every path.  The exception is `needs_pre_emit`
-                // expressions (Literal, Constant, Override, ZeroValue,
-                // FunctionArgument, GlobalVariable, LocalVariable) -
-                // naga considers these implicitly emitted at function
-                // entry, so they are in scope everywhere regardless
-                // of where in the arena they were first appended.
                 let mut meet: HashMap<PointerKey, naga::Handle<naga::Expression>> = cache
                     .as_map()
                     .iter()
                     .filter(|(k, _)| pointer_key_involves_any_local(k, &accept_modified))
-                    .filter(|(_, v)| {
-                        v.index() < arena_len_pre_if || expressions[**v].needs_pre_emit()
-                    })
+                    .filter(|(_, v)| !in_branches(**v) || expressions[**v].needs_pre_emit())
                     .map(|(k, &v)| (k.clone(), v))
                     .collect();
                 cache.rollback_to(cp_pre_if);
@@ -1188,6 +1699,7 @@ fn collect_redundant_loads(
                 collect_redundant_loads(
                     reject,
                     expressions,
+                    scope_idx,
                     cache,
                     replacements,
                     all_loads,
@@ -1239,12 +1751,17 @@ fn collect_redundant_loads(
             }
             naga::Statement::Switch { cases, .. } => {
                 let cp_pre_switch = cache.checkpoint();
-                // Same arena-highwater guard as the `If` arm: only
-                // forwarding targets that existed before the switch
-                // are reachable on every post-switch path.  A value
-                // handle introduced inside one case cannot legitimately
-                // be reached from outside the switch.
-                let arena_len_pre_switch = expressions.len();
+                // Forwarding to a handle emitted only inside a case
+                // is unsound post-switch because naga's WGSL writer
+                // `let`-binds inside the case's brace.  Per-case O(1)
+                // membership against `scope_idx`; total per-probe cost
+                // is O(K) where K = number of cases.  Same scope and
+                // arena-highwater reasoning as the `If` arm above.
+                let in_cases = |v: naga::Handle<naga::Expression>| {
+                    cases
+                        .iter()
+                        .any(|case| scope_idx.is_in_subtree(&case.body, v))
+                };
 
                 // Meet-over-branches is only sound for switches that
                 // execute *exactly one* case on every path.  That
@@ -1256,9 +1773,6 @@ fn collect_redundant_loads(
                     .iter()
                     .any(|c| matches!(c.value, naga::SwitchValue::Default));
                 let any_fallthrough = cases.iter().any(|c| c.fall_through);
-                // `has_default` already implies `!cases.is_empty()`, so
-                // the explicit non-empty check was redundant; dropped
-                // along with this refactor.
                 let meet_applicable = has_default && !any_fallthrough;
 
                 let mut total_modified: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
@@ -1268,6 +1782,7 @@ fn collect_redundant_loads(
                     collect_redundant_loads(
                         &case.body,
                         expressions,
+                        scope_idx,
                         cache,
                         replacements,
                         all_loads,
@@ -1283,7 +1798,7 @@ fn collect_redundant_loads(
                                 // (analogous under-restriction to the
                                 // `If` arm; later cases narrow further
                                 // via in-place retain).  Filter on
-                                // the arena-highwater + `needs_pre_emit`
+                                // the in-cases scope + `needs_pre_emit`
                                 // gate so the meet only carries values
                                 // reachable on every post-switch path.
                                 let initial: HashMap<_, _> = cache
@@ -1293,8 +1808,7 @@ fn collect_redundant_loads(
                                         pointer_key_involves_any_local(k, &case_modified)
                                     })
                                     .filter(|(_, v)| {
-                                        v.index() < arena_len_pre_switch
-                                            || expressions[**v].needs_pre_emit()
+                                        !in_cases(**v) || expressions[**v].needs_pre_emit()
                                     })
                                     .map(|(k, &v)| (k.clone(), v))
                                     .collect();
@@ -1302,12 +1816,14 @@ fn collect_redundant_loads(
                             }
                             Some(m) => {
                                 // Subsequent cases: intersect in place.
-                                // The arena-highwater check is omitted
-                                // here because every entry surviving
-                                // the first-case filter already
-                                // satisfies it; re-checking is wasted
-                                // work (entries cannot acquire a higher
-                                // arena index after the fact).
+                                // The scope filter is omitted here
+                                // because every entry surviving the
+                                // first-case filter is already known
+                                // not to live inside any case body, and
+                                // case-subtree membership is a function
+                                // of the cases collection alone (the
+                                // `scope_idx` is immutable across the
+                                // walk) - it cannot change per case.
                                 m.retain(|k, v| cache.get(k) == Some(v));
                             }
                         }
@@ -1353,6 +1869,7 @@ fn collect_redundant_loads(
                 collect_redundant_loads(
                     body,
                     expressions,
+                    scope_idx,
                     cache,
                     replacements,
                     all_loads,
@@ -1365,6 +1882,7 @@ fn collect_redundant_loads(
                 collect_redundant_loads(
                     continuing,
                     expressions,
+                    scope_idx,
                     cache,
                     replacements,
                     all_loads,
@@ -1380,7 +1898,12 @@ fn collect_redundant_loads(
 
                 modified_out.extend(loop_modified);
             }
-            // Other statements don't modify local variables.
+            // Pointer-bearing statements that may mutate a local
+            // through an aliased pointer.  Each arm invalidates BOTH
+            // `cache` AND `store_source` for the affected local; the
+            // two must stay in lockstep because a stale `store_source`
+            // entry left after a cache miss would mis-classify the
+            // producing Store as having no surviving forwarded loads.
             naga::Statement::Call { arguments, .. } => {
                 // Invalidate cache entries for any local whose pointer is
                 // passed as an argument - the callee may write through it.
@@ -1388,6 +1911,7 @@ fn collect_redundant_loads(
                     if let Some(local) = get_stored_local(expressions, arg) {
                         modified_out.insert(local);
                         invalidate_cache_for_local(cache, local);
+                        invalidate_store_source_for_local(&mut store_source, local);
                     }
                 }
             }
@@ -1398,14 +1922,20 @@ fn collect_redundant_loads(
                 if let Some(local) = get_stored_local(expressions, *payload) {
                     modified_out.insert(local);
                     invalidate_cache_for_local(cache, local);
+                    invalidate_store_source_for_local(&mut store_source, local);
                 }
             }
-            naga::Statement::CooperativeStore { target, .. } => {
-                // CooperativeStore writes data through a pointer - invalidate
-                // cache for the target local to prevent stale load dedup.
-                if let Some(local) = get_stored_local(expressions, *target) {
+            naga::Statement::CooperativeStore { data, .. } => {
+                // CooperativeStore writes the matrix value (carried in
+                // the unused `target` field) through `data.pointer`.
+                // When `data.pointer` roots at a function-local, that
+                // local's slot is mutated and must be invalidated;
+                // `target` is the source read and is already tracked
+                // via the Emit/Load walking.
+                if let Some(local) = get_stored_local(expressions, data.pointer) {
                     modified_out.insert(local);
                     invalidate_cache_for_local(cache, local);
+                    invalidate_store_source_for_local(&mut store_source, local);
                 }
             }
             naga::Statement::Atomic { pointer, .. } => {
@@ -1414,17 +1944,40 @@ fn collect_redundant_loads(
                 if let Some(local) = get_stored_local(expressions, *pointer) {
                     modified_out.insert(local);
                     invalidate_cache_for_local(cache, local);
+                    invalidate_store_source_for_local(&mut store_source, local);
                 }
             }
             naga::Statement::RayQuery { query, .. } => {
-                // RayQuery mutates state through the query pointer
-                // (Initialize / Proceed) - invalidate cache for that local.
+                // `query` is the only function-local pointer this
+                // statement carries (typed `ptr<function, ray_query>`).
+                // The `fun`-level operands (acceleration_structure,
+                // descriptor, hit_t) are typed values, not pointers;
+                // any `Load` they wrap is caught by the `Emit` arm
+                // above.
                 if let Some(local) = get_stored_local(expressions, *query) {
                     modified_out.insert(local);
                     invalidate_cache_for_local(cache, local);
+                    invalidate_store_source_for_local(&mut store_source, local);
                 }
             }
-            _ => {}
+            // Statements that do not touch function-local pointers and
+            // do not contain nested blocks - enumerated explicitly
+            // (no `_ => {}`) so a future naga release adding a new
+            // pointer-bearing statement breaks the build here instead
+            // of silently bypassing this walker's load-forwarding /
+            // dead-store analysis.
+            naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. } => {}
         }
     }
 }
@@ -1437,6 +1990,26 @@ fn invalidate_cache_for_local(
     local: naga::Handle<naga::LocalVariable>,
 ) {
     cache.retain_logged(|k, _| match k {
+        PointerKey::Local(l) | PointerKey::LocalField(l, _) | PointerKey::LocalDynamic(l, _) => {
+            *l != local
+        }
+    });
+}
+
+/// Remove every `store_source` entry whose `PointerKey` names `local`.
+/// Mirrors [`invalidate_cache_for_local`]'s predicate so the two
+/// invalidation steps stay in lockstep; the same five statement arms
+/// (Call / Atomic / RayPipelineFunction / RayQuery / CooperativeStore)
+/// that clear `cache` for a touched local also clear `store_source`.
+/// If a new `PointerKey` variant is added, the exhaustive `match` here
+/// (and in `invalidate_cache_for_local` /
+/// `pointer_key_involves_any_local`) breaks the build, forcing every
+/// site to be updated in lockstep.
+fn invalidate_store_source_for_local(
+    store_source: &mut HashMap<PointerKey, StoreInfo>,
+    local: naga::Handle<naga::LocalVariable>,
+) {
+    store_source.retain(|key, _| match key {
         PointerKey::Local(l) | PointerKey::LocalField(l, _) | PointerKey::LocalDynamic(l, _) => {
             *l != local
         }
@@ -1494,8 +2067,10 @@ fn collect_escaped_locals(
                     escaped.insert(local);
                 }
             }
-            naga::Statement::CooperativeStore { target, .. } => {
-                if let Some(local) = get_stored_local(expressions, *target) {
+            naga::Statement::CooperativeStore { data, .. } => {
+                // Test-only mirror of the production walker:
+                // `data.pointer` is the write side.
+                if let Some(local) = get_stored_local(expressions, data.pointer) {
                     escaped.insert(local);
                 }
             }
@@ -1528,12 +2103,10 @@ fn collect_escaped_locals(
     }
 }
 
-/// Collect all local variables potentially modified within a block
-/// (recursively).  Used to determine which cache entries survive across
-/// Loop / If / Switch boundaries.
-/// Return every local whose value can be mutated by the statements
-/// inside `block`.  Shared with `dead_branch` to approximate
-/// "this local might change" without re-walking the statement tree.
+/// Every local whose value can be mutated by the statements inside
+/// `block` (recursively).  Shared with `dead_branch`; both passes rely
+/// on the same "might change" predicate to invalidate cached or
+/// hoisted load values across control-flow joins.
 pub(crate) fn collect_modified_locals(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
@@ -1559,8 +2132,11 @@ pub(crate) fn collect_modified_locals(
                     modified.insert(lh);
                 }
             }
-            naga::Statement::CooperativeStore { target, .. } => {
-                if let Some(lh) = get_stored_local(expressions, *target) {
+            naga::Statement::CooperativeStore { data, .. } => {
+                // Write side is `data.pointer`; `target` is the matrix
+                // VALUE (a CooperativeMatrix-typed read), so it cannot
+                // root at a LocalVariable per naga's validator.
+                if let Some(lh) = get_stored_local(expressions, data.pointer) {
                     modified.insert(lh);
                 }
             }
@@ -1587,7 +2163,25 @@ pub(crate) fn collect_modified_locals(
             naga::Statement::Block(inner) => {
                 collect_modified_locals(inner, expressions, modified);
             }
-            _ => {}
+            // Statements that neither modify a function-local through
+            // a pointer nor contain nested blocks - enumerated
+            // explicitly so a future naga release adding a new
+            // pointer-bearing variant breaks the build here instead
+            // of silently leaving a local out of the modified set
+            // (and thereby letting the caller forward a stale value).
+            naga::Statement::Emit(_)
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. } => {}
         }
     }
 }
@@ -1704,7 +2298,29 @@ fn apply_to_block(
                     expressions,
                 );
             }
-            _ => {}
+            // Leaf statements - apply_to_block only specializes Emit
+            // (range rebuild) and Store (dead-Store filter); every
+            // other variant is preserved verbatim.  Enumerated
+            // explicitly so a future naga release adding a new
+            // block-bearing variant breaks the build here instead
+            // of silently skipping recursion through it.
+            naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Call { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
         }
 
         let mut remap = |h: naga::Handle<naga::Expression>| -> naga::Handle<naga::Expression> {
@@ -1758,45 +2374,20 @@ mod tests {
     }
 
     fn is_handle_in_any_emit(block: &naga::Block, target: naga::Handle<naga::Expression>) -> bool {
-        for statement in block {
-            match statement {
-                naga::Statement::Emit(range) => {
-                    if range.clone().any(|h| h == target) {
-                        return true;
-                    }
-                }
-                naga::Statement::Block(inner) => {
-                    if is_handle_in_any_emit(inner, target) {
-                        return true;
-                    }
-                }
-                naga::Statement::If { accept, reject, .. } => {
-                    if is_handle_in_any_emit(accept, target)
-                        || is_handle_in_any_emit(reject, target)
-                    {
-                        return true;
-                    }
-                }
-                naga::Statement::Switch { cases, .. } => {
-                    for case in cases {
-                        if is_handle_in_any_emit(&case.body, target) {
-                            return true;
-                        }
-                    }
-                }
-                naga::Statement::Loop {
-                    body, continuing, ..
-                } => {
-                    if is_handle_in_any_emit(body, target)
-                        || is_handle_in_any_emit(continuing, target)
-                    {
-                        return true;
-                    }
-                }
-                _ => {}
+        block.iter().any(|statement| match statement {
+            naga::Statement::Emit(range) => range.clone().any(|h| h == target),
+            naga::Statement::Block(inner) => is_handle_in_any_emit(inner, target),
+            naga::Statement::If { accept, reject, .. } => {
+                is_handle_in_any_emit(accept, target) || is_handle_in_any_emit(reject, target)
             }
-        }
-        false
+            naga::Statement::Switch { cases, .. } => cases
+                .iter()
+                .any(|case| is_handle_in_any_emit(&case.body, target)),
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => is_handle_in_any_emit(body, target) || is_handle_in_any_emit(continuing, target),
+            _ => false,
+        })
     }
 
     #[test]
@@ -2242,9 +2833,11 @@ fn fs_main() -> @location(0) vec4f {
         let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
         let mut all_loads = HashMap::new();
         let mut seeded_by_store = HashMap::new();
+        let scope_idx = ExpressionScopeIndex::build(&function.body, &function.expressions);
         collect_redundant_loads(
             &function.body,
             &function.expressions,
+            &scope_idx,
             &mut cache,
             &mut replacements,
             &mut all_loads,
@@ -2269,10 +2862,18 @@ fn fs_main() -> @location(0) vec4f {
     }
 
     #[test]
-    fn cooperative_store_invalidates_cache_and_marks_escaped() {
-        // Construct IR where a local is stored to, loaded, then written
-        // by a CooperativeStore, then loaded again.  The second load must
-        // NOT be deduplicated with the first.
+    fn cooperative_store_through_data_pointer_invalidates_cache() {
+        // Construct realistic IR (matching what naga's WGSL frontend
+        // produces for `coopStore(matrix_value, &mat_var, stride)`):
+        //
+        //   target = FunctionArgument(0)   (CooperativeMatrix VALUE - read)
+        //   data.pointer = LocalVariable(mat_var)  (destination - WRITE)
+        //
+        // A cache entry for `mat_var` seeded before the CooperativeStore
+        // must be invalidated by data.pointer's root, even though
+        // `target` has CooperativeMatrix type and therefore cannot itself
+        // resolve to a LocalVariable per naga's validator
+        // (`naga/valid/function.rs:1660`).
 
         let mut module = naga::Module::default();
 
@@ -2290,15 +2891,12 @@ fn fs_main() -> @location(0) vec4f {
             naga::Span::UNDEFINED,
         );
 
-        let f32_ty = module.types.insert(
-            naga::Type {
-                name: None,
-                inner: naga::TypeInner::Scalar(f32_scalar),
-            },
-            naga::Span::UNDEFINED,
-        );
-
         let mut function = naga::Function::default();
+        function.arguments.push(naga::FunctionArgument {
+            name: Some("mat_in".into()),
+            ty: coop_ty,
+            binding: None,
+        });
 
         let local_mat = function.local_variables.append(
             naga::LocalVariable {
@@ -2313,6 +2911,9 @@ fn fs_main() -> @location(0) vec4f {
             naga::Expression::LocalVariable(local_mat),
             naga::Span::UNDEFINED,
         );
+        let matrix_arg = function
+            .expressions
+            .append(naga::Expression::FunctionArgument(0), naga::Span::UNDEFINED);
         let load1 = function.expressions.append(
             naga::Expression::Load { pointer: ptr_mat },
             naga::Span::UNDEFINED,
@@ -2321,44 +2922,21 @@ fn fs_main() -> @location(0) vec4f {
             naga::Expression::Load { pointer: ptr_mat },
             naga::Span::UNDEFINED,
         );
-        let lit_val = function.expressions.append(
-            naga::Expression::Literal(naga::Literal::F32(0.0)),
-            naga::Span::UNDEFINED,
-        );
-
-        // Dummy global for CooperativeData pointer/stride.
-        let dummy_global = module.global_variables.append(
-            naga::GlobalVariable {
-                name: Some("buf".into()),
-                space: naga::AddressSpace::Storage {
-                    access: naga::StorageAccess::LOAD | naga::StorageAccess::STORE,
-                },
-                binding: None,
-                ty: f32_ty,
-                init: None,
-                memory_decorations: naga::MemoryDecorations::empty(),
-            },
-            naga::Span::UNDEFINED,
-        );
-        let data_ptr = function.expressions.append(
-            naga::Expression::GlobalVariable(dummy_global),
-            naga::Span::UNDEFINED,
-        );
         let stride = function.expressions.append(
             naga::Expression::Literal(naga::Literal::U32(16)),
             naga::Span::UNDEFINED,
         );
 
         // Block:
-        //   Store(mat_var, 0.0)     (dummy - just to seed the local)
-        //   Emit(load1)             -> cache: {mat_var: load1}
-        //   CooperativeStore(mat_var, data)  -> should INVALIDATE cache
-        //   Emit(load2)             -> must NOT be replaced with load1
+        //   Store(&mat_var, mat_in)         (seed: mat_var := mat_in)
+        //   Emit(load1)                     (cache forwards to mat_in)
+        //   coopStore(mat_in, &mat_var, 16) (writes into mat_var via data.pointer)
+        //   Emit(load2)                     (must NOT dedup with load1)
         let mut body = naga::Block::new();
         body.push(
             naga::Statement::Store {
                 pointer: ptr_mat,
-                value: lit_val,
+                value: matrix_arg,
             },
             naga::Span::UNDEFINED,
         );
@@ -2368,9 +2946,9 @@ fn fs_main() -> @location(0) vec4f {
         );
         body.push(
             naga::Statement::CooperativeStore {
-                target: ptr_mat,
+                target: matrix_arg,
                 data: naga::CooperativeData {
-                    pointer: data_ptr,
+                    pointer: ptr_mat,
                     stride,
                     row_major: false,
                 },
@@ -2388,9 +2966,11 @@ fn fs_main() -> @location(0) vec4f {
         let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
         let mut all_loads = HashMap::new();
         let mut seeded_by_store = HashMap::new();
+        let scope_idx = ExpressionScopeIndex::build(&function.body, &function.expressions);
         collect_redundant_loads(
             &function.body,
             &function.expressions,
+            &scope_idx,
             &mut cache,
             &mut replacements,
             &mut all_loads,
@@ -2399,17 +2979,30 @@ fn fs_main() -> @location(0) vec4f {
             &mut HashSet::new(),
         );
 
-        // load2 must NOT be in replacements.
+        // load2 must NOT be in replacements: the CooperativeStore wrote
+        // to mat_var through `data.pointer`, so the cache entry forwarded
+        // by load1 is stale.
         assert!(
             !replacements.contains_key(&load2),
-            "load after CooperativeStore must not be deduplicated (cache should be invalidated)"
+            "load after CooperativeStore must not be deduplicated \
+             (cache must be invalidated via data.pointer's root local)"
         );
 
-        // Verify escaped-local tracking.
-        let escaped = locals_passed_by_pointer(&function.body, &function.expressions);
+        // Verify partial-store tracking: `mat_var` should be flagged as
+        // partially-stored because the matrix write through
+        // `data.pointer` may not cover the local's full type.
+        let mut escaped = HashSet::new();
+        let mut partially_stored = HashSet::new();
+        collect_escaped_and_partially_stored(
+            &function.body,
+            &function.expressions,
+            &mut escaped,
+            &mut partially_stored,
+        );
         assert!(
-            escaped.contains(&local_mat),
-            "local written by CooperativeStore should be marked as escaped"
+            partially_stored.contains(&local_mat),
+            "local written by CooperativeStore must be flagged as partially_stored \
+             (matrix write through data.pointer may not cover the full local)"
         );
     }
 
@@ -2509,9 +3102,11 @@ fn fs_main() -> @location(0) vec4f {
         let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
         let mut all_loads = HashMap::new();
         let mut seeded_by_store = HashMap::new();
+        let scope_idx = ExpressionScopeIndex::build(&function.body, &function.expressions);
         collect_redundant_loads(
             &function.body,
             &function.expressions,
+            &scope_idx,
             &mut cache,
             &mut replacements,
             &mut all_loads,
@@ -3460,37 +4055,20 @@ fn fs_main() -> @location(0) vec4f {
     }
 
     fn has_store_to(block: &naga::Block, ptr_h: naga::Handle<naga::Expression>) -> bool {
-        for stmt in block.iter() {
-            match stmt {
-                naga::Statement::Store { pointer, .. } if *pointer == ptr_h => return true,
-                naga::Statement::Block(inner) => {
-                    if has_store_to(inner, ptr_h) {
-                        return true;
-                    }
-                }
-                naga::Statement::If { accept, reject, .. } => {
-                    if has_store_to(accept, ptr_h) || has_store_to(reject, ptr_h) {
-                        return true;
-                    }
-                }
-                naga::Statement::Switch { cases, .. } => {
-                    for case in cases {
-                        if has_store_to(&case.body, ptr_h) {
-                            return true;
-                        }
-                    }
-                }
-                naga::Statement::Loop {
-                    body, continuing, ..
-                } => {
-                    if has_store_to(body, ptr_h) || has_store_to(continuing, ptr_h) {
-                        return true;
-                    }
-                }
-                _ => {}
+        block.iter().any(|stmt| match stmt {
+            naga::Statement::Store { pointer, .. } => *pointer == ptr_h,
+            naga::Statement::Block(inner) => has_store_to(inner, ptr_h),
+            naga::Statement::If { accept, reject, .. } => {
+                has_store_to(accept, ptr_h) || has_store_to(reject, ptr_h)
             }
-        }
-        false
+            naga::Statement::Switch { cases, .. } => {
+                cases.iter().any(|case| has_store_to(&case.body, ptr_h))
+            }
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => has_store_to(body, ptr_h) || has_store_to(continuing, ptr_h),
+            _ => false,
+        })
     }
 
     #[test]
@@ -3755,6 +4333,571 @@ fn f(c: bool) -> i32 {
             count_stores_to_local(f, x),
             2,
             "dead Store across call with non-aliasing ptr arg should be removed"
+        );
+    }
+
+    // MARK: Block / If / Switch scope-leak regressions
+    //
+    // Each of these shaders sets up a value that is bound by an `Emit`
+    // inside a `Statement::Block` / `Statement::If` / `Statement::Switch`,
+    // then reads the variable that received it from outside the block.
+    // Before the scope-leak fix the pass forwarded the post-block load
+    // to the in-block value handle, producing IR that the validator
+    // rejects ("expression used outside its scope"); `run_pass`'s
+    // post-pass `validate_module` call asserts this never happens.
+
+    #[test]
+    fn block_scope_leak_regression_statement_block() {
+        // Reduced from the empirical reproducer in the review:
+        // the inner brace forces the Compose's `let temp` binding to
+        // be lexically scoped to the block, but the post-block load of
+        // `x` would have been forwarded to that binding without the
+        // scope-aware filter.
+        let source = r#"
+fn f(a: f32, b: f32, c: f32) -> vec3<f32> {
+    var x: vec3<f32>;
+    {
+        let temp = vec3<f32>(a, b, c);
+        x = temp;
+    }
+    let post = x;
+    return post;
+}
+@compute @workgroup_size(1) fn main() { _ = f(1.0, 2.0, 3.0); }
+"#;
+        let (_, _module) = run_pass(source);
+    }
+
+    #[test]
+    fn block_scope_leak_regression_if_branch() {
+        // The Compose is bound inside the accept branch.  A naive
+        // forward into the post-if read of `x` would land on an
+        // out-of-scope handle on the reject path.
+        let source = r#"
+fn f(c: bool, a: f32, b: f32, d: f32) -> vec3<f32> {
+    var x: vec3<f32>;
+    if c {
+        let temp = vec3<f32>(a, b, d);
+        x = temp;
+    } else {
+        x = vec3<f32>(0.0);
+    }
+    let post = x;
+    return post;
+}
+@compute @workgroup_size(1) fn main() { _ = f(true, 1.0, 2.0, 3.0); }
+"#;
+        let (_, _module) = run_pass(source);
+    }
+
+    // MARK: ExpressionScopeIndex regressions
+
+    #[test]
+    fn scope_index_assigns_monotonic_positions_in_emit_order() {
+        // Build a tiny function body by hand:
+        //   Emit(e0, e1)   <- position 0
+        //   Store(p, v)    <- position 1
+        //   Emit(e2)       <- position 2
+        let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
+        // Fake pointer + value; we never resolve them to real types,
+        // we just need stable Expression handles.
+        let p = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(0)),
+            naga::Span::UNDEFINED,
+        );
+        let v = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(1)),
+            naga::Span::UNDEFINED,
+        );
+        let e0 = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(2)),
+            naga::Span::UNDEFINED,
+        );
+        let e1 = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(3)),
+            naga::Span::UNDEFINED,
+        );
+        let e2 = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(4)),
+            naga::Span::UNDEFINED,
+        );
+        let mut body = naga::Block::new();
+        body.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(e0, e1)),
+            naga::Span::UNDEFINED,
+        );
+        body.push(
+            naga::Statement::Store {
+                pointer: p,
+                value: v,
+            },
+            naga::Span::UNDEFINED,
+        );
+        body.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(e2, e2)),
+            naga::Span::UNDEFINED,
+        );
+
+        let idx = ExpressionScopeIndex::build(&body, &arena);
+
+        // All handles in the first Emit share position 0.
+        assert_eq!(idx.handle_position(e0), Some(0));
+        assert_eq!(idx.handle_position(e1), Some(0));
+        // Store gets position 1.
+        assert_eq!(idx.store_position((p, v)), Some(1));
+        // Second Emit gets position 2.
+        assert_eq!(idx.handle_position(e2), Some(2));
+        // The top-level body's interval covers all 3 positions.
+        assert!(idx.is_in_subtree(&body, e0));
+        assert!(idx.is_in_subtree(&body, e2));
+    }
+
+    #[test]
+    fn scope_index_recurses_into_control_flow() {
+        // Body: Store(p,v)              pos 0
+        //       If {                    pos 1
+        //         accept: Emit(a)        pos 2
+        //         reject: Emit(b)        pos 3
+        //       }
+        //       Store(p2, v2)            pos 4
+        let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
+        let p = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(0)),
+            naga::Span::UNDEFINED,
+        );
+        let v = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(1)),
+            naga::Span::UNDEFINED,
+        );
+        let cond = arena.append(
+            naga::Expression::Literal(naga::Literal::Bool(true)),
+            naga::Span::UNDEFINED,
+        );
+        let a = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(2)),
+            naga::Span::UNDEFINED,
+        );
+        let b = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(3)),
+            naga::Span::UNDEFINED,
+        );
+        let p2 = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(4)),
+            naga::Span::UNDEFINED,
+        );
+        let v2 = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(5)),
+            naga::Span::UNDEFINED,
+        );
+
+        let mut accept = naga::Block::new();
+        accept.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(a, a)),
+            naga::Span::UNDEFINED,
+        );
+        let mut reject = naga::Block::new();
+        reject.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(b, b)),
+            naga::Span::UNDEFINED,
+        );
+
+        let mut body = naga::Block::new();
+        body.push(
+            naga::Statement::Store {
+                pointer: p,
+                value: v,
+            },
+            naga::Span::UNDEFINED,
+        );
+        body.push(
+            naga::Statement::If {
+                condition: cond,
+                accept,
+                reject,
+            },
+            naga::Span::UNDEFINED,
+        );
+        body.push(
+            naga::Statement::Store {
+                pointer: p2,
+                value: v2,
+            },
+            naga::Span::UNDEFINED,
+        );
+
+        let idx = ExpressionScopeIndex::build(&body, &arena);
+
+        assert_eq!(idx.store_position((p, v)), Some(0));
+        assert_eq!(idx.handle_position(a), Some(2));
+        assert_eq!(idx.handle_position(b), Some(3));
+        // Second Store comes AFTER both branches, so position 4.
+        assert_eq!(idx.store_position((p2, v2)), Some(4));
+        // And the key invariant: second-store position > both
+        // branch-Emit positions.
+        assert!(idx.store_position((p2, v2)).unwrap() > idx.handle_position(a).unwrap());
+        assert!(idx.store_position((p2, v2)).unwrap() > idx.handle_position(b).unwrap());
+
+        // Subtree membership: `a` is in `accept` only, `b` is in
+        // `reject` only.  Re-borrow the branches through the body so
+        // the assertions exercise the same block addresses that
+        // production callers see.
+        let (accept_ref, reject_ref) = match &body[1] {
+            naga::Statement::If { accept, reject, .. } => (accept, reject),
+            _ => unreachable!(),
+        };
+        assert!(idx.is_in_subtree(accept_ref, a));
+        assert!(!idx.is_in_subtree(accept_ref, b));
+        assert!(idx.is_in_subtree(reject_ref, b));
+        assert!(!idx.is_in_subtree(reject_ref, a));
+    }
+
+    #[test]
+    fn scope_index_collides_stores_to_minimum() {
+        // Two distinct Store statements with the same (ptr, val)
+        // identity: the index records the MINIMUM position so a
+        // Load between them is correctly classified as "after" the
+        // earliest Store (conservative: over-keeps).
+        let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
+        let p = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(0)),
+            naga::Span::UNDEFINED,
+        );
+        let v = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(1)),
+            naga::Span::UNDEFINED,
+        );
+        let mut body = naga::Block::new();
+        body.push(
+            naga::Statement::Store {
+                pointer: p,
+                value: v,
+            },
+            naga::Span::UNDEFINED,
+        );
+        body.push(
+            naga::Statement::Store {
+                pointer: p,
+                value: v,
+            },
+            naga::Span::UNDEFINED,
+        );
+
+        let idx = ExpressionScopeIndex::build(&body, &arena);
+
+        // Two distinct stores share identity (p, v); the recorded
+        // position is the earliest (0), not the latest (1).
+        assert_eq!(idx.store_position((p, v)), Some(0));
+    }
+
+    /// Statement-bound result handles (Call.result, Atomic.result,
+    /// WorkGroupUniformLoad.result, Subgroup*.result,
+    /// RayQueryFunction::Proceed.result) are NOT in any Emit range.
+    /// The pre-fix `compute_statement_positions` only walked Emit
+    /// ranges and Stores, so result handles had no recorded position -
+    /// any has_later_live_load check against a result handle would
+    /// fail and the producing Store would be wrongly classified as
+    /// having no later live Load.  The merged `ExpressionScopeIndex`
+    /// must record result-handle positions so the scope-leak filter
+    /// and the dead-store gate both see consistent positions.
+    ///
+    /// Atomic exercises the `Option<Handle>`-bearing arm; the same
+    /// codepath in the index walker covers all other result-bearing
+    /// statement variants (WorkGroupUniformLoad, Call, Subgroup*,
+    /// RayQueryFunction::Proceed).
+    #[test]
+    fn scope_index_records_statement_bound_result_handles() {
+        let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
+        let ptr = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(0)),
+            naga::Span::UNDEFINED,
+        );
+        let val = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(1)),
+            naga::Span::UNDEFINED,
+        );
+        // Using a Literal placeholder for the result handle keeps the
+        // test self-contained; the index doesn't validate expression
+        // shape, only handle identity.
+        let atomic_result = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(2)),
+            naga::Span::UNDEFINED,
+        );
+        let wg_result = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(3)),
+            naga::Span::UNDEFINED,
+        );
+
+        let mut body = naga::Block::new();
+        body.push(
+            naga::Statement::Atomic {
+                pointer: ptr,
+                fun: naga::AtomicFunction::Add,
+                value: val,
+                result: Some(atomic_result),
+            },
+            naga::Span::UNDEFINED,
+        );
+        body.push(
+            naga::Statement::WorkGroupUniformLoad {
+                pointer: ptr,
+                result: wg_result,
+            },
+            naga::Span::UNDEFINED,
+        );
+
+        let idx = ExpressionScopeIndex::build(&body, &arena);
+
+        // Statement-bound result handles get the position of their
+        // emitting statement.  Atomic is at position 0,
+        // WorkGroupUniformLoad at 1.
+        assert_eq!(idx.handle_position(atomic_result), Some(0));
+        assert_eq!(idx.handle_position(wg_result), Some(1));
+
+        // Both result handles are inside the body's subtree.
+        assert!(idx.is_in_subtree(&body, atomic_result));
+        assert!(idx.is_in_subtree(&body, wg_result));
+    }
+
+    /// The empty-block interval `[enter, enter)` must reject every
+    /// handle (no handle is "inside" an empty block).  Loop
+    /// continuing blocks are routinely empty in WGSL output, so the
+    /// scope-leak filter's `is_in_subtree` would mis-classify
+    /// handles if the empty case were wrong.
+    #[test]
+    fn scope_index_empty_block_subtree_membership() {
+        let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
+        let e0 = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(0)),
+            naga::Span::UNDEFINED,
+        );
+        // Body: Emit(e0)                  pos 0
+        //       Block { /* empty */ }     pos 1 (no descendants)
+        let inner = naga::Block::new();
+        let mut body = naga::Block::new();
+        body.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(e0, e0)),
+            naga::Span::UNDEFINED,
+        );
+        body.push(naga::Statement::Block(inner), naga::Span::UNDEFINED);
+
+        let idx = ExpressionScopeIndex::build(&body, &arena);
+
+        // e0 is in body's subtree but NOT in the empty inner block.
+        let inner_ref = match &body[1] {
+            naga::Statement::Block(b) => b,
+            _ => unreachable!(),
+        };
+        assert!(idx.is_in_subtree(&body, e0));
+        assert!(!idx.is_in_subtree(inner_ref, e0));
+    }
+
+    /// Pre-emit expressions (Literal, Constant, LocalVariable, ...)
+    /// are not bound by any statement and are in scope everywhere in
+    /// the function.  `handle_position` must return `None` for them,
+    /// and the subtree-membership check correctly treats them as
+    /// outside (the filter sites `||` with `needs_pre_emit` to keep
+    /// them).
+    #[test]
+    fn scope_index_pre_emit_handles_have_no_position() {
+        let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
+        // A literal that is NEVER emitted - it could be used as a
+        // pointer/value expression but no Emit statement covers it.
+        let unused_literal = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(42)),
+            naga::Span::UNDEFINED,
+        );
+        let body = naga::Block::new(); // empty body
+        let idx = ExpressionScopeIndex::build(&body, &arena);
+        assert_eq!(idx.handle_position(unused_literal), None);
+        assert!(!idx.is_in_subtree(&body, unused_literal));
+    }
+
+    #[test]
+    fn block_scope_leak_regression_switch_case() {
+        // Same shape inside a switch case body.  `has_default` and no
+        // fall-through make the switch eligible for meet-over-branches,
+        // so the post-switch cache would otherwise have carried the
+        // in-case value forward.
+        let source = r#"
+fn f(sel: u32, a: f32, b: f32, c: f32) -> vec3<f32> {
+    var x: vec3<f32>;
+    switch sel {
+        case 0u: {
+            let temp = vec3<f32>(a, b, c);
+            x = temp;
+        }
+        default: {
+            x = vec3<f32>(0.0);
+        }
+    }
+    let post = x;
+    return post;
+}
+@compute @workgroup_size(1) fn main() { _ = f(0u, 1.0, 2.0, 3.0); }
+"#;
+        let (_, _module) = run_pass(source);
+    }
+
+    /// Statement-bound result handles (CallResult, AtomicResult,
+    /// WorkGroupUniformLoadResult, SubgroupBallotResult,
+    /// SubgroupOperationResult, RayQueryProceedResult) are NOT bound
+    /// inside `Emit` ranges - they are let-bound by naga's WGSL writer
+    /// at the statement's containing block.  If `Statement::Block { x =
+    /// helper(); }` stores a `CallResult` into a local, the cache entry
+    /// `Local(x) -> CallResult_handle` must be filtered out at the
+    /// closing brace just like Emit'd values.  Pre-fix
+    /// `collect_emitted_handles_in_block` only walked `Emit` ranges
+    /// and missed every statement-bound result, leaking forwarding
+    /// targets past the brace.
+    #[test]
+    fn block_scope_leak_regression_call_result_in_block() {
+        let source = r#"
+fn helper(a: f32, b: f32, c: f32) -> vec3<f32> { return vec3<f32>(a, b, c); }
+fn f(a: f32, b: f32, c: f32) -> vec3<f32> {
+    var x: vec3<f32>;
+    {
+        x = helper(a, b, c);
+    }
+    let post = x;
+    return post;
+}
+@compute @workgroup_size(1) fn main() { _ = f(1.0, 2.0, 3.0); }
+"#;
+        let (_, _module) = run_pass(source);
+    }
+
+    /// Same scope-leak shape but exercising `Statement::If` branch
+    /// containing the CallResult-seeded Store.
+    #[test]
+    fn block_scope_leak_regression_call_result_in_if_branch() {
+        let source = r#"
+fn helper(a: f32, b: f32, c: f32) -> vec3<f32> { return vec3<f32>(a, b, c); }
+fn f(cond: bool, a: f32, b: f32, c: f32) -> vec3<f32> {
+    var x: vec3<f32>;
+    if cond {
+        x = helper(a, b, c);
+    } else {
+        x = vec3<f32>(0.0);
+    }
+    let post = x;
+    return post;
+}
+@compute @workgroup_size(1) fn main() { _ = f(true, 1.0, 2.0, 3.0); }
+"#;
+        let (_, _module) = run_pass(source);
+    }
+
+    /// Same scope-leak shape exercising `Statement::Atomic` whose
+    /// `result` is bound at the statement site (not in an Emit).
+    #[test]
+    fn block_scope_leak_regression_atomic_result_in_block() {
+        let source = r#"
+@group(0) @binding(0) var<storage, read_write> counter: atomic<u32>;
+fn f() -> u32 {
+    var x: u32;
+    {
+        x = atomicAdd(&counter, 1u);
+    }
+    let post = x;
+    return post;
+}
+@compute @workgroup_size(1) fn main() { _ = f(); }
+"#;
+        let (_, _module) = run_pass(source);
+    }
+
+    /// Regression for the Block-arm cache-staleness bug.
+    ///
+    /// Setup: a local `var failed = false;` followed by `failed |= X;`
+    /// chains, where SOME `failed |= X;` statements live inside nested
+    /// `{ ... }` blocks.
+    ///
+    /// Pre-fix bug: on exit from a nested `Statement::Block` that wrote
+    /// to `failed`, the cache rollback restored the pre-block init
+    /// entry (`Local(failed) -> Literal(false)`) without invalidating
+    /// it.  A subsequent `Load(failed)` inside another nested block
+    /// would cache-hit on the stale init and be forwarded to
+    /// `Literal(false)`, producing `failed = false | X` in the
+    /// generator output - structurally valid WGSL that OVERWRITES
+    /// `failed`'s accumulated state with `X`, dropping every earlier
+    /// `failed |= ...`.  Naga's validator does not catch this because
+    /// it checks structural validity, not semantic equivalence with
+    /// the source.
+    ///
+    /// Fix: after rollback, drop cache entries for any local that was
+    /// modified inside the block - mirrors the existing invalidation
+    /// step in the `If`, `Switch`, and `Loop` arms.
+    ///
+    /// Empirically reproduced by `data/extra-test3/validate_draw.wgsl`,
+    /// where the input has the same `var failed = false; { failed |= ...; }`
+    /// shape and pre-fix output dropped accumulator state at three of
+    /// five F-writes.
+    ///
+    /// Signal: emit the optimised IR back to WGSL and check that the
+    /// pattern `failed=false|` does NOT appear in writes inside nested
+    /// blocks.  An init-forwarded first write is acceptable (init IS
+    /// `false`), but subsequent writes inside nested blocks must read
+    /// `failed`'s current value, not the pre-block init.
+    #[test]
+    fn block_arm_does_not_forward_stale_init_after_inner_block_writes() {
+        let source = r#"
+fn test_fn(a: bool, b: bool, c: bool) -> bool {
+    var failed = false;
+    {
+        failed |= a;
+    }
+    {
+        failed |= b;
+    }
+    {
+        failed |= c;
+    }
+    return failed;
+}
+
+@compute @workgroup_size(1) fn main() {
+    _ = test_fn(true, false, false);
+}
+"#;
+        let (_, module) = run_pass(source);
+
+        // Emit the optimised IR back to WGSL.  Bypass naga's
+        // capability gate for f16-only features; this test uses only
+        // booleans.
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("module should validate");
+        let mut out = String::new();
+        let mut writer =
+            naga::back::wgsl::Writer::new(&mut out, naga::back::wgsl::WriterFlags::empty());
+        writer.write(&module, &info).expect("should emit WGSL");
+
+        // Strip whitespace for robust pattern matching across naga
+        // formatting tweaks.
+        let stripped: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+
+        // Pre-fix bug signature: writes inside nested blocks would
+        // emit as `failed = false | X` (or some form where the LHS of
+        // the OR is the literal `false` instead of `Load(failed)`).
+        // With the fix, the first write may still forward the init
+        // (`failed = false | a`) - that one is correct because the
+        // init IS `false`.  Subsequent writes must NOT carry that
+        // pattern.  We check that the count of `failed=false|`
+        // occurrences is at most one (the init-forwarded first
+        // write).
+        let bad_pattern_count = stripped.matches("failed=false|").count();
+        assert!(
+            bad_pattern_count <= 1,
+            "expected at most 1 init-forwarded `failed=false|` (the first \
+             write), found {} occurrences.  Pre-fix bug forwards \
+             Load(failed) inside nested blocks to the stale init, \
+             producing additional `failed=false|X` writes that drop \
+             accumulator state.  Output:\n{}",
+            bad_pattern_count,
+            out,
         );
     }
 }

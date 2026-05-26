@@ -7,9 +7,22 @@ use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
 
 /// DCE pass that delegates to naga's arena compactor.  `changed` is
-/// inferred from arena length deltas across the six arenas naga's
-/// compactor touches (types, constants, overrides, globals, global
-/// expressions, functions).
+/// inferred from arena length deltas across the six arenas this pass
+/// snapshots: types, constants, overrides, globals, global
+/// expressions, functions.
+///
+/// Length-only comparison is sound because `naga::compact` only
+/// removes entries - it never reorders without shrinking - so an
+/// unchanged length tuple means every arena is bit-identical to its
+/// pre-compact state.  Other module-level state naga's compactor
+/// touches (`special_types`, `diagnostic_filters`, `entry_points`)
+/// is NOT length-checked here, on the principle that any change
+/// there will be reflected by a downstream cascade in one of the
+/// six tracked arenas (a removed predeclared type drops the type
+/// arena, etc.).  If a future naga release ever lands compactor
+/// edits that leave the six tracked arenas intact, this gate would
+/// silently report `changed = false` and the pipeline would converge
+/// one sweep early.
 #[derive(Debug, Default)]
 pub struct CompactPass;
 

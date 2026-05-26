@@ -1,16 +1,28 @@
 //! Centralised classifiers and walkers for [`naga::Expression`] and
-//! [`naga::Statement`] shapes.
+//! [`naga::Statement`] shapes.  Every helper uses an exhaustive
+//! `match` with no `_` arm so a future naga variant trips the build
+//! here, forcing a deliberate classification decision at the single
+//! point of truth rather than letting passes drift on private
+//! deny-lists.
 //!
-//! Multiple passes once carried private deny-lists of expression kinds
-//! (see notes in `inlining.rs`).  Each list had to be updated whenever
-//! naga added a variant (`CooperativeLoad`, `RayQueryGetIntersection`,
-//! and so on), and a missed update silently produced wrong output.
-//! The helpers here use exhaustive `match` with no `_` arm, so the
-//! compiler refuses to build when naga grows a new variant and forces
-//! a deliberate classification decision at that moment.
+//! Consumers:
+//! * `inlining` - template clone gate (`is_disallowed_inline_expression`)
+//!   and statement-handle remapper (`try_map_expression_handles_in_place`).
+//! * `dead_branch` - `expression_needs_emit` for the short-circuit
+//!   re-sugar invariant (`val_a` must be declarative).
+//! * `load_dedup` - `needs_pre_emit` for the scope-leak filter; reuses
+//!   the emit-range rebuilder.
+//! * `cse` - `flatten_replacement_chains`,
+//!   `try_map_expression_handles_in_place`, and the post-CSE
+//!   statement walker.
+//! * `const_fold` - `rebuild_emit_ranges_after_removal`, plus a local
+//!   `is_pure_to_clone` that is a *tightened derivative* of
+//!   `is_disallowed_inline_expression` (additionally rejects Load and
+//!   image / derivative reads because const_fold CLONES expression
+//!   content into sibling arena slots rather than referencing it).
 //!
-//! Semantics match the previous per-pass copies exactly; the behaviour
-//! is unchanged, only the single source of truth has moved.
+//! `coalescing` deliberately keeps its own hand-rolled exhaustive
+//! statement walker and does NOT consume this module.
 
 // MARK: Expression classifiers
 
@@ -126,6 +138,158 @@ pub fn is_disallowed_inline_expression(expression: &naga::Expression) -> bool {
 
 // MARK: Handle remapping
 
+/// Read-only counterpart to [`try_map_expression_handles_in_place`]:
+/// invoke `visit` for every child-expression handle of `expression`
+/// in naga's IR-exposure order.  Declarative and result variants
+/// have no children and are skipped.
+///
+/// Exhaustive match - load-bearing for downstream ref-counting
+/// (`const_fold`'s identity gate) and liveness (`dead_param`'s root
+/// collector).  A missed variant would understate counts, letting
+/// the identity gate green-light an unsafe clone or dead-param
+/// elimination drop a live argument.
+pub fn visit_expression_children(
+    expression: &naga::Expression,
+    mut visit: impl FnMut(naga::Handle<naga::Expression>),
+) {
+    use naga::Expression as E;
+    match expression {
+        E::Literal(_)
+        | E::Constant(_)
+        | E::Override(_)
+        | E::ZeroValue(_)
+        | E::FunctionArgument(_)
+        | E::GlobalVariable(_)
+        | E::LocalVariable(_)
+        | E::CallResult(_)
+        | E::AtomicResult { .. }
+        | E::WorkGroupUniformLoadResult { .. }
+        | E::RayQueryProceedResult
+        | E::SubgroupBallotResult
+        | E::SubgroupOperationResult { .. } => {}
+        E::Compose { components, .. } => {
+            for &c in components {
+                visit(c);
+            }
+        }
+        E::Access { base, index } => {
+            visit(*base);
+            visit(*index);
+        }
+        E::AccessIndex { base, .. } => visit(*base),
+        E::Splat { value, .. } => visit(*value),
+        E::Swizzle { vector, .. } => visit(*vector),
+        E::Load { pointer } => visit(*pointer),
+        E::Unary { expr: e, .. } => visit(*e),
+        E::Binary { left, right, .. } => {
+            visit(*left);
+            visit(*right);
+        }
+        E::Select {
+            condition,
+            accept,
+            reject,
+        } => {
+            visit(*condition);
+            visit(*accept);
+            visit(*reject);
+        }
+        E::Derivative { expr: e, .. } => visit(*e),
+        E::Relational { argument, .. } => visit(*argument),
+        E::Math {
+            arg,
+            arg1,
+            arg2,
+            arg3,
+            ..
+        } => {
+            visit(*arg);
+            if let Some(a) = arg1 {
+                visit(*a);
+            }
+            if let Some(a) = arg2 {
+                visit(*a);
+            }
+            if let Some(a) = arg3 {
+                visit(*a);
+            }
+        }
+        E::As { expr: e, .. } => visit(*e),
+        E::ArrayLength(e) => visit(*e),
+        E::ImageSample {
+            image,
+            sampler,
+            coordinate,
+            array_index,
+            offset,
+            level,
+            depth_ref,
+            ..
+        } => {
+            visit(*image);
+            visit(*sampler);
+            visit(*coordinate);
+            if let Some(ai) = array_index {
+                visit(*ai);
+            }
+            if let Some(o) = offset {
+                visit(*o);
+            }
+            match level {
+                naga::SampleLevel::Auto | naga::SampleLevel::Zero => {}
+                naga::SampleLevel::Exact(h) | naga::SampleLevel::Bias(h) => visit(*h),
+                naga::SampleLevel::Gradient { x, y } => {
+                    visit(*x);
+                    visit(*y);
+                }
+            }
+            if let Some(d) = depth_ref {
+                visit(*d);
+            }
+        }
+        E::ImageLoad {
+            image,
+            coordinate,
+            array_index,
+            sample,
+            level,
+        } => {
+            visit(*image);
+            visit(*coordinate);
+            if let Some(ai) = array_index {
+                visit(*ai);
+            }
+            if let Some(s) = sample {
+                visit(*s);
+            }
+            if let Some(l) = level {
+                visit(*l);
+            }
+        }
+        E::ImageQuery { image, query } => {
+            visit(*image);
+            match query {
+                naga::ImageQuery::Size { level: Some(l) } => visit(*l),
+                naga::ImageQuery::Size { level: None }
+                | naga::ImageQuery::NumLevels
+                | naga::ImageQuery::NumLayers
+                | naga::ImageQuery::NumSamples => {}
+            }
+        }
+        E::RayQueryVertexPositions { query, .. } => visit(*query),
+        E::RayQueryGetIntersection { query, .. } => visit(*query),
+        E::CooperativeLoad { data, .. } => {
+            visit(data.pointer);
+            visit(data.stride);
+        }
+        E::CooperativeMultiplyAdd { a, b, c } => {
+            visit(*a);
+            visit(*b);
+            visit(*c);
+        }
+    }
+}
+
 /// Remap every child-expression handle inside `expression` through
 /// `remap`.  Returns `None` if `remap` returns `None` for any handle,
 /// leaving `expression` in a partially-remapped state (callers are
@@ -227,8 +391,19 @@ pub fn try_map_expression_handles_in_place(
         }
         naga::Expression::ImageQuery { image, query } => {
             *image = remap(*image)?;
-            if let naga::ImageQuery::Size { level: Some(level) } = query {
-                *level = remap(*level)?;
+            // Exhaustive match over ImageQuery variants so a future
+            // naga release that adds a handle-bearing variant breaks
+            // the build here instead of silently bypassing the
+            // remap walk (matches the contract documented in this
+            // file's module header).
+            match query {
+                naga::ImageQuery::Size { level: Some(level) } => {
+                    *level = remap(*level)?;
+                }
+                naga::ImageQuery::Size { level: None }
+                | naga::ImageQuery::NumLevels
+                | naga::ImageQuery::NumLayers
+                | naga::ImageQuery::NumSamples => {}
             }
         }
         naga::Expression::Unary { expr, .. } => {
@@ -386,9 +561,13 @@ pub fn map_cooperative_data_handles(
 
 // MARK: Statement walkers
 
-/// Remap every expression handle referenced by `statement`.  Control
-/// flow is walked exhaustively so a future naga variant must be
-/// explicitly classified here before the build succeeds.
+/// Remap every expression handle referenced by `statement`.
+/// Exhaustive match - a future naga variant breaks the build here.
+///
+/// Per-statement only: callers walk nested blocks themselves.
+/// Read-only recursive counterpart is
+/// [`visit_block_expression_handles`]; any new handle-bearing
+/// `Statement` variant must be added to both.
 pub fn remap_statement_handles(
     statement: &mut naga::Statement,
     remap: &mut impl FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
@@ -507,6 +686,207 @@ pub fn remap_statement_handles(
     }
 }
 
+/// Visit every expression handle referenced by `block`, recursing
+/// through nested control flow.  Fires `visit` once per direct
+/// statement-field reference (`Store.value`, `If.condition`, each
+/// `Call.arguments` element, etc.).
+///
+/// `include_emit_handles` selects between two semantics:
+/// * `true` - also fires `visit` once per handle inside each
+///   `Statement::Emit` range.  Use for analyses that treat Emit'd
+///   expressions as reachable (liveness, where they are let-bound
+///   names visible to downstream consumers).
+/// * `false` - suppresses Emit visits.  Use for data-flow reference
+///   counting; Emit is sequencing, not a use, and conflating the two
+///   would push every Emit'd expression to refcount `>= 1` and defeat
+///   any unique-owner gate.
+///
+/// Exhaustive match (no `_` arm), in lockstep with
+/// [`remap_statement_handles`]; any new handle-bearing statement
+/// variant must be added to both.
+pub fn visit_block_expression_handles<F>(
+    block: &naga::Block,
+    include_emit_handles: bool,
+    visit: &mut F,
+) where
+    F: FnMut(naga::Handle<naga::Expression>),
+{
+    for stmt in block.iter() {
+        match stmt {
+            naga::Statement::Emit(range) => {
+                if include_emit_handles {
+                    for h in range.clone() {
+                        visit(h);
+                    }
+                }
+            }
+            naga::Statement::Block(inner) => {
+                visit_block_expression_handles(inner, include_emit_handles, visit);
+            }
+            naga::Statement::If {
+                condition,
+                accept,
+                reject,
+            } => {
+                visit(*condition);
+                visit_block_expression_handles(accept, include_emit_handles, visit);
+                visit_block_expression_handles(reject, include_emit_handles, visit);
+            }
+            naga::Statement::Switch { selector, cases } => {
+                visit(*selector);
+                for case in cases {
+                    visit_block_expression_handles(&case.body, include_emit_handles, visit);
+                }
+            }
+            naga::Statement::Loop {
+                body,
+                continuing,
+                break_if,
+            } => {
+                visit_block_expression_handles(body, include_emit_handles, visit);
+                visit_block_expression_handles(continuing, include_emit_handles, visit);
+                if let Some(handle) = break_if {
+                    visit(*handle);
+                }
+            }
+            naga::Statement::Return { value } => {
+                if let Some(handle) = value {
+                    visit(*handle);
+                }
+            }
+            naga::Statement::Store { pointer, value } => {
+                visit(*pointer);
+                visit(*value);
+            }
+            naga::Statement::ImageStore {
+                image,
+                coordinate,
+                array_index,
+                value,
+            } => {
+                visit(*image);
+                visit(*coordinate);
+                if let Some(index) = array_index {
+                    visit(*index);
+                }
+                visit(*value);
+            }
+            naga::Statement::Atomic {
+                pointer,
+                fun,
+                value,
+                result,
+            } => {
+                visit(*pointer);
+                if let naga::AtomicFunction::Exchange { compare: Some(c) } = fun {
+                    visit(*c);
+                }
+                visit(*value);
+                if let Some(handle) = result {
+                    visit(*handle);
+                }
+            }
+            naga::Statement::ImageAtomic {
+                image,
+                coordinate,
+                array_index,
+                fun,
+                value,
+            } => {
+                visit(*image);
+                visit(*coordinate);
+                if let Some(index) = array_index {
+                    visit(*index);
+                }
+                if let naga::AtomicFunction::Exchange { compare: Some(c) } = fun {
+                    visit(*c);
+                }
+                visit(*value);
+            }
+            naga::Statement::WorkGroupUniformLoad { pointer, result } => {
+                visit(*pointer);
+                visit(*result);
+            }
+            naga::Statement::Call {
+                arguments, result, ..
+            } => {
+                for &argument in arguments {
+                    visit(argument);
+                }
+                if let Some(handle) = result {
+                    visit(*handle);
+                }
+            }
+            naga::Statement::RayQuery { query, fun } => {
+                visit(*query);
+                match fun {
+                    naga::RayQueryFunction::Initialize {
+                        acceleration_structure,
+                        descriptor,
+                    } => {
+                        visit(*acceleration_structure);
+                        visit(*descriptor);
+                    }
+                    naga::RayQueryFunction::Proceed { result } => visit(*result),
+                    naga::RayQueryFunction::GenerateIntersection { hit_t } => visit(*hit_t),
+                    naga::RayQueryFunction::ConfirmIntersection
+                    | naga::RayQueryFunction::Terminate => {}
+                }
+            }
+            naga::Statement::RayPipelineFunction(fun) => {
+                let naga::RayPipelineFunction::TraceRay {
+                    acceleration_structure,
+                    descriptor,
+                    payload,
+                } = fun;
+                visit(*acceleration_structure);
+                visit(*descriptor);
+                visit(*payload);
+            }
+            naga::Statement::SubgroupBallot { result, predicate } => {
+                visit(*result);
+                if let Some(handle) = predicate {
+                    visit(*handle);
+                }
+            }
+            naga::Statement::SubgroupGather {
+                mode,
+                argument,
+                result,
+            } => {
+                visit(*argument);
+                visit(*result);
+                match mode {
+                    naga::GatherMode::Broadcast(handle)
+                    | naga::GatherMode::Shuffle(handle)
+                    | naga::GatherMode::ShuffleDown(handle)
+                    | naga::GatherMode::ShuffleUp(handle)
+                    | naga::GatherMode::ShuffleXor(handle)
+                    | naga::GatherMode::QuadBroadcast(handle) => visit(*handle),
+                    naga::GatherMode::BroadcastFirst | naga::GatherMode::QuadSwap(_) => {}
+                }
+            }
+            naga::Statement::SubgroupCollectiveOperation {
+                argument, result, ..
+            } => {
+                visit(*argument);
+                visit(*result);
+            }
+            naga::Statement::CooperativeStore { target, data } => {
+                visit(*target);
+                visit(data.pointer);
+                visit(data.stride);
+            }
+            // Terminators / barriers reference no handles.
+            naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_) => {}
+        }
+    }
+}
+
 // MARK: Emit-range surgery
 
 /// Drop every handle in `removed` from every `Emit` range inside
@@ -570,7 +950,28 @@ pub fn rebuild_emit_ranges_after_removal(
                 rebuild_emit_ranges_after_removal(body, removed);
                 rebuild_emit_ranges_after_removal(continuing, removed);
             }
-            _ => {}
+            // Leaf statements - only `Emit` ranges and nested blocks
+            // need rebuilding.  Enumerated explicitly so a future
+            // naga release adding a new block-bearing variant breaks
+            // the build here instead of silently bypassing recursion.
+            naga::Statement::Store { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Call { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
         }
         block.push(statement, span);
     }

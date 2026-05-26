@@ -40,24 +40,27 @@ impl Pass for DeadParamPass {
 
             let live = compute_live_expr_set(func);
 
+            // One-pass collection so the unused-arg filter is O(1)
+            // per parameter instead of O(arena) per parameter.
+            let mut live_arg_indices: HashSet<u32> = HashSet::with_capacity(func.arguments.len());
+            for (h, e) in func.expressions.iter() {
+                if let naga::Expression::FunctionArgument(idx) = e
+                    && live.contains(&h)
+                {
+                    live_arg_indices.insert(*idx);
+                }
+            }
+
             let unused: Vec<usize> = (0..func.arguments.len())
                 .filter(|&i| {
-                    // Skip parameters whose type is not constructible:
-                    // the rewrite below would turn their
-                    // `FunctionArgument(ty)` into `ZeroValue(ty)`, but
-                    // naga's validator rejects `ZeroValue` for opaque
-                    // or resource-backed types.  See
-                    // `is_non_constructible_type` for the exact set.
+                    // Non-constructible types would survive the
+                    // arg -> ZeroValue rewrite below as invalid IR
+                    // (`ZeroValue` is rejected for opaque/resource
+                    // types).  Keep them.
                     if is_non_constructible_type(func.arguments[i].ty, &module.types) {
                         return false;
                     }
-                    // A parameter is unused when no live
-                    // `FunctionArgument(i)` expression reaches a
-                    // statement root.
-                    !func.expressions.iter().any(|(h, e)| {
-                        matches!(e, naga::Expression::FunctionArgument(idx) if *idx == i as u32)
-                            && live.contains(&h)
-                    })
+                    !live_arg_indices.contains(&(i as u32))
                 })
                 .collect();
 
@@ -76,27 +79,27 @@ impl Pass for DeadParamPass {
         // gap.
         for (&fh, indices) in &removals {
             let func = &mut module.functions[fh];
-            let removed_set: HashSet<usize> = indices.iter().copied().collect();
 
-            // Snapshot the types before the vec is mutated so
-            // the rewrite below can still consult them.
+            // Snapshot types keyed by original index so the expression
+            // rewrite below can resolve a removed slot's type after
+            // `func.arguments` has shrunk.
             let removed_types: HashMap<usize, naga::Handle<naga::Type>> =
                 indices.iter().map(|&i| (i, func.arguments[i].ty)).collect();
 
-            // Reverse-index removal keeps earlier indices valid
-            // across the loop.
+            // Reverse iteration keeps earlier indices valid.
             for &idx in indices.iter().rev() {
                 func.arguments.remove(idx);
             }
 
-            // Expression arena fixup: dead `FunctionArgument` entries
-            // become `ZeroValue` so the validator still sees a typed
-            // value; live entries shift down by the count of removed
-            // slots below them.
+            // Expression arena fixup: dead args become `ZeroValue`
+            // (typed, validator-acceptable); live args shift down by
+            // the count of removed slots below them.  `indices` is
+            // small (typically <= 5 dead args), so linear `contains`
+            // beats hash-set allocation overhead.
             for (_, expr) in func.expressions.iter_mut() {
                 if let naga::Expression::FunctionArgument(arg_idx) = expr {
                     let old = *arg_idx as usize;
-                    if removed_set.contains(&old) {
+                    if indices.contains(&old) {
                         *expr = naga::Expression::ZeroValue(removed_types[&old]);
                     } else {
                         let shift = indices.iter().filter(|&&i| i < old).count();
@@ -109,10 +112,10 @@ impl Pass for DeadParamPass {
         // Phase 3: drop the corresponding actual arguments at every
         // call site across regular functions and entry points.
         for (_, func) in module.functions.iter_mut() {
-            remove_call_args_in_block(&mut func.body, &removals);
+            remove_call_args_in_block(&mut func.body, &removals)?;
         }
         for entry in module.entry_points.iter_mut() {
-            remove_call_args_in_block(&mut entry.function.body, &removals);
+            remove_call_args_in_block(&mut entry.function.body, &removals)?;
         }
 
         Ok(true)
@@ -128,7 +131,7 @@ impl Pass for DeadParamPass {
 fn remove_call_args_in_block(
     block: &mut naga::Block,
     removals: &HashMap<naga::Handle<naga::Function>, Vec<usize>>,
-) {
+) -> Result<(), Error> {
     for stmt in block.iter_mut() {
         match stmt {
             naga::Statement::Call {
@@ -138,33 +141,65 @@ fn remove_call_args_in_block(
             } => {
                 if let Some(indices) = removals.get(function) {
                     for &idx in indices.iter().rev() {
-                        if idx < arguments.len() {
-                            arguments.remove(idx);
+                        // Surface caller/callee arity drift as a
+                        // structured error attributed to dead_param,
+                        // not as a downstream validation crash under
+                        // some sibling pass's name.
+                        if idx >= arguments.len() {
+                            return Err(Error::Validation(format!(
+                                "dead_param: removal index {idx} out of bounds for call \
+                                 site with {} arguments - caller/callee out of sync",
+                                arguments.len()
+                            )));
                         }
+                        arguments.remove(idx);
                     }
                 }
             }
             naga::Statement::If { accept, reject, .. } => {
-                remove_call_args_in_block(accept, removals);
-                remove_call_args_in_block(reject, removals);
+                remove_call_args_in_block(accept, removals)?;
+                remove_call_args_in_block(reject, removals)?;
             }
             naga::Statement::Switch { cases, .. } => {
                 for case in cases.iter_mut() {
-                    remove_call_args_in_block(&mut case.body, removals);
+                    remove_call_args_in_block(&mut case.body, removals)?;
                 }
             }
             naga::Statement::Loop {
                 body, continuing, ..
             } => {
-                remove_call_args_in_block(body, removals);
-                remove_call_args_in_block(continuing, removals);
+                remove_call_args_in_block(body, removals)?;
+                remove_call_args_in_block(continuing, removals)?;
             }
             naga::Statement::Block(inner) => {
-                remove_call_args_in_block(inner, removals);
+                remove_call_args_in_block(inner, removals)?;
             }
-            _ => {}
+            // Leaf statements - no Call to surgery, no nested blocks.
+            // Enumerated explicitly so a future naga release adding
+            // a new block-bearing variant breaks the build here
+            // instead of silently leaving a Call's argument list
+            // out of sync with the renumbered callee signature.
+            naga::Statement::Emit(_)
+            | naga::Statement::Store { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
         }
     }
+    Ok(())
 }
 
 // MARK: Liveness analysis
@@ -186,7 +221,7 @@ fn compute_live_expr_set(func: &naga::Function) -> HashSet<naga::Handle<naga::Ex
         if !live.insert(handle) {
             continue;
         }
-        visit_expr_children(&func.expressions[handle], |child| {
+        super::expr_util::visit_expression_children(&func.expressions[handle], |child| {
             if !live.contains(&child) {
                 worklist.push(child);
             }
@@ -196,182 +231,18 @@ fn compute_live_expr_set(func: &naga::Function) -> HashSet<naga::Handle<naga::Ex
     live
 }
 
-/// Collect every expression handle a statement references directly
-/// (the roots of the liveness graph) and push them into `roots`.
-/// Recurses into nested blocks; exhaustive statement coverage is
-/// required because a missed statement type would understate liveness
-/// and let the pass remove live parameters.
+/// Collect the roots of the liveness graph: every expression handle
+/// a statement directly references, including Emit'd handles (those
+/// are let-bound names reachable from elsewhere in the function).
+/// A missed statement variant would under-track liveness and let the
+/// pass remove a live parameter - the shared walker's exhaustive
+/// match defends against that.
 fn collect_stmt_expr_roots(block: &naga::Block, roots: &mut Vec<naga::Handle<naga::Expression>>) {
-    for stmt in block.iter() {
-        match stmt {
-            naga::Statement::Emit(range) => {
-                for h in range.clone() {
-                    roots.push(h);
-                }
-            }
-            naga::Statement::If {
-                condition,
-                accept,
-                reject,
-            } => {
-                roots.push(*condition);
-                collect_stmt_expr_roots(accept, roots);
-                collect_stmt_expr_roots(reject, roots);
-            }
-            naga::Statement::Switch { selector, cases } => {
-                roots.push(*selector);
-                for case in cases {
-                    collect_stmt_expr_roots(&case.body, roots);
-                }
-            }
-            naga::Statement::Loop {
-                body,
-                continuing,
-                break_if,
-            } => {
-                collect_stmt_expr_roots(body, roots);
-                collect_stmt_expr_roots(continuing, roots);
-                if let Some(bi) = break_if {
-                    roots.push(*bi);
-                }
-            }
-            naga::Statement::Block(inner) => {
-                collect_stmt_expr_roots(inner, roots);
-            }
-            naga::Statement::Store { pointer, value } => {
-                roots.push(*pointer);
-                roots.push(*value);
-            }
-            naga::Statement::Return { value: Some(v) } => {
-                roots.push(*v);
-            }
-            naga::Statement::Return { value: None } => {}
-            naga::Statement::Call {
-                arguments, result, ..
-            } => {
-                roots.extend(arguments.iter().copied());
-                if let Some(r) = result {
-                    roots.push(*r);
-                }
-            }
-            naga::Statement::ImageStore {
-                image,
-                coordinate,
-                array_index,
-                value,
-            } => {
-                roots.push(*image);
-                roots.push(*coordinate);
-                if let Some(ai) = array_index {
-                    roots.push(*ai);
-                }
-                roots.push(*value);
-            }
-            naga::Statement::Atomic {
-                pointer,
-                value,
-                result,
-                fun,
-            } => {
-                roots.push(*pointer);
-                roots.push(*value);
-                if let Some(r) = result {
-                    roots.push(*r);
-                }
-                if let naga::AtomicFunction::Exchange { compare: Some(c) } = fun {
-                    roots.push(*c);
-                }
-            }
-            naga::Statement::WorkGroupUniformLoad { pointer, result } => {
-                roots.push(*pointer);
-                roots.push(*result);
-            }
-            naga::Statement::RayQuery { query, fun } => {
-                roots.push(*query);
-                match fun {
-                    naga::RayQueryFunction::Initialize {
-                        acceleration_structure,
-                        descriptor,
-                    } => {
-                        roots.push(*acceleration_structure);
-                        roots.push(*descriptor);
-                    }
-                    naga::RayQueryFunction::Proceed { result } => {
-                        roots.push(*result);
-                    }
-                    naga::RayQueryFunction::GenerateIntersection { hit_t } => {
-                        roots.push(*hit_t);
-                    }
-                    naga::RayQueryFunction::ConfirmIntersection
-                    | naga::RayQueryFunction::Terminate => {}
-                }
-            }
-            naga::Statement::SubgroupBallot { result, predicate } => {
-                roots.push(*result);
-                if let Some(p) = predicate {
-                    roots.push(*p);
-                }
-            }
-            naga::Statement::SubgroupGather {
-                mode,
-                argument,
-                result,
-            } => {
-                roots.push(*argument);
-                roots.push(*result);
-                match mode {
-                    naga::GatherMode::Broadcast(h)
-                    | naga::GatherMode::Shuffle(h)
-                    | naga::GatherMode::ShuffleDown(h)
-                    | naga::GatherMode::ShuffleUp(h)
-                    | naga::GatherMode::ShuffleXor(h)
-                    | naga::GatherMode::QuadBroadcast(h) => {
-                        roots.push(*h);
-                    }
-                    naga::GatherMode::BroadcastFirst | naga::GatherMode::QuadSwap(_) => {}
-                }
-            }
-            naga::Statement::SubgroupCollectiveOperation {
-                argument, result, ..
-            } => {
-                roots.push(*argument);
-                roots.push(*result);
-            }
-            naga::Statement::RayPipelineFunction(fun) => {
-                let naga::RayPipelineFunction::TraceRay {
-                    acceleration_structure,
-                    descriptor,
-                    payload,
-                } = fun;
-                roots.push(*acceleration_structure);
-                roots.push(*descriptor);
-                roots.push(*payload);
-            }
-            naga::Statement::CooperativeStore { target, data } => {
-                roots.push(*target);
-                roots.push(data.pointer);
-                roots.push(data.stride);
-            }
-            naga::Statement::ImageAtomic {
-                image,
-                coordinate,
-                array_index,
-                fun,
-                value,
-            } => {
-                roots.push(*image);
-                roots.push(*coordinate);
-                if let Some(ai) = array_index {
-                    roots.push(*ai);
-                }
-                roots.push(*value);
-                if let naga::AtomicFunction::Exchange { compare: Some(c) } = fun {
-                    roots.push(*c);
-                }
-            }
-            _ => {}
-        }
-    }
+    super::expr_util::visit_block_expression_handles(
+        block,
+        /*include_emit_handles=*/ true,
+        &mut |h| roots.push(h),
+    );
 }
 
 // MARK: Constructibility gating
@@ -394,14 +265,11 @@ fn collect_stmt_expr_roots(block: &naga::Block, roots: &mut Vec<naga::Handle<nag
 /// - [`TypeInner::BindingArray`]: binding arrays are resource bundles
 ///   scoped to globals and never appear as function-argument values.
 ///
-/// Aggregate types ([`Struct`], [`Array`]) are intentionally NOT
-/// recursed into.  naga also rejects function parameters whose type
-/// is an aggregate carrying any of the above leaves, so such a
-/// parameter cannot reach this predicate.  Keeping the check flat
-/// avoids a recursive walk through the type arena on every invocation.
-///
-/// [`Struct`]: naga::TypeInner::Struct
-/// [`Array`]: naga::TypeInner::Array
+/// Aggregates (`Struct`, `Array`) are not recursed into: WGSL
+/// already rejects opaque-leaf-bearing aggregates as function
+/// parameters at the front-end, so any aggregate reaching this
+/// predicate is constructible by naga's rules.  Flat check avoids a
+/// recursive type-arena walk per invocation.
 fn is_non_constructible_type(
     ty_handle: naga::Handle<naga::Type>,
     types: &naga::UniqueArena<naga::Type>,
@@ -417,148 +285,6 @@ fn is_non_constructible_type(
             | naga::TypeInner::Atomic(_)
             | naga::TypeInner::BindingArray { .. }
     )
-}
-
-// MARK: Expression child walker
-
-/// Visit every child expression handle of `expr`, invoking `f` for
-/// each.  Declarative and result expressions yield nothing.  Walker
-/// is exhaustive so a future naga variant forces a deliberate
-/// classification decision instead of silently under-reporting
-/// liveness.
-fn visit_expr_children(expr: &naga::Expression, mut f: impl FnMut(naga::Handle<naga::Expression>)) {
-    use naga::Expression as E;
-    match expr {
-        E::Literal(_)
-        | E::Constant(_)
-        | E::Override(_)
-        | E::ZeroValue(_)
-        | E::FunctionArgument(_)
-        | E::GlobalVariable(_)
-        | E::LocalVariable(_)
-        | E::CallResult(_)
-        | E::AtomicResult { .. }
-        | E::WorkGroupUniformLoadResult { .. }
-        | E::RayQueryProceedResult
-        | E::SubgroupBallotResult
-        | E::SubgroupOperationResult { .. } => {}
-        E::Compose { components, .. } => {
-            for &c in components {
-                f(c);
-            }
-        }
-        E::Access { base, index } => {
-            f(*base);
-            f(*index);
-        }
-        E::AccessIndex { base, .. } => f(*base),
-        E::Splat { value, .. } => f(*value),
-        E::Swizzle { vector, .. } => f(*vector),
-        E::Load { pointer } => f(*pointer),
-        E::Unary { expr: e, .. } => f(*e),
-        E::Binary { left, right, .. } => {
-            f(*left);
-            f(*right);
-        }
-        E::Select {
-            condition,
-            accept,
-            reject,
-        } => {
-            f(*condition);
-            f(*accept);
-            f(*reject);
-        }
-        E::Derivative { expr: e, .. } => f(*e),
-        E::Relational { argument, .. } => f(*argument),
-        E::Math {
-            arg,
-            arg1,
-            arg2,
-            arg3,
-            ..
-        } => {
-            f(*arg);
-            if let Some(a) = arg1 {
-                f(*a);
-            }
-            if let Some(a) = arg2 {
-                f(*a);
-            }
-            if let Some(a) = arg3 {
-                f(*a);
-            }
-        }
-        E::As { expr: e, .. } => f(*e),
-        E::ArrayLength(e) => f(*e),
-        E::ImageSample {
-            image,
-            sampler,
-            coordinate,
-            array_index,
-            offset,
-            level,
-            depth_ref,
-            ..
-        } => {
-            f(*image);
-            f(*sampler);
-            f(*coordinate);
-            if let Some(ai) = array_index {
-                f(*ai);
-            }
-            if let Some(o) = offset {
-                f(*o);
-            }
-            match level {
-                naga::SampleLevel::Auto | naga::SampleLevel::Zero => {}
-                naga::SampleLevel::Exact(h) | naga::SampleLevel::Bias(h) => f(*h),
-                naga::SampleLevel::Gradient { x, y } => {
-                    f(*x);
-                    f(*y);
-                }
-            }
-            if let Some(d) = depth_ref {
-                f(*d);
-            }
-        }
-        E::ImageLoad {
-            image,
-            coordinate,
-            array_index,
-            sample,
-            level,
-        } => {
-            f(*image);
-            f(*coordinate);
-            if let Some(ai) = array_index {
-                f(*ai);
-            }
-            if let Some(s) = sample {
-                f(*s);
-            }
-            if let Some(l) = level {
-                f(*l);
-            }
-        }
-        E::ImageQuery { image, query } => {
-            f(*image);
-            if let naga::ImageQuery::Size { level: Some(l) } = query {
-                f(*l);
-            }
-        }
-        E::RayQueryVertexPositions { query, .. } => f(*query),
-        E::RayQueryGetIntersection { query, .. } => f(*query),
-        E::CooperativeLoad { data, .. } => {
-            f(data.pointer);
-            f(data.stride);
-        }
-        E::CooperativeMultiplyAdd { a, b, c } => {
-            f(*a);
-            f(*b);
-            f(*c);
-        }
-    }
 }
 
 // MARK: Tests

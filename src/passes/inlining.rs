@@ -14,7 +14,7 @@
 //! exceed `MAX_MULTI_SITE_EXPANSION` net added nodes, the function
 //! is left alone.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
@@ -42,6 +42,14 @@ pub const MAX_PROFILE_MAX_INLINE_CALL_SITES: usize = 6;
 /// cloning a non-trivial body over multiple sites is almost always a
 /// net size regression.  Single-site inlining is unaffected (the
 /// expansion term is zero).
+///
+/// Deliberately hard-coded rather than promoted to `Config`: the
+/// value is a function of the post-mangle call-site length (~ 2-3
+/// chars including `(` `)`), not a profile knob.  The pipeline runs
+/// inlining ONCE per sweep, sandwiched between const_fold and
+/// dead_branch on both sides (see `passes/mod.rs`); multi-sweep
+/// convergence catches single-site cases that mature only after later
+/// simplification rather than re-running inlining mid-sweep.
 const MAX_MULTI_SITE_EXPANSION: usize = 6;
 
 /// Inlining pass parameterised on the per-run node and call-site
@@ -138,7 +146,12 @@ fn collect_inline_templates(
             continue;
         };
 
-        let mut visited = HashSet::new();
+        // `visited` is dense over the callee's expression arena and
+        // re-checked at every node in the recursive walk; back it
+        // with a `Vec<bool>` indexed by `handle.index()` instead of
+        // a hashed `HashSet`.  Pre-sized to `function.expressions.len()`
+        // so no growth occurs during the analysis.
+        let mut visited = vec![false; function.expressions.len()];
         let Some(node_count) = analyze_inline_expression(
             return_expr,
             &function.expressions,
@@ -216,7 +229,29 @@ fn collect_call_counts_in_block(
                 collect_call_counts_in_block(body, counts);
                 collect_call_counts_in_block(continuing, counts);
             }
-            _ => {}
+            // Leaf statements - no Call children, no nested blocks.
+            // Enumerated explicitly so a future naga release adding
+            // a new block-bearing variant breaks the build here and
+            // forces a deliberate inclusion / exclusion decision
+            // instead of silently leaving the call count short.
+            naga::Statement::Emit(_)
+            | naga::Statement::Store { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
         }
     }
 }
@@ -252,11 +287,13 @@ fn analyze_inline_expression(
     handle: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
     argument_count: usize,
-    visited: &mut HashSet<naga::Handle<naga::Expression>>,
+    visited: &mut [bool],
 ) -> Option<usize> {
-    if !visited.insert(handle) {
+    let slot = visited.get_mut(handle.index())?;
+    if *slot {
         return Some(0);
     }
+    *slot = true;
 
     let expr = &expressions[handle];
     if is_disallowed_inline_expression(expr) {
@@ -330,7 +367,17 @@ fn inline_in_block(
                     && template.argument_count == arguments.len()
                 {
                     let old_len = expressions.len();
-                    let mut memo = HashMap::new();
+                    // Memo backed by `Vec<Option<Handle>>` indexed by
+                    // template-arena `handle.index()` instead of a
+                    // HashMap.  The template expression arena is the
+                    // densest possible address space (one slot per
+                    // expression) and `clone_inline_expression` may
+                    // re-visit handles many times when the same
+                    // sub-expression is shared - the memo lookup is
+                    // the hot spot.  Direct indexing removes the
+                    // SipHash cost from the inner traversal.
+                    let mut memo: Vec<Option<naga::Handle<naga::Expression>>> =
+                        vec![None; template.expressions.len()];
                     if let Some(root_handle) = clone_inline_expression(
                         template.return_expr,
                         template,
@@ -457,14 +504,25 @@ fn push_emit_ranges_for_new_expressions(
 /// the caller-supplied `arguments`.  `memo` guarantees each template
 /// handle produces exactly one caller handle so shared sub-DAGs stay
 /// shared after cloning.
+///
+/// `memo` is pre-sized to `template.expressions.len()` by the caller
+/// (see `inline_in_function`).  Every `handle` reached through the
+/// recursion below comes from `template.expressions` (the recursion
+/// only traverses children of the just-cloned expression, which is
+/// itself a clone of an entry in the template's arena), so
+/// `handle.index() < memo.len()` is an invariant; both the read and
+/// write use direct indexing in lockstep, so an invariant violation
+/// panics loudly at the offending site rather than silently
+/// returning `None` on the read and then panicking on the write
+/// (inconsistent diagnostics).
 fn clone_inline_expression(
     handle: naga::Handle<naga::Expression>,
     template: &InlineTemplate,
     arguments: &[naga::Handle<naga::Expression>],
     caller_expressions: &mut naga::Arena<naga::Expression>,
-    memo: &mut HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    memo: &mut [Option<naga::Handle<naga::Expression>>],
 ) -> Option<naga::Handle<naga::Expression>> {
-    if let Some(mapped) = memo.get(&handle).copied() {
+    if let Some(mapped) = memo[handle.index()] {
         return Some(mapped);
     }
 
@@ -484,7 +542,7 @@ fn clone_inline_expression(
         }
     };
 
-    memo.insert(handle, mapped);
+    memo[handle.index()] = Some(mapped);
     Some(mapped)
 }
 
@@ -731,7 +789,32 @@ fn rebuild_block_expressions(
                 rebuild_block_expressions(body, old_expressions, new_expressions, handle_map);
                 rebuild_block_expressions(continuing, old_expressions, new_expressions, handle_map);
             }
-            _ => {}
+            // Leaf statements - `remap_statement_handles` above
+            // already rewrote every Expression-handle this statement
+            // references; only the block-bearing variants need
+            // explicit recursion here.  Enumerated explicitly so a
+            // future naga release adding a new block-bearing variant
+            // breaks the build here instead of silently leaving the
+            // nested body with old-arena handles.
+            naga::Statement::Emit(_)
+            | naga::Statement::Store { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Call { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
         }
 
         rebuilt.push(statement, span);

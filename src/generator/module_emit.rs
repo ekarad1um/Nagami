@@ -442,11 +442,14 @@ impl<'a> Generator<'a> {
                 naga::AddressSpace::Storage { access } => {
                     self.out.push('<');
                     self.out.push_str("storage");
-                    // Elide the default `read` access mode - WGSL
-                    // defaults storage bindings to read-only.
-                    if access != naga::StorageAccess::LOAD {
+                    // Elide the default `read` access.  Compare against
+                    // the resolved name (not the raw bitflag) so empty
+                    // / non-LOAD-only flag combinations classify
+                    // correctly via `storage_access`'s mapping.
+                    let acc_str = storage_access(access);
+                    if acc_str != "read" {
                         self.push_separator();
-                        self.out.push_str(storage_access(access));
+                        self.out.push_str(acc_str);
                     }
                     self.push_angle_end();
                 }
@@ -647,6 +650,17 @@ impl<'a> Generator<'a> {
         members: &[naga::StructMember],
         struct_span: u32,
     ) -> Result<(), Error> {
+        // `self.layouter[h]` panics on the first missing handle, and a
+        // failed `Layouter::update` leaves every type after the error
+        // unpopulated.  Refuse to emit so the pipeline's fallback path
+        // handles the struct instead of crashing here.
+        if !self.layouter_complete {
+            return Err(Error::Emit(format!(
+                "layouter is incomplete (some module types could not be \
+                 laid out); cannot safely emit struct '{}'",
+                self.type_names[&ty_handle]
+            )));
+        }
         self.out.push_str("struct ");
         self.out.push_str(&self.type_names[&ty_handle]);
         self.open_brace();
@@ -676,8 +690,18 @@ impl<'a> Generator<'a> {
             if need_align {
                 // Find the smallest power-of-2 alignment that, applied to
                 // default_offset, yields at least member.offset.
-                // We try an @align attribute on THIS member.
-                let a = 1u32 << member.offset.trailing_zeros();
+                //
+                // Defensive: `member.offset.trailing_zeros()` returns
+                // 32 when offset == 0 (panic on `1u32 << 32` in debug,
+                // UB on release pre-1.x).  `need_align` above already
+                // rules out offset == 0 (`expected_offset == 0` for
+                // the first member and `member.offset > expected_offset`
+                // demands a strictly larger offset, so we never reach
+                // here with offset 0), but `checked_shl` makes the
+                // invariant inspection-proof.
+                let a = 1u32
+                    .checked_shl(member.offset.trailing_zeros())
+                    .unwrap_or(0);
                 // Verify: round_up(default_offset, a) == member.offset
                 let align_obj = naga::proc::Alignment::new(a);
                 let works = align_obj
@@ -686,8 +710,18 @@ impl<'a> Generator<'a> {
                 if works {
                     self.out.push_str(&format!("@align({a}) "));
                 } else {
-                    // Fallback: use @size on previous member to pad.
-                    // This case is handled below via @size.
+                    // The gap from `default_offset` to `member.offset`
+                    // is not a power-of-two alignment expressible on
+                    // this member - it would require `@size` on the
+                    // previous member, whose text is already committed
+                    // to `self.out`.  Refuse rather than emit the wrong
+                    // layout; the fallback emitter handles it.
+                    return Err(Error::Emit(format!(
+                        "struct member '{}'[{}] requires padding that can be expressed \
+                         only with @size on the previous member; cannot emit safely \
+                         (member.offset={}, default_offset={}, computed_align={})",
+                        self.type_names[&ty_handle], idx, member.offset, default_offset, a,
+                    )));
                 }
             }
 
@@ -993,154 +1027,24 @@ pub(super) fn collect_emitted_handles(block: &naga::Block, live: &mut Vec<bool>)
     }
 }
 
-/// Saturating increment of `counts[h]`.  Saturating arithmetic is
-/// only a safety net because the real ceiling is the statement
-/// count, which fits comfortably in `usize` for any realistic shader.
+/// Increment `counts[h]` by one.  The maximum ref count is bounded by
+/// the total expression-reference count in the function, which fits
+/// comfortably in `usize` for any realistic shader, so a checked add
+/// is unwarranted - on overflow the program is already pathological
+/// and `usize::MAX` writes would have been the least of our worries.
 fn bump(counts: &mut [usize], h: naga::Handle<naga::Expression>) {
     counts[h.index()] += 1;
 }
 
-/// Visit each direct child expression handle of `expr`, calling `f` for each.
-/// Invoke `f` on every child expression handle directly referenced
-/// by `expr`.  Declarative and result expressions yield nothing.
-/// Exhaustive per variant so a new naga expression forces the caller
-/// to decide how to classify it.
+/// Generator-local alias for the shared exhaustive child walker in
+/// [`crate::passes::expr_util::visit_expression_children`].  Kept as a
+/// thin `pub(super)` indirection so the generator's call sites
+/// don't take a direct dependency on the passes layer.
 pub(super) fn visit_expr_children(
     expr: &naga::Expression,
-    mut f: impl FnMut(naga::Handle<naga::Expression>),
+    f: impl FnMut(naga::Handle<naga::Expression>),
 ) {
-    use naga::Expression as E;
-    match expr {
-        E::Literal(_)
-        | E::Constant(_)
-        | E::Override(_)
-        | E::ZeroValue(_)
-        | E::FunctionArgument(_)
-        | E::GlobalVariable(_)
-        | E::LocalVariable(_)
-        | E::CallResult(_)
-        | E::AtomicResult { .. }
-        | E::WorkGroupUniformLoadResult { .. }
-        | E::RayQueryProceedResult
-        | E::SubgroupBallotResult
-        | E::SubgroupOperationResult { .. } => {}
-        E::Compose { components, .. } => {
-            for h in components {
-                f(*h);
-            }
-        }
-        E::Access { base, index } => {
-            f(*base);
-            f(*index);
-        }
-        E::AccessIndex { base, .. } => f(*base),
-        E::Splat { value, .. } => f(*value),
-        E::Swizzle { vector, .. } => f(*vector),
-        E::Load { pointer } => f(*pointer),
-        E::ImageSample {
-            image,
-            sampler,
-            coordinate,
-            array_index,
-            offset,
-            level,
-            depth_ref,
-            ..
-        } => {
-            f(*image);
-            f(*sampler);
-            f(*coordinate);
-            if let Some(i) = array_index {
-                f(*i);
-            }
-            if let Some(o) = offset {
-                f(*o);
-            }
-            match level {
-                naga::SampleLevel::Auto | naga::SampleLevel::Zero => {}
-                naga::SampleLevel::Exact(h) | naga::SampleLevel::Bias(h) => f(*h),
-                naga::SampleLevel::Gradient { x, y } => {
-                    f(*x);
-                    f(*y);
-                }
-            }
-            if let Some(d) = depth_ref {
-                f(*d);
-            }
-        }
-        E::ImageLoad {
-            image,
-            coordinate,
-            array_index,
-            sample,
-            level,
-        } => {
-            f(*image);
-            f(*coordinate);
-            if let Some(i) = array_index {
-                f(*i);
-            }
-            if let Some(s) = sample {
-                f(*s);
-            }
-            if let Some(l) = level {
-                f(*l);
-            }
-        }
-        E::ImageQuery { image, query } => {
-            f(*image);
-            if let naga::ImageQuery::Size { level: Some(l) } = query {
-                f(*l);
-            }
-        }
-        E::Unary { expr, .. } => f(*expr),
-        E::Binary { left, right, .. } => {
-            f(*left);
-            f(*right);
-        }
-        E::Select {
-            condition,
-            accept,
-            reject,
-        } => {
-            f(*condition);
-            f(*accept);
-            f(*reject);
-        }
-        E::Derivative { expr, .. } => f(*expr),
-        E::Relational { argument, .. } => f(*argument),
-        E::Math {
-            arg,
-            arg1,
-            arg2,
-            arg3,
-            ..
-        } => {
-            f(*arg);
-            if let Some(v) = arg1 {
-                f(*v);
-            }
-            if let Some(v) = arg2 {
-                f(*v);
-            }
-            if let Some(v) = arg3 {
-                f(*v);
-            }
-        }
-        E::As { expr, .. } => f(*expr),
-        E::ArrayLength(h) => f(*h),
-        E::RayQueryVertexPositions { query, .. } => f(*query),
-        E::RayQueryGetIntersection { query, .. } => f(*query),
-        E::CooperativeLoad { data, .. } => {
-            f(data.pointer);
-            f(data.stride);
-        }
-        E::CooperativeMultiplyAdd { a, b, c } => {
-            f(*a);
-            f(*b);
-            f(*c);
-        }
-    }
+    crate::passes::expr_util::visit_expression_children(expr, f);
 }
 
 /// Shortcut helper that bumps `counts` for every child handle of
