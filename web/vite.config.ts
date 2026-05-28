@@ -56,6 +56,9 @@ export default defineConfig({
     ViteMinifyPlugin(),
   ],
   base: '/',
+  worker: {
+    format: 'es',
+  },
   optimizeDeps: {
     exclude: ['nagami-rs'],
   },

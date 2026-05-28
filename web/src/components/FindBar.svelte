@@ -26,6 +26,9 @@
     const hasHighlightAPI = typeof CSS !== "undefined" && "highlights" in CSS;
     const scopeLabels = { all: "All", input: "In", output: "Out" } as const;
 
+    let contentVersion = $state(0);
+    let contentDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+
     function cycleScope() {
         const order: ("all" | "input" | "output")[] = [
             "all",
@@ -42,10 +45,30 @@
         inputEl?.select();
     });
 
-    // Rebuild search ranges when query, content, regex mode, or scope changes
+    // Coalesce content changes. Without this we redo the DOM walk on every
+    // keystroke and race the async shiki highlight (stale Range nodes).
     $effect(() => {
         inputContent;
         outputContent;
+        if (contentDebounceTimer !== undefined)
+            clearTimeout(contentDebounceTimer);
+        contentDebounceTimer = setTimeout(() => {
+            contentDebounceTimer = undefined;
+            contentVersion++;
+        }, 80);
+        return () => {
+            if (contentDebounceTimer !== undefined) {
+                clearTimeout(contentDebounceTimer);
+                contentDebounceTimer = undefined;
+            }
+        };
+    });
+
+    // Rebuild search ranges. Reacts immediately to query/option changes;
+    // reacts to content via the debounced contentVersion above.
+    $effect(() => {
+        contentVersion;
+        query;
         caseSensitive;
         useRegex;
         searchScope;

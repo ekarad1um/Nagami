@@ -58,34 +58,52 @@
     });
   });
 
-  // Input highlighting (editable mode)
+  // Input highlighting (editable mode) - coalesced via rAF so rapid typing
+  // re-tokenizes once per paint frame instead of once per keystroke.
   let inputHighlightedHtml = $state("");
   let inputHighlightedCode = $state("");
   let inputHighlightSeq = 0;
+  let inputHighlightRaf: number | null = null;
 
   $effect(() => {
-    const seq = ++inputHighlightSeq;
     if (readonly) return;
     const code = value;
+    const seq = ++inputHighlightSeq;
+
+    if (inputHighlightRaf !== null) {
+      cancelAnimationFrame(inputHighlightRaf);
+      inputHighlightRaf = null;
+    }
+
     if (!code) {
       inputHighlightedHtml = "";
       inputHighlightedCode = "";
       return;
     }
-    const sync = highlightSync(code);
-    if (sync) {
-      inputHighlightedHtml = sync;
-      inputHighlightedCode = code;
-      return;
-    }
-    inputHighlightedHtml = "";
-    inputHighlightedCode = "";
-    highlight(code).then((html) => {
-      if (seq === inputHighlightSeq) {
-        inputHighlightedHtml = html;
+
+    inputHighlightRaf = requestAnimationFrame(() => {
+      inputHighlightRaf = null;
+      if (seq !== inputHighlightSeq) return;
+      const sync = highlightSync(code);
+      if (sync) {
+        inputHighlightedHtml = sync;
         inputHighlightedCode = code;
+        return;
       }
+      highlight(code).then((html) => {
+        if (seq === inputHighlightSeq) {
+          inputHighlightedHtml = html;
+          inputHighlightedCode = code;
+        }
+      });
     });
+
+    return () => {
+      if (inputHighlightRaf !== null) {
+        cancelAnimationFrame(inputHighlightRaf);
+        inputHighlightRaf = null;
+      }
+    };
   });
 
   let lineCount = $derived.by(() => {
@@ -323,7 +341,7 @@
 </script>
 
 <div
-  class="flex flex-col min-h-0 min-w-0 flex-1 {dragover
+  class="flex flex-col min-h-0 min-w-0 flex-1 relative {dragover
     ? 'ring-2 ring-emerald-400/50 ring-inset'
     : ''}"
   role="region"
@@ -386,9 +404,14 @@
     {/if}
   </div>
 
-  <!-- Loading indicator -->
+  <!-- Loading indicator: absolute overlay anchored just below the 32px (h-8)
+       header. Kept out of the flex flow so toggling it doesn't add/remove
+       2px of layout, which previously caused the code area to jitter on
+       every minify now that the WASM runs off the main thread. -->
   {#if loading}
-    <div class="loading-bar shrink-0"></div>
+    <div
+      class="loading-bar absolute left-0 right-0 top-8 z-10 pointer-events-none"
+    ></div>
   {/if}
 
   <!-- Code area -->

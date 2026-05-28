@@ -176,7 +176,7 @@
     {loading}
     {downloadName}
     wrap={outputWrap}
-    placeholder={loading ? "Loading WASM..." : "Minified output appears here"}
+    placeholder={loading ? "Minifying..." : "Minified output appears here"}
   />
 </main>
 

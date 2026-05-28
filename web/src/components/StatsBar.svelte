@@ -94,7 +94,7 @@
         <span class="text-emerald-400 font-medium">{savings}% smaller</span>
       {/if}
     {:else if loading}
-      <span class="text-slate-500">Loading WASM...</span>
+      <span class="text-slate-500">Minifying...</span>
     {:else}
       <span class="text-slate-600">Paste or drop a WGSL shader</span>
     {/if}
