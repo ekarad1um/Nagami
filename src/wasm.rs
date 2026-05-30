@@ -375,13 +375,13 @@ pub fn version() -> String {
 const TS_TYPES: &str = r#"
 export type PrecisionMode =
     | "full"
-    | number                                  // shorthand: number = decimal places
+    | number
     | { decimalPlaces: number }
     | { significantFigures: number }
-    | { sigFigs: number };                    // alias of significantFigures
+    | { sigFigs: number };
 
 export type FloatPrecision =
-    | PrecisionMode                           // applied uniformly to every float kind
+    | PrecisionMode
     | {
         f16?: PrecisionMode;
         f32?: PrecisionMode;
