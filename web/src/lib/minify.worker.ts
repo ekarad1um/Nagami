@@ -32,7 +32,7 @@ function ensureReady(): Promise<void> {
 
 // Start WASM compile/instantiate as soon as the worker boots so the first
 // request doesn't pay the full init latency.
-ensureReady().catch(() => {});
+ensureReady().catch(() => { });
 
 ctx.onmessage = async (e: MessageEvent<RunRequest>) => {
   const { id, source, config } = e.data;

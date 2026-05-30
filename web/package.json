@@ -1,7 +1,7 @@
 {
   "name": "nagami-playground",
   "private": true,
-  "version": "2026.4.62",
+  "version": "2026.5.29",
   "type": "module",
   "description": "Web playground for Nagami - IR-level WGSL shader minifier with DCE, folding, inlining, and mangling, powered by WebAssembly.",
   "homepage": "https://nagami.0xfff8e7.dev",
@@ -31,7 +31,7 @@
     "vite-plugin-minify": "^2.1.0"
   },
   "dependencies": {
-    "nagami-rs": "^2026.4.62",
+    "nagami-rs": "^2026.5.29",
     "shiki": "^4.1.0"
   }
 }

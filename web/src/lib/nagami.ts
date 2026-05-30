@@ -25,6 +25,10 @@ let worker: Worker | null = null;
 let nextId = 0;
 const pending = new Map<number, (r: RunOutput) => void>();
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function failAllPending(reason: string): void {
   for (const resolve of pending.values()) {
     resolve({ output: null, error: reason });
@@ -66,14 +70,39 @@ export function run(source: string, config?: Config): Promise<RunOutput> {
   try {
     w = ensureWorker();
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return Promise.resolve({ output: null, error: msg });
+    return Promise.resolve({ output: null, error: errorMessage(err) });
   }
   const id = ++nextId;
   return new Promise<RunOutput>((resolve) => {
     pending.set(id, resolve);
-    w.postMessage({ id, source, config });
+    try {
+      postRequest(w, { id, source, config });
+    } catch (err) {
+      // postMessage threw even after sanitising (e.g. a structurally
+      // un-serialisable config). Honour run()'s never-reject contract: drop
+      // the now-unanswerable pending entry and surface a structured error.
+      pending.delete(id);
+      resolve({ output: null, error: errorMessage(err) });
+    }
   });
+}
+
+// Post a request to the worker, guarding the structuredClone boundary.
+function postRequest(
+  w: Worker,
+  req: { id: number; source: string; config?: Config },
+): void {
+  try {
+    w.postMessage(req);
+  } catch {
+    w.postMessage({
+      id: req.id,
+      source: req.source,
+      config: req.config
+        ? (JSON.parse(JSON.stringify(req.config)) as Config)
+        : undefined,
+    });
+  }
 }
 
 // Eagerly construct the worker on module load so WASM streaming-compile

@@ -49,12 +49,7 @@
   let minifyGen = 0;
 
   function snapshotOptions(config: Config): Config {
-    return {
-      ...config,
-      preserveSymbols: config.preserveSymbols
-        ? [...config.preserveSymbols]
-        : undefined,
-    };
+    return $state.snapshot(config) as Config;
   }
 
   function scheduleMinify() {
