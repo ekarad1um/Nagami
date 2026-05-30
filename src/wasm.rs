@@ -17,7 +17,7 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::config::{Config, Profile};
+use crate::config::{Config, FloatPrecision, PrecisionMode, Profile};
 
 // MARK: JS value extraction
 
@@ -114,6 +114,116 @@ fn require_usize(v: f64, key: &str) -> Result<usize, JsError> {
     Ok(v as usize)
 }
 
+// MARK: Precision decoding
+
+/// Decode a single per-type precision slot from a JS value.  Accepts:
+///
+/// * `null` / `undefined` / `"full"` -> [`PrecisionMode::Full`]
+/// * a bare number `N` -> shorthand for `{ decimalPlaces: N }`
+/// * `{ decimalPlaces: N }` -> [`PrecisionMode::DecimalPlaces`]
+/// * `{ significantFigures: N }` or `{ sigFigs: N }` -> [`PrecisionMode::SignificantFigures`]
+///
+/// `field_path` is used in error messages to point the caller at the
+/// offending slot (e.g. `"floatPrecision.f32"`).
+fn parse_precision_mode(val: &JsValue, field_path: &str) -> Result<PrecisionMode, JsError> {
+    if val.is_undefined() || val.is_null() {
+        return Ok(PrecisionMode::Full);
+    }
+    if let Some(s) = val.as_string() {
+        return match s.as_str() {
+            "full" => Ok(PrecisionMode::Full),
+            other => Err(JsError::new(&format!(
+                "{field_path}: unknown string mode \"{other}\" (expected \"full\")"
+            ))),
+        };
+    }
+    if let Some(n) = val.as_f64() {
+        let p = require_u8(n, field_path)?;
+        return Ok(PrecisionMode::DecimalPlaces(p));
+    }
+    if val.is_object() {
+        let dp = get_f64(val, "decimalPlaces");
+        let sf = get_f64(val, "significantFigures").or_else(|| get_f64(val, "sigFigs"));
+        return match (dp, sf) {
+            (Some(_), Some(_)) => Err(JsError::new(&format!(
+                "{field_path}: decimalPlaces and significantFigures are mutually exclusive"
+            ))),
+            (Some(p), None) => Ok(PrecisionMode::DecimalPlaces(require_u8(
+                p,
+                &format!("{field_path}.decimalPlaces"),
+            )?)),
+            (None, Some(s)) => Ok(PrecisionMode::SignificantFigures(require_u8(
+                s,
+                &format!("{field_path}.significantFigures"),
+            )?)),
+            (None, None) => Ok(PrecisionMode::Full),
+        };
+    }
+    Err(JsError::new(&format!(
+        "{field_path} must be \"full\", a number, or an object with decimalPlaces / significantFigures"
+    )))
+}
+
+/// Decode the `floatPrecision` field into a [`FloatPrecision`].  The JS
+/// value may be:
+///
+/// * absent / `null` -> all kinds default to [`PrecisionMode::Full`]
+/// * a single precision-mode spec (see [`parse_precision_mode`]) ->
+///   applied uniformly to every float kind, mirroring
+///   [`FloatPrecision::all`]
+/// * an object with optional `f16` / `f32` / `f64` / `abstractFloat`
+///   keys, each accepting any spec form parsed by [`parse_precision_mode`]
+fn parse_float_precision(config: &JsValue) -> Result<FloatPrecision, JsError> {
+    let Some(val) = get_opt(config, "floatPrecision") else {
+        return Ok(FloatPrecision::default());
+    };
+
+    // Per-type form: object that carries at least one recognised slot.
+    // Read each slot once and parse it in place; otherwise fall through
+    // to the uniform-mode interpretation (so `floatPrecision: 6` and
+    // `floatPrecision: { decimalPlaces: 6 }` both work).
+    if val.is_object() {
+        let f16 = get_opt(&val, "f16");
+        let f32 = get_opt(&val, "f32");
+        let f64 = get_opt(&val, "f64");
+        let abs = get_opt(&val, "abstractFloat");
+        if f16.is_some() || f32.is_some() || f64.is_some() || abs.is_some() {
+            // Reject mixing per-type keys with a uniform-mode key on the
+            // same object (e.g. `{ f32: 6, decimalPlaces: 3 }`): the
+            // top-level `decimalPlaces` would be silently dropped, which
+            // mirrors exactly the "silently misinterpret bad input" trap
+            // `get_string_array` was deliberately hardened against.
+            if get_opt(&val, "decimalPlaces").is_some()
+                || get_opt(&val, "significantFigures").is_some()
+                || get_opt(&val, "sigFigs").is_some()
+            {
+                return Err(JsError::new(
+                    "floatPrecision: cannot mix per-type keys (f16/f32/f64/abstractFloat) \
+                     with uniform keys (decimalPlaces/significantFigures/sigFigs) on the same object",
+                ));
+            }
+            let mut out = FloatPrecision::default();
+            if let Some(v) = f16 {
+                out.f16 = parse_precision_mode(&v, "floatPrecision.f16")?;
+            }
+            if let Some(v) = f32 {
+                out.f32 = parse_precision_mode(&v, "floatPrecision.f32")?;
+            }
+            if let Some(v) = f64 {
+                out.f64 = parse_precision_mode(&v, "floatPrecision.f64")?;
+            }
+            if let Some(v) = abs {
+                out.abstract_float = parse_precision_mode(&v, "floatPrecision.abstractFloat")?;
+            }
+            return Ok(out);
+        }
+    }
+
+    // Uniform mode: same spec applied to every float kind.
+    let mode = parse_precision_mode(&val, "floatPrecision")?;
+    Ok(FloatPrecision::all(mode))
+}
+
 // MARK: Config decoding
 
 /// Decode a JS config object into [`Config`], returning [`Config::default`]
@@ -147,9 +257,7 @@ fn parse_config(config: JsValue) -> Result<Config, JsError> {
     if let Some(indent) = get_f64(&config, "indent") {
         cfg.indent = require_u8(indent, "indent")?;
     }
-    if let Some(v) = get_f64(&config, "maxPrecision") {
-        cfg.max_precision = Some(require_u8(v, "maxPrecision")?);
-    }
+    cfg.float_precision = parse_float_precision(&config)?;
     if let Some(v) = get_f64(&config, "maxInlineNodeCount") {
         cfg.max_inline_node_count = Some(require_usize(v, "maxInlineNodeCount")?);
     }
@@ -265,13 +373,29 @@ pub fn version() -> String {
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_TYPES: &str = r#"
+export type PrecisionMode =
+    | "full"
+    | number                                  // shorthand: number = decimal places
+    | { decimalPlaces: number }
+    | { significantFigures: number }
+    | { sigFigs: number };                    // alias of significantFigures
+
+export type FloatPrecision =
+    | PrecisionMode                           // applied uniformly to every float kind
+    | {
+        f16?: PrecisionMode;
+        f32?: PrecisionMode;
+        f64?: PrecisionMode;
+        abstractFloat?: PrecisionMode;
+      };
+
 export interface Config {
     profile?: "baseline" | "aggressive" | "max";
     preserveSymbols?: string[];
     mangle?: boolean;
     beautify?: boolean;
     indent?: number;
-    maxPrecision?: number;
+    floatPrecision?: FloatPrecision;
     maxInlineNodeCount?: number;
     maxInlineCallSites?: number;
     preamble?: string;

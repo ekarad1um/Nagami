@@ -19,7 +19,7 @@ Nagami lowers WGSL into [Naga IR](https://github.com/gfx-rs/wgpu/tree/trunk/naga
 - Swizzle coalescing - `vec3(v.x, v.y, v.z)` -> `v.xyz`
 - Literal extraction - repeated magic numbers -> shared `const`
 - Shortest literal form - `1048576f` -> `0x1p20f`
-- Float precision trimming - truncate decimal places (lossy, opt-in)
+- Float precision trimming - decimal places or significant figures, per type (lossy, opt-in)
 - Compound assignment - `x = x + 1` -> `x += 1`
 - Type elision - redundant type annotations on `var`/`const` stripped
 - Branch flipping - `if c {} else { x; }` -> `if !c { x; }`
@@ -50,6 +50,8 @@ nagami shader.wgsl -o out.wgsl -p baseline          # lighter touch, no mangle
 cat shader.wgsl | nagami - > out.wgsl               # stdin -> stdout
 nagami shader.wgsl --check                          # exit 1 if not minified
 nagami shader.wgsl --preamble env.wgsl -o out.wgsl  # external declarations
+nagami shader.wgsl --decimal-places 6 -o out.wgsl   # lossy: cap fractional digits
+nagami shader.wgsl --sig-figs 4 -o out.wgsl         # lossy: cap significant figures
 ```
 
 ## Profiles
@@ -134,12 +136,14 @@ With config (all fields optional):
 
 ```js
 const { source, report } = run(shader, {
-  profile: 'max',             // "baseline" | "aggressive" | "max" — default "max"
+  profile: 'max',             // "baseline" | "aggressive" | "max" (default)
   mangle: true,               // rename identifiers (default: on for "max")
   preserveSymbols: ['main'],  // names to keep untouched
   beautify: false,            // compact output (default: false)
   indent: 2,                  // spaces per level when beautify is true
-  maxPrecision: 6,            // truncate float literals (lossy, opt-in)
+  floatPrecision: 6,          // shorthand: N decimal places, all float kinds (lossy, opt-in)
+                              // also accepts { decimalPlaces: 6 }, { significantFigures: 4 },
+                              // or per-type: { f32: 6, f64: { significantFigures: 12 } }
   maxInlineNodeCount: 48,     // inlining budget per function
   maxInlineCallSites: 6,      // inlining budget per call site
   preamble: preambleSrc,      // external decls prepended for parsing, stripped from output

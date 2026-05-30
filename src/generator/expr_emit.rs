@@ -52,6 +52,46 @@ fn literal_needs_typed_form_outside_constructor(literal: naga::Literal) -> bool 
     )
 }
 
+/// Convert a constant **width-8** literal (`F64` / `U64` / `I64`) to `target`
+/// (one of f32 / i32 / u32 / bool), matching naga's value-conversion
+/// semantics, or `None` for any other source/target (or a non-finite f32).
+///
+/// Mirror of [`super::super::passes::const_fold::cast_width8_to`] (kept in
+/// sync; any divergence is caught by the round-trip tests).  Used only by
+/// [`Generator::try_emit_const_width8_vector_narrow`] to fold a *vector*
+/// width-8 narrowing cast that const_fold cannot (`materialize_vector` would
+/// need the converted component literals to already exist as arena handles).
+/// f64 sources CLAMP on int narrowing; u64/i64 sources WRAP (`as`) - naga only
+/// clamps float sources.
+fn cast_width8_to_literal(src: naga::Literal, target: naga::Scalar) -> Option<naga::Literal> {
+    use naga::Literal as L;
+    use naga::ScalarKind as K;
+    if let L::F64(v) = src {
+        return match (target.kind, target.width) {
+            (K::Float, 4) => {
+                let r = v as f32;
+                r.is_finite().then_some(L::F32(r))
+            }
+            (K::Sint, 4) => Some(L::I32(v.clamp(i32::MIN as f64, i32::MAX as f64) as i32)),
+            (K::Uint, 4) => Some(L::U32(v.clamp(u32::MIN as f64, u32::MAX as f64) as u32)),
+            (K::Bool, _) => Some(L::Bool(v != 0.0)),
+            _ => None,
+        };
+    }
+    let v: i128 = match src {
+        L::U64(v) => v as i128,
+        L::I64(v) => v as i128,
+        _ => return None,
+    };
+    match (target.kind, target.width) {
+        (K::Float, 4) => Some(L::F32(v as f32)),
+        (K::Sint, 4) => Some(L::I32(v as i32)),
+        (K::Uint, 4) => Some(L::U32(v as u32)),
+        (K::Bool, _) => Some(L::Bool(v != 0)),
+        _ => None,
+    }
+}
+
 /// `true` when the literal numerically equals zero.  Both `+0.0` and
 /// `-0.0` qualify (IEEE `==` already conflates them; F16 is matched on
 /// bit-pattern because its `==` is not available without `half`).
@@ -315,8 +355,8 @@ impl<'a> Generator<'a> {
     ) -> Result<String, Error> {
         if !ctx.expr_names.contains_key(&arg) {
             if let naga::Expression::Literal(lit) = &ctx.func.expressions[arg] {
-                let bare = literal_to_wgsl_bare(*lit, self.options.max_precision);
-                let key = literal_extract_key(*lit, self.options.max_precision);
+                let bare = literal_to_wgsl_bare(*lit, &self.options.float_precision);
+                let key = literal_extract_key(*lit, &self.options.float_precision);
                 if let Some(name) = self.extracted_literals.get(&key) {
                     return Ok(name.clone());
                 }
@@ -424,7 +464,7 @@ impl<'a> Generator<'a> {
                 {
                     concrete
                 } else {
-                    let key = literal_extract_key(*lit, self.options.max_precision);
+                    let key = literal_extract_key(*lit, &self.options.float_precision);
                     if let Some(name) = self.extracted_literals.get(&key) {
                         name.clone()
                     } else if literal_needs_typed_form_outside_constructor(*lit) {
@@ -434,7 +474,7 @@ impl<'a> Generator<'a> {
                         // not strictly inside one of the two sanctioned
                         // bare-emit positions, because the bare form
                         // changes the inferred concrete type.
-                        literal_to_wgsl(*lit, self.options.max_precision)
+                        literal_to_wgsl(*lit, &self.options.float_precision)
                     } else {
                         key.expr_text
                     }
@@ -457,11 +497,11 @@ impl<'a> Generator<'a> {
                             // literal text at every use site, so the
                             // same shared-const substitution applies
                             // here.  Same bare-emit safety gate.
-                            let key = literal_extract_key(*lit, self.options.max_precision);
+                            let key = literal_extract_key(*lit, &self.options.float_precision);
                             if let Some(name) = self.extracted_literals.get(&key) {
                                 name.clone()
                             } else if literal_needs_typed_form_outside_constructor(*lit) {
-                                literal_to_wgsl(*lit, self.options.max_precision)
+                                literal_to_wgsl(*lit, &self.options.float_precision)
                             } else {
                                 self.emit_global_expr(c.init)?
                             }
@@ -891,7 +931,7 @@ impl<'a> Generator<'a> {
                 // form (literal_to_wgsl) to ensure type matching with the other argument.
                 let reject_str =
                     if let naga::Expression::Literal(lit) = &ctx.func.expressions[*reject] {
-                        literal_to_wgsl(*lit, self.options.max_precision)
+                        literal_to_wgsl(*lit, &self.options.float_precision)
                     } else {
                         self.emit_expr(*reject, ctx)?
                     };
@@ -900,7 +940,7 @@ impl<'a> Generator<'a> {
 
                 let accept_str =
                     if let naga::Expression::Literal(lit) = &ctx.func.expressions[*accept] {
-                        literal_to_wgsl(*lit, self.options.max_precision)
+                        literal_to_wgsl(*lit, &self.options.float_precision)
                     } else {
                         self.emit_expr(*accept, ctx)?
                     };
@@ -934,7 +974,7 @@ impl<'a> Generator<'a> {
                     // inference and validation fallback.
                     if !ctx.expr_names.contains_key(expr) {
                         if let naga::Expression::Literal(lit) = ctx.func.expressions[*expr] {
-                            s.push_str(&literal_to_wgsl(lit, self.options.max_precision));
+                            s.push_str(&literal_to_wgsl(lit, &self.options.float_precision));
                         } else {
                             s.push_str(&self.emit_expr(*expr, ctx)?);
                         }
@@ -1076,6 +1116,44 @@ impl<'a> Generator<'a> {
                         kind, ctx.display_name,
                     )));
                 }
+                // Narrowing a CONST width-8 vector (`vec2<f32>(vec2<f64>(.5lf,..))`,
+                // `vec2<u32>(vec2<u64>(..lu..))`) is rejected by naga's frontend
+                // on re-parse - and naga's own backend emits the same invalid
+                // token, so the run() fallback can't save it.  const_fold
+                // handles the scalar case but not the vector one
+                // (`materialize_vector` needs the converted component literals
+                // to already exist as arena handles).  When the (inlined,
+                // unnamed) operand is a const Compose/Splat of width-8 literals
+                // and the target is f32/i32/u32/bool, fold it here to a valid
+                // converted constructor.  Everything else - runtime vectors,
+                // named operands, f16/f64/i64/u64 targets, non-finite results -
+                // falls through to the verbatim path below.
+                if convert.is_some()
+                    && vec_size.is_some()
+                    && src_width == 8
+                    && matches!(
+                        src_inner,
+                        naga::TypeInner::Vector { scalar, .. }
+                            if matches!(
+                                scalar.kind,
+                                naga::ScalarKind::Float
+                                    | naga::ScalarKind::Sint
+                                    | naga::ScalarKind::Uint
+                            )
+                    )
+                    && !ctx.expr_names.contains_key(expr)
+                    && let Some(folded) = self.try_emit_const_width8_vector_narrow(
+                        *expr,
+                        naga::Scalar {
+                            kind: *kind,
+                            width: target_width,
+                        },
+                        &target_inner,
+                        ctx,
+                    )?
+                {
+                    return Ok(folded);
+                }
                 let target = self.type_name_for_inner(&target_inner)?;
                 let source = self.emit_expr(*expr, ctx)?;
                 let mut s = if convert.is_some() {
@@ -1143,11 +1221,11 @@ impl<'a> Generator<'a> {
             // otherwise downstream WGSL coercion could re-derive a
             // different concrete type.
             Some(ConcretizedAbstract::Lit(concrete)) => {
-                let key = literal_extract_key(concrete, self.options.max_precision);
+                let key = literal_extract_key(concrete, &self.options.float_precision);
                 if let Some(name) = self.extracted_literals.get(&key) {
                     Some(name.clone())
                 } else {
-                    Some(literal_to_wgsl(concrete, self.options.max_precision))
+                    Some(literal_to_wgsl(concrete, &self.options.float_precision))
                 }
             }
             // Pre-built text form (e.g. `f16(0.5f)`, `i32(<huge>)`) cannot
@@ -1183,7 +1261,7 @@ impl<'a> Generator<'a> {
         use naga::Expression as E;
         let arena = &self.module.global_expressions;
         Ok(match &arena[expr] {
-            E::Literal(lit) => literal_to_wgsl(*lit, self.options.max_precision),
+            E::Literal(lit) => literal_to_wgsl(*lit, &self.options.float_precision),
             E::Constant(h) => {
                 let c = &self.module.constants[*h];
                 if c.name.is_some() {
@@ -1239,7 +1317,7 @@ impl<'a> Generator<'a> {
                 })?;
                 let mut s = format!("{type_name}(");
                 if let E::Literal(lit) = &arena[*value] {
-                    s.push_str(&literal_to_wgsl_bare(*lit, self.options.max_precision));
+                    s.push_str(&literal_to_wgsl_bare(*lit, &self.options.float_precision));
                 } else {
                     s.push_str(&self.emit_global_expr(*value)?);
                 }
@@ -1260,7 +1338,7 @@ impl<'a> Generator<'a> {
                 ) && compose_is_splat(components, arena);
                 if is_splat {
                     if let naga::Expression::Literal(lit) = &arena[components[0]] {
-                        s.push_str(&literal_to_wgsl_bare(*lit, self.options.max_precision));
+                        s.push_str(&literal_to_wgsl_bare(*lit, &self.options.float_precision));
                     } else {
                         s.push_str(&self.emit_global_expr(components[0])?);
                     }
@@ -1271,7 +1349,7 @@ impl<'a> Generator<'a> {
                             s.push_str(sep);
                         }
                         if let naga::Expression::Literal(lit) = &arena[*c] {
-                            s.push_str(&literal_to_wgsl_bare(*lit, self.options.max_precision));
+                            s.push_str(&literal_to_wgsl_bare(*lit, &self.options.float_precision));
                         } else {
                             s.push_str(&self.emit_global_expr(*c)?);
                         }
@@ -1316,7 +1394,7 @@ impl<'a> Generator<'a> {
                 // the same concrete type.  If either is a literal, we must use a type-suffixed
                 // form (literal_to_wgsl) to ensure type matching with the other argument.
                 let reject_str = if let naga::Expression::Literal(lit) = &arena[*reject] {
-                    literal_to_wgsl(*lit, self.options.max_precision)
+                    literal_to_wgsl(*lit, &self.options.float_precision)
                 } else {
                     self.emit_global_expr(*reject)?
                 };
@@ -1324,7 +1402,7 @@ impl<'a> Generator<'a> {
                 s.push_str(sep);
 
                 let accept_str = if let naga::Expression::Literal(lit) = &arena[*accept] {
-                    literal_to_wgsl(*lit, self.options.max_precision)
+                    literal_to_wgsl(*lit, &self.options.float_precision)
                 } else {
                     self.emit_global_expr(*accept)?
                 };
@@ -1522,6 +1600,77 @@ impl<'a> Generator<'a> {
                 )));
             }
         })
+    }
+
+    /// Fold a narrowing cast of a *const width-8 vector* (`vecN<f64/u64/i64>`)
+    /// into a directly-emitted converted constructor (e.g.
+    /// `vec2<f32>(vec2<f64>(.5lf,1.5lf))` -> `vec2f(.5,1.5)`).  Returns `None`
+    /// (so the caller falls through to the verbatim `target(source)` path)
+    /// when the operand is not a Compose/Splat whose components are *all*
+    /// width-8 literals, or when any component does not convert to a finite,
+    /// representable target literal - the latter keeps the unrepresentable
+    /// f64->f32-overflow case as a diagnosable hard error rather than silently
+    /// emitting an `inf` token.
+    fn try_emit_const_width8_vector_narrow(
+        &self,
+        operand: naga::Handle<naga::Expression>,
+        target: naga::Scalar,
+        target_inner: &naga::TypeInner,
+        ctx: &FunctionCtx<'a, '_>,
+    ) -> Result<Option<String>, Error> {
+        let width8 = |l: naga::Literal| {
+            matches!(
+                l,
+                naga::Literal::F64(_) | naga::Literal::U64(_) | naga::Literal::I64(_)
+            )
+        };
+        let lits: Vec<naga::Literal> = match &ctx.func.expressions[operand] {
+            naga::Expression::Compose { components, .. } => {
+                let mut out = Vec::with_capacity(components.len());
+                for &c in components.iter() {
+                    match ctx.func.expressions[c] {
+                        naga::Expression::Literal(l) if width8(l) => out.push(l),
+                        _ => return Ok(None),
+                    }
+                }
+                out
+            }
+            naga::Expression::Splat { size, value } => match ctx.func.expressions[*value] {
+                naga::Expression::Literal(l) if width8(l) => vec![l; *size as usize],
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let mut converted = Vec::with_capacity(lits.len());
+        for l in lits {
+            match cast_width8_to_literal(l, target) {
+                Some(lit) => converted.push(lit),
+                None => return Ok(None),
+            }
+        }
+        let mut s = self.type_name_for_inner(target_inner)?;
+        s.push('(');
+        // Collapse to splat form when every converted component is identical
+        // (bit-equal, so `-0` stays distinct from `0`), matching the
+        // generator's normal splat-elision.
+        let all_same =
+            converted.len() > 1 && converted.iter().all(|l| literal_bit_eq(l, &converted[0]));
+        if all_same {
+            s.push_str(&literal_to_wgsl_bare(
+                converted[0],
+                &self.options.float_precision,
+            ));
+        } else {
+            let sep = self.comma_sep();
+            for (i, lit) in converted.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(sep);
+                }
+                s.push_str(&literal_to_wgsl_bare(*lit, &self.options.float_precision));
+            }
+        }
+        s.push(')');
+        Ok(Some(s))
     }
 
     // MARK: Type helpers
@@ -2064,7 +2213,7 @@ impl<'a> Generator<'a> {
             _ => return None,
         }?;
 
-        Some(literal_to_wgsl(concrete, self.options.max_precision))
+        Some(literal_to_wgsl(concrete, &self.options.float_precision))
     }
 }
 

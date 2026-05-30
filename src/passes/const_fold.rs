@@ -682,6 +682,66 @@ impl ConstFoldContext for LocalConstFoldContext<'_> {
 
 // MARK: Resolver entry points
 
+/// Convert a constant **width-8** literal (`F64` / `U64` / `I64`) to `target`
+/// (one of f32 / i32 / u32 / bool), matching naga's value-conversion
+/// semantics, or `None` for any other source/target.
+///
+/// Used by [`resolve_const_value`]'s `As` arm to fold a narrowing cast of a
+/// width-8 literal: naga's own frontend refuses to const-fold these (f64/u64/
+/// i64 are non-standard WGSL), so the `As` node otherwise survives into our IR
+/// and the emitter produces `f32(<F64 literal>)` / `u32(<U64 literal>)`, which
+/// naga then *rejects* on re-parse.  Folding it both fixes the round-trip and
+/// (for floats) shortens the output.
+///
+/// Semantics mirror `naga::proc::ConstantEvaluator::cast` exactly:
+/// * `f64 -> f32` rounds to nearest, declined when it overflows to a
+///   non-finite value (so the emitter never has to render `inf`).
+/// * `f64 -> i32/u32` truncates toward zero and **clamps** to range (the
+///   i32/u32 bounds are exactly representable in f64, so clamp-then-`as` is
+///   exact) - naga clamps *float* sources.
+/// * `u64/i64 -> i32/u32` **wraps** (low 32 bits / mod 2^32) - naga does NOT
+///   clamp integer sources; `i64(-1) -> u32` is `4294967295u`, not `0`.
+/// * `u64/i64 -> f32` rounds to nearest (always finite: `|v| <= u64::MAX` is
+///   far below `f32::MAX`).
+/// * `-> bool` is `v != 0`.
+///
+/// f16 / f64 / i64 / u64 targets return `None` (naga accepts those
+/// `T(<width-8 literal>)` forms, so the cast is left as-is).
+///
+/// Mirrored by `generator::expr_emit::cast_width8_to_literal`, which handles
+/// the *vector* form this scalar fold cannot; keep the two value-conversion
+/// routines in sync (any divergence is caught by the round-trip tests).
+fn cast_width8_to(src: naga::Literal, target: naga::Scalar) -> Option<naga::Literal> {
+    use naga::Literal as L;
+    use naga::ScalarKind as K;
+    if let L::F64(v) = src {
+        return match (target.kind, target.width) {
+            (K::Float, 4) => {
+                let r = v as f32;
+                r.is_finite().then_some(L::F32(r))
+            }
+            (K::Sint, 4) => Some(L::I32(v.clamp(i32::MIN as f64, i32::MAX as f64) as i32)),
+            (K::Uint, 4) => Some(L::U32(v.clamp(u32::MIN as f64, u32::MAX as f64) as u32)),
+            (K::Bool, _) => Some(L::Bool(v != 0.0)),
+            _ => None,
+        };
+    }
+    // 64-bit integer sources, carried through i128 so one arm covers both u64
+    // and i64; integer narrowing WRAPS (`as`), it does not clamp.
+    let v: i128 = match src {
+        L::U64(v) => v as i128,
+        L::I64(v) => v as i128,
+        _ => return None,
+    };
+    match (target.kind, target.width) {
+        (K::Float, 4) => Some(L::F32(v as f32)),
+        (K::Sint, 4) => Some(L::I32(v as i32)),
+        (K::Uint, 4) => Some(L::U32(v as u32)),
+        (K::Bool, _) => Some(L::Bool(v != 0)),
+        _ => None,
+    }
+}
+
 /// Resolve `handle` to a fully-constant [`ConstValue`], threading
 /// `visiting` to short-circuit cyclic expression graphs.  This is the
 /// composite-aware generalisation of [`resolve_literal`]; it handles
@@ -803,6 +863,34 @@ fn resolve_const_value<C: ConstFoldContext>(
                 ConstValue::Scalar(naga::Literal::Bool(false)) => {
                     resolve_const_value(*reject, ctx, visiting)
                 }
+                _ => None,
+            }
+        }
+
+        // Fold a converting cast (`T(x)`, `convert: Some`) of a constant
+        // WIDTH-8 SCALAR (f64/u64/i64) to f32/i32/u32/bool.  naga's frontend
+        // refuses to const-fold these (the source types are non-standard
+        // WGSL), so the `As` node survives into our IR and the emitter
+        // produces `f32(<F64 literal>)` / `u32(<U64 literal>)`, which naga
+        // rejects on re-parse.  Folding to the converted literal fixes the
+        // round-trip (and, for floats, shortens the output).  Left untouched:
+        // bitcasts (`convert: None`), other targets (f16/f64/i64/u64 - naga
+        // accepts those forms), non-width-8 operands (naga already const-folds
+        // every other narrowing cast), and VECTOR operands - a converted
+        // vector can't be materialized here (the converted component literals
+        // don't exist in the arena yet), so it falls through and the
+        // generator's vector path / run() fallback-revalidation guard handles it.
+        naga::Expression::As {
+            expr: operand,
+            kind,
+            convert,
+        } => {
+            let width = (*convert)?;
+            let target = naga::Scalar { kind: *kind, width };
+            match resolve_const_value(*operand, ctx, visiting)? {
+                ConstValue::Scalar(
+                    lit @ (naga::Literal::F64(_) | naga::Literal::U64(_) | naga::Literal::I64(_)),
+                ) => cast_width8_to(lit, target).map(ConstValue::Scalar),
                 _ => None,
             }
         }
@@ -1233,12 +1321,12 @@ fn eval_unary(op: naga::UnaryOperator, rhs: naga::Literal) -> Option<naga::Liter
 
     match (op, rhs) {
         // Float negation is exact for every non-NaN value (including
-        // +-Inf), but naga's validator rejects `Literal::F32`/`F64`
+        // +/-Inf), but naga's validator rejects `Literal::F32`/`F64`
         // whose value is NaN or infinity (`LiteralError::NonFinite`
         // in `naga::valid::expression::check_literal_value`).  Gating
         // on `is_finite()` keeps the post-fold IR aligned with that
         // contract; a `!is_nan()` relaxation would re-introduce
-        // +-Inf-bearing literals on any upstream that injects them
+        // +/-Inf-bearing literals on any upstream that injects them
         // (e.g. a future SPIR-V -> naga round-trip).
         (U::Negate, L::F32(v)) if (-v).is_finite() => Some(L::F32(-v)),
         (U::Negate, L::F64(v)) if (-v).is_finite() => Some(L::F64(-v)),
@@ -1572,7 +1660,7 @@ fn eval_math_scalar(
         },
 
         // Tier 1: decomposition.  Rust's `floor`/`ceil`/`round_ties_even`/
-        // `trunc` propagate NaN and pass +-Inf through verbatim; both
+        // `trunc` propagate NaN and pass +/-Inf through verbatim; both
         // tripped by naga's literal validator, so route through
         // `finite_*` and let the runtime evaluate the unfolded form
         // under IEEE rules.
@@ -1710,7 +1798,7 @@ fn eval_math_scalar(
         M::Atan2 => match (arg, arg1?) {
             // WGSL leaves `atan2(0, 0)` implementation-defined; Rust
             // returns `0.0`, but a GPU may legitimately return any of
-            // {0, +-pi/2, pi}.  Refuse fold when both arguments are
+            // {0, +/-pi/2, pi}.  Refuse fold when both arguments are
             // zero so runtime semantics are preserved.
             (L::F32(y), L::F32(x)) if y != 0.0 || x != 0.0 => finite_f32(y.atan2(x)),
             (L::F64(y), L::F64(x)) if y != 0.0 || x != 0.0 => finite_f64(y.atan2(x)),
@@ -2330,6 +2418,115 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    #[test]
+    fn cast_width8_to_matches_wgsl_value_conversion() {
+        use naga::Literal as L;
+        let f16 = naga::Scalar {
+            kind: naga::ScalarKind::Float,
+            width: 2,
+        };
+        let f64t = naga::Scalar {
+            kind: naga::ScalarKind::Float,
+            width: 8,
+        };
+        let i64t = naga::Scalar {
+            kind: naga::ScalarKind::Sint,
+            width: 8,
+        };
+
+        // --- f64 source: round-to-nearest (f32), CLAMP-then-truncate (int) ---
+        assert_eq!(
+            cast_width8_to(L::F64(0.5), naga::Scalar::F32),
+            Some(L::F32(0.5))
+        );
+        assert_eq!(
+            cast_width8_to(L::F64(2.5), naga::Scalar::I32),
+            Some(L::I32(2))
+        );
+        assert_eq!(
+            cast_width8_to(L::F64(-2.9), naga::Scalar::I32),
+            Some(L::I32(-2))
+        );
+        assert_eq!(
+            cast_width8_to(L::F64(3.9), naga::Scalar::U32),
+            Some(L::U32(3))
+        );
+        assert_eq!(
+            cast_width8_to(L::F64(-5.0), naga::Scalar::U32),
+            Some(L::U32(0))
+        );
+        assert_eq!(
+            cast_width8_to(L::F64(1e30), naga::Scalar::I32),
+            Some(L::I32(i32::MAX))
+        );
+        assert_eq!(
+            cast_width8_to(L::F64(0.0), naga::Scalar::BOOL),
+            Some(L::Bool(false))
+        );
+        assert_eq!(
+            cast_width8_to(L::F64(1.5), naga::Scalar::BOOL),
+            Some(L::Bool(true))
+        );
+        // f64 declines: non-finite f32 result, and f16/f64 targets.
+        assert_eq!(cast_width8_to(L::F64(1e308), naga::Scalar::F32), None);
+        assert_eq!(cast_width8_to(L::F64(0.5), f16), None);
+        assert_eq!(cast_width8_to(L::F64(0.5), f64t), None);
+
+        // --- u64 source: WRAP (low 32 bits / mod 2^32), NOT clamp ---
+        assert_eq!(
+            cast_width8_to(L::U64(107), naga::Scalar::U32),
+            Some(L::U32(107))
+        );
+        assert_eq!(
+            cast_width8_to(L::U64(1 << 32), naga::Scalar::U32),
+            Some(L::U32(0))
+        );
+        assert_eq!(
+            cast_width8_to(L::U64(1 << 32), naga::Scalar::I32),
+            Some(L::I32(0))
+        );
+        assert_eq!(
+            cast_width8_to(L::U64(5), naga::Scalar::F32),
+            Some(L::F32(5.0))
+        );
+        assert_eq!(
+            cast_width8_to(L::U64(0), naga::Scalar::BOOL),
+            Some(L::Bool(false))
+        );
+        assert_eq!(
+            cast_width8_to(L::U64(3), naga::Scalar::BOOL),
+            Some(L::Bool(true))
+        );
+
+        // --- i64 source: WRAP; `i64(-1) -> u32` is 4294967295, not 0 ---
+        assert_eq!(
+            cast_width8_to(L::I64(-1), naga::Scalar::U32),
+            Some(L::U32(u32::MAX))
+        );
+        assert_eq!(
+            cast_width8_to(L::I64(-1), naga::Scalar::I32),
+            Some(L::I32(-1))
+        );
+        assert_eq!(
+            cast_width8_to(L::I64((1 << 33) + 7), naga::Scalar::I32),
+            Some(L::I32(7))
+        );
+        assert_eq!(
+            cast_width8_to(L::I64(-5), naga::Scalar::F32),
+            Some(L::F32(-5.0))
+        );
+        assert_eq!(
+            cast_width8_to(L::I64(0), naga::Scalar::BOOL),
+            Some(L::Bool(false))
+        );
+        // int -> f16 / i64 declined (naga accepts those forms).
+        assert_eq!(cast_width8_to(L::U64(5), f16), None);
+        assert_eq!(cast_width8_to(L::I64(5), i64t), None);
+
+        // Non-width-8 sources are never folded here.
+        assert_eq!(cast_width8_to(L::I32(5), naga::Scalar::U32), None);
+    }
+
     fn run_pass(module: &mut naga::Module) -> bool {
         let mut pass = ConstFoldPass;
         let config = Config::default();
@@ -2566,7 +2763,7 @@ mod tests {
         // Naga's IR validator rejects `Literal::F32`/`F64` with NaN
         // or infinity values (`check_literal_value` returns
         // `LiteralError::NonFinite`).  The Negate fold therefore
-        // refuses both NaN -> NaN and +-Inf -> -+Inf, even though
+        // refuses both NaN -> NaN and +/-Inf -> -/+Inf, even though
         // the latter is a valid IEEE operation - emitting a non-
         // finite literal would produce IR the validator rejects.
         // Tests both +Inf and NaN inputs.
@@ -2680,7 +2877,7 @@ mod tests {
     #[test]
     fn atan2_zero_zero_does_not_fold() {
         // WGSL leaves atan2(0, 0) implementation-defined; GPUs may
-        // return 0, +-pi/2, or pi.  Rust returns 0.0, which would
+        // return 0, +/-pi/2, or pi.  Rust returns 0.0, which would
         // disagree with some runtimes.
         let r = eval_math_scalar(
             naga::MathFunction::Atan2,

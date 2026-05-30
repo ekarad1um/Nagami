@@ -3,7 +3,7 @@
 //! names, mangling (with and without preserved symbols), shared
 //! literal extraction, deferred-variable emission, struct layout
 //! attributes, workgroup-size trimming, override `@id` annotations,
-//! the `max_precision` round-trip, beautify combined with mangling,
+//! the `float_precision` round-trip, beautify combined with mangling,
 //! and a handful of parenthesisation edge cases.
 
 use super::super::{GenerateOptions, generate_wgsl};
@@ -398,6 +398,59 @@ fn no_extraction_for_short_or_rare_literal() {
         "#;
     let out = compact(src);
     assert!(!out.contains("const"), "unexpected const extraction: {out}");
+}
+
+#[test]
+fn extracts_typed_only_f64_literal_at_lower_break_even() {
+    // Issue D: a needs-typed literal (F64) used only in standalone (typed)
+    // positions emits the longer `123.456lf` form (9 chars), so its per-use
+    // cost is priced there.  Three such uses now break even
+    // (3*(9-1) - (8+1+9) = 6 > 0) and extract; the old bare-length estimate
+    // (3*(7-1) - 18 = 0) missed it.  Each `return` is a standalone (non-
+    // constructor) position, so `has_bare` is false and the typed price applies.
+    let src = r#"
+            fn a() -> f64 { return 123.456lf; }
+            fn b() -> f64 { return 123.456lf; }
+            fn c() -> f64 { return 123.456lf; }
+            @fragment fn main() -> @location(0) vec4f {
+                return vec4f(f32(a()), f32(b()), f32(c()), 1.0);
+            }
+        "#;
+    let out = compact(src);
+    assert_valid_wgsl(&out);
+    assert_eq!(
+        out.matches("123.456").count(),
+        1,
+        "typed-only f64 literal should be extracted to a single const: {out}"
+    );
+    assert!(out.contains("const"), "expected an extracted const: {out}");
+}
+
+#[test]
+fn does_not_over_extract_bare_heavy_needs_typed_literal() {
+    // Issue D regression guard: an F64 literal used only BARE inside
+    // constructors emits the short `1.5` (3 chars), so pricing it at the typed
+    // `1.5lf` length (the UNSAFE naive fix) would over-extract and GROW the
+    // output.  With any bare use present the model keeps the bare price, so
+    // this stays inline (5*(3-1) - (8+1+5) = -4 <= 0).  Distinct second
+    // components keep the constructors from being treated as one value.
+    let src = r#"
+            fn a() -> vec2<f64> { return vec2<f64>(1.5lf, 2lf); }
+            fn b() -> vec2<f64> { return vec2<f64>(1.5lf, 3lf); }
+            fn c() -> vec2<f64> { return vec2<f64>(1.5lf, 4lf); }
+            fn d() -> vec2<f64> { return vec2<f64>(1.5lf, 5lf); }
+            fn e() -> vec2<f64> { return vec2<f64>(1.5lf, 6lf); }
+            @fragment fn main() -> @location(0) vec4f {
+                let s = a() + b() + c() + d() + e();
+                return vec4f(f32(s.x), f32(s.y), 0.0, 1.0);
+            }
+        "#;
+    let out = compact(src);
+    assert_valid_wgsl(&out);
+    assert!(
+        !out.contains("const"),
+        "bare-heavy f64 literal must not be extracted (would grow output): {out}"
+    );
 }
 
 #[test]
@@ -863,10 +916,10 @@ fn global_override_expressions_emit_access_swizzle_math_cast_and_relational() {
     assert_valid_wgsl(&out);
 }
 
-// MARK: max_precision round-trip
+// MARK: float_precision round-trip
 
 #[test]
-fn max_precision_truncates_float() {
+fn precision_rounds_float() {
     let src = r#"
         @compute @workgroup_size(1)
         fn main() {
@@ -884,7 +937,57 @@ fn max_precision_truncates_float() {
 }
 
 #[test]
-fn max_precision_preserves_integers() {
+fn significant_figures_round_trips_f16_near_max() {
+    // Regression: f16 emits through f32 widening, and SignificantFigures
+    // of a near-max value (65504 -> 70000) produced an out-of-range token
+    // (`70000h`) that naga rejects.  Exercised through `generate_wgsl`
+    // directly (no `run()` validation-fallback to mask it), the output
+    // must re-parse as valid WGSL.
+    let src = r#"
+        enable f16;
+        @compute @workgroup_size(1)
+        fn main() {
+            var x: f16 = 65504h;
+            _ = x;
+        }
+    "#;
+    for s in [1u8, 2, 3] {
+        let out = compact_with_float_precision(
+            src,
+            FloatPrecision {
+                f16: PrecisionMode::SignificantFigures(s),
+                ..Default::default()
+            },
+        );
+        assert!(!out.contains("inf"), "f16 sf={s} produced inf token: {out}");
+        assert_valid_wgsl(&out);
+    }
+}
+
+#[test]
+fn significant_figures_round_trips_near_type_max() {
+    // Companion to the f16 case: f32/f64 literals at their type maximum
+    // must not round UP across the leading decade into `inf` under
+    // SignificantFigures, which would emit `inff` / `inflf`.
+    let src = r#"
+        @compute @workgroup_size(1)
+        fn main() {
+            var a: f32 = 3.4028235e38f;
+            _ = a;
+        }
+    "#;
+    for s in [1u8, 2, 3, 4, 5] {
+        let out = compact_with_float_precision(
+            src,
+            FloatPrecision::all(PrecisionMode::SignificantFigures(s)),
+        );
+        assert!(!out.contains("inf"), "f32 sf={s} produced inf token: {out}");
+        assert_valid_wgsl(&out);
+    }
+}
+
+#[test]
+fn precision_preserves_integers() {
     let src = r#"
         @compute @workgroup_size(1)
         fn main() {
@@ -898,6 +1001,33 @@ fn max_precision_preserves_integers() {
         "integer should be preserved exactly: {out}"
     );
     assert_valid_wgsl(&out);
+}
+
+#[test]
+fn typed_f64_and_f16_short_suffix_forms_round_trip() {
+    // The F64/F16 typed arms now emit hex-float (`0x1p50lf`) and
+    // scientific (`1e15lf`, `1e4h`) literals where shorter.  Drive those
+    // exact forms through the full generator and re-parse to guarantee
+    // naga still accepts them (a future naga grammar change would trip
+    // this rather than silently shipping invalid output).
+    let src = r#"
+        enable f16;
+        @compute @workgroup_size(1)
+        fn main() {
+            var a: f64 = 1125899906842624.0lf;   // 2^50 -> 0x1p50lf
+            var b: f64 = 1e15lf;                  // clean power of ten
+            var c: f16 = 10000h;                  // -> 1e4h
+            _ = a; _ = b; _ = c;
+        }
+    "#;
+    let out = compact(src);
+    assert_valid_wgsl(&out);
+    assert!(out.contains("0x1p50lf"), "expected hex f64 form: {out}");
+    assert!(
+        out.contains("1e15lf"),
+        "expected scientific f64 form: {out}"
+    );
+    assert!(out.contains("1e4h"), "expected scientific f16 form: {out}");
 }
 
 // MARK: beautify + mangle combo
@@ -929,7 +1059,7 @@ fn beautify_mangle_roundtrip() {
             beautify: true,
             indent: 2,
             mangle: true,
-            max_precision: None,
+            float_precision: FloatPrecision::default(),
             ..Default::default()
         },
     )

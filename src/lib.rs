@@ -265,35 +265,120 @@ fn has_enable_f16_directive(source: &str) -> bool {
 /// concatenation so the result remains valid.
 fn split_directives(source: &str) -> (&str, &str) {
     let bytes = source.as_bytes();
-    let mut pos = 0;
-    for line in source.lines() {
-        let trimmed = line.trim();
-        let is_directive_like = trimmed.is_empty()
-            || trimmed.starts_with("//")
-            || trimmed.starts_with("enable ")
-            || trimmed.starts_with("requires ")
-            // `diagnostic` must be followed by `(` (the canonical form
-            // `diagnostic(severity, rule);`) or whitespace (the rarer
-            // `diagnostic (...)` styling).  A bare
-            // `starts_with("diagnostic")` would misclassify user
-            // identifiers such as `diagnostic_counter` and incorrectly
-            // hoist them above the preamble.
-            || trimmed.starts_with("diagnostic(")
-            || trimmed.starts_with("diagnostic ")
-            || trimmed.starts_with("diagnostic\t");
-        if !is_directive_like {
+    let len = bytes.len();
+    // `boundary` is the committed end of the leading directive region; it
+    // advances only past a fully `;`-terminated directive (plus any trailing
+    // blank lines).  Scanning by `;` rather than by line is what makes this
+    // correct on *compact* generator output, where the whole module is one
+    // physical line (`enable f16;@fragment ...`) - a line-based scan would
+    // misclassify the entire module as one directive and drop the body,
+    // mis-ordering a prepended preamble's directives after declarations.
+    let mut boundary = 0usize;
+    let mut pos = 0usize;
+    loop {
+        // Skip whitespace and `//` / `/* */` comments WITHOUT committing the
+        // boundary, so leading trivia before a NON-directive is not hoisted.
+        // Only ASCII whitespace is skipped (directives are ASCII); a UTF-8
+        // lead byte (>= 0xC2) is never ASCII whitespace, so the byte cursor
+        // can never land inside a multi-byte sequence - `&source[scan..]`
+        // below is always on a char boundary.
+        let mut scan = pos;
+        loop {
+            while scan < len && bytes[scan].is_ascii_whitespace() {
+                scan += 1;
+            }
+            if scan + 1 < len && bytes[scan] == b'/' && bytes[scan + 1] == b'/' {
+                let mut j = scan + 2;
+                while j < len && bytes[j] != b'\n' {
+                    j += 1;
+                }
+                scan = j;
+                continue;
+            }
+            if scan + 1 < len && bytes[scan] == b'/' && bytes[scan + 1] == b'*' {
+                let mut j = scan + 2;
+                let mut depth = 1usize;
+                while j + 1 < len && depth > 0 {
+                    if bytes[j] == b'/' && bytes[j + 1] == b'*' {
+                        depth += 1;
+                        j += 2;
+                    } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+                        depth -= 1;
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                }
+                scan = if depth > 0 { len } else { j };
+                continue;
+            }
             break;
         }
-        pos += line.len();
-        // Advance past the line terminator (`\r\n` or `\n`).
-        if bytes.get(pos) == Some(&b'\r') {
-            pos += 1;
+        if scan >= len {
+            // Only trivia remains - preserve the old contract of treating a
+            // trivia-only prefix as "all directives" (harmless: no decls).
+            boundary = len;
+            break;
         }
-        if bytes.get(pos) == Some(&b'\n') {
-            pos += 1;
+        // A directive keyword must end on a word boundary so user identifiers
+        // like `requires_foo` / `diagnostic_counter` / `enablef16` are not
+        // hoisted.  `diagnostic` may also be followed immediately by `(`
+        // (the canonical `diagnostic(severity, rule);` form).
+        let rest = &source[scan..];
+        let is_directive = if let Some(a) = rest.strip_prefix("enable") {
+            a.starts_with([' ', '\t', '\n', '\r'])
+        } else if let Some(a) = rest.strip_prefix("requires") {
+            a.starts_with([' ', '\t', '\n', '\r'])
+        } else if let Some(a) = rest.strip_prefix("diagnostic") {
+            a.starts_with(['(', ' ', '\t', '\n', '\r'])
+        } else {
+            false
+        };
+        if !is_directive {
+            break;
         }
+        // Consume through the terminating `;`.
+        let mut j = scan;
+        while j < len && bytes[j] != b';' {
+            j += 1;
+        }
+        if j >= len {
+            // Unterminated directive (already-invalid WGSL): commit the rest.
+            boundary = len;
+            break;
+        }
+        // Swallow one trailing line break plus any following blank lines so
+        // the directive block ends cleanly (mirrors the old line-based form).
+        let mut k = j + 1;
+        while k < len && (bytes[k] == b' ' || bytes[k] == b'\t') {
+            k += 1;
+        }
+        let mut m = k;
+        if m < len && bytes[m] == b'\r' {
+            m += 1;
+        }
+        if m < len && bytes[m] == b'\n' {
+            k = m + 1;
+            loop {
+                let mut x = k;
+                while x < len && (bytes[x] == b' ' || bytes[x] == b'\t') {
+                    x += 1;
+                }
+                let mut y = x;
+                if y < len && bytes[y] == b'\r' {
+                    y += 1;
+                }
+                if y < len && bytes[y] == b'\n' {
+                    k = y + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        boundary = k;
+        pos = k;
     }
-    (&source[..pos], &source[pos..])
+    (&source[..boundary], &source[boundary..])
 }
 
 /// Concatenate `fragments` so each non-empty fragment is followed by
@@ -610,7 +695,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
             beautify: config.beautify,
             indent: config.indent,
             mangle: config.mangle(),
-            max_precision: config.max_precision,
+            float_precision: config.float_precision,
             preserve_symbols: effective_config.preserve_symbols.iter().cloned().collect(),
             preamble_names,
             type_alias: true,
@@ -697,6 +782,19 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                             "warning: generator output failed text validation; falling back to naga emitter"
                         );
                     }
+                    // The naga-emitter fallback is *usually* valid, but it is
+                    // not guaranteed: naga's own wgsl-out can emit tokens its
+                    // frontend then rejects (e.g. an `f32(<f64 literal>)` cast,
+                    // or an f16 literal whose `enable f16;` directive it drops).
+                    // Re-validate before trusting it so a doubly-invalid case
+                    // surfaces as a diagnosable error instead of silently
+                    // shipping invalid WGSL (matching the preamble posture above).
+                    if let Err(ve) = io::validate_wgsl_text(&naga_output) {
+                        return Err(Error::Emit(format!(
+                            "generator output failed validation and the naga-emitter \
+                             fallback is also invalid: {ve}"
+                        )));
+                    }
                     (
                         naga_output,
                         before_bytes,
@@ -716,6 +814,14 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                         "warning: generator emit failed ({}); falling back to naga emitter",
                         e
                     );
+                }
+                // Re-validate the naga fallback (see above) so a doubly-invalid
+                // case errors instead of shipping invalid WGSL.
+                if let Err(ve) = io::validate_wgsl_text(&naga_output) {
+                    return Err(Error::Emit(format!(
+                        "generator emit failed ({e}) and the naga-emitter \
+                         fallback is also invalid: {ve}"
+                    )));
                 }
                 (naga_output, before_bytes, false, true, false, 0)
             }
@@ -1458,6 +1564,46 @@ mod tests {
     }
 
     #[test]
+    fn split_directives_compact_single_line() {
+        // Compact generator output is one physical line; the splitter must
+        // still stop right after the directive's `;`, not swallow the body.
+        let src = "enable f16;@group(0)@binding(0)var<storage,read_write>A:f16;\
+                   @compute @workgroup_size(1) fn m(){A=1h;}";
+        let (dirs, body) = split_directives(src);
+        assert_eq!(dirs, "enable f16;");
+        assert_eq!(
+            body,
+            "@group(0)@binding(0)var<storage,read_write>A:f16;\
+             @compute @workgroup_size(1) fn m(){A=1h;}"
+        );
+        // Multiple directives run together on one line are all consumed.
+        let (dirs, body) =
+            split_directives("enable f16;enable dual_source_blending;@fragment fn m(){}");
+        assert_eq!(dirs, "enable f16;enable dual_source_blending;");
+        assert_eq!(body, "@fragment fn m(){}");
+    }
+
+    #[test]
+    fn split_directives_word_boundary_single_line() {
+        // Identifiers that merely start with a directive keyword must NOT be
+        // hoisted, even when the whole input is one line.
+        assert_eq!(
+            split_directives("enablef16;fn m(){}"),
+            ("", "enablef16;fn m(){}")
+        );
+        assert_eq!(
+            split_directives("requires_foo();fn m(){}"),
+            ("", "requires_foo();fn m(){}")
+        );
+        // A real directive followed mid-line by a `diagnostic`-prefixed
+        // identifier stops at that identifier.
+        assert_eq!(
+            split_directives("enable f16;diagnostic_counter_thing fn m(){}"),
+            ("enable f16;", "diagnostic_counter_thing fn m(){}")
+        );
+    }
+
+    #[test]
     fn references_f16_token_ignores_identifiers() {
         // `myf16var` and `f16_test` must NOT be detected as an f16 token.
         assert!(!references_f16_token("var myf16var: i32;"));
@@ -1746,28 +1892,43 @@ mod tests {
 
     #[test]
     fn preamble_with_enable_f16_shader() {
-        // Regression: preamble declarations must not precede source
-        // directives.  Without `split_directives`, the combined source
-        // would look like:
-        //   struct Inputs { ... }     // declaration
-        //   enable f16;               // directive after declaration; illegal
+        // Regression for F1: a preamble that carries its OWN `enable f16;`
+        // directive, combined with a source that genuinely USES f16, minified
+        // in COMPACT mode (where the whole module is one physical line).  A
+        // line-based directive splitter misclassified that single line as one
+        // big directive and placed the preamble's `enable` after the emitted
+        // declarations -> "expected global declaration, but found a global
+        // directive" (a hard Error::Emit, since the naga fallback is unsafe
+        // with a preamble).  The `;`-aware splitter keeps every directive
+        // ahead of every declaration.
+        //
+        // (The old form of this test passed even on buggy code: its `enable
+        // f16;` was dropped as unused and its preamble carried no directive,
+        // so the mis-splice was never exercised.)
         let preamble = "\
-            struct Inputs { time: f32, size: vec2f, }\n\
-            @group(0) @binding(0) var<uniform> inputs: Inputs;\
+            enable f16;\n\
+            @group(0) @binding(0) var<uniform> bias: f16;\
         ";
         let source = "\
-            enable f16;\n\
-            @fragment fn main() -> @location(0) vec4f {\n\
-                return vec4f(inputs.time, inputs.size, 1.0);\n\
+            @group(0) @binding(1) var<storage, read_write> sink: f16;\n\
+            @compute @workgroup_size(1) fn main() {\n\
+                var h: f16 = 1.0h;\n\
+                h = h + bias;\n\
+                sink = h;\n\
             }\
         ";
         let config = Config {
             preamble: Some(preamble.to_string()),
             ..Default::default()
         };
+        // Default config => compact mode: the F1 failure path.
         let output = run(source, &config)
-            .expect("shader with enable f16 + preamble must parse and minify successfully");
-        assert!(!output.source.is_empty(), "output should not be empty");
+            .expect("enable f16; in preamble + f16 source must minify in compact mode");
+        assert!(
+            output.source.contains("enable f16;"),
+            "the surviving f16 use must keep the enable directive: {}",
+            output.source
+        );
     }
 
     // MARK: Splat elision tests
@@ -1785,6 +1946,148 @@ mod tests {
         io::validate_wgsl_text(&output.source)
             .unwrap_or_else(|e| panic!("output is invalid WGSL: {e}\n{}", output.source));
         output.source
+    }
+
+    #[test]
+    fn run_never_ships_invalid_wgsl_when_fallback_is_also_invalid() {
+        // Regression for the rollback re-validation guard: when BOTH the
+        // custom generator AND naga's own wgsl-out fallback emit text that
+        // naga's frontend rejects, run() must surface a diagnosable error
+        // rather than silently shipping output that does not re-parse.
+        // Invariant under test: run() either errors, or returns output that
+        // round-trips.  (Robust to future naga changes - if a naga release
+        // accepts these forms, the Ok branch simply validates clean.)
+        let inputs = [
+            // f64 literal narrowed to f32: naga const-substitutes the literal
+            // under the cast, then rejects `f32(<F64 literal>)`.
+            "@group(0) @binding(0) var<storage, read_write> s: f32;\n\
+             @compute @workgroup_size(1) fn m() { let a: f64 = 0.5lf; s = f32(a); }",
+            // f16 literal in a cast whose `enable f16;` naga's backend drops.
+            "enable f16;\n\
+             @fragment fn m() -> @location(0) vec4f { let h: f16 = 1.0h; return vec4f(f32(h)); }",
+        ];
+        for src in inputs {
+            if let Ok(output) = run(src, &Config::default()) {
+                io::validate_wgsl_text(&output.source).unwrap_or_else(|e| {
+                    panic!(
+                        "run() shipped invalid WGSL (it should have errored): {e}\n{}",
+                        output.source
+                    )
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn folds_f64_literal_narrowing_cast_to_valid_literal() {
+        // Regression for issue A: naga const-substitutes `let a: f64 = 2.5lf`
+        // into the cast, yielding `As { Literal(F64), convert }`, which the
+        // emitter rendered as `f32(2.5lf)` - a token naga rejects on re-parse.
+        // const_fold now folds the narrowing cast of an F64 literal to the
+        // converted scalar literal, so the output round-trips (and shrinks).
+        for (decl, stmt) in [
+            ("var<storage, read_write> s: f32;", "s = f32(a);"),
+            ("var<storage, read_write> s: i32;", "s = i32(a);"),
+            ("var<storage, read_write> s: u32;", "s = u32(a);"),
+        ] {
+            let src = format!(
+                "@group(0) @binding(0) {decl}\n\
+                 @compute @workgroup_size(1) fn m() {{ let a: f64 = 2.5lf; {stmt} }}"
+            );
+            let output = run(&src, &Config::default())
+                .unwrap_or_else(|e| panic!("f64 narrowing cast must minify, got error: {e}"));
+            io::validate_wgsl_text(&output.source)
+                .unwrap_or_else(|e| panic!("output is invalid WGSL: {e}\n{}", output.source));
+            // The `T(<F64 literal>)` cast must be folded away, not emitted
+            // (no `lf)` token - the f64 literal no longer appears in a cast).
+            assert!(
+                !output.source.contains("lf)"),
+                "f64 cast literal should be folded, not emitted as a cast: {}",
+                output.source
+            );
+        }
+    }
+
+    #[test]
+    fn folds_f64_vector_narrowing_cast_to_valid_constructor() {
+        // Residual issue #1: a const f64 VECTOR narrowing cast
+        // (`vec2<f32>(vec2<f64>(.5lf,1.5lf))`) is rejected by naga on re-parse,
+        // and const_fold can't materialize the converted vector (the converted
+        // F32 component literals don't exist as arena handles), so it used to
+        // hard-error.  The generator now folds it to a converted constructor.
+        for (store_ty, decl_a, cast) in [
+            ("vec2<f32>", "vec2<f64>(0.5lf, 1.5lf)", "vec2<f32>(a)"),
+            (
+                "vec3<f32>",
+                "vec3<f64>(0.5lf, 1.5lf, 2.5lf)",
+                "vec3<f32>(a)",
+            ),
+            ("vec2<i32>", "vec2<f64>(2.5lf, 3.5lf)", "vec2<i32>(a)"),
+        ] {
+            let src = format!(
+                "@group(0) @binding(0) var<storage, read_write> o: {store_ty};\n\
+                 @compute @workgroup_size(1) fn m() {{ let a = {decl_a}; o = {cast}; }}"
+            );
+            let output = run(&src, &Config::default()).unwrap_or_else(|e| {
+                panic!("f64 vector narrowing cast must minify, got error: {e}\nsrc:{src}")
+            });
+            io::validate_wgsl_text(&output.source)
+                .unwrap_or_else(|e| panic!("output is invalid WGSL: {e}\n{}", output.source));
+            // The `vecN<f32>(vecN<f64>(..lf..))` cast must be folded away.
+            assert!(
+                !output.source.contains("lf)"),
+                "f64 vector cast should be folded, not emitted: {}",
+                output.source
+            );
+        }
+    }
+
+    #[test]
+    fn folds_int64_narrowing_cast_to_valid_literal() {
+        // The u64/i64 (`lu`/`li`) narrowing cast is the exact analogue of the
+        // f64 cast: naga rejects re-parsing `u32(<U64 literal>)`, and naga's own
+        // backend emits the same token, so it used to hard-error.  const_fold
+        // (scalar) and the generator (vector) now fold it, WRAPPING on
+        // narrowing - `u32(i64(-1))` is `4294967295`, NOT a clamped `0` -
+        // matching naga's value-conversion semantics.
+        let cases = [
+            // (decl, cast, expected substring in the folded output)
+            ("let a: u64 = 107lu;", "o = u32(a);", "107"),
+            ("let a: u64 = 4294967296lu;", "o = u32(a);", "0"), // 2^32 wraps to 0
+            ("let a: i64 = -1li;", "o = u32(a);", "4294967295"), // wrap, not clamp
+            (
+                "let a = vec2<u64>(107lu, 4294967296lu);",
+                "o = vec2<u32>(a);",
+                "vec2u(107,0)",
+            ),
+        ];
+        for (decl, cast, expect) in cases {
+            let store_ty = if cast.contains("vec2") {
+                "vec2<u32>"
+            } else {
+                "u32"
+            };
+            let src = format!(
+                "@group(0) @binding(0) var<storage, read_write> o: {store_ty};\n\
+                 @compute @workgroup_size(1) fn m() {{ {decl} {cast} }}"
+            );
+            let output = run(&src, &Config::default()).unwrap_or_else(|e| {
+                panic!("int64 narrowing cast must minify, got error: {e}\nsrc:{src}")
+            });
+            io::validate_wgsl_text(&output.source)
+                .unwrap_or_else(|e| panic!("output is invalid WGSL: {e}\n{}", output.source));
+            // The `T(<width-8 literal>)` cast must be folded (no `lu)`/`li)`).
+            assert!(
+                !output.source.contains("lu)") && !output.source.contains("li)"),
+                "int64 cast should be folded, not emitted: {}",
+                output.source
+            );
+            assert!(
+                output.source.contains(expect),
+                "expected wrapped value {expect:?} in output: {}",
+                output.source
+            );
+        }
     }
 
     #[test]

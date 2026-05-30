@@ -287,7 +287,7 @@ impl<'a> Generator<'a> {
                 {
                     self.out.push_str(&super::syntax::literal_to_wgsl(
                         lit,
-                        self.options.max_precision,
+                        &self.options.float_precision,
                     ));
                 } else {
                     self.out.push_str(&self.emit_expr(*selector, ctx)?);
@@ -440,7 +440,7 @@ impl<'a> Generator<'a> {
                         if let naga::Expression::Literal(lit) = ctx.func.expressions[*value] {
                             self.out.push_str(&super::syntax::literal_to_wgsl(
                                 lit,
-                                self.options.max_precision,
+                                &self.options.float_precision,
                             ));
                         } else {
                             self.out.push_str(&self.emit_expr(*value, ctx)?);
@@ -1125,7 +1125,7 @@ impl<'a> Generator<'a> {
                     if let naga::Expression::Literal(lit) = ctx.func.expressions[value] {
                         self.out.push_str(&super::syntax::literal_to_wgsl(
                             lit,
-                            self.options.max_precision,
+                            &self.options.float_precision,
                         ));
                     } else {
                         self.out.push_str(&self.emit_expr(value, ctx)?);

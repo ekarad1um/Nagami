@@ -938,7 +938,7 @@ impl<'a> Generator<'a> {
                 if let (true, naga::Expression::Literal(lit)) = (can_elide_type, init_expr) {
                     self.out.push_str(&super::syntax::literal_to_wgsl(
                         *lit,
-                        self.options.max_precision,
+                        &self.options.float_precision,
                     ));
                 } else {
                     self.out.push_str(&self.emit_expr(init, &mut ctx)?);

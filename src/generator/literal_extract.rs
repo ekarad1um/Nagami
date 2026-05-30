@@ -27,7 +27,7 @@ impl<'a> Generator<'a> {
     /// exceeds the break-even threshold, extract it into a shared
     /// module-scope `const` so each use site shrinks to the bound name.
     pub(super) fn scan_and_extract_literals(&mut self) {
-        let max_precision = self.options.max_precision;
+        let precision = &self.options.float_precision;
         let module = &self.module;
 
         // Helper: count textual literal emissions in a single function.
@@ -69,7 +69,7 @@ impl<'a> Generator<'a> {
              func_info: &naga::valid::FunctionInfo,
              ref_counts: &[usize],
              live: &[bool],
-             literal_counts: &mut HashMap<LiteralExtractKey, usize>| {
+             literal_counts: &mut HashMap<LiteralExtractKey, (usize, bool)>| {
                 // Predicate: is this handle a literal-like that we would tally
                 // (a `Literal`, or an unnamed `Constant` whose init is a literal)?
                 let literal_lit = |h: naga::Handle<naga::Expression>| -> Option<naga::Literal> {
@@ -121,12 +121,31 @@ impl<'a> Generator<'a> {
                 // remain eligible (no adjustment).
                 let mut adjust: Vec<usize> = vec![0; func.expressions.len()];
 
+                // `bare_handle[h]` = true if literal-like handle `h` is ever
+                // emitted in a BARE constructor context (a `Compose` slot or a
+                // `Splat` value).  This drives the extraction cost model: a
+                // needs-typed literal (F16/F64/I64/U64) used only in TYPED
+                // (standalone) positions emits the longer suffixed form and can
+                // be priced there, but if it also appears bare we price
+                // conservatively at the bare length to avoid over-extracting
+                // into a net-larger output.
+                let mut bare_handle: Vec<bool> = vec![false; func.expressions.len()];
+
                 for (ch, expr) in func.expressions.iter() {
                     if !live[ch.index()] {
                         continue;
                     }
                     match expr {
                         naga::Expression::Compose { ty, components } => {
+                            // Every Compose slot (vector / matrix / array /
+                            // struct) is emitted bare via `emit_constructor_arg`,
+                            // so mark each literal-like component as having a bare
+                            // use BEFORE the splat-collapse early-returns below.
+                            for &comp in components.iter() {
+                                if literal_lit(comp).is_some() {
+                                    bare_handle[comp.index()] = true;
+                                }
+                            }
                             if components.len() < 2 {
                                 continue;
                             }
@@ -167,6 +186,11 @@ impl<'a> Generator<'a> {
                             if matches!(func.expressions[*e], naga::Expression::Literal(_)) {
                                 adjust[e.index()] += 1;
                             }
+                        }
+                        // A Splat's scalar value is emitted bare inside the
+                        // vector constructor it expands to.
+                        naga::Expression::Splat { value, .. } if literal_lit(*value).is_some() => {
+                            bare_handle[value.index()] = true;
                         }
                         _ => {}
                     }
@@ -269,8 +293,10 @@ impl<'a> Generator<'a> {
                         Some(ConcretizedAbstract::Text(_)) => continue,
                         None => lit,
                     };
-                    let emitted = literal_extract_key(key_lit, max_precision);
-                    *literal_counts.entry(emitted).or_insert(0) += emissions;
+                    let emitted = literal_extract_key(key_lit, precision);
+                    let entry = literal_counts.entry(emitted).or_insert((0, false));
+                    entry.0 += emissions;
+                    entry.1 |= bare_handle[h.index()];
                 }
             };
 
@@ -299,7 +325,7 @@ impl<'a> Generator<'a> {
         //    pattern) lets each branch index `self.info` naturally
         //    (`self.info[handle]` vs. `self.info.get_entry_point(idx)`)
         //    without an O(N) `.nth(cache_idx)` walk.
-        let mut literal_counts: HashMap<LiteralExtractKey, usize> = HashMap::new();
+        let mut literal_counts: HashMap<LiteralExtractKey, (usize, bool)> = HashMap::new();
         let mut cache_idx: usize = 0;
         for (handle, func) in self.module.functions.iter() {
             let live = std::mem::take(&mut self.ref_count_cache[cache_idx].live);
@@ -359,7 +385,7 @@ impl<'a> Generator<'a> {
 
         // 3. Collect profitable candidates sorted by estimated savings.
         //    `savings = K * (L - N) - (BOILERPLATE + N + D)` where `K`
-        //    is the use count, `L` the literal text length, `N` the
+        //    is the use count, `L` the per-use emitted length, `N` the
         //    bound name length (estimated as 1 for the initial filter),
         //    and `D` the declaration text length.  The boilerplate term
         //    differs by output style:
@@ -367,16 +393,27 @@ impl<'a> Generator<'a> {
         //      beautify: `const N = D;\n` = 6 + 3 + 2 = 11 fixed chars
         //    Mis-pricing in beautify mode wrongly accepts borderline
         //    extractions that net-cost two bytes per use.
+        //
+        //    Per-use length `L`: a needs-typed literal (F16/F64/I64/U64 - the
+        //    only kinds where `decl_text` carries a suffix `expr_text` lacks)
+        //    emits the longer TYPED form (= `decl_text`) at every standalone
+        //    use, so it is priced there - UNLESS it also appears bare in a
+        //    constructor (`has_bare`), in which case some uses are the shorter
+        //    bare form and we stay conservative (`expr_text`) so we never
+        //    over-extract into a net-larger output.  For every other kind
+        //    `decl_text == expr_text`, so this is a no-op.
         let boilerplate: isize = if self.options.beautify { 11 } else { 8 };
-        let mut candidates: Vec<(isize, LiteralExtractKey, usize)> = literal_counts
+        let mut candidates: Vec<(isize, LiteralExtractKey, usize, bool)> = literal_counts
             .into_iter()
-            .filter_map(|(key, count)| {
+            .filter_map(|(key, (count, has_bare))| {
                 let expr_len = key.expr_text.len() as isize;
                 let decl_len = key.decl_text.len() as isize;
+                let typed_only = !has_bare && key.decl_text != key.expr_text;
+                let use_len = if typed_only { decl_len } else { expr_len };
                 let k = count as isize;
-                let est = k * (expr_len - 1) - (boilerplate + 1 + decl_len);
+                let est = k * (use_len - 1) - (boilerplate + 1 + decl_len);
                 if est > 0 {
-                    Some((est, key, count))
+                    Some((est, key, count, has_bare))
                 } else {
                     None
                 }
@@ -404,14 +441,17 @@ impl<'a> Generator<'a> {
         // rollback, every rejection silently consumes a short-name slot
         // and pushes accepted-but-later candidates into longer names.
         let mut counter = 0usize;
-        for (_, key, count) in candidates {
+        for (_, key, count, has_bare) in candidates {
             let counter_before = counter;
             let name = next_name_unique(&mut counter, &forbidden);
             let n = name.len() as isize;
             let expr_len = key.expr_text.len() as isize;
             let decl_len = key.decl_text.len() as isize;
+            // Same per-use pricing as the filter pass (see step 3).
+            let typed_only = !has_bare && key.decl_text != key.expr_text;
+            let use_len = if typed_only { decl_len } else { expr_len };
             let k = count as isize;
-            let savings = k * (expr_len - n) - (boilerplate + n + decl_len);
+            let savings = k * (use_len - n) - (boilerplate + n + decl_len);
             if savings > 0 {
                 forbidden.insert(name.clone());
                 self.extracted_literals.insert(key, name);

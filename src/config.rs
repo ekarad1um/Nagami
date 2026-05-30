@@ -1,11 +1,70 @@
 //! Public configuration surface for the minification pipeline.
 //!
-//! The three types below form the knobs callers tune before invoking
-//! [`crate::run`] or [`crate::run_module`]: [`Profile`] selects the pass
-//! bundle, [`TraceConfig`] gates diagnostic instrumentation, and
-//! [`Config`] composes both with the user-visible output options.
+//! Five types form the knobs callers tune before invoking [`crate::run`]
+//! or [`crate::run_module`]: [`Profile`] selects the pass bundle,
+//! [`TraceConfig`] gates diagnostic instrumentation, [`PrecisionMode`]
+//! and [`FloatPrecision`] control float-literal trimming, and [`Config`]
+//! composes them all with the user-visible output options.
 
 use std::path::PathBuf;
+
+/// Strategy for trimming a float literal's printed precision at emission
+/// time.  All variants except [`Self::Full`] are **lossy** and must be
+/// opted into explicitly per type via [`FloatPrecision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PrecisionMode {
+    /// Preserve the full IR value; emit the shortest round-trip text.
+    #[default]
+    Full,
+    /// Round to at most `N` digits after the decimal point before
+    /// formatting.  `0` rounds every literal to an integer-valued
+    /// float.  Best for fractional-precision tuning (e.g. `0.123456 -> 0.12`).
+    DecimalPlaces(u8),
+    /// Round to at most `N` significant figures.  `0` is treated as `1`
+    /// (zero sig figs would always round to zero, which is rarely useful).
+    /// Best for magnitude-aware quantization (e.g. `1234567.89 -> 1230000`,
+    /// `0.0012345 -> 0.0012`).
+    SignificantFigures(u8),
+}
+
+/// Per-type precision caps applied to float literals at emission time.
+///
+/// Each float kind in the IR (`f16`, `f32`, `f64`, and the untyped
+/// `AbstractFloat`) gets its own [`PrecisionMode`] slot so callers can
+/// pair a lossy `f32` budget with full-precision `f64`, or trim `f16`
+/// to its native precision without affecting other types.
+///
+/// Defaults to `Full` on every slot - i.e. no rounding anywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FloatPrecision {
+    /// Precision applied to `f16` literals (and the `f32`-converted
+    /// value the emitter goes through, which is value-equivalent at
+    /// f16's 10-bit mantissa).
+    pub f16: PrecisionMode,
+    /// Precision applied to `f32` literals.
+    pub f32: PrecisionMode,
+    /// Precision applied to `f64` literals.
+    pub f64: PrecisionMode,
+    /// Precision applied to literals whose IR form is still
+    /// `AbstractFloat` at emission (typically extracted-`const` decls
+    /// and standalone module-scope abstract literals).  Naga widens
+    /// these to f64 internally.
+    pub abstract_float: PrecisionMode,
+}
+
+impl FloatPrecision {
+    /// Convenience constructor: apply the same `mode` to every float
+    /// kind.  Equivalent to building [`FloatPrecision`] field-by-field
+    /// with the same value in each slot.
+    pub fn all(mode: PrecisionMode) -> Self {
+        Self {
+            f16: mode,
+            f32: mode,
+            f64: mode,
+            abstract_float: mode,
+        }
+    }
+}
 
 /// Optimization aggressiveness level, selecting which pass bundle
 /// [`crate::passes::build_ir_passes`] constructs.
@@ -88,9 +147,10 @@ pub struct Config {
     pub beautify: bool,
     /// Spaces per indentation level; honoured only when `beautify` is set.
     pub indent: u8,
-    /// Maximum decimal places for float literals.  `None` preserves full
-    /// precision; any `Some(n)` is lossy and must be opted into by the caller.
-    pub max_precision: Option<u8>,
+    /// Per-type precision caps for float literals.  Defaults to
+    /// [`PrecisionMode::Full`] on every kind - opt in per-type as
+    /// needed.  Any non-`Full` mode is lossy.
+    pub float_precision: FloatPrecision,
     /// Override the per-function expression-node ceiling used to gate
     /// inlining.  `None` selects the profile default.
     pub max_inline_node_count: Option<usize>,
@@ -117,7 +177,7 @@ impl Default for Config {
             mangle: None,
             beautify: false,
             indent: 2,
-            max_precision: None,
+            float_precision: FloatPrecision::default(),
             max_inline_node_count: None,
             max_inline_call_sites: None,
             trace: TraceConfig::default(),

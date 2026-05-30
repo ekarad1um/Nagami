@@ -8,7 +8,7 @@
 //! layers the full IR-pass pipeline on top for end-to-end assertions.
 
 use super::super::{GenerateOptions, generate_wgsl};
-pub use crate::config::{Config, Profile};
+pub use crate::config::{Config, FloatPrecision, PrecisionMode, Profile};
 
 /// Parse, validate, and emit `src` with the baseline
 /// compact-mode options: no beautify, no mangling, full precision.
@@ -27,7 +27,7 @@ pub fn compact(src: &str) -> String {
             beautify: false,
             indent: 0,
             mangle: false,
-            max_precision: None,
+            float_precision: FloatPrecision::default(),
             ..Default::default()
         },
     )
@@ -57,7 +57,7 @@ pub fn compact_aliased(src: &str) -> String {
             beautify: false,
             indent: 0,
             mangle: false,
-            max_precision: None,
+            float_precision: FloatPrecision::default(),
             type_alias: true,
             ..Default::default()
         },
@@ -83,7 +83,7 @@ pub fn compact_mangled_aliased(src: &str) -> String {
             beautify: false,
             indent: 0,
             mangle: true,
-            max_precision: None,
+            float_precision: FloatPrecision::default(),
             type_alias: true,
             ..Default::default()
         },
@@ -109,7 +109,7 @@ pub fn compact_mangled_preserved(src: &str, preserve: &[&str]) -> String {
             beautify: false,
             indent: 0,
             mangle: true,
-            max_precision: None,
+            float_precision: FloatPrecision::default(),
             preserve_symbols: preserve.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         },
@@ -152,16 +152,26 @@ pub fn compact_beautified(src: &str) -> String {
             beautify: true,
             indent: 2,
             mangle: false,
-            max_precision: None,
+            float_precision: FloatPrecision::default(),
             ..Default::default()
         },
     )
     .expect("generate failed")
 }
 
-/// Compact variant with a bounded `max_precision`.  Used by tests
-/// that exercise lossy float trimming.
+/// Compact variant with `DecimalPlaces(prec)` applied to every float
+/// kind.  Used by tests that exercise lossy float trimming with a
+/// single uniform mode, mirroring the simple "one knob for every kind"
+/// case of the [`FloatPrecision`] API.
 pub fn compact_with_precision(src: &str, prec: u8) -> String {
+    compact_with_float_precision(src, FloatPrecision::all(PrecisionMode::DecimalPlaces(prec)))
+}
+
+/// Compact variant driven by an explicit [`FloatPrecision`].  Used by
+/// tests that exercise `SignificantFigures` (and per-type) trimming
+/// end-to-end through the generator, where the rounded value must still
+/// emit a token that re-parses as valid WGSL.
+pub fn compact_with_float_precision(src: &str, float_precision: FloatPrecision) -> String {
     let module = naga::front::wgsl::parse_str(src).expect("parse failed");
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
@@ -176,7 +186,7 @@ pub fn compact_with_precision(src: &str, prec: u8) -> String {
             beautify: false,
             indent: 0,
             mangle: false,
-            max_precision: Some(prec),
+            float_precision,
             ..Default::default()
         },
     )

@@ -12,6 +12,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::config::FloatPrecision;
+
 use super::syntax::LiteralExtractKey;
 
 // MARK: Options
@@ -28,9 +30,10 @@ pub struct GenerateOptions {
     pub indent: u8,
     /// Rename struct types and struct members to short identifiers.
     pub mangle: bool,
-    /// Maximum decimal places for float literals; `None` preserves
-    /// full precision and any `Some(n)` is lossy.
-    pub max_precision: Option<u8>,
+    /// Per-type precision caps applied to float literals at emission.
+    /// Default ([`FloatPrecision::default`]) preserves full precision
+    /// on every kind; any non-`Full` mode is lossy.
+    pub float_precision: FloatPrecision,
     /// Reserve this many bytes up front in the output buffer to amortise
     /// reallocation across the emission pass.
     pub initial_capacity: usize,
@@ -50,7 +53,7 @@ impl Default for GenerateOptions {
             beautify: false,
             indent: 2,
             mangle: false,
-            max_precision: None,
+            float_precision: FloatPrecision::default(),
             initial_capacity: 16 * 1024,
             preserve_symbols: HashSet::new(),
             preamble_names: HashSet::new(),

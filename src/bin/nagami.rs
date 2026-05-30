@@ -153,9 +153,37 @@ struct Args {
     #[arg(
         long,
         value_name = "N",
-        help = "Maximum decimal places for float literals (lossy; omit for full precision)."
+        conflicts_with = "sig_figs",
+        help = "Round every float literal to at most N decimal places (lossy)."
     )]
-    max_precision: Option<u8>,
+    decimal_places: Option<u8>,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Round every float literal to at most N significant figures (lossy)."
+    )]
+    sig_figs: Option<u8>,
+}
+
+/// Translate the two CLI precision flags into a [`FloatPrecision`].
+/// Clap rejects `--decimal-places` and `--sig-figs` together at parse
+/// time (`conflicts_with = "sig_figs"` on `decimal_places`), so this
+/// helper only needs to map the at-most-one-set case.  When neither
+/// flag is given, all float kinds default to
+/// [`nagami::config::PrecisionMode::Full`].
+fn precision_from_cli(
+    decimal_places: Option<u8>,
+    sig_figs: Option<u8>,
+) -> nagami::config::FloatPrecision {
+    use nagami::config::{FloatPrecision, PrecisionMode};
+    if let Some(p) = decimal_places {
+        FloatPrecision::all(PrecisionMode::DecimalPlaces(p))
+    } else if let Some(s) = sig_figs {
+        FloatPrecision::all(PrecisionMode::SignificantFigures(s))
+    } else {
+        FloatPrecision::default()
+    }
 }
 
 fn main() -> ExitCode {
@@ -236,7 +264,7 @@ fn run_cli() -> Result<bool, Box<dyn std::error::Error>> {
         },
         beautify: args.beautify,
         indent: args.indent,
-        max_precision: args.max_precision,
+        float_precision: precision_from_cli(args.decimal_places, args.sig_figs),
         max_inline_node_count: args.max_inline_node_count,
         max_inline_call_sites: args.max_inline_call_sites,
         trace: nagami::config::TraceConfig {
@@ -438,5 +466,22 @@ mod tests {
     #[test]
     fn args_command_definition_is_internally_consistent() {
         Args::command().debug_assert();
+    }
+
+    /// Pin the flag -> [`FloatPrecision`] translation.  Clap rejects the
+    /// both-set case at parse time, so only the at-most-one-set arms are
+    /// reachable; this covers each of them plus the neither-set default.
+    #[test]
+    fn precision_from_cli_maps_flags_to_modes() {
+        use nagami::config::{FloatPrecision, PrecisionMode};
+        assert_eq!(
+            precision_from_cli(Some(3), None),
+            FloatPrecision::all(PrecisionMode::DecimalPlaces(3))
+        );
+        assert_eq!(
+            precision_from_cli(None, Some(2)),
+            FloatPrecision::all(PrecisionMode::SignificantFigures(2))
+        );
+        assert_eq!(precision_from_cli(None, None), FloatPrecision::default());
     }
 }
