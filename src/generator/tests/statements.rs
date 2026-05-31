@@ -894,7 +894,9 @@ fn call_pointer_arg_not_inlined_across_store_to_pointee() {
     "#;
     let out = compact(src);
     let call_pos = out.find("g(&").expect("call must be emitted");
-    let store_pos = out.find("d*=2").expect("the `d = d * 2` store must be emitted");
+    let store_pos = out
+        .find("d*=2")
+        .expect("the `d = d * 2` store must be emitted");
     assert!(
         call_pos < store_pos,
         "call taking `&d` must be evaluated BEFORE `d = d*2` (let-bound), not \
@@ -1070,7 +1072,10 @@ fn fn_using_param_writing_helper_on_own_local_is_pure() {
         "a function whose helper writes only its OWN local is pure and should \
          inline at its use: {out}"
     );
-    assert!(out.contains("noise("), "the call must still be emitted: {out}");
+    assert!(
+        out.contains("noise("),
+        "the call must still be emitted: {out}"
+    );
     assert_valid_wgsl(&out);
 }
 
@@ -1553,7 +1558,10 @@ fn array_element_swap_load_must_bind() {
         !out.contains("buf[1]=buf[0]"),
         "buf[0] read after its store must be let-bound (not re-read post-write): {out}"
     );
-    assert!(out.contains("let "), "the snapshot load must be let-bound: {out}");
+    assert!(
+        out.contains("let "),
+        "the snapshot load must be let-bound: {out}"
+    );
     assert_valid_wgsl(&out);
 }
 

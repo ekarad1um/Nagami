@@ -856,8 +856,8 @@ pub fn visit_statement_expression_handles<F>(
                 }
                 naga::RayQueryFunction::Proceed { result } => visit(*result),
                 naga::RayQueryFunction::GenerateIntersection { hit_t } => visit(*hit_t),
-                naga::RayQueryFunction::ConfirmIntersection
-                | naga::RayQueryFunction::Terminate => {}
+                naga::RayQueryFunction::ConfirmIntersection | naga::RayQueryFunction::Terminate => {
+                }
             }
         }
         naga::Statement::RayPipelineFunction(fun) => {

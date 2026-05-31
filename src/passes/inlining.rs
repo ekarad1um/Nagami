@@ -467,12 +467,8 @@ fn inline_in_block(
                 // seeded from `body_replacements`, hence a superset.  Using
                 // only `body_replacements` would leave a continuing-inlined
                 // call's result orphaned in `break_if` -> invalid IR -> rollback.
-                let (cc, continuing_replacements) = inline_in_block(
-                    &mut continuing,
-                    expressions,
-                    templates,
-                    &body_replacements,
-                );
+                let (cc, continuing_replacements) =
+                    inline_in_block(&mut continuing, expressions, templates, &body_replacements);
                 changed += cc;
                 if let Some(handle) = break_if {
                     break_if = Some(resolve_replacement(handle, &continuing_replacements));

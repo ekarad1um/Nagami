@@ -846,8 +846,12 @@ impl<'a> Generator<'a> {
         // whose update clause would inline a must-bind load).
         let must_bind_loads = compute_must_bind_loads(func, self.module);
         let for_loop_vars = find_for_loop_vars(func, &must_bind_loads);
-        let inlineable_calls =
-            find_inlineable_calls(&func.body, &ref_counts, &func.expressions, &self.pure_functions);
+        let inlineable_calls = find_inlineable_calls(
+            &func.body,
+            &ref_counts,
+            &func.expressions,
+            &self.pure_functions,
+        );
         let mut ctx = FunctionCtx {
             func,
             info: finfo,
@@ -1936,25 +1940,55 @@ fn find_inlineable_calls(
             }
             naga::Statement::If { accept, reject, .. } => {
                 pending.clear();
-                result.extend(find_inlineable_calls(accept, ref_counts, expressions, pure_functions));
-                result.extend(find_inlineable_calls(reject, ref_counts, expressions, pure_functions));
+                result.extend(find_inlineable_calls(
+                    accept,
+                    ref_counts,
+                    expressions,
+                    pure_functions,
+                ));
+                result.extend(find_inlineable_calls(
+                    reject,
+                    ref_counts,
+                    expressions,
+                    pure_functions,
+                ));
             }
             naga::Statement::Loop {
                 body, continuing, ..
             } => {
                 pending.clear();
-                result.extend(find_inlineable_calls(body, ref_counts, expressions, pure_functions));
-                result.extend(find_inlineable_calls(continuing, ref_counts, expressions, pure_functions));
+                result.extend(find_inlineable_calls(
+                    body,
+                    ref_counts,
+                    expressions,
+                    pure_functions,
+                ));
+                result.extend(find_inlineable_calls(
+                    continuing,
+                    ref_counts,
+                    expressions,
+                    pure_functions,
+                ));
             }
             naga::Statement::Switch { cases, .. } => {
                 pending.clear();
                 for case in cases {
-                    result.extend(find_inlineable_calls(&case.body, ref_counts, expressions, pure_functions));
+                    result.extend(find_inlineable_calls(
+                        &case.body,
+                        ref_counts,
+                        expressions,
+                        pure_functions,
+                    ));
                 }
             }
             naga::Statement::Block(inner) => {
                 pending.clear();
-                result.extend(find_inlineable_calls(inner, ref_counts, expressions, pure_functions));
+                result.extend(find_inlineable_calls(
+                    inner,
+                    ref_counts,
+                    expressions,
+                    pure_functions,
+                ));
             }
             _ => {
                 pending.clear();
@@ -2540,10 +2574,13 @@ fn analyze_statement(
                         None => true,
                     };
                     if track {
-                        pending.insert(h, PendingLoad {
-                            place,
-                            written: false,
-                        });
+                        pending.insert(
+                            h,
+                            PendingLoad {
+                                place,
+                                written: false,
+                            },
+                        );
                     }
                 }
             }

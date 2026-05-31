@@ -572,7 +572,10 @@ fn global_swap_load_not_inlined_across_store() {
         !out.contains("A[1] = A[0]"),
         "A[0] read after its own store must be let-bound, not re-read post-write: {out}"
     );
-    assert!(out.contains("let "), "the swap snapshot must be let-bound: {out}");
+    assert!(
+        out.contains("let "),
+        "the swap snapshot must be let-bound: {out}"
+    );
     assert_valid_wgsl(&out);
 }
 
@@ -629,7 +632,9 @@ fn load_before_loop_used_after_must_bind() {
     let out = compact_with_passes(src, Profile::Max);
     // The snapshot of `g` must be let-bound before the loop; otherwise both
     // stores read the post-loop `g`.
-    let let_pos = out.find("let ").expect("the pre-loop snapshot must be let-bound");
+    let let_pos = out
+        .find("let ")
+        .expect("the pre-loop snapshot must be let-bound");
     let loop_pos = out
         .find("for ")
         .or_else(|| out.find("loop"))
@@ -728,7 +733,9 @@ fn for_loop_guard_preload_must_not_read_must_bind_load_post_barrier() {
         !out.contains("for ("),
         "a guard-preload loop reading a must-bind load post-barrier must bail to plain loop: {out}"
     );
-    let snap = out.find("= A[0]").expect("the A[0] snapshot must be let-bound");
+    let snap = out
+        .find("= A[0]")
+        .expect("the A[0] snapshot must be let-bound");
     let barrier = out
         .find("workgroupUniformLoad")
         .expect("the barrier must be preserved");
@@ -766,7 +773,9 @@ fn for_loop_guard_preload_body_only_must_bind_load_snapshotted_before_barrier() 
         !out.contains("for ("),
         "a body-only must-bind load defined before a guard-preload barrier must bail to plain loop: {out}"
     );
-    let snap = out.find("= A[0]").expect("the A[0] snapshot must be let-bound");
+    let snap = out
+        .find("= A[0]")
+        .expect("the A[0] snapshot must be let-bound");
     let barrier = out
         .find("workgroupUniformLoad")
         .expect("the barrier must be preserved");

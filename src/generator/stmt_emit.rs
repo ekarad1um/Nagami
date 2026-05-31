@@ -89,8 +89,10 @@ fn count_update_stmt_emissions(
 /// `continuing` update preloads plus the single core update statement.
 pub(super) struct ForLoopShape<'a> {
     /// `(pointer, result)` for each leading body `WorkGroupUniformLoad`.
-    pub(super) guard_preloads:
-        Vec<(naga::Handle<naga::Expression>, naga::Handle<naga::Expression>)>,
+    pub(super) guard_preloads: Vec<(
+        naga::Handle<naga::Expression>,
+        naga::Handle<naga::Expression>,
+    )>,
     /// Body statement indices of those preloads (excluded from the for-body).
     pub(super) guard_preload_stmt_indices: Vec<usize>,
     /// Body index of the if-break guard statement.
@@ -100,8 +102,10 @@ pub(super) struct ForLoopShape<'a> {
     /// `true` when the guard is `if cond { break; }` (exit form; negate for `for`).
     pub(super) needs_negation: bool,
     /// `(pointer, result)` for each leading `continuing` `WorkGroupUniformLoad`.
-    pub(super) update_preloads:
-        Vec<(naga::Handle<naga::Expression>, naga::Handle<naga::Expression>)>,
+    pub(super) update_preloads: Vec<(
+        naga::Handle<naga::Expression>,
+        naga::Handle<naga::Expression>,
+    )>,
     /// The single core update statement in `continuing`, if any.  Its KIND
     /// (Store / Call / ImageStore) is NOT validated here - callers that emit it
     /// check that separately.
