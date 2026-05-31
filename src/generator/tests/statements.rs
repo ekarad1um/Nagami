@@ -1049,6 +1049,87 @@ fn impure_call_as_store_rhs_inlines_adjacently() {
     assert_valid_wgsl(&out);
 }
 
+/// An impure call used once inside an expression whose every OTHER operand is
+/// memory-free (here literals) inlines: the call is the statement's sole memory
+/// access, so nothing can be reordered across its side effect regardless of
+/// operand evaluation order.  `prng` writes the global `seed`, yet the
+/// `(prng() - .5) * .1` form drops the `let` binding.
+#[test]
+fn impure_call_inlines_into_memfree_surround_expression() {
+    let src = r#"
+        var<private> seed: f32;
+        @group(0) @binding(0) var<storage, read_write> outv: f32;
+        fn prng() -> f32 { seed = seed * 1.1 + 0.3; return seed; }
+        @compute @workgroup_size(1) fn main() {
+            outv = (prng() - 0.5) * 0.1;
+        }
+    "#;
+    let out = compact(src);
+    assert!(
+        out.contains("(prng()-"),
+        "the impure call should inline into the literal-only expression: {out}"
+    );
+    assert!(
+        !out.contains("let "),
+        "no `let` binding should survive when the call inlines: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// Same recovery for a value-bearing `if` condition: the call is one side of
+/// the comparison and the other side is a literal, so it inlines into the
+/// condition rather than binding.
+#[test]
+fn impure_call_inlines_into_if_condition_with_literal_sibling() {
+    let src = r#"
+        var<private> tick: i32;
+        @group(0) @binding(0) var<storage, read_write> outv: i32;
+        fn step() -> i32 { tick = tick + 1; return tick; }
+        @compute @workgroup_size(1) fn main() {
+            if (step() == 3) { outv = 1; }
+        }
+    "#;
+    let out = compact(src);
+    assert!(
+        out.contains("if step()=="),
+        "the impure call should inline into the if-condition: {out}"
+    );
+    assert!(
+        !out.contains("let "),
+        "no `let` binding should survive when the call inlines: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// CRITICAL tamper-evident guard for `impure_call_inlines_safely`: when a
+/// SIBLING operand reads memory (`pre`, a load of the global `bump` writes),
+/// the call MUST stay `let`-bound.  Inlining `pre + bump()` would let WGSL's
+/// left-to-right order read `pre`'s memory before / after the increment in a
+/// way the binding fixes - a reorder miscompile.  Fails the moment the
+/// memory-free-surround check is weakened to admit a load sibling.
+#[test]
+fn impure_call_not_inlined_when_sibling_reads_memory() {
+    let src = r#"
+        var<private> g: i32;
+        @group(0) @binding(0) var<storage, read_write> outv: i32;
+        fn bump() -> i32 { g = g + 1; return g; }
+        @compute @workgroup_size(1) fn main() {
+            let pre = g;
+            outv = pre + bump();
+        }
+    "#;
+    let out = compact(src);
+    assert!(
+        out.contains("=bump()"),
+        "an impure call with a memory-reading sibling must stay let-bound: {out}"
+    );
+    assert!(
+        !out.contains("+bump()"),
+        "the impure call must NOT inline next to the load sibling: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
 /// A function whose only writes are through a helper's pointer parameter
 /// applied to its OWN local is PURE (the writes never escape it), so its
 /// single-use call inlines.  The per-parameter effect analysis must see the

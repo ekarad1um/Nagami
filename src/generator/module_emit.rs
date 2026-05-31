@@ -1810,13 +1810,14 @@ pub(super) fn compute_pure_functions(module: &naga::Module) -> Vec<bool> {
 ///
 /// 1. its `ref_count` is exactly 1 (used once);
 /// 2. its callee is PURE (`pure_functions[callee]`), OR it is an impure call
-///    consumed as the DIRECT value of the immediately-following `Store`/`Return`
-///    (see `last_impure`): an impure call writes memory, and relocating it to an
-///    arbitrary use site would re-order that write against an intervening read
-///    OR an operand-evaluation-order sibling read of the same memory - a silent
-///    miscompile.  Operand order is invisible here, so purity is the gate for
-///    the general case; the one exception is an adjacent direct-value use, where
-///    the call provably neither moves nor gains a sibling; and
+///    whose consuming statement evaluates NO other memory access (see
+///    `last_impure` / `impure_call_inlines_safely`): an impure call writes
+///    memory, and relocating it to an arbitrary use site would re-order that
+///    write against an intervening read OR an operand-evaluation-order sibling
+///    read of the same memory - a silent miscompile.  Operand order is
+///    invisible here, so purity is the gate for the general case; the exception
+///    is a consuming statement whose every other operand is memory-free, where
+///    the call is the sole memory access and nothing can be reordered; and
 /// 3. the consuming statement is reached from the `Call` without crossing a
 ///    potentially-interfering side-effecting statement (another `Call`,
 ///    `Atomic` / `ImageStore` / `RayQuery` and the like, a non-local `Store`,
@@ -1839,38 +1840,25 @@ fn find_inlineable_calls(
 ) -> std::collections::HashSet<naga::Handle<naga::Expression>> {
     let mut result = std::collections::HashSet::new();
     let mut pending: Vec<PendingCall> = Vec::new();
-    // The result of an IMPURE call from the immediately-previous statement.  It
-    // may be inlined ONLY if THIS statement consumes it as a *direct* value (a
-    // `Store` value or `Return` value): then the call is emitted at the adjacent
-    // store/return - it neither moves nor gains a sibling operand, so no read
-    // can be re-ordered across its side effect, regardless of what it writes
-    // (`out = atomicAdd(&c, 1)`, `return f()`).  Any other next statement (an
-    // `Emit` that wraps it in a larger expression, or an intervening statement)
-    // would move or re-order it, so it stays bound.
+    // The result of an IMPURE call from an earlier statement, still eligible to
+    // be inlined into the statement that consumes it.  An impure call writes
+    // memory, so it may be inlined only where its side effect cannot be
+    // reordered against any other memory access - decided by
+    // `impure_call_inlines_safely` (the consuming statement's every OTHER
+    // operand must be memory-free).  `Emit` statements between the call and its
+    // consumer only build the consuming expression and write nothing, so the
+    // candidate survives them; the first non-`Emit` statement decides.
     let mut last_impure: Option<naga::Handle<naga::Expression>> = None;
 
     for stmt in block.iter() {
-        // Adjacent direct-value inline of the previous statement's impure call.
-        if let Some(h) = last_impure.take() {
-            let direct = match stmt {
-                // `<place> = call()`: safe only when the store TARGET reads no
-                // memory to evaluate (a bare variable).  An `arr[idx]` place
-                // could read `idx` from memory the call writes, and WGSL's
-                // pointer-vs-value evaluation order would then decide whether
-                // that read sees the pre- or post-call value - a reorder we must
-                // not depend on.
-                naga::Statement::Store { pointer, value } if *value == h => matches!(
-                    expressions[*pointer],
-                    naga::Expression::LocalVariable(_)
-                        | naga::Expression::GlobalVariable(_)
-                        | naga::Expression::FunctionArgument(_)
-                ),
-                // `return call()`: no place, no sibling - always safe.
-                naga::Statement::Return { value: Some(v) } if *v == h => true,
-                _ => false,
-            };
-            if direct {
-                result.insert(h);
+        if let Some(h) = last_impure {
+            if matches!(stmt, naga::Statement::Emit(_)) {
+                // Still assembling the consuming expression; keep `h` pending.
+            } else {
+                last_impure = None;
+                if impure_call_inlines_safely(stmt, h, expressions) {
+                    result.insert(h);
+                }
             }
         }
 
@@ -1915,9 +1903,10 @@ fn find_inlineable_calls(
                         reads_locals,
                     });
                 } else {
-                    // Impure: eligible only for an adjacent direct-value inline
-                    // by the IMMEDIATELY-following statement (see `last_impure`),
-                    // where the call cannot move or gain a sibling.
+                    // Impure: eligible to be inlined into its consuming
+                    // statement only where that statement evaluates no other
+                    // memory access (see `last_impure` /
+                    // `impure_call_inlines_safely`).
                     last_impure = Some(*h);
                 }
             }
@@ -1998,6 +1987,112 @@ fn find_inlineable_calls(
 
     result.extend(pending.into_iter().map(|p| p.result));
     result
+}
+
+/// Whether an impure single-use call producing `call_result` can be inlined
+/// into `stmt`, the first non-`Emit` statement after the call.
+///
+/// Safe exactly when every expression `stmt` evaluates APART FROM the call is
+/// memory-free (a literal / constant / by-value parameter, or arithmetic over
+/// such).  Then the inlined call is the statement's ONLY memory access besides
+/// its own terminal store, so its side effect cannot be reordered against a
+/// sibling read, an intervening read, or a hoisted `let`-bound load - whatever
+/// the call writes, nothing else in the statement observes it.  This makes the
+/// operand evaluation order (and which sub-expressions the generator chooses to
+/// `let`-bind) irrelevant, which is what keeps the analysis sound without
+/// modelling either.
+///
+/// Subsumes the bare `out = call()` / `return call()` direct-value forms and
+/// additionally recovers `out = (call() - .5) * k`, `if call() == k`,
+/// `switch call()`, and `arr[const] = call()`.  An expression that reads memory
+/// anywhere outside the call (e.g. `out = g + call()` with `g` a load) makes
+/// the statement ineligible, so the call stays `let`-bound.  Only value-bearing
+/// statement kinds are handled; any other consuming statement keeps the call
+/// bound.
+fn impure_call_inlines_safely(
+    stmt: &naga::Statement,
+    call_result: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+) -> bool {
+    use naga::Statement as S;
+    let mut found = false;
+    let mut memo = std::collections::HashMap::new();
+    let mut memfree =
+        |root| expr_is_memory_free(root, call_result, expressions, &mut found, &mut memo);
+    let all_memfree = match stmt {
+        // Evaluate BOTH operands (no short-circuit) so `found` is set whichever
+        // side carries the call: an `arr[const] = call()` places it in `value`,
+        // while a `bare = (call()..)` also keeps `pointer` memory-free.
+        S::Store { pointer, value } => {
+            let p = memfree(*pointer);
+            let v = memfree(*value);
+            p && v
+        }
+        S::Return { value: Some(v) } => memfree(*v),
+        // Only the condition / selector is the consuming expression; the branch
+        // bodies are later statements that legitimately access memory.
+        S::If { condition, .. } => memfree(*condition),
+        S::Switch { selector, .. } => memfree(*selector),
+        _ => return false,
+    };
+    found && all_memfree
+}
+
+/// `true` when evaluating the expression tree rooted at `root` reads no memory
+/// and observes no side effect, treating `call_result` as a transparent hole
+/// (it is the one call we intend to inline) and setting `*found` when that hole
+/// is reached.  A `Load`, any effect-result expression (call / atomic / image /
+/// ray / subgroup / `arrayLength`), and any future variant default to NOT
+/// memory-free, so the predicate is conservative by construction.
+fn expr_is_memory_free(
+    root: naga::Handle<naga::Expression>,
+    call_result: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+    found: &mut bool,
+    memo: &mut std::collections::HashMap<naga::Handle<naga::Expression>, bool>,
+) -> bool {
+    if root == call_result {
+        // The inlined call is reached on a unique path (`ref_count == 1`), so
+        // this never collides with a memoised entry.
+        *found = true;
+        return true;
+    }
+    if let Some(&m) = memo.get(&root) {
+        return m;
+    }
+    use naga::Expression as E;
+    let memory_free = match &expressions[root] {
+        E::Literal(_)
+        | E::Constant(_)
+        | E::Override(_)
+        | E::ZeroValue(_)
+        | E::FunctionArgument(_)
+        | E::GlobalVariable(_)
+        | E::LocalVariable(_) => true,
+        E::Access { .. }
+        | E::AccessIndex { .. }
+        | E::Splat { .. }
+        | E::Swizzle { .. }
+        | E::Unary { .. }
+        | E::Binary { .. }
+        | E::Select { .. }
+        | E::Relational { .. }
+        | E::Math { .. }
+        | E::As { .. }
+        | E::Compose { .. }
+        | E::Derivative { .. } => {
+            let mut ok = true;
+            visit_expr_children(&expressions[root], |child| {
+                if !expr_is_memory_free(child, call_result, expressions, found, memo) {
+                    ok = false;
+                }
+            });
+            ok
+        }
+        _ => false,
+    };
+    memo.insert(root, memory_free);
+    memory_free
 }
 
 /// Visit every direct expression handle referenced by `stmt` (for Emit
