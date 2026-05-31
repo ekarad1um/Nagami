@@ -419,10 +419,39 @@ fn unwrap_logical_not(
 
 // MARK: Constant-condition elimination
 
+/// `true` when `block` (recursively) contains a statement that produces a
+/// result EXPRESSION (`Call`/`Atomic`/`WorkGroupUniformLoad`/`RayQuery`/
+/// `Subgroup*`).  A constant-condition collapse KEEPS such an `if`/`switch`
+/// branch intact rather than dropping it: dropping it would orphan the result
+/// expression (its producer statement is gone), which fails validation and
+/// rolls the whole pass back every sweep.  Variant-only and conservative - a
+/// result-less `Call` also trips it, at the cost of one kept-but-dead branch.
+fn block_has_result_producer(block: &naga::Block) -> bool {
+    use naga::Statement as S;
+    block.iter().any(|stmt| match stmt {
+        S::Call { .. }
+        | S::Atomic { .. }
+        | S::WorkGroupUniformLoad { .. }
+        | S::RayQuery { .. }
+        | S::SubgroupBallot { .. }
+        | S::SubgroupGather { .. }
+        | S::SubgroupCollectiveOperation { .. } => true,
+        S::Block(inner) => block_has_result_producer(inner),
+        S::If { accept, reject, .. } => {
+            block_has_result_producer(accept) || block_has_result_producer(reject)
+        }
+        S::Switch { cases, .. } => cases.iter().any(|c| block_has_result_producer(&c.body)),
+        S::Loop {
+            body, continuing, ..
+        } => block_has_result_producer(body) || block_has_result_producer(continuing),
+        _ => false,
+    })
+}
+
 /// Recursively walk `block`, folding branches whose condition is a
-/// compile-time literal `true` / `false` and pruning unreachable
-/// switch cases.  Returns the number of transformations applied so
-/// the caller can aggregate change counts across phases.
+/// compile-time literal `true` / `false` and pruning unreachable switch
+/// cases.  Returns the number of transformations applied so the caller can
+/// aggregate change counts across phases.
 fn eliminate_dead_branches(
     block: &mut naga::Block,
     expressions: &naga::Arena<naga::Expression>,
@@ -497,12 +526,42 @@ fn eliminate_dead_branches(
                 // literal, so a branch on a named `const X: bool = ...;`
                 // is eliminated even before const_fold inlines it.
                 Some(naga::Literal::Bool(true)) => {
-                    splice_block(&mut rebuilt, accept);
-                    changed += 1;
+                    // `accept` is taken; `reject` is dropped.  If `reject`
+                    // produced a statement result (`Call`/`Atomic`/...), dropping
+                    // it would orphan that result EXPRESSION (its producer is
+                    // gone) - invalid IR the validator rejects, rolling the whole
+                    // pass back every sweep.  Keep the `if` intact in that case:
+                    // the branch is dead-but-valid, and leaving it avoids both
+                    // the invalid IR and the wasted per-sweep revalidation.
+                    if block_has_result_producer(&reject) {
+                        rebuilt.push(
+                            naga::Statement::If {
+                                condition,
+                                accept,
+                                reject,
+                            },
+                            span,
+                        );
+                    } else {
+                        splice_block(&mut rebuilt, accept);
+                        changed += 1;
+                    }
                 }
                 Some(naga::Literal::Bool(false)) => {
-                    splice_block(&mut rebuilt, reject);
-                    changed += 1;
+                    // `accept` is dropped: same orphaned-result hazard.
+                    if block_has_result_producer(&accept) {
+                        rebuilt.push(
+                            naga::Statement::If {
+                                condition,
+                                accept,
+                                reject,
+                            },
+                            span,
+                        );
+                    } else {
+                        splice_block(&mut rebuilt, reject);
+                        changed += 1;
+                    }
                 }
                 _ => {
                     // After recursion, if both branches are empty the
@@ -546,21 +605,34 @@ fn eliminate_dead_branches(
             // Switch with constant integer selector
             naga::Statement::Switch { selector, cases } => {
                 if let Some(value) = resolve_switch_value(selector, expressions, const_lits) {
-                    match find_matching_case_index(&cases, value) {
-                        Some(start_idx) if !case_body_has_bare_break(&cases, start_idx) => {
-                            let body = collect_case_body(cases, start_idx);
-                            splice_block(&mut rebuilt, body);
-                            changed += 1;
-                        }
-                        None => {
-                            // No match and no default -> the switch is a no-op.
-                            changed += 1;
-                        }
-                        // Matched case body has a bare Break that targets the
-                        // switch.  Splicing would mis-target it, so keep the
-                        // switch as-is.
-                        Some(_) => {
-                            rebuilt.push(naga::Statement::Switch { selector, cases }, span);
+                    // A constant-selector collapse splices the matched case and
+                    // DROPS the others (or all, on no-match).  Dropping a case
+                    // that produced a statement result orphans that result
+                    // expression - invalid IR that rolls the WHOLE pass back
+                    // every sweep (also discarding unrelated dead_branch work).
+                    // Keep the switch intact when any case body carries a result
+                    // producer, mirroring the `if`-arm guard.  (The degenerate
+                    // sole-`default` splice below drops nothing, so needs no
+                    // guard.)
+                    if cases.iter().any(|c| block_has_result_producer(&c.body)) {
+                        rebuilt.push(naga::Statement::Switch { selector, cases }, span);
+                    } else {
+                        match find_matching_case_index(&cases, value) {
+                            Some(start_idx) if !case_body_has_bare_break(&cases, start_idx) => {
+                                let body = collect_case_body(cases, start_idx);
+                                splice_block(&mut rebuilt, body);
+                                changed += 1;
+                            }
+                            None => {
+                                // No match and no default -> the switch is a no-op.
+                                changed += 1;
+                            }
+                            // Matched case body has a bare Break that targets the
+                            // switch.  Splicing would mis-target it, so keep the
+                            // switch as-is.
+                            Some(_) => {
+                                rebuilt.push(naga::Statement::Switch { selector, cases }, span);
+                            }
                         }
                     }
                 } else {
@@ -1523,7 +1595,29 @@ fn expr_matches_known(
     match known {
         KnownValue::Zero => is_zero_value(expressions, handle, const_lits),
         KnownValue::Literal(lit) => resolve_to_literal(expressions, handle, const_lits)
-            .is_some_and(|resolved| resolved == *lit),
+            .is_some_and(|resolved| literal_bit_eq(&resolved, lit)),
+    }
+}
+
+/// Bit-exact literal equality.  Float variants (`F16`/`F32`/`F64`/
+/// `AbstractFloat`) compare bit patterns, so `+0.0` and `-0.0` - IEEE-equal
+/// but distinct bits - are NOT conflated, and two identical NaN payloads
+/// ARE.  That is exactly the right test for "does storing `a` actually
+/// change a value already known to be `b`": a store is redundant only when
+/// it writes the identical bit pattern.  naga's derived `PartialEq` uses
+/// IEEE `==` (where `+0.0 == -0.0`), which would let the redundant-store
+/// elimination drop a sign-flipping store - a silent miscompile for
+/// sign-of-zero-sensitive ops (`1.0/x`, `sign`, `copysign`, bit reinterpret).
+/// Int/bool variants are already bit-exact under `==`, and mismatched
+/// variants are correctly unequal.
+fn literal_bit_eq(a: &naga::Literal, b: &naga::Literal) -> bool {
+    use naga::Literal as L;
+    match (a, b) {
+        (L::F16(x), L::F16(y)) => x.to_bits() == y.to_bits(),
+        (L::F32(x), L::F32(y)) => x.to_bits() == y.to_bits(),
+        (L::F64(x), L::F64(y)) => x.to_bits() == y.to_bits(),
+        (L::AbstractFloat(x), L::AbstractFloat(y)) => x.to_bits() == y.to_bits(),
+        _ => a == b,
     }
 }
 
@@ -1645,6 +1739,54 @@ mod tests {
     }
 
     // If: condition folded to true
+
+    /// Collapsing a constant-selector `switch` whose DROPPED case produced a
+    /// statement result (a non-inlined call) would orphan that result
+    /// expression - invalid IR.  The guard keeps the switch intact instead.
+    /// `run_pass` validates the post-pass module and panics on invalid IR, so
+    /// this test fails if the guard is removed.
+    #[test]
+    fn constant_switch_with_result_producing_dropped_case_stays_valid() {
+        let src = r#"
+fn helper() -> i32 { return 7; }
+@compute @workgroup_size(1)
+fn main() {
+    var x: i32 = 0;
+    switch 1 {
+        case 0: { x = helper(); }
+        default: { x = 5; }
+    }
+    _ = x;
+}
+"#;
+        // Must not panic: the pass leaves valid IR (switch kept, result
+        // expression keeps its producer).
+        let (_changed, module) = run_pass(src);
+        // The switch survives (was NOT collapsed) because case 0 carries a
+        // call result the collapse cannot safely drop.
+        let main = module
+            .entry_points
+            .iter()
+            .find(|e| e.name == "main")
+            .expect("main entry point");
+        fn has_switch(block: &naga::Block) -> bool {
+            block.iter().any(|s| match s {
+                naga::Statement::Switch { .. } => true,
+                naga::Statement::Block(b) => has_switch(b),
+                naga::Statement::If { accept, reject, .. } => {
+                    has_switch(accept) || has_switch(reject)
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => has_switch(body) || has_switch(continuing),
+                _ => false,
+            })
+        }
+        assert!(
+            has_switch(&main.function.body),
+            "switch with a result-producing dropped case must be kept intact"
+        );
+    }
 
     #[test]
     fn eliminates_if_true_accept_branch() {

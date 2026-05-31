@@ -320,6 +320,13 @@ impl<'a> Generator<'a> {
             E::GlobalVariable(h) => self.global_names[h.index()].clone(),
             E::LocalVariable(h) => ctx.local_names[h].clone(),
             E::Access { .. } | E::AccessIndex { .. } => self.emit_lvalue(expr, ctx)?,
+            // A function-argument `ptr<...>` used as the base of an lvalue
+            // access chain (`(*p).field = ..`, `(*p)[i] = ..`) is a pointer
+            // value, not a reference, so it needs the explicit `(*p)` deref;
+            // see `emit_postfix_base` for the value-context counterpart.
+            _ if self.pointer_is_ptr_value(expr, ctx) => {
+                format!("(*{})", self.emit_expr(expr, ctx)?)
+            }
             _ => self.emit_expr(expr, ctx)?,
         })
     }
@@ -384,6 +391,11 @@ impl<'a> Generator<'a> {
             // Select base for the *postfix* context it cannot rule out - bytes
             // that are redundant in this loose position.
             if let Some(base) = self.compose_identity_collapse_base(arg, ctx) {
+                // A pointer-value base collapses to the dereferenced value
+                // `(*p)`, not the bare pointer; see `emit_postfix_base`.
+                if self.pointer_is_ptr_value(base, ctx) {
+                    return Ok(format!("(*{})", self.emit_expr(base, ctx)?));
+                }
                 let s = self.emit_expr(base, ctx)?;
                 // Same template-ambiguity guard as the direct-Binary case
                 // above: a bare leading `<` / `<=` right after a constructor's
@@ -427,15 +439,21 @@ impl<'a> Generator<'a> {
         match &arena[handle] {
             naga::Expression::Splat { value, .. } => Some(*value),
             naga::Expression::Compose { ty, components } => {
-                // Only vector-typed Compose can be elided (not matrix/struct).
-                if !matches!(self.module.types[*ty].inner, naga::TypeInner::Vector { .. }) {
-                    return None;
-                }
-                if compose_is_splat(components, arena) {
-                    Some(components[0])
-                } else {
-                    None
-                }
+                // A real scalar splat has exactly `size` scalar lanes -
+                // `vecN(s, s, .., s)`.  A vector built from SUB-VECTORS
+                // (`vec4(v2, v2)`) can also satisfy `compose_is_splat` when its
+                // parts are identical handles, but then `components[0]` is a
+                // VECTOR, and substituting it into the binary splat-elision
+                // path emits a type-mismatched operand (`v2 * v4`).  Require the
+                // scalar-per-lane shape, mirroring the sibling splat-collapse
+                // guards (`components.len() == size`).
+                let is_splat = matches!(
+                    self.module.types[*ty].inner,
+                    naga::TypeInner::Vector { size, .. }
+                        if components.len() == size as usize
+                            && components.len() > 1
+                ) && compose_is_splat(components, arena);
+                if is_splat { Some(components[0]) } else { None }
             }
             _ => None,
         }
@@ -453,6 +471,17 @@ impl<'a> Generator<'a> {
         base: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
+        // A pointer VALUE (a function-argument `ptr<...>`) does NOT
+        // auto-deref in WGSL, so a postfix `.field` / `.xyz` / `[i]` on it
+        // - or its use as a collapsed identity value - requires an explicit
+        // `(*base)`.  naga's permissive frontend accepts `p.x` on a pointer,
+        // but strict parsers (tint/Dawn/browsers, nagami's target) reject it.
+        // References (globals, locals, access chains rooted in them)
+        // auto-deref and emit bare.  Checked before the cached path because
+        // a function argument renders by name yet still needs the deref.
+        if self.pointer_is_ptr_value(base, ctx) {
+            return Ok(format!("(*{})", self.emit_expr(base, ctx)?));
+        }
         // Named / cached expressions produce a single identifier token;
         // no parentheses needed.
         if ctx.expr_names.contains_key(&base) {
@@ -465,7 +494,14 @@ impl<'a> Generator<'a> {
                 | naga::Expression::Select { .. }
         );
         let s = self.emit_expr(base, ctx)?;
-        if needs_parens {
+        // A base that renders with a leading `*` - a whole-pointee `Load` of a
+        // pointer value (`let _ = (*p)`) inlined into a postfix position, which
+        // emits `*p` via the `E::Load`/`emit_lvalue` deref path - must be
+        // parenthesised: a bare `*p.field` / `*p[i]` parses as `*(p.field)` and
+        // is rejected ("operand of `*` must be a pointer").  Wrap so the deref
+        // binds first: `(*p).field`.  (A let-bound such Load short-circuits via
+        // the cached path above and renders as a bare name, needing no wrap.)
+        if needs_parens || s.starts_with('*') {
             Ok(format!("({s})"))
         } else {
             Ok(s)
@@ -864,6 +900,14 @@ impl<'a> Generator<'a> {
                 if wrap {
                     s.insert(0, '(');
                     s.push(')');
+                }
+                // WGSL reserves `--` and `++`, so a `Negate` over a child that
+                // already renders with a leading `-` (a nested `-(-x)`, or a
+                // negative literal) would lex as a forbidden decrement token.
+                // A single space disambiguates and is one byte cheaper than
+                // wrapping in parens.  (`!`/`~` form no reserved adjacency.)
+                if matches!(op, naga::UnaryOperator::Negate) && !wrap && s.starts_with('-') {
+                    s.insert(0, ' ');
                 }
                 s.insert_str(0, op_str);
                 s

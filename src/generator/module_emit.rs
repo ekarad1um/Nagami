@@ -2381,6 +2381,35 @@ fn global_is_writable(module: &naga::Module, g: naga::Handle<naga::GlobalVariabl
     }
 }
 
+/// `true` when texture global `g` is a STORE-access storage texture, i.e.
+/// a `textureStore`/`textureAtomic` (here or in a callee) can mutate it, so
+/// a prior `textureLoad` of it can go stale.  Sampled textures and
+/// read-only storage textures are immutable resources and never produce a
+/// hazard.  Note: textures live in `AddressSpace::Handle`, for which
+/// [`global_is_writable`] returns `false` - writability for a texture is a
+/// property of its storage *access*, not its address space, so the
+/// `ImageLoad` hazard test MUST route through this helper, not that one.
+///
+/// A `binding_array<texture_storage_*<...>>` global has type
+/// `TypeInner::BindingArray`, not `Image`, so peel one level to its element
+/// type before classifying (WGSL/naga forbid nested binding arrays, so a
+/// single peel suffices).  Without it a `textureLoad(texs[i], ..)` would be
+/// dropped from the hazard set and inlined past a `textureStore` to the same
+/// element - a silent miscompile.
+fn image_is_writable_storage(module: &naga::Module, g: naga::Handle<naga::GlobalVariable>) -> bool {
+    let mut inner = &module.types[module.global_variables[g].ty].inner;
+    if let naga::TypeInner::BindingArray { base, .. } = inner {
+        inner = &module.types[*base].inner;
+    }
+    matches!(
+        inner,
+        naga::TypeInner::Image {
+            class: naga::ImageClass::Storage { access, .. },
+            ..
+        } if access.contains(naga::StorageAccess::STORE)
+    )
+}
+
 /// A write a statement performs, as seen by the load-hazard analysis.
 ///
 /// Every `naga::Statement` variant is classified exhaustively in
@@ -2501,9 +2530,19 @@ fn statement_write_effects(
                 out.push(WriteEffect::Place(p));
             }
         }
-        // Image stores write only textures (resource handles), which are
-        // never reached by a `Load` expression - no alias with any tracked load.
-        S::ImageStore { .. } | S::ImageAtomic { .. } => {}
+        // Image stores/atomics mutate a storage texture.  A buffer `Load`
+        // never reaches a texture, but an `ImageLoad` (registered as a
+        // pending load below) does, so the write must invalidate it.  The
+        // destination is `image`; the stored value / atomic operand is a
+        // read handled by the use-detection path.
+        S::ImageStore { image, .. } | S::ImageAtomic { image, .. } => {
+            match resolve_place(*image, expressions) {
+                Some(p) => out.push(WriteEffect::Place(p)),
+                // An image reached through an unresolved (function-argument)
+                // value could be any texture global; stay conservative.
+                None => out.push(WriteEffect::Globals),
+            }
+        }
         // Subgroup operations exchange already-computed values across lanes via
         // registers; they perform NO memory access and impose no memory
         // ordering, so they cannot stale any load.  (Their argument operands
@@ -2657,26 +2696,61 @@ fn analyze_statement(
             }
             // Then register the loads this Emit introduces.
             for h in range.clone() {
-                if let naga::Expression::Load { pointer } = &expressions[h] {
-                    let place = resolve_place(*pointer, expressions);
-                    let track = match &place {
-                        Some(p) => match p.root {
-                            PlaceRoot::Global(g) => global_is_writable(module, g),
-                            PlaceRoot::Local(_) => true,
-                        },
-                        // Unknown place (function-argument pointer): track it -
-                        // any later write may alias the pointee.
-                        None => true,
-                    };
-                    if track {
-                        pending.insert(
-                            h,
-                            PendingLoad {
-                                place,
-                                written: false,
+                match &expressions[h] {
+                    naga::Expression::Load { pointer } => {
+                        let place = resolve_place(*pointer, expressions);
+                        let track = match &place {
+                            Some(p) => match p.root {
+                                PlaceRoot::Global(g) => global_is_writable(module, g),
+                                PlaceRoot::Local(_) => true,
                             },
-                        );
+                            // Unknown place (function-argument pointer): track it -
+                            // any later write may alias the pointee.
+                            None => true,
+                        };
+                        if track {
+                            pending.insert(
+                                h,
+                                PendingLoad {
+                                    place,
+                                    written: false,
+                                },
+                            );
+                        }
                     }
+                    // `textureLoad` reads a texel; a later `textureStore` /
+                    // `textureAtomic` (or a callee) to the same storage texture
+                    // can stale it, exactly like a buffer `Load`.  Track it so a
+                    // single-use `textureLoad` is bound rather than inlined past
+                    // the write.  Gate on storage-texture writability via
+                    // `image_is_writable_storage` - NOT `global_is_writable`,
+                    // which reports textures (Handle space) as non-writable and
+                    // would silently drop the hazard.
+                    naga::Expression::ImageLoad { image, .. } => {
+                        let place = resolve_place(*image, expressions);
+                        let track = match &place {
+                            Some(p) => match p.root {
+                                PlaceRoot::Global(g) => image_is_writable_storage(module, g),
+                                // A texture is always a Handle-space global,
+                                // never a local; treat a malformed Local root
+                                // conservatively.
+                                PlaceRoot::Local(_) => true,
+                            },
+                            // Texture passed as a value parameter: a callee may
+                            // hold and store to it - track conservatively.
+                            None => true,
+                        };
+                        if track {
+                            pending.insert(
+                                h,
+                                PendingLoad {
+                                    place,
+                                    written: false,
+                                },
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
         }

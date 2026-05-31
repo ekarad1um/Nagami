@@ -678,6 +678,32 @@ fn count_literals_does_not_extract_atomic_int_literal() {
     assert_valid_wgsl(&out);
 }
 
+#[test]
+fn count_literals_does_not_extract_atomic_store_int_literal() {
+    // `atomicStore`'s integer value is type-pinned by `emit_atomic_store`,
+    // bypassing `extracted_literals` exactly like `atomicAdd`, so its
+    // over-count must also be subtracted - else a dead `const` is extracted
+    // that no (typed-form) use site references.
+    let src = r#"
+            @group(0) @binding(0) var<storage, read_write> au: atomic<u32>;
+            fn t1() { atomicStore(&au, 12345678u); }
+            fn t2() { atomicStore(&au, 12345678u); }
+            fn t3() { atomicStore(&au, 12345678u); }
+            @compute @workgroup_size(1)
+            fn main() { t1(); t2(); t3(); }
+        "#;
+    let out = compact(src);
+    assert!(
+        out.contains("12345678"),
+        "literal should still appear in output: {out}"
+    );
+    assert!(
+        !out.contains("=12345678") && !out.contains("= 12345678"),
+        "atomicStore literal should NOT have been extracted into a const decl: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
 // MARK: Deferred variable edge cases
 
 #[test]

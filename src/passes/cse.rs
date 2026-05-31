@@ -417,6 +417,23 @@ fn collect_cse_replacements(
                 let checkpoint = cse_map.checkpoint();
 
                 collect_cse_replacements(body, expressions, cse_map, replacements);
+
+                // Body canonicals must NOT leak into `continuing`: a
+                // `continue` jumps straight to the continuing block,
+                // skipping every body `Emit` lexically after it, so a
+                // canonical emitted past a (conditional) `continue` does
+                // NOT dominate the continuing block.  Redirecting a
+                // continuing-block expression to such a body handle reads
+                // a value the `continue` iteration never produced - a
+                // silent miscompile (naga's loop validator checks
+                // body+continuing flow-insensitively and accepts it).
+                // Roll back to the pre-body (parent-scope only) state,
+                // which always dominates the continuing block.  This
+                // conservatively forgoes legitimate body->continuing CSE
+                // in loops with no `continue`; recovering it would
+                // require proving no `continue` precedes the canonical.
+                cse_map.rollback_to(checkpoint);
+
                 collect_cse_replacements(continuing, expressions, cse_map, replacements);
 
                 cse_map.rollback_to(checkpoint);

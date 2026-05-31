@@ -60,7 +60,16 @@ impl Pass for RenamePass {
             }
 
             for (_, ov) in module.overrides.iter_mut() {
+                // An override with an explicit `@id(N)` is identified to the
+                // host by its numeric id, so its name is free to mangle.  An
+                // `@id`-less override is identified ONLY by its declaration
+                // name - that name is the key in the pipeline `constants`
+                // record - so renaming it silently breaks host pipeline-constant
+                // specialization (the value falls back to the default).  Treat
+                // `@id`-less overrides like preserve-listed names; their names
+                // are reserved in `collect_reserved_names`.
                 if let Some(name) = ov.name.as_deref()
+                    && ov.id.is_some()
                     && !self.preserve.contains(name)
                 {
                     let new_name = next_available_name(&mut counter, &mut used_names);
@@ -218,8 +227,11 @@ fn collect_reserved_names(
             }
         }
         for (_, ov) in module.overrides.iter() {
+            // Reserve preserve-listed overrides AND every `@id`-less override:
+            // the latter keeps its name (the host's pipeline-constant key) and
+            // is not renamed, so no mangled identifier may collide with it.
             if let Some(name) = ov.name.as_deref()
-                && preserve.contains(name)
+                && (preserve.contains(name) || ov.id.is_none())
             {
                 reserved.insert(name.to_string());
             }

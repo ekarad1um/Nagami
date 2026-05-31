@@ -213,8 +213,27 @@ impl<'a> Generator<'a> {
                             | naga::Literal::AbstractInt(_)
                     )
                 }
+                // Mirror `atomic_scalar_for_expr`: a `Store` whose pointer
+                // resolves to `atomic<T>` lowers through `emit_atomic_store`,
+                // forcing an integer literal value to typed form just like an
+                // `Atomic` statement.
+                fn pointer_is_atomic(
+                    pointer: naga::Handle<naga::Expression>,
+                    func_info: &naga::valid::FunctionInfo,
+                    types: &naga::UniqueArena<naga::Type>,
+                ) -> bool {
+                    match func_info[pointer].ty.inner_with(types) {
+                        naga::TypeInner::Atomic(_) => true,
+                        naga::TypeInner::Pointer { base, .. } => {
+                            matches!(types[*base].inner, naga::TypeInner::Atomic(_))
+                        }
+                        _ => false,
+                    }
+                }
                 fn walk_block_for_atomic_lits<F: FnMut(naga::Handle<naga::Expression>)>(
                     block: &naga::Block,
+                    func_info: &naga::valid::FunctionInfo,
+                    types: &naga::UniqueArena<naga::Type>,
                     visit: &mut F,
                 ) {
                     for stmt in block {
@@ -225,27 +244,44 @@ impl<'a> Generator<'a> {
                                 }
                                 visit(*value);
                             }
-                            naga::Statement::Block(b) => walk_block_for_atomic_lits(b, visit),
+                            // `atomicStore(&a, <int lit>)`: same typed-form force
+                            // via `emit_atomic_store`/`emit_expr_for_atomic`.
+                            naga::Statement::Store { pointer, value }
+                                if pointer_is_atomic(*pointer, func_info, types) =>
+                            {
+                                visit(*value);
+                            }
+                            // `ImageAtomic` value (and Exchange compare) route
+                            // through `emit_expr_for_atomic` too.
+                            naga::Statement::ImageAtomic { fun, value, .. } => {
+                                if let naga::AtomicFunction::Exchange { compare: Some(c) } = fun {
+                                    visit(*c);
+                                }
+                                visit(*value);
+                            }
+                            naga::Statement::Block(b) => {
+                                walk_block_for_atomic_lits(b, func_info, types, visit)
+                            }
                             naga::Statement::If { accept, reject, .. } => {
-                                walk_block_for_atomic_lits(accept, visit);
-                                walk_block_for_atomic_lits(reject, visit);
+                                walk_block_for_atomic_lits(accept, func_info, types, visit);
+                                walk_block_for_atomic_lits(reject, func_info, types, visit);
                             }
                             naga::Statement::Switch { cases, .. } => {
                                 for case in cases {
-                                    walk_block_for_atomic_lits(&case.body, visit);
+                                    walk_block_for_atomic_lits(&case.body, func_info, types, visit);
                                 }
                             }
                             naga::Statement::Loop {
                                 body, continuing, ..
                             } => {
-                                walk_block_for_atomic_lits(body, visit);
-                                walk_block_for_atomic_lits(continuing, visit);
+                                walk_block_for_atomic_lits(body, func_info, types, visit);
+                                walk_block_for_atomic_lits(continuing, func_info, types, visit);
                             }
                             _ => {}
                         }
                     }
                 }
-                walk_block_for_atomic_lits(&func.body, &mut |h| {
+                walk_block_for_atomic_lits(&func.body, func_info, &module.types, &mut |h| {
                     if let Some(lit) = literal_lit(h)
                         && is_int_lit(lit)
                     {

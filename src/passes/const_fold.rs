@@ -115,9 +115,11 @@ impl Pass for ConstFoldPass {
             // checks the original count, not whatever it would be
             // mid-loop after partial rewrites.
             let refcounts = count_handle_refs(function);
+            let emit_ranges = build_emit_range_map(&function.body);
             let (folded, simplified) = fold_local_expressions(
                 &mut function.expressions,
                 &refcounts,
+                &emit_ranges,
                 &const_literals,
                 &module.types,
                 &vector_type_cache,
@@ -130,9 +132,11 @@ impl Pass for ConstFoldPass {
         }
         for entry in module.entry_points.iter_mut() {
             let refcounts = count_handle_refs(&entry.function);
+            let emit_ranges = build_emit_range_map(&entry.function.body);
             let (folded, simplified) = fold_local_expressions(
                 &mut entry.function.expressions,
                 &refcounts,
+                &emit_ranges,
                 &const_literals,
                 &module.types,
                 &vector_type_cache,
@@ -172,7 +176,7 @@ fn fold_global_expressions(
         .collect::<Vec<_>>();
     let mut changed = 0usize;
 
-    // O(N) one-time setup for O(1) materialize_vector lookups (E2).
+    // O(N) one-time setup for O(1) materialize_vector lookups.
     let mut literal_cache = build_literal_cache(&module.global_expressions);
 
     // Shared cycle-tracker reused across every global handle (see the
@@ -335,30 +339,105 @@ fn count_handle_refs(function: &naga::Function) -> Vec<u32> {
     counts
 }
 
+/// Map every materialised expression handle to the id of the
+/// `Statement::Emit` range that produces it.  Two handles share an id
+/// IFF the *same* `Emit` statement materialises both - i.e. no
+/// statement of any kind separates them in program order.
+///
+/// The identity / involution folds consult this to decide when an
+/// impure operand (a `Load`) may be relocated to its consumer's `Emit`
+/// slot.  Between two distinct `Emit` ranges there is always a non-`Emit`
+/// statement, and every non-`Emit` statement is either a memory write,
+/// a synchronisation barrier, or a control-flow edge (loop / branch /
+/// terminator) - each of which makes moving a read across it unsound
+/// (a post-write value, a re-execution, or a conditional execution).
+/// So "operand and consumer share one `Emit` range" is exactly
+/// "provably no intervening memory write": the precise store-aware
+/// guard, expressed without re-walking control flow per fold.
+///
+/// Nested blocks continue the same id counter so handles in different
+/// blocks never collide on an id; the map is read-only for the duration
+/// of one fold pass (the body's `Emit` ranges are rebuilt only
+/// afterwards by `rebuild_emit_ranges_after_removal`).
+fn build_emit_range_map(body: &naga::Block) -> HashMap<naga::Handle<naga::Expression>, usize> {
+    fn walk(
+        block: &naga::Block,
+        map: &mut HashMap<naga::Handle<naga::Expression>, usize>,
+        next_id: &mut usize,
+    ) {
+        use naga::Statement as S;
+        for stmt in block.iter() {
+            match stmt {
+                S::Emit(range) => {
+                    let id = *next_id;
+                    *next_id += 1;
+                    for h in range.clone() {
+                        map.insert(h, id);
+                    }
+                }
+                S::Block(inner) => walk(inner, map, next_id),
+                S::If { accept, reject, .. } => {
+                    walk(accept, map, next_id);
+                    walk(reject, map, next_id);
+                }
+                S::Switch { cases, .. } => {
+                    for case in cases {
+                        walk(&case.body, map, next_id);
+                    }
+                }
+                S::Loop {
+                    body, continuing, ..
+                } => {
+                    walk(body, map, next_id);
+                    walk(continuing, map, next_id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut map = HashMap::new();
+    let mut next_id = 0usize;
+    walk(body, &mut map, &mut next_id);
+    map
+}
+
 /// Fold `arena` in place.  Returns two outputs: the set of handles
 /// that must leave their original `Emit` ranges (folded-to-literal
 /// expressions lose their emit requirement) and the number of
 /// simplifications performed, so the caller can roll both into the
 /// module-wide change counter.
 ///
-/// `refcounts` is the per-handle reference count produced by
-/// [`count_handle_refs`].  Used by the identity / involution /
-/// select-collapse gates to allow cloning an impure operand (e.g.
-/// `Load`) when the operand is uniquely referenced by the expression
-/// being folded: the rewrite makes the operand dead, and the caller
-/// then drops it from its `Emit` range so no double-execution occurs.
+/// `refcounts` (from [`count_handle_refs`]) and `emit_ranges` (from
+/// [`build_emit_range_map`]) together gate cloning an impure operand (e.g. a
+/// `Load`) in the identity / involution arms: clone only when the operand is
+/// uniquely referenced by the folding expression AND shares its `Emit` range,
+/// so the operand becomes dead (caller drops its `Emit` entry, no double
+/// execution) and the relocated read never crosses an intervening statement.
+/// The `select`-collapse arm clones pure operands only and consults neither.
 fn fold_local_expressions(
     arena: &mut naga::Arena<naga::Expression>,
     refcounts: &[u32],
+    emit_ranges: &HashMap<naga::Handle<naga::Expression>, usize>,
     const_literals: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
     types: &naga::UniqueArena<naga::Type>,
     vector_type_cache: &HashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>>,
 ) -> (HashSet<naga::Handle<naga::Expression>>, usize) {
+    // Two handles are co-located (no statement, hence no memory write,
+    // between them) when they belong to the same `Emit` range.  Absent
+    // ids default to "not co-located" - sound: it only ever suppresses
+    // an impure-operand relocation.
+    let same_emit_range = |a: naga::Handle<naga::Expression>, b: naga::Handle<naga::Expression>| {
+        emit_ranges
+            .get(&a)
+            .zip(emit_ranges.get(&b))
+            .is_some_and(|(x, y)| x == y)
+    };
     let mut handles = Vec::with_capacity(arena.len());
     handles.extend(arena.iter().map(|(h, _)| h));
     let mut folded = HashSet::new();
 
-    // O(N) one-time setup for O(1) materialize_vector lookups (E2).
+    // O(N) one-time setup for O(1) materialize_vector lookups.
     // The literal cache maps each scalar literal -> smallest handle carrying
     // it.  We keep it in sync as the scalar-fold branch writes new literals
     // into the arena; see `note_literal_in_cache`.
@@ -487,8 +566,16 @@ fn fold_local_expressions(
                 // bump pushing their count to `>= 2`; see that fn's doc.
                 if let Some(other) = check_identity_operand(op, left, right, arena) {
                     let other_pure = is_pure_to_clone(&arena[other]);
-                    let other_uniquely_owned =
-                        !other_pure && refcounts.get(other.index()).copied() == Some(1);
+                    // Relocating an impure operand (a `Load`) onto this
+                    // Binary's `Emit` slot is sound only when the two share
+                    // an `Emit` range: otherwise a statement separates them
+                    // and the relocated read could cross a memory write,
+                    // barrier, or control-flow edge (read-after-write
+                    // reorder).  Refcount uniqueness alone does not protect
+                    // the evaluation *position*; see `build_emit_range_map`.
+                    let other_uniquely_owned = !other_pure
+                        && refcounts.get(other.index()).copied() == Some(1)
+                        && same_emit_range(other, handle);
                     if other_pure || other_uniquely_owned {
                         arena[handle] = arena[other].clone();
                         simplify_count += 1;
@@ -523,9 +610,16 @@ fn fold_local_expressions(
                     let inner_pure = is_pure_to_clone(&arena[inner]);
                     let intermediate_uniquely_owned =
                         refcounts.get(expr.index()).copied() == Some(1);
+                    // Same store-aware guard as the identity arm: the
+                    // relocated inner read must share an `Emit` range with
+                    // this outer Unary (`handle`).  When `inner` and `handle`
+                    // co-locate, the intermediate `expr` - topologically
+                    // between them - necessarily does too, so gating on the
+                    // (inner, handle) pair also covers it.
                     let inner_uniquely_owned = !inner_pure
                         && intermediate_uniquely_owned
-                        && refcounts.get(inner.index()).copied() == Some(1);
+                        && refcounts.get(inner.index()).copied() == Some(1)
+                        && same_emit_range(inner, handle);
                     if inner_pure || inner_uniquely_owned {
                         arena[handle] = arena[inner].clone();
                         simplify_count += 1;
@@ -2424,6 +2518,33 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    /// Test shim for [`fold_local_expressions`].  Unit tests build bare
+    /// expression arenas with no `Function` body, so there are no real
+    /// `Emit` ranges to feed the store-aware relocation guard.  Mapping
+    /// every handle to a single shared range models the safe "all
+    /// co-located, no intervening statement" case, so the guard is a
+    /// no-op and these tests keep exercising the folding logic they
+    /// target.  Tests that specifically need a cross-range (hazardous)
+    /// layout call [`fold_local_expressions`] directly with a custom map.
+    fn fold_local(
+        arena: &mut naga::Arena<naga::Expression>,
+        refcounts: &[u32],
+        const_literals: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
+        types: &naga::UniqueArena<naga::Type>,
+        vector_type_cache: &HashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>>,
+    ) -> (HashSet<naga::Handle<naga::Expression>>, usize) {
+        let ranges: HashMap<naga::Handle<naga::Expression>, usize> =
+            arena.iter().map(|(h, _)| (h, 0usize)).collect();
+        fold_local_expressions(
+            arena,
+            refcounts,
+            &ranges,
+            const_literals,
+            types,
+            vector_type_cache,
+        )
+    }
+
     #[test]
     fn cast_width8_to_matches_wgsl_value_conversion() {
         use naga::Literal as L;
@@ -2577,7 +2698,7 @@ mod tests {
             Default::default(),
         );
 
-        let (changed, _) = fold_local_expressions(
+        let (changed, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -2624,7 +2745,7 @@ mod tests {
             Default::default(),
         );
 
-        let (changed, _) = fold_local_expressions(
+        let (changed, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -2660,7 +2781,7 @@ mod tests {
             Default::default(),
         );
 
-        let (changed, _) = fold_local_expressions(
+        let (changed, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -2706,7 +2827,7 @@ mod tests {
         let mut const_literals = HashMap::new();
         const_literals.insert(constant_handle, naga::Literal::F32(41.0));
 
-        let (changed, _) = fold_local_expressions(
+        let (changed, _) = fold_local(
             &mut arena,
             &[],
             &const_literals,
@@ -2742,7 +2863,7 @@ mod tests {
             Default::default(),
         );
 
-        let (changed, _) = fold_local_expressions(
+        let (changed, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -3699,7 +3820,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (folded, identity) = fold_local_expressions(
+        let (folded, identity) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -3751,7 +3872,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (folded, identity) = fold_local_expressions(
+        let (folded, identity) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -3821,7 +3942,7 @@ fn fs_main() -> @location(0) vec4f {
             "test setup invariant: Load should be referenced only by the Binary"
         );
 
-        let (folded, identity) = fold_local_expressions(
+        let (folded, identity) = fold_local(
             &mut arena,
             &refcounts,
             &HashMap::new(),
@@ -3851,6 +3972,129 @@ fn fs_main() -> @location(0) vec4f {
             matches!(arena[add], naga::Expression::Load { .. }),
             "expected Load after fold, got {:?}",
             arena[add]
+        );
+    }
+
+    /// Store-aware guard: a uniquely-owned impure operand whose
+    /// `Emit` range differs from the folding Binary's MUST NOT be
+    /// relocated - a statement (here, a hazardous memory write) sits
+    /// between them, so cloning the Load into the Binary's later slot
+    /// would move the read past the write (read-after-write reorder).
+    /// Models `let a = data[0]; data[0] = ...; data[1] = 0u + a;`.
+    #[test]
+    fn identity_fold_unique_impure_cross_emit_range_blocked() {
+        let mut arena = naga::Arena::new();
+        let zero = arena.append(
+            naga::Expression::Literal(naga::Literal::U32(0)),
+            Default::default(),
+        );
+        let ptr = arena.append(naga::Expression::FunctionArgument(0), Default::default());
+        let load = arena.append(naga::Expression::Load { pointer: ptr }, Default::default());
+        let add = arena.append(
+            naga::Expression::Binary {
+                op: naga::BinaryOperator::Add,
+                left: zero,
+                right: load,
+            },
+            Default::default(),
+        );
+
+        let mut refcounts = vec![0u32; arena.len()];
+        for (_, expr) in arena.iter() {
+            crate::passes::expr_util::visit_expression_children(expr, |child| {
+                refcounts[child.index()] += 1;
+            });
+        }
+        assert_eq!(refcounts[load.index()], 1, "Load is uniquely owned");
+
+        // Load lives in Emit range 0, the Binary in range 1: a
+        // statement (a store) separates them.  The guard must refuse.
+        let ranges: HashMap<naga::Handle<naga::Expression>, usize> =
+            HashMap::from([(load, 0usize), (add, 1usize)]);
+        let (folded, identity) = fold_local_expressions(
+            &mut arena,
+            &refcounts,
+            &ranges,
+            &HashMap::new(),
+            &naga::UniqueArena::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            identity, 0,
+            "cross-`Emit`-range impure operand must NOT be relocated by the identity fold"
+        );
+        assert!(
+            !folded.contains(&load),
+            "the original Load must stay in its Emit range (not dropped)"
+        );
+        assert!(
+            matches!(arena[add], naga::Expression::Binary { .. }),
+            "the Binary must be left untouched, got {:?}",
+            arena[add]
+        );
+    }
+
+    /// Involution arm of the store-aware guard: the same rule applies to
+    /// `-(-x)` - a uniquely-owned impure inner operand whose `Emit` range
+    /// differs from the outer Unary's must NOT be relocated.  Models
+    /// `let a = data[0]; data[0] = ...; data[1] = -(-a);`.
+    #[test]
+    fn involution_fold_unique_impure_cross_emit_range_blocked() {
+        let mut arena = naga::Arena::new();
+        let ptr = arena.append(naga::Expression::FunctionArgument(0), Default::default());
+        let load = arena.append(naga::Expression::Load { pointer: ptr }, Default::default());
+        let neg1 = arena.append(
+            naga::Expression::Unary {
+                op: naga::UnaryOperator::Negate,
+                expr: load,
+            },
+            Default::default(),
+        );
+        let neg2 = arena.append(
+            naga::Expression::Unary {
+                op: naga::UnaryOperator::Negate,
+                expr: neg1,
+            },
+            Default::default(),
+        );
+
+        let mut refcounts = vec![0u32; arena.len()];
+        for (_, expr) in arena.iter() {
+            crate::passes::expr_util::visit_expression_children(expr, |child| {
+                refcounts[child.index()] += 1;
+            });
+        }
+        assert_eq!(refcounts[load.index()], 1, "inner Load is uniquely owned");
+        assert_eq!(
+            refcounts[neg1.index()],
+            1,
+            "intermediate Unary is uniquely owned"
+        );
+
+        // Inner Load in Emit range 0; the outer Unary in range 1 - a
+        // statement (a store) separates them, so relocation is unsound.
+        let ranges: HashMap<naga::Handle<naga::Expression>, usize> =
+            HashMap::from([(load, 0usize), (neg1, 1usize), (neg2, 1usize)]);
+        let (folded, identity) = fold_local_expressions(
+            &mut arena,
+            &refcounts,
+            &ranges,
+            &HashMap::new(),
+            &naga::UniqueArena::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            identity, 0,
+            "cross-`Emit`-range impure inner must NOT be relocated by the involution fold"
+        );
+        assert!(
+            !folded.contains(&load),
+            "the inner Load must stay in its Emit range"
+        );
+        assert!(
+            matches!(arena[neg2], naga::Expression::Unary { .. }),
+            "the outer Unary must be left untouched, got {:?}",
+            arena[neg2]
         );
     }
 
@@ -3897,7 +4141,7 @@ fn fs_main() -> @location(0) vec4f {
             "test setup invariant: Load is referenced by Unary and Binary"
         );
 
-        let (folded, identity) = fold_local_expressions(
+        let (folded, identity) = fold_local(
             &mut arena,
             &refcounts,
             &HashMap::new(),
@@ -3952,7 +4196,7 @@ fn fs_main() -> @location(0) vec4f {
         // then 1 * 41.0 is identity-eliminated.
         let mut const_literals = HashMap::new();
         const_literals.insert(constant_handle, naga::Literal::F32(41.0));
-        let (folded, _) = fold_local_expressions(
+        let (folded, _) = fold_local(
             &mut arena,
             &[],
             &const_literals,
@@ -3981,7 +4225,7 @@ fn fs_main() -> @location(0) vec4f {
             },
             Default::default(),
         );
-        let (folded2, identity2) = fold_local_expressions(
+        let (folded2, identity2) = fold_local(
             &mut arena2,
             &[],
             &HashMap::new(),
@@ -4275,7 +4519,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (folded, count) = fold_local_expressions(
+        let (folded, count) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4311,7 +4555,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (folded, count) = fold_local_expressions(
+        let (folded, count) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4346,7 +4590,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (folded, count) = fold_local_expressions(
+        let (folded, count) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4381,7 +4625,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, count) = fold_local_expressions(
+        let (_, count) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4431,7 +4675,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (folded, count) = fold_local_expressions(
+        let (folded, count) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4473,7 +4717,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (folded, count) = fold_local_expressions(
+        let (folded, count) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4507,7 +4751,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (folded, _) = fold_local_expressions(
+        let (folded, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4554,7 +4798,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (folded, count) = fold_local_expressions(
+        let (folded, count) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4591,7 +4835,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (folded, count) = fold_local_expressions(
+        let (folded, count) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4635,7 +4879,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_folded, _count) = fold_local_expressions(
+        let (_folded, _count) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4672,7 +4916,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_folded, count) = fold_local_expressions(
+        let (_folded, count) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4710,7 +4954,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_folded, count) = fold_local_expressions(
+        let (_folded, count) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4807,7 +5051,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4885,7 +5129,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4942,7 +5186,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -4988,7 +5232,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (folded, _) = fold_local_expressions(
+        let (folded, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -5048,7 +5292,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -5110,7 +5354,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -5134,7 +5378,7 @@ fn fs_main() -> @location(0) vec4f {
         );
         let zero = arena.append(naga::Expression::ZeroValue(vec3f_ty), Default::default());
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -5183,7 +5427,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -5238,7 +5482,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -5323,7 +5567,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -5389,7 +5633,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -5462,7 +5706,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -5517,7 +5761,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -5584,7 +5828,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -5658,7 +5902,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (_, _) = fold_local_expressions(
+        let (_, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -5684,7 +5928,7 @@ fn fs_main() -> @location(0) vec4f {
         let mut arena = naga::Arena::new();
         let zv = arena.append(naga::Expression::ZeroValue(f32_ty), Default::default());
 
-        let (folded, _) = fold_local_expressions(
+        let (folded, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -6691,7 +6935,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (changed, _) = fold_local_expressions(
+        let (changed, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -6727,7 +6971,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (changed, _) = fold_local_expressions(
+        let (changed, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -6767,7 +7011,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (changed, _) = fold_local_expressions(
+        let (changed, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -6793,7 +7037,7 @@ fn fs_main() -> @location(0) vec4f {
             Default::default(),
         );
 
-        let (changed, _) = fold_local_expressions(
+        let (changed, _) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),
@@ -7013,7 +7257,7 @@ fn main(@location(0) v: vec3<f32>) -> @location(0) vec4<f32> {
             Default::default(),
         );
 
-        let (_folded, simplified) = fold_local_expressions(
+        let (_folded, simplified) = fold_local(
             &mut arena,
             &[],
             &HashMap::new(),

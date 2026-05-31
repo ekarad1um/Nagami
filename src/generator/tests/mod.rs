@@ -12,6 +12,7 @@ mod helpers;
 mod compound_assign;
 mod dead_code;
 mod expressions;
+mod miscompile_regressions;
 mod names_and_output;
 mod pipeline;
 mod precedence;
