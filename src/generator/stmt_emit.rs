@@ -1762,11 +1762,12 @@ impl<'a> Generator<'a> {
         self.emit_expr(other, ctx)
     }
 
-    /// Emit `let <name> = <call>;` when there is a result handle, or
-    /// just `<call>;` otherwise.  When the result is used exactly once
-    /// and no side-effecting statements can intervene (pre-computed in
-    /// `inlineable_calls`), the call text is stored directly so it can
-    /// be emitted inline at the use site, avoiding the `let` binding.
+    /// Emit a call statement, binding its result only when something reads
+    /// it.  A never-read result (`ref_count == 0`) or no result handle emits
+    /// the bare `<call>;`, preserving the side effect without a dead `let`.
+    /// A single-use result in an inline-safe zone (pre-computed in
+    /// `inlineable_calls`) stashes the call text for inline emission at the
+    /// use site.  Otherwise it binds `let <name> = <call>;`.
     fn emit_call_result(
         &mut self,
         call: &str,
@@ -1774,6 +1775,18 @@ impl<'a> Generator<'a> {
         ctx: &mut FunctionCtx<'a, '_>,
     ) {
         if let Some(handle) = result {
+            // Result is never read (e.g. `atomicAdd(&ctr, 5u);` written as a
+            // bare statement): emit the bare call so its side effect still
+            // runs, but drop the dead `let` binding.  An impure call cannot be
+            // DCE'd, so without this it would always carry an unread `let`.
+            // A Call/Atomic result is bumped only by genuine uses (statement
+            // operands or children of live expressions), never by its own
+            // producing statement, so ref_count 0 means the result is unread.
+            if ctx.ref_counts[handle.index()] == 0 {
+                self.out.push_str(call);
+                self.out.push(';');
+                return;
+            }
             if ctx.inlineable_calls.contains(&handle) {
                 // Single-use in a safe zone: store call text for inline emission
                 ctx.expr_names.insert(handle, call.to_string());

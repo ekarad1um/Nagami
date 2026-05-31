@@ -92,6 +92,17 @@ fn cast_width8_to_literal(src: naga::Literal, target: naga::Scalar) -> Option<na
     }
 }
 
+/// `true` when `l` is a width-8 numeric literal (`f64`/`u64`/`i64`) - the
+/// only literals [`Generator::try_emit_const_width8_vector_narrow`] folds.
+/// `literal_extract`'s narrow-fold pre-pass mirrors this set, so both must
+/// agree or the extraction count diverges from what the emitter prints.
+pub(super) fn literal_is_width8(l: naga::Literal) -> bool {
+    matches!(
+        l,
+        naga::Literal::F64(_) | naga::Literal::U64(_) | naga::Literal::I64(_)
+    )
+}
+
 /// `true` when the literal numerically equals zero.  Both `+0.0` and
 /// `-0.0` qualify (IEEE `==` already conflates them; F16 is matched on
 /// bit-pattern because its `==` is not available without `half`).
@@ -1711,25 +1722,19 @@ impl<'a> Generator<'a> {
         target_inner: &naga::TypeInner,
         ctx: &FunctionCtx<'a, '_>,
     ) -> Result<Option<String>, Error> {
-        let width8 = |l: naga::Literal| {
-            matches!(
-                l,
-                naga::Literal::F64(_) | naga::Literal::U64(_) | naga::Literal::I64(_)
-            )
-        };
         let lits: Vec<naga::Literal> = match &ctx.func.expressions[operand] {
             naga::Expression::Compose { components, .. } => {
                 let mut out = Vec::with_capacity(components.len());
                 for &c in components.iter() {
                     match ctx.func.expressions[c] {
-                        naga::Expression::Literal(l) if width8(l) => out.push(l),
+                        naga::Expression::Literal(l) if literal_is_width8(l) => out.push(l),
                         _ => return Ok(None),
                     }
                 }
                 out
             }
             naga::Expression::Splat { size, value } => match ctx.func.expressions[*value] {
-                naga::Expression::Literal(l) if width8(l) => vec![l; *size as usize],
+                naga::Expression::Literal(l) if literal_is_width8(l) => vec![l; *size as usize],
                 _ => return Ok(None),
             },
             _ => return Ok(None),

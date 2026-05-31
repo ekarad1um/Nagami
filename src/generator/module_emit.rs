@@ -14,6 +14,27 @@ use crate::error::Error;
 use super::core::{FunctionCtx, FunctionExprInfo, Generator};
 use super::syntax::{address_space, binding_attrs, storage_access};
 
+/// `true` when a constant's init expression already renders its own
+/// concrete WGSL type, making a `const NAME: T = ...` annotation
+/// redundant: `Compose` / `ZeroValue` / `Splat` constructors spell their
+/// type, and a concrete (non-abstract) `Literal` carries a typed suffix.
+/// Single source of truth: `generate_constants` omits the annotation in
+/// exactly these cases, and `count_type_handle_refs` counts a constant's
+/// declared type only when it is NOT one of these, so both must read the
+/// same predicate or the alias-savings estimate diverges from the output.
+pub(super) fn const_init_has_explicit_type(init: &naga::Expression) -> bool {
+    match init {
+        naga::Expression::Compose { .. }
+        | naga::Expression::ZeroValue(_)
+        | naga::Expression::Splat { .. } => true,
+        naga::Expression::Literal(lit) => !matches!(
+            lit,
+            naga::Literal::AbstractInt(_) | naga::Literal::AbstractFloat(_)
+        ),
+        _ => false,
+    }
+}
+
 impl<'a> Generator<'a> {
     /// Run the entire module emission pipeline end to end.  Populates
     /// the `ref_count_cache`, extracts shared literals, decides which
@@ -56,7 +77,7 @@ impl<'a> Generator<'a> {
         }
 
         // Emit `enable` directives for features the module actually uses.
-        // Mirrors naga's own enable detection (back/wgsl/writer.rs).
+        // Mirrors naga's own `enable`-directive detection.
         let mut needs_f16 = false;
         let mut needs_dual_source_blending = false;
         let mut needs_clip_distances = false;
@@ -132,6 +153,41 @@ impl<'a> Generator<'a> {
                 }
                 _ => {}
             }
+        }
+
+        // The type scan above (mirroring naga's own writer) misses an f16
+        // value that registers no standalone f16 `TypeInner`: a bare `F16`
+        // literal or a value-changing cast to f16 that survives folding
+        // because it has a runtime operand (e.g. `f32(f16(x) + 2h)` keeps a
+        // `2h` literal and an `f16(..)` cast).  Both still emit text that
+        // requires `enable f16;`, so also scan every expression arena -
+        // const-init, per-function, and entry-point - for them; omitting
+        // the directive there yields invalid, naga-rejected output.
+        if !needs_f16 {
+            let scan = |arena: &naga::Arena<naga::Expression>| {
+                arena.iter().any(|(_, e)| {
+                    matches!(
+                        e,
+                        naga::Expression::Literal(naga::Literal::F16(_))
+                            | naga::Expression::As {
+                                kind: naga::ScalarKind::Float,
+                                convert: Some(2),
+                                ..
+                            }
+                    )
+                })
+            };
+            needs_f16 = scan(&self.module.global_expressions)
+                || self
+                    .module
+                    .functions
+                    .iter()
+                    .any(|(_, f)| scan(&f.expressions))
+                || self
+                    .module
+                    .entry_points
+                    .iter()
+                    .any(|ep| scan(&ep.function.expressions));
         }
 
         // Scan entry point bindings (arguments and result).
@@ -351,23 +407,11 @@ impl<'a> Generator<'a> {
             }
             self.out.push_str("const ");
             self.out.push_str(&self.constant_names[h.index()]);
-            // Omit the type annotation when the RHS text already carries a
-            // concrete type: Compose/ZeroValue have explicit type constructors,
-            // and concrete Literal values now carry typed suffixes (e.g. `f`,
-            // `i`, `u`).  We keep the annotation for abstract literals,
-            // Constant refs, and arithmetic where the textual type may differ.
+            // Keep the `: T` annotation only when the init text does not
+            // already spell its own type (abstract literals, `Constant`
+            // refs, arithmetic); see `const_init_has_explicit_type`.
             let init_expr = &self.module.global_expressions[c.init];
-            let rhs_has_explicit_type = match init_expr {
-                naga::Expression::Compose { .. }
-                | naga::Expression::ZeroValue(_)
-                | naga::Expression::Splat { .. } => true,
-                naga::Expression::Literal(lit) => !matches!(
-                    lit,
-                    naga::Literal::AbstractInt(_) | naga::Literal::AbstractFloat(_)
-                ),
-                _ => false,
-            };
-            if !rhs_has_explicit_type {
+            if !const_init_has_explicit_type(init_expr) {
                 self.push_colon();
                 self.out.push_str(&self.type_ref(c.ty)?);
             }

@@ -218,25 +218,35 @@ fn run_cli() -> Result<bool, Box<dyn std::error::Error>> {
         .into());
     }
 
-    // Refuse `--in-place` against an input that is also the preamble:
-    // we would parse the user's source, strip the preamble's
-    // declarations from the output, then overwrite the same file with
-    // the preamble-less result - silently deleting the user's
-    // preamble decls.  Comparing canonicalised paths catches both
-    // exact matches and resolves `./foo.wgsl` vs `foo.wgsl`.
-    if args.in_place
-        && let Some(preamble_path) = args.preamble.as_ref()
-    {
-        let same = std::fs::canonicalize(&args.input).ok().and_then(|input_c| {
-            std::fs::canonicalize(preamble_path)
-                .ok()
-                .map(|pre_c| input_c == pre_c)
-        });
-        if same == Some(true) {
+    // Refuse to write the minified output over the `--preamble` file: the
+    // run strips the preamble's declarations from the output, so writing
+    // that result back would silently and permanently destroy them.  The
+    // destructive destination is reachable via `--in-place` (writes the
+    // input) and `-o <path>` (writes that path); `-o -` (stdout) has no
+    // file.  `same_file` matches by inode where possible, so symlinks and
+    // hard links to the preamble are caught too, and a not-yet-created
+    // output (or a missing preamble, which errors at the read below) never
+    // false-matches.
+    if let Some(preamble_path) = args.preamble.as_ref() {
+        let dest: Option<&Path> = if args.in_place {
+            Some(args.input.as_path())
+        } else {
+            args.output.as_deref().filter(|p| !is_dash_path(p))
+        };
+        if let Some(dest) = dest
+            && same_file(dest, preamble_path)
+        {
+            let flag = if args.in_place {
+                "--in-place"
+            } else {
+                "-o <output>"
+            };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "--in-place cannot be used when --preamble points at the same file as input \
-                 (the rewrite would delete the preamble's declarations)",
+                format!(
+                    "{flag} cannot write to the same file as --preamble \
+                     (the rewrite would delete the preamble's declarations)"
+                ),
             )
             .into());
         }
@@ -319,6 +329,30 @@ fn run_cli() -> Result<bool, Box<dyn std::error::Error>> {
 /// `true` when `path` is the single dash convention for stdin/stdout.
 fn is_dash_path(path: &Path) -> bool {
     path == Path::new("-")
+}
+
+/// `true` when both paths resolve to the same on-disk file.  On Unix this
+/// compares device + inode, which also equates hard links (distinct names
+/// sharing one inode that path canonicalization cannot match); elsewhere it
+/// falls back to canonical-path comparison.  Returns `false` when either
+/// path is missing or cannot be stat-ed, so a not-yet-created output is
+/// never mistaken for an existing file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(a), fs::metadata(b)) {
+            (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (fs::canonicalize(a), fs::canonicalize(b)) {
+            (Ok(ca), Ok(cb)) => ca == cb,
+            _ => false,
+        }
+    }
 }
 
 /// Read input from `path` or from stdin when `path` is the `-` sentinel.

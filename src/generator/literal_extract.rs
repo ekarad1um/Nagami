@@ -17,7 +17,7 @@ use crate::name_gen::next_name_unique;
 
 use super::core::Generator;
 use super::expr_emit::{
-    ConcretizedAbstract, compose_is_splat, concretize_abstract_literal_via_inner,
+    ConcretizedAbstract, compose_is_splat, concretize_abstract_literal_via_inner, literal_is_width8,
 };
 use super::syntax::{LiteralExtractKey, literal_extract_key};
 
@@ -92,12 +92,10 @@ impl<'a> Generator<'a> {
                 // Per-handle adjustment: how many bumps to *subtract* from
                 // `ref_counts[h]` to obtain the true textual emission count.
                 //
-                // Initially zero; populated by walking live arena expressions
-                // below.  The two expression-level bypasses are fused into a
-                // single iteration because their predicates are disjoint
-                // (`Compose` vs. `Select` vs. `Derivative`) and the per-iteration
-                // overhead (`live[]` index, dispatch on `expr` kind) dominates
-                // the inner work for typical shader sizes.
+                // Initially zero; the expression-level bypasses are fused into
+                // a single iteration since their predicates are disjoint and the
+                // per-iteration overhead (`live[]` index, `expr`-kind dispatch)
+                // dominates the inner work for typical shader sizes.
                 //
                 // Bypass paths (kept in sync with the emission code):
                 //   * `emit_expr::Compose` splat-collapse - vector composes whose
@@ -105,6 +103,11 @@ impl<'a> Generator<'a> {
                 //     `components[0]`; literal-like components in slots `>= 1`
                 //     contribute zero textual emissions despite each bumping
                 //     `ref_counts` once via `count_expr_children`.
+                //   * `emit_expr` width-8 vector-narrowing fold - a vector
+                //     `As{convert:Some}` over an inlined width-8 Compose/Splat
+                //     emits every component as CONVERTED text, so the original
+                //     width-8 literals contribute zero emissions (the
+                //     `narrow_folded` pre-pass below identifies these operands).
                 //   * `emit_expr::Select` - direct `Expression::Literal` operands
                 //     (NOT unnamed `Constant` operands) in the `reject`/`accept`
                 //     slots are forced to typed form so both branches share a
@@ -131,12 +134,70 @@ impl<'a> Generator<'a> {
                 // into a net-larger output.
                 let mut bare_handle: Vec<bool> = vec![false; func.expressions.len()];
 
+                // Operands of the const width-8 vector-narrowing fold (see
+                // `try_emit_const_width8_vector_narrow`): an `As { convert:
+                // Some, .. }` whose single-use, inlined operand is a vector
+                // `Compose` / `Splat` of width-8 (F64/U64/I64) literals.  That
+                // fold emits each component's CONVERTED text directly and never
+                // consults `extracted_literals`, so the width-8 literals it
+                // covers contribute zero substitutable emissions under their
+                // original suffixed key.  Counting them (as `count_expr_children`
+                // does) would extract a `const` no use site references - a
+                // strictly net-larger output.  Collected first so the
+                // Compose/Splat arms below can drop those slots wholesale
+                // (and skip the splat-collapse accounting, which models the
+                // operand's normal emission path that the fold replaces).
+                // `ref_counts == 1` mirrors the emitter's "operand not
+                // let-bound" gate; over-matching only forgoes an extraction
+                // (never a miscompile), so the approximation is safe.
+                let is_width8_lit = |h: naga::Handle<naga::Expression>| matches!(func.expressions[h], naga::Expression::Literal(l) if literal_is_width8(l));
+                let mut narrow_folded: std::collections::HashSet<naga::Handle<naga::Expression>> =
+                    std::collections::HashSet::new();
+                for (ch, expr) in func.expressions.iter() {
+                    if !live[ch.index()] {
+                        continue;
+                    }
+                    let naga::Expression::As {
+                        expr: src,
+                        convert: Some(_),
+                        ..
+                    } = expr
+                    else {
+                        continue;
+                    };
+                    if ref_counts.get(src.index()).copied() != Some(1) {
+                        continue;
+                    }
+                    let folds = match &func.expressions[*src] {
+                        naga::Expression::Compose { ty, components } => {
+                            matches!(module.types[*ty].inner, naga::TypeInner::Vector { .. })
+                                && components.iter().all(|&c| is_width8_lit(c))
+                        }
+                        naga::Expression::Splat { value, .. } => is_width8_lit(*value),
+                        _ => false,
+                    };
+                    if folds {
+                        narrow_folded.insert(*src);
+                    }
+                }
+
                 for (ch, expr) in func.expressions.iter() {
                     if !live[ch.index()] {
                         continue;
                     }
                     match expr {
                         naga::Expression::Compose { ty, components } => {
+                            // Consumed by a width-8 narrowing fold: every slot is
+                            // emitted as converted text under a different key, so
+                            // drop all per-slot bumps and skip the splat logic.
+                            // `narrow_folded` guarantees every component is a
+                            // width-8 `Literal`, so no `literal_lit` filter needed.
+                            if narrow_folded.contains(&ch) {
+                                for &comp in components.iter() {
+                                    adjust[comp.index()] += 1;
+                                }
+                                continue;
+                            }
                             // Every Compose slot (vector / matrix / array /
                             // struct) is emitted bare via `emit_constructor_arg`,
                             // so mark each literal-like component as having a bare
@@ -190,7 +251,15 @@ impl<'a> Generator<'a> {
                         // A Splat's scalar value is emitted bare inside the
                         // vector constructor it expands to.
                         naga::Expression::Splat { value, .. } if literal_lit(*value).is_some() => {
-                            bare_handle[value.index()] = true;
+                            // Consumed by a width-8 narrowing fold: the value is
+                            // emitted once as converted text, never under its
+                            // original key, so drop the bump `count_expr_children`
+                            // added for this Splat's single value reference.
+                            if narrow_folded.contains(&ch) {
+                                adjust[value.index()] += 1;
+                            } else {
+                                bare_handle[value.index()] = true;
+                            }
                         }
                         _ => {}
                     }
@@ -396,7 +465,9 @@ impl<'a> Generator<'a> {
                         continue;
                     }
                     let Some(lit) = literal_lit(h) else { continue };
-                    // Subtract over-count from splat-collapsed Composes.
+                    // Subtract the over-count accumulated in `adjust` (splat
+                    // collapse, width-8 narrow fold, atomic int-literal and
+                    // deferred/switch typed-form forcing).
                     // `adjust[h]` cannot exceed `refs[h]` (it counts a strict
                     // subset of the bumps that produced `refs[h]`), but we
                     // saturate defensively.

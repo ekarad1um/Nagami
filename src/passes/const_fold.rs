@@ -2561,7 +2561,7 @@ mod tests {
             width: 8,
         };
 
-        // --- f64 source: round-to-nearest (f32), CLAMP-then-truncate (int) ---
+        // f64 source: round-to-nearest (f32), CLAMP-then-truncate (int)
         assert_eq!(
             cast_width8_to(L::F64(0.5), naga::Scalar::F32),
             Some(L::F32(0.5))
@@ -2599,7 +2599,7 @@ mod tests {
         assert_eq!(cast_width8_to(L::F64(0.5), f16), None);
         assert_eq!(cast_width8_to(L::F64(0.5), f64t), None);
 
-        // --- u64 source: WRAP (low 32 bits / mod 2^32), NOT clamp ---
+        // u64 source: WRAP (low 32 bits / mod 2^32), NOT clamp
         assert_eq!(
             cast_width8_to(L::U64(107), naga::Scalar::U32),
             Some(L::U32(107))
@@ -2625,7 +2625,7 @@ mod tests {
             Some(L::Bool(true))
         );
 
-        // --- i64 source: WRAP; `i64(-1) -> u32` is 4294967295, not 0 ---
+        // i64 source: WRAP; `i64(-1) -> u32` is 4294967295, not 0
         assert_eq!(
             cast_width8_to(L::I64(-1), naga::Scalar::U32),
             Some(L::U32(u32::MAX))

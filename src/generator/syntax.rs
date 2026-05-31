@@ -855,11 +855,17 @@ pub(super) fn address_space(space: naga::AddressSpace) -> &'static str {
         naga::AddressSpace::Storage { .. } => "storage",
         naga::AddressSpace::RayPayload => "ray_payload",
         naga::AddressSpace::IncomingRayPayload => "incoming_ray_payload",
-        // naga-internal address spaces with no WGSL equivalent; map to
-        // "private" as a safe fallback.
-        naga::AddressSpace::Handle
-        | naga::AddressSpace::Immediate
-        | naga::AddressSpace::TaskPayload => "private",
+        // naga's WGSL front-end spells push-constant / immediate-data space
+        // `immediate` (it rejects `push_constant`); rendering it as `private`
+        // would silently swap the host-supplied data source for zero-init
+        // per-invocation memory - a miscompile.
+        naga::AddressSpace::Immediate => "immediate",
+        // No surface-WGSL `var<...>` form: reaching this arm for a global var
+        // would silently emit `var<private>`.  Safe ONLY because `Handle` is
+        // intercepted upstream (emits a bare `var`) and a `TaskPayload` global
+        // fails naga validation before emission; the `private` text is an
+        // arbitrary placeholder for that unreachable case, not a semantic pick.
+        naga::AddressSpace::Handle | naga::AddressSpace::TaskPayload => "private",
     }
 }
 

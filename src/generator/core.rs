@@ -241,9 +241,21 @@ fn count_type_handle_refs(
         }
     }
 
-    // Constants (only live ones).
+    // Count a live constant's declared type only when the `: <type>`
+    // annotation is actually emitted, i.e. when the init text does NOT
+    // already spell its own type (see `const_init_has_explicit_type`).
+    // Otherwise the type is double-counted - here AND in the Compose /
+    // ZeroValue global-expression walk below - inflating the alias-savings
+    // estimate enough to introduce a net-larger alias.  Two known, safe
+    // imprecisions remain (both only ever forgo a borderline alias, never
+    // enlarge output): a `Splat`-init const under-counts because the
+    // global-expr walk does not tally `Splat`, and an unnamed constant
+    // (which `generate_constants` skips entirely) is still counted here.
     for (h, c) in module.constants.iter() {
-        if live_constants.contains(&h) {
+        if !live_constants.contains(&h) {
+            continue;
+        }
+        if !super::module_emit::const_init_has_explicit_type(&module.global_expressions[c.init]) {
             inc(c.ty);
         }
     }
@@ -372,13 +384,9 @@ fn compute_live_constants(
     live
 }
 
-/// Recursively collect `Constant` references inside a global expression tree.
-///
-/// Covers all expression variants that can appear in `module.global_expressions`
-/// and may contain child expression handles.
-/// Walk a global-expression sub-tree, pushing every referenced
-/// constant into `out`.  Recursive to mirror the composite structure
-/// of `Compose`, `Splat`, `Swizzle`, and their relatives.
+/// Recursively collect `Constant` references inside a global-expression
+/// tree, covering every `global_expressions` variant that can hold child
+/// expression handles (`Compose`, `Splat`, `Swizzle`, and relatives).
 fn collect_const_refs_in_global_expr(
     expr_h: naga::Handle<naga::Expression>,
     module: &naga::Module,
@@ -861,26 +869,14 @@ impl<'a> Generator<'a> {
             tok_for_sep,
             indent_unit,
         ) = if options.beautify {
-            // Pre-compute single indent unit from a 32-byte static
-            // buffer.  Indentation past 32 is silently clamped; the
-            // upper bound covers every realistic style (most callers
-            // use 2 or 4 spaces).  Switching to a dynamic allocation
-            // would force `indent_unit: &'static str` on the Generator
-            // to become an owned `String`, rippling through every
-            // emission helper that captures the slice - the perf cost
-            // of those allocations is not worth the rare case of
-            // `indent > 32`.  If the slice is too short for the
-            // requested indent, debug-assert so misconfigurations are
-            // caught in tests rather than producing under-indented
-            // output silently in release.
-            const SPACES: &str = "                                ";
-            debug_assert!(
-                (options.indent as usize) <= SPACES.len(),
-                "indent={} exceeds the {}-byte static buffer; output will be silently clamped",
-                options.indent,
-                SPACES.len(),
-            );
-            let unit = &SPACES[..(options.indent as usize).min(SPACES.len())];
+            // The buffer spans the full `u8` range, so any `options.indent`
+            // (a `u8`, hence <= 255 < 256) yields an in-bounds all-ASCII
+            // slice, honoured exactly and never clamped.  A `&'static str`
+            // slice keeps `indent_unit` borrow-free; a dynamic `String`
+            // would ripple through every emission helper that captures it.
+            static SPACES: [u8; 256] = [b' '; 256];
+            let unit = std::str::from_utf8(&SPACES[..options.indent as usize])
+                .expect("ASCII spaces are valid UTF-8");
             (
                 ", ",
                 " = ",

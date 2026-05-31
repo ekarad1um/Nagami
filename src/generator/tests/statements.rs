@@ -1049,6 +1049,35 @@ fn impure_call_as_store_rhs_inlines_adjacently() {
     assert_valid_wgsl(&out);
 }
 
+/// An impure call / atomic whose result is NEVER read (a bare
+/// `atomicAdd(&ctr, n);` statement) must emit the bare call - its side effect
+/// still runs - and NOT a dead `let x = ...;` binding.  An impure call cannot
+/// be DCE'd, so the unread binding would otherwise survive forever.
+#[test]
+fn discarded_impure_call_result_drops_dead_let() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> ctr: atomic<u32>;
+        @compute @workgroup_size(1) fn main() {
+            atomicAdd(&ctr, 5u);
+            atomicAdd(&ctr, 3u);
+        }
+    "#;
+    // mangle off (compact): the source name `ctr` survives, so match it.
+    let out = compact(src);
+    assert_eq!(
+        out.matches("atomicAdd(&ctr,").count(),
+        2,
+        "both atomic calls should be emitted: {out}"
+    );
+    // Target only the dead-binding form (immune to unrelated `let`s, unlike
+    // the broad `!contains("let ")` the sibling test warns against).
+    assert!(
+        !out.contains("=atomicAdd"),
+        "an unread impure-call result must not bind `let <name>=atomicAdd(...)`: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
 /// An impure call used once inside an expression whose every OTHER operand is
 /// memory-free (here literals) inlines: the call is the statement's sole memory
 /// access, so nothing can be reordered across its side effect regardless of

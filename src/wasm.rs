@@ -69,14 +69,11 @@ fn get_f64(obj: &JsValue, key: &str) -> Result<Option<f64>, JsError> {
     }
 }
 
-/// Read `obj[key]` as an array of strings.  Returns `Ok(None)` when
-/// the field is missing or not an array (callers default to "no
-/// override"), `Err` when the array contains a non-string element so
-/// the caller cannot silently misinterpret bad input.  Previously the
-/// helper dropped non-string entries silently, which let
-/// `preserveSymbols: ["main", 42]` slip through as just `["main"]` -
-/// the caller's preserve-list then lacked an entry the user thought
-/// they had set, producing surprising renames.
+/// Read `obj[key]` as an array of strings.  Returns `Ok(None)` only when
+/// the field is absent (callers default to "no override"); returns `Err`
+/// when it is present but not an array, or is an array with a non-string
+/// element, so a malformed value is never silently misinterpreted (e.g.
+/// `preserveSymbols: ["main", 42]` errors rather than dropping `42`).
 fn get_string_array(obj: &JsValue, key: &str) -> Result<Option<Vec<String>>, JsError> {
     let Some(val) = get_opt(obj, key) else {
         return Ok(None);
@@ -150,6 +147,10 @@ fn require_usize(v: f64, key: &str) -> Result<usize, JsError> {
 /// `field_path` is used in error messages to point the caller at the
 /// offending slot (e.g. `"floatPrecision.f32"`).
 fn parse_precision_mode(val: &JsValue, field_path: &str) -> Result<PrecisionMode, JsError> {
+    // Shared across the two "wrong type" diagnostics below so the accepted
+    // forms cannot drift apart.
+    const EXPECTED: &str =
+        "\"full\", a number, or an object with decimalPlaces / significantFigures";
     if val.is_undefined() || val.is_null() {
         return Ok(PrecisionMode::Full);
     }
@@ -164,6 +165,18 @@ fn parse_precision_mode(val: &JsValue, field_path: &str) -> Result<PrecisionMode
     if let Some(n) = val.as_f64() {
         let p = require_u8(n, field_path)?;
         return Ok(PrecisionMode::DecimalPlaces(p));
+    }
+    // `Array.isArray(x)` implies `typeof x === "object"`, so a JS array
+    // would otherwise reach the `is_object()` branch, match no
+    // decimalPlaces/significantFigures key, and be silently coerced to
+    // `PrecisionMode::Full` - hiding a malformed slot.  Reject genuine
+    // arrays explicitly (covers both `floatPrecision: [..]` and per-type
+    // `{ f32: [..] }`, since each slot funnels through this fn).  Typed
+    // arrays are not `Array.isArray` and still hit the object path.
+    if js_sys::Array::is_array(val) {
+        return Err(JsError::new(&format!(
+            "{field_path} must be {EXPECTED} (received an array)"
+        )));
     }
     if val.is_object() {
         let dp = get_f64(val, "decimalPlaces")?;
@@ -186,9 +199,7 @@ fn parse_precision_mode(val: &JsValue, field_path: &str) -> Result<PrecisionMode
             (None, None) => Ok(PrecisionMode::Full),
         };
     }
-    Err(JsError::new(&format!(
-        "{field_path} must be \"full\", a number, or an object with decimalPlaces / significantFigures"
-    )))
+    Err(JsError::new(&format!("{field_path} must be {EXPECTED}")))
 }
 
 /// Decode the `floatPrecision` field into a [`FloatPrecision`].  The JS

@@ -223,3 +223,43 @@ fn inlined_pointee_load_postfix_base_is_parenthesized() {
         "output looks like the verbose naga fallback (lost minification): {out}"
     );
 }
+
+/// A `var<immediate>` (push-constant / immediate-data) global must keep its
+/// address space.  Emitting `var<private>` instead (a per-invocation,
+/// zero-initialised mutable with a different data source) is a silent
+/// miscompile: the shader reads default-initialised memory rather than the
+/// host-supplied immediate data.  Guards against `address_space` mapping
+/// `AddressSpace::Immediate` to the `"private"` fallback.
+#[test]
+fn immediate_address_space_is_preserved() {
+    let src = "var<immediate> pc: vec4<f32>;\
+        @fragment fn main() -> @location(0) vec4<f32> { return pc; }";
+    let out = minify(src);
+    assert!(
+        out.contains("var<immediate>"),
+        "var<immediate> must be preserved, not rewritten to another space: {out}"
+    );
+    assert!(
+        !out.contains("var<private>"),
+        "var<immediate> must not become var<private> (changes the data source): {out}"
+    );
+}
+
+/// An f16 value that survives only as a bare literal inside a conversion
+/// (`f32(1.0h + 2.0h)` folds to `f32(3h)`) still requires `enable f16;` in
+/// the output.  The directive scan must catch f16 *literals* / casts, not
+/// just registered f16 *types*; otherwise the emitted text is rejected by
+/// naga ("the `f16` enable extension is not enabled") and the whole run
+/// fails.  `minify` re-parses + validates, so a missing directive panics here.
+#[test]
+fn enable_f16_emitted_for_surviving_f16_literal_in_conversion() {
+    // No explicit `enable f16;`: detection must inject it on input AND the
+    // emitter must re-assert it on output for the folded `f32(3h)`.
+    let src = "@fragment fn main() -> @location(0) vec4<f32> { \
+        let x = 1.0h + 2.0h; return vec4<f32>(f32(x), 0.0, 0.0, 1.0); }";
+    let out = minify(src);
+    assert!(
+        out.contains("enable f16;"),
+        "output uses an f16 literal but dropped `enable f16;`: {out}"
+    );
+}

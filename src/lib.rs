@@ -82,12 +82,11 @@ fn preprocess_source_for_naga(source: &str) -> String {
         stripped.push('\n');
     }
 
-    // Corpus shaders frequently use f16 constructs without declaring
-    // `enable f16;`.  Inject the directive when absent so the shader
-    // remains parseable.  Both detection helpers ignore comments and
-    // match whole tokens, so identifiers like `myf16var` or an
-    // existing `enable   f16;` with extra whitespace do not fool the
-    // check.
+    // Shaders often use f16 without an explicit `enable f16;`; inject it
+    // when absent so naga can parse them.  `references_f16_token` matches
+    // whole tokens on comment-stripped text (so `myf16var`/`mesh` never
+    // trigger), and `has_enable_f16_directive` tolerates arbitrary
+    // whitespace in an existing `enable   f16;` so it is not injected twice.
     if references_f16_token(&stripped) && !has_enable_f16_directive(&stripped) {
         let mut with_f16 = String::with_capacity(stripped.len() + 12);
         with_f16.push_str("enable f16;\n");
@@ -206,23 +205,84 @@ fn strip_wgsl_comments(source: &str) -> String {
     String::from_utf8(out).expect("comment stripping preserves UTF-8")
 }
 
-/// `true` when `source` references the bare `f16` token in code
-/// (outside comments and not as part of a longer identifier).
+/// `true` when an identifier token names a 16-bit-float type: the scalar
+/// `f16`, or a predeclared half-precision vector / matrix alias
+/// (`vec2h`..`vec4h`, `mat2x2h`..`mat4x4h`).  Every one of these requires
+/// `enable f16;` yet only `f16` itself contains the substring "f16".
+fn is_f16_type_token(tok: &[u8]) -> bool {
+    matches!(
+        tok,
+        b"f16"
+            | b"vec2h"
+            | b"vec3h"
+            | b"vec4h"
+            | b"mat2x2h"
+            | b"mat2x3h"
+            | b"mat2x4h"
+            | b"mat3x2h"
+            | b"mat3x3h"
+            | b"mat3x4h"
+            | b"mat4x2h"
+            | b"mat4x3h"
+            | b"mat4x4h"
+    )
+}
+
+/// `true` when `source` uses any construct that requires `enable f16;`:
+/// the `f16` keyword, a predeclared half-precision type alias
+/// (`vec2h`/.../`mat4x4h`), or a numeric literal carrying the `h`
+/// f16 suffix (`1.0h`, `0h`, `1.5e2h`, `0x1p2h`).  Scans the
+/// comment-stripped text token by token so a longer identifier
+/// (`myf16var`, `mesh`) and a comment never trigger a false match.
+///
+/// A spurious positive is harmless: naga tolerates a redundant
+/// `enable f16;`, and the emitter drops the directive from the output
+/// whenever the final module uses no f16 - so detection errs broad.
 fn references_f16_token(source: &str) -> bool {
     let cleaned = strip_wgsl_comments(source);
     let bytes = cleaned.as_bytes();
-    let needle = b"f16";
+    let len = bytes.len();
     let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if &bytes[i..i + needle.len()] == needle {
-            let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
-            let after_idx = i + needle.len();
-            let after_ok = after_idx >= bytes.len() || !is_ident_char(bytes[after_idx]);
-            if before_ok && after_ok {
+    while i < len {
+        let b = bytes[i];
+        if is_ident_char(b) && !b.is_ascii_digit() {
+            // Identifier / keyword token: letters, digits, `_`, not
+            // leading with a digit.  Match the whole token so a longer
+            // identifier that merely contains `f16`/`...h` is excluded.
+            let start = i;
+            while i < len && is_ident_char(bytes[i]) {
+                i += 1;
+            }
+            if is_f16_type_token(&bytes[start..i]) {
                 return true;
             }
+        } else if b.is_ascii_digit() || (b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit())
+        {
+            // Numeric literal: consume mantissa, hex digits, the
+            // `e`/`E`/`p`/`P` exponent (with its optional sign), and the
+            // trailing type-suffix letters.  A literal whose suffix is
+            // `h` is an f16 value; any letters inside belong to the
+            // literal, so only the final byte can be that suffix.
+            let start = i;
+            i += 1;
+            while i < len {
+                let c = bytes[i];
+                // A `+`/`-` continues the literal only as an exponent sign
+                // (right after `e`/`E`/`p`/`P`); otherwise it ends the token.
+                let part_of_literal = c.is_ascii_alphanumeric()
+                    || c == b'.'
+                    || ((c == b'+' || c == b'-') && matches!(bytes[i - 1] | 0x20, b'e' | b'p'));
+                if !part_of_literal {
+                    break;
+                }
+                i += 1;
+            }
+            if bytes[i - 1] == b'h' && i - start >= 2 {
+                return true;
+            }
+        } else {
+            i += 1;
         }
-        i += 1;
     }
     false
 }
@@ -1665,6 +1725,28 @@ mod tests {
         assert!(references_f16_token("var x: f16 = 1.0h;"));
         assert!(references_f16_token("let v = vec3<f16>(0h);"));
         assert!(references_f16_token("fn f() -> f16 { return 0h; }"));
+    }
+
+    #[test]
+    fn references_f16_token_detects_aliases_and_suffix() {
+        // Predeclared half-precision aliases (no `f16` substring).
+        assert!(references_f16_token("var v: vec2h = vec2h(1.0h, 2.0h);"));
+        assert!(references_f16_token("let v = vec3h(0h);"));
+        assert!(references_f16_token("var m: mat4x4h;"));
+        assert!(references_f16_token("let m = mat2x3h();"));
+        // `h` float-literal suffix in its various spellings, no alias/keyword.
+        assert!(references_f16_token("let x = 1.0h + 2.0h;"));
+        assert!(references_f16_token("let x = 0h;"));
+        assert!(references_f16_token("let x = 1.5e2h;"));
+        assert!(references_f16_token("let x = 1.0e-3h;"));
+        assert!(references_f16_token("let x = 0x1p2h;"));
+        // Negatives: longer identifiers, other float suffixes, plain ints.
+        assert!(!references_f16_token("var width: f32; var height: f32;"));
+        assert!(!references_f16_token("let mesh = 1.0;"));
+        assert!(!references_f16_token("var vec2hh: i32;"));
+        assert!(!references_f16_token("let x = 1.0f + 2u + 3;"));
+        assert!(!references_f16_token("let x = 1.0e-3;"));
+        assert!(!references_f16_token("fn vec2h_helper() {}"));
     }
 
     #[test]
