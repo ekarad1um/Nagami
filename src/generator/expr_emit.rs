@@ -374,6 +374,35 @@ impl<'a> Generator<'a> {
                 let s = self.emit_expr_uncached(arg, ctx)?;
                 return Ok(format!("({s})"));
             }
+            // An identity-swizzle `Compose` (`vecN(b.0,..,b.N-1)`) collapses to
+            // its bare base `b`.  A constructor argument is a complete,
+            // comma-delimited expression with nothing appended, so the base
+            // needs no parentheses here even when it is an operator expression
+            // (`mat3x3(l*m, ..)`, not `mat3x3((l*m), ..)`).  Emitting it through
+            // the general path would route the collapse through
+            // `emit_postfix_base`, which conservatively wraps a Binary/Unary/
+            // Select base for the *postfix* context it cannot rule out - bytes
+            // that are redundant in this loose position.
+            if let Some(base) = self.compose_identity_collapse_base(arg, ctx) {
+                let s = self.emit_expr(base, ctx)?;
+                // Same template-ambiguity guard as the direct-Binary case
+                // above: a bare leading `<` / `<=` right after a constructor's
+                // `(` can be mis-scanned as a template list.  If the collapsed
+                // base is itself an (uncached) `Less`/`LessEqual` comparison,
+                // wrap it.  Other operator bases (`*`, `+`, ...) stay bare.
+                if !ctx.expr_names.contains_key(&base)
+                    && matches!(
+                        ctx.func.expressions[base],
+                        naga::Expression::Binary {
+                            op: naga::BinaryOperator::Less | naga::BinaryOperator::LessEqual,
+                            ..
+                        }
+                    )
+                {
+                    return Ok(format!("({s})"));
+                }
+                return Ok(s);
+            }
         }
         self.emit_expr(arg, ctx)
     }
@@ -607,7 +636,27 @@ impl<'a> Generator<'a> {
             E::FunctionArgument(i) => ctx.argument_names[*i as usize].clone(),
             E::GlobalVariable(h) => self.global_names[h.index()].clone(),
             E::LocalVariable(h) => ctx.local_names[h].clone(),
-            E::Load { pointer } => self.emit_lvalue(*pointer, ctx)?,
+            E::Load { pointer } => {
+                // Reading an atomic requires the `atomicLoad` builtin: a bare
+                // atomic identifier is non-portable - naga lowers `atomicLoad(&p)`
+                // and a direct read to the SAME `Load`, so it accepts either, but
+                // the WGSL spec and strict consumers (tint/Dawn) reject reading
+                // `atomic<T>` directly.  Mirror `emit_atomic_store` exactly.
+                if self.atomic_scalar_for_expr(*pointer, ctx).is_some() {
+                    if self.pointer_is_ptr_value(*pointer, ctx) {
+                        // Already a `ptr<>` value (a pointer parameter): emit it
+                        // BY VALUE - `emit_lvalue` would deref it to `*p`, giving
+                        // `atomicLoad(*p)`.  (Latent today: naga rejects atomic
+                        // pointer parameters, so this branch is unreachable - kept
+                        // correct and consistent with `emit_atomic_store`.)
+                        format!("atomicLoad({})", self.emit_expr(*pointer, ctx)?)
+                    } else {
+                        format!("atomicLoad(&{})", self.emit_lvalue(*pointer, ctx)?)
+                    }
+                } else {
+                    self.emit_lvalue(*pointer, ctx)?
+                }
+            }
             E::ImageSample {
                 image,
                 sampler,
@@ -1941,6 +1990,55 @@ impl<'a> Generator<'a> {
         None
     }
 
+    /// If `expr` is an uncached vector `Compose` that
+    /// [`try_compose_as_full_swizzle`] would reduce to its *bare* base (the
+    /// identity case `vecN(b.0, .., b.N-1)` -> `b`), return that base handle;
+    /// otherwise `None`.
+    ///
+    /// Callers in a *loose* position (a comma-delimited constructor/call
+    /// argument, where nothing is appended to the result) use this to emit the
+    /// base directly via `emit_expr`, skipping the `emit_postfix_base` wrap
+    /// that the general collapse path applies for the tight postfix context it
+    /// cannot rule out.  Mirrors the identity branch of
+    /// `try_compose_as_full_swizzle` exactly so the two never disagree.
+    fn compose_identity_collapse_base(
+        &self,
+        expr: naga::Handle<naga::Expression>,
+        ctx: &FunctionCtx<'a, '_>,
+    ) -> Option<naga::Handle<naga::Expression>> {
+        if ctx.expr_names.contains_key(&expr) {
+            return None;
+        }
+        let naga::Expression::Compose { ty, components } = &ctx.func.expressions[expr] else {
+            return None;
+        };
+        if !matches!(self.module.types[*ty].inner, naga::TypeInner::Vector { .. }) {
+            return None;
+        }
+        if components.len() < 2 || components.len() > 4 {
+            return None;
+        }
+        let mut common_base: Option<naga::Handle<naga::Expression>> = None;
+        let mut pattern: Vec<u32> = Vec::with_capacity(components.len());
+        for &comp in components.iter() {
+            let (base, idx) = self.swizzle_component(comp, ctx)?;
+            match common_base {
+                None => common_base = Some(base),
+                Some(b) if b == base => {}
+                _ => return None,
+            }
+            pattern.push(idx);
+        }
+        let base = common_base.unwrap();
+        // Identity: pattern is [0,1,..,N-1] over a same-size source vector.
+        let src_n = self.vector_size_of(base, ctx)?;
+        if pattern.len() == src_n && pattern.iter().enumerate().all(|(i, &idx)| idx == i as u32) {
+            Some(base)
+        } else {
+            None
+        }
+    }
+
     /// Try to emit a vector Compose entirely as a bare swizzle expression,
     /// eliminating the type constructor.
     ///
@@ -1980,11 +2078,18 @@ impl<'a> Generator<'a> {
             && pattern.len() == src_n
             && pattern.iter().enumerate().all(|(i, &idx)| idx == i as u32)
         {
-            return Ok(Some(self.emit_expr(base, ctx)?));
+            // Collapsing to the bare base: route through the postfix-aware
+            // path so an uncached Binary/Unary/Select base keeps the parens
+            // its consuming context needs (the substituted text stands in
+            // for the whole Compose node, whose own shape no longer signals
+            // "this is an operator expression" to the parent).
+            return Ok(Some(self.emit_postfix_base(base, ctx)?));
         }
 
-        // Emit as `base.xyzw`
-        let mut s = self.emit_expr(base, ctx)?;
+        // Emit as `base.xyzw`.  The base carries a `.swizzle` suffix, so it
+        // must be parenthesised when it is a Binary/Unary/Select - otherwise
+        // `(a-b).yx` degrades to `a-b.yx`, which parses as `a-(b.yx)`.
+        let mut s = self.emit_postfix_base(base, ctx)?;
         s.push('.');
         for &idx in &pattern {
             s.push(Self::SWIZZLE_LETTERS[idx as usize]);
@@ -2049,7 +2154,9 @@ impl<'a> Generator<'a> {
             first = false;
             match group {
                 ComposeGroup::Swizzle { base, indices } => {
-                    s.push_str(&self.emit_expr(*base, ctx)?);
+                    // Postfix-aware: a Binary/Unary/Select base before the
+                    // `.swizzle` suffix must be parenthesised (`(a-b).xy`).
+                    s.push_str(&self.emit_postfix_base(*base, ctx)?);
                     s.push('.');
                     for &idx in indices {
                         s.push(Self::SWIZZLE_LETTERS[idx as usize]);
@@ -2312,22 +2419,26 @@ fn child_needs_parens(
 
     // Bitwise operators (`&`/`|`/`^`) require `unary_expression` on
     // both sides per WGSL's grammar (https://www.w3.org/TR/WGSL/#operator-precedence-associativity)
-    // so a bare additive child like `a^b-1u` is grammatically ill-formed
-    // even when precedence alone would group it correctly.
-    // Wrap such children unconditionally for strict-parser compatibility;
-    // naga's own parser is permissive but downstream consumers need not be.
+    // so ANY binary child (e.g. `a^b-1u`, `a&b*c`, `a|b<<c`) is
+    // grammatically ill-formed even when precedence alone would group it
+    // correctly.  naga's own parser is permissive, but the strict
+    // recursive-descent parsers nagami targets (Tint/Dawn/browsers) reject
+    // it, and naga round-trips the malformed text so no fallback fires.
+    // The one exception is the grammar's left-recursion
+    // (`binary_and_expression '&' unary_expression`): a *left* child that
+    // uses the *same* bitwise operator is legal unparenthesised, so keep it
+    // bare to avoid needless parens on `a&b&c`.
     if matches!(
         parent_op,
         naga::BinaryOperator::And
             | naga::BinaryOperator::ExclusiveOr
             | naga::BinaryOperator::InclusiveOr
-    ) && let Some(op) = child_op
-        && matches!(
-            op,
-            naga::BinaryOperator::Add | naga::BinaryOperator::Subtract
-        )
-    {
-        return true;
+    ) {
+        return match child_op {
+            Some(op) => is_right || op != parent_op,
+            // Unary / atom children already satisfy `unary_expression`.
+            None => false,
+        };
     }
 
     // WGSL shift operators require `unary_expression` on both sides.

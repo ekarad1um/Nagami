@@ -841,8 +841,11 @@ pub(super) fn type_ref_from_handle(
 
 // MARK: Attribute and qualifier rendering
 
-/// Map a [`naga::AddressSpace`] to its WGSL keyword.  `Function`
-/// returns the empty string because WGSL leaves `var<function>` implicit.
+/// Map a [`naga::AddressSpace`] to its WGSL keyword.  `Function` returns
+/// `"function"` (not the empty string): the keyword is mandatory wherever a
+/// `ptr<function, T>` type is rendered.  (A `var<function>` *declaration*
+/// leaves the space implicit, but that path emits no qualifier via this
+/// helper.)
 pub(super) fn address_space(space: naga::AddressSpace) -> &'static str {
     match space {
         naga::AddressSpace::Function => "function",

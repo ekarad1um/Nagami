@@ -687,10 +687,10 @@ fn call_before_store_not_inlined() {
 
 // MARK: Call result inlining across control flow / side effects
 
-// Regression tests for `find_inlineable_calls` consumption detection.
-// Before the fix, a subsequent side-effecting statement (If, non-local
-// Store, etc.) would clear the pending set even when the single-use
-// Call result had already been consumed by an earlier Emit/Store/Return.
+// Regression tests for `find_inlineable_calls` consumption detection: a
+// side-effecting statement (If, non-local Store, etc.) must not clear a
+// single-use Call result from the pending set once an earlier
+// Emit/Store/Return has already consumed it.
 
 /// Use is in an `if` condition (direct handle reference) AFTER the Call.
 /// The `if` clears `pending`, but consumption must fire first.
@@ -715,8 +715,8 @@ fn call_result_used_before_if_is_inlined() {
     assert_valid_wgsl(&out);
 }
 
-/// Use is in a local Store BEFORE a later `if`.  Variant of the shader that
-/// motivated this fix: `let D = B(..); M = vec3(M.x, M.yz * D); if (...) {}`.
+/// Use is in a local Store BEFORE a later `if`, the pattern
+/// `let D = B(..); M = vec3(M.x, M.yz * D); if (...) {}`.
 #[test]
 fn call_result_used_in_local_store_before_if_is_inlined() {
     let src = r#"
@@ -836,6 +836,275 @@ fn call_result_used_as_next_call_argument_is_inlined() {
     assert!(
         out.contains("g(f(") || out.contains("g(f("),
         "call used as next call's argument should be inlined: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// Negative: a single-use Call whose ARGUMENT loads a local must not be
+/// inlined across a Store to that same local.  Inlining moves the call's
+/// evaluation to the use site, where its `v` argument would re-read the
+/// post-store value - a silent reorder miscompilation.  The call text
+/// (`impure(v)`) is identical either way; only its position relative to
+/// `v = v * 2` reveals the bug, so assert on evaluation order.
+#[test]
+fn call_arg_reading_local_not_inlined_across_store_to_that_local() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32, 8>;
+        fn impure(x: i32) -> i32 { buf[7] = 99; return x + 100; }
+        @compute @workgroup_size(1) fn main() {
+            var v: i32 = i32(buf[6]);
+            let c = impure(v);   // argument loads local `v`
+            v = v * 2;           // store to `v` BEFORE `c` is used
+            buf[0] = c;
+            buf[1] = v;
+        }
+    "#;
+    let out = compact(src);
+    let call_pos = out.find("impure(").expect("call must be emitted");
+    let store_pos = out
+        .find("v*=2")
+        .expect("the `v = v * 2` store must be emitted");
+    assert!(
+        call_pos < store_pos,
+        "call reading `v` must be evaluated BEFORE `v = v*2` (let-bound), not \
+         inlined after it: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// Positive companion: a single-use Call whose argument does NOT read the
+/// stored local stays inlineable across the local Store (the precise check
+/// must not become a blanket disable).
+/// Negative: a single-use Call whose argument is a POINTER to a local
+/// (`g(&d)`) must not be inlined across a Store to that local - the callee
+/// derefs the pointer at call time, so reordering past `d = d*2` reads the
+/// post-store value.  Only the call's position relative to `d*=2` reveals it.
+#[test]
+fn call_pointer_arg_not_inlined_across_store_to_pointee() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32, 4>;
+        fn g(p: ptr<function, i32>) -> i32 { return *p + 100; }
+        @compute @workgroup_size(1) fn main() {
+            var d: i32 = i32(buf[3]);
+            let c = g(&d);
+            d = d * 2;
+            buf[0] = c;
+            buf[1] = d;
+        }
+    "#;
+    let out = compact(src);
+    let call_pos = out.find("g(&").expect("call must be emitted");
+    let store_pos = out.find("d*=2").expect("the `d = d * 2` store must be emitted");
+    assert!(
+        call_pos < store_pos,
+        "call taking `&d` must be evaluated BEFORE `d = d*2` (let-bound), not \
+         inlined after it: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// Negative: a single-use Call whose argument is a POINTER to a local must not
+/// be inlined across a later READ of that local either (not just a Store).  The
+/// callee may WRITE the pointee (`*p = *p + 100`), so inlining the call past a
+/// read like `let t = d;` would move the write after the read - the read would
+/// see the pre-call value.  The Store-interference check alone misses this, so
+/// pointer-to-local calls are made un-inlineable outright.
+#[test]
+fn call_pointer_arg_not_inlined_across_later_read_of_pointee() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32, 4>;
+        fn g(p: ptr<function, i32>) -> i32 { *p = *p + 100; return *p; }
+        @compute @workgroup_size(1) fn main() {
+            var d: i32 = i32(buf[3]);
+            let c = g(&d);
+            let t = d;
+            buf[0] = c;
+            buf[1] = t;
+            buf[2] = t;
+        }
+    "#;
+    let out = compact(src);
+    let call_pos = out.find("g(&").expect("call must be emitted");
+    // `t = d` reads the pointee; in the broken form the call is inlined into
+    // `buf[0] = ...g(&d)` AFTER that read, so the read sees the pre-call value.
+    // The call must be let-bound and emitted BEFORE the first read of `d`.
+    let read_pos = out
+        .find("=d;")
+        .or_else(|| out.find("=d}"))
+        .or_else(|| out.rfind("d;"))
+        .expect("a read of `d` must be emitted");
+    assert!(
+        call_pos < read_pos,
+        "call taking `&d` (callee writes the pointee) must be evaluated BEFORE \
+         the later read of `d`, not inlined past it: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn call_arg_not_reading_stored_local_still_inlines_across_store() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32, 8>;
+        fn pure_add(x: i32) -> i32 { return x + 100; }
+        @compute @workgroup_size(1) fn main() {
+            var v: i32 = i32(buf[6]);
+            let c = pure_add(7);   // argument reads no local
+            v = v * 2;             // store to an UNRELATED local
+            buf[0] = c;
+            buf[1] = v;
+        }
+    "#;
+    let out = compact(src);
+    assert!(
+        !out.contains("let ") && !out.contains("var c"),
+        "call whose arg does not read `v` should still inline across the \
+         `v = v*2` store: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// Negative: a single-use Call whose callee WRITES A GLOBAL must not be
+/// inlined past a later read of that global.  Inlining relocates the call's
+/// write to the use site, where left-to-right operand evaluation reads the
+/// global BEFORE the call writes it - the snapshot `r` would observe the
+/// pre-call value (`g - writes_g()` computes `11 - 1`, not the source's
+/// `777 - 1`).  Purity gating keeps the impure call bound; only its OWN
+/// position (a separate `let`) preserves the order, so assert it is not folded
+/// into the `O[0] = ...` store.
+#[test]
+fn call_writing_global_not_inlined_past_read_of_that_global() {
+    let src = r#"
+        var<private> g: i32;
+        @group(0) @binding(0) var<storage, read_write> O: array<i32>;
+        fn writes_g() -> i32 { g = 777; return 1; }
+        @compute @workgroup_size(1) fn main() {
+            g = 11;
+            let c = writes_g();   // writes g = 777
+            let r = g;            // reads the POST-call g (777)
+            O[0] = r - c;         // 777 - 1; inlining would give 11 - 1
+        }
+    "#;
+    let out = compact(src);
+    let store_rhs = out
+        .split("O[0]")
+        .nth(1)
+        .expect("the O[0] store must be emitted");
+    let rhs = store_rhs.split(';').next().unwrap_or("");
+    assert!(
+        !rhs.contains('('),
+        "an impure (global-writing) call must be bound before the read it would \
+         reorder against, not inlined into the store RHS: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// A pure callee is unaffected by the purity gate: with no intervening write
+/// to anything its argument reads, its single-use result still inlines at the
+/// use site (no surviving `let`), so the gate does not over-bind.
+#[test]
+fn pure_call_still_inlines_at_single_use() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> O: array<i32>;
+        fn dbl(x: i32) -> i32 { return x * 2 + 1; }
+        @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) gi: u32) {
+            let c = dbl(i32(gi));
+            O[0] = c;
+        }
+    "#;
+    let out = compact(src);
+    assert!(
+        !out.contains("let "),
+        "a pure single-use call should inline at its use site: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// An IMPURE call (writes a global) consumed as the WHOLE value of the
+/// immediately-following store to a bare variable is emitted at that store: it
+/// neither moves nor gains a sibling, so it is safe to inline despite being
+/// impure (`outv = atomicAdd(...)`).  The purity gate must NOT over-bind this
+/// common idiom to `let x = ...; outv = x;`.
+#[test]
+fn impure_call_as_store_rhs_inlines_adjacently() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> ctr: atomic<u32>;
+        @group(0) @binding(1) var<storage, read_write> outv: u32;
+        fn bump() -> u32 { return atomicAdd(&ctr, 1u); }
+        @compute @workgroup_size(1) fn main() {
+            outv = bump();
+        }
+    "#;
+    let out = compact(src);
+    // The call must be inlined AS the store RHS (`outv=bump()`), not bound to a
+    // `let` first (`let x=bump();outv=x;`).  (`compact` keeps source names; the
+    // `let` inside `bump` for the atomic result is unrelated, so assert on the
+    // store text directly rather than the absence of any `let`.)
+    assert!(
+        out.contains("outv=bump()"),
+        "an impure call that is the whole RHS of the immediately-following store \
+         to a bare variable should inline at that store, not bind: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// A function whose only writes are through a helper's pointer parameter
+/// applied to its OWN local is PURE (the writes never escape it), so its
+/// single-use call inlines.  The per-parameter effect analysis must see the
+/// `modf_polyfill`-style write to `&w` (a local) as contained, not a side
+/// effect.
+#[test]
+fn fn_using_param_writing_helper_on_own_local_is_pure() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> O: array<i32>;
+        fn modf_like(v: f32, ip: ptr<function, f32>) -> f32 { *ip = trunc(v); return v - *ip; }
+        fn noise(x: f32) -> f32 { var w: f32; let f = modf_like(x, &w); return f * 2.0 + w; }
+        @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) gi: u32) {
+            let c = noise(f32(gi));
+            O[0] = i32(c);
+        }
+    "#;
+    let out = compact(src);
+    // Inlined into the store (`O[0]=i32(noise(...))`), not bound (`let c=noise`).
+    assert!(
+        !out.contains("=noise("),
+        "a function whose helper writes only its OWN local is pure and should \
+         inline at its use: {out}"
+    );
+    assert!(out.contains("noise("), "the call must still be emitted: {out}");
+    assert_valid_wgsl(&out);
+}
+
+/// CRITICAL guard for the per-parameter effect analysis: a function that writes
+/// a GLOBAL by passing `&global` to a pointer-writing helper is IMPURE - the
+/// write escapes - and must NOT be inlined past a later read of that global
+/// (the same reorder hazard as a direct global write).  If the analysis
+/// mistook the helper's param-write for "contained", it would inline the call
+/// and silently miscompile.
+#[test]
+fn fn_writing_global_via_helper_param_not_inlined_past_read() {
+    let src = r#"
+        var<private> G: i32;
+        @group(0) @binding(0) var<storage, read_write> O: array<i32>;
+        @group(0) @binding(1) var<uniform> seed: i32;
+        fn helper(p: ptr<private, i32>) { *p = 777; }
+        fn writes_g() -> i32 { helper(&G); return seed; }   // writes G THROUGH helper's param
+        @compute @workgroup_size(1) fn main() {
+            G = 11;
+            let c = writes_g();   // writes G = 777
+            let r = G;            // reads the POST-call G
+            O[0] = r - c;         // inlining would read pre-call G (reorder)
+        }
+    "#;
+    let out = compact(src);
+    let store_rhs = out
+        .split("O[0]")
+        .nth(1)
+        .expect("the O[0] store must be emitted");
+    let rhs = store_rhs.split(';').next().unwrap_or("");
+    assert!(
+        !rhs.contains('('),
+        "a function writing a global through a helper's pointer param is impure \
+         and must be bound before the read, not inlined: {out}"
     );
     assert_valid_wgsl(&out);
 }
@@ -1231,6 +1500,123 @@ fn sequential_for_loops_independent() {
     assert!(
         for_count == 2,
         "expected 2 for-loops, found {for_count}: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+// MARK: Mutated-load binding
+
+/// The classic swap `let t = x; x = y; y = t;` must keep the snapshot `t`
+/// `let`-bound.  `t` is a `Load` of local `x`; inlining it as the bare name
+/// `x` makes `y = t` read the value AFTER `x = y` overwrote `x`, so both end
+/// up with the old `y` - not a swap.
+#[test]
+fn swap_via_temp_load_must_bind() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32, 4>;
+        @compute @workgroup_size(1) fn main() {
+            var x = buf[0]; var y = buf[1];
+            let t = x; x = y; y = t;
+            buf[0] = x; buf[1] = y;
+        }
+    "#;
+    let out = compact(src);
+    // The broken inlining collapses `x=y;y=t` to `x=y;y=x`, reading the
+    // just-overwritten `x`.  The snapshot must be bound instead.
+    assert!(
+        !out.contains("x=y;y=x"),
+        "swap snapshot must be let-bound, not inlined to the overwritten var: {out}"
+    );
+    assert!(
+        out.contains("x=y;"),
+        "the swap body must still be emitted: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// Array-element swap via two single-use element loads.  `a = buf[0]` is read
+/// AFTER `buf[0]` is overwritten by `buf[0] = b`, so it must be bound; `b`
+/// (used before any write to `buf[1]`) stays inlined.
+#[test]
+fn array_element_swap_load_must_bind() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32, 4>;
+        @compute @workgroup_size(1) fn main() {
+            let a = buf[0]; let b = buf[1];
+            buf[0] = b; buf[1] = a;
+        }
+    "#;
+    let out = compact(src);
+    // Broken: `buf[0]=buf[1];buf[1]=buf[0]` (second store reads the overwritten
+    // buf[0]).  Fixed binds buf[0] first: `let A=buf[0];buf[0]=buf[1];buf[1]=A`.
+    assert!(
+        !out.contains("buf[1]=buf[0]"),
+        "buf[0] read after its store must be let-bound (not re-read post-write): {out}"
+    );
+    assert!(out.contains("let "), "the snapshot load must be let-bound: {out}");
+    assert_valid_wgsl(&out);
+}
+
+/// A load through a pointer PARAMETER (`*p`) whose pointee is overwritten
+/// before the load's use must be bound.  `let s = *p; *p = 5; return s;`
+/// must return the original `*p`, not `5`.  The load's place is unresolved
+/// (function-argument pointer), so the analysis treats it as aliasing every
+/// write - the store through `*p` invalidates the snapshot.
+#[test]
+fn load_through_pointer_param_must_bind_across_write() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        fn f(p: ptr<function, i32>) -> i32 { let s = *p; *p = 5; return s; }
+        @compute @workgroup_size(1) fn main() { var v = buf[0]; buf[1] = f(&v); }
+    "#;
+    let out = compact(src);
+    assert!(
+        !out.contains("return *p"),
+        "the pre-store snapshot of *p must be let-bound, not re-read after `*p = 5`: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// Precision (sound): a function-argument pointer load `*p` reads caller
+/// memory or a global, never a NAMED LOCAL of this function, so an unrelated
+/// store to a local must NOT force it to bind - it stays inlined.
+#[test]
+fn pointer_param_load_inlined_across_unrelated_local_store() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        fn f(p: ptr<function,i32>) -> i32 {
+            let s = *p;
+            var t = 0; t = 7;
+            return s + t;
+        }
+        @compute @workgroup_size(1) fn main() { var v = buf[0]; buf[1] = f(&v); }
+    "#;
+    let out = compact(src);
+    assert!(
+        !out.contains("=*p"),
+        "*p must NOT be let-bound across a store to an unrelated local: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// Soundness companion: a store THROUGH a second pointer parameter could alias
+/// `*p` (the caller may pass the same target to both), so the `*p` snapshot
+/// MUST bind across it.
+#[test]
+fn pointer_param_load_bound_across_store_through_other_param() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        fn g(p: ptr<function,i32>, q: ptr<function,i32>) -> i32 {
+            let s = *p;
+            *q = 99;
+            return s + *q;
+        }
+        @compute @workgroup_size(1) fn main() { var v = buf[0]; var w = buf[1]; buf[2] = g(&v, &w); }
+    "#;
+    let out = compact(src);
+    assert!(
+        !out.contains("return *p"),
+        "*p (possibly aliased by *q) must be snapshotted before `*q = 99`, not re-read after: {out}"
     );
     assert_valid_wgsl(&out);
 }

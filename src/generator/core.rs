@@ -133,6 +133,12 @@ pub(super) struct Generator<'a> {
     /// consumers that need the live mask (e.g. `literal_extract`) do
     /// not re-walk the body.
     pub(super) ref_count_cache: Vec<FunctionExprInfo>,
+    /// Per-`module.functions` purity bitmap (`true` = no side effect
+    /// observable beyond the return value).  Computed once in
+    /// `generate_module` and read by `find_inlineable_calls` to keep impure
+    /// single-use calls bound rather than inlined past a read of what they
+    /// write.  Indexed by `Handle<Function>::index`.
+    pub(super) pure_functions: Vec<bool>,
     // Pre-computed format tokens chosen at construction time from
     // `options.beautify` so the hot path never branches per character.
     tok_separator: &'static str,
@@ -180,6 +186,13 @@ pub(super) struct FunctionCtx<'a, 'm> {
     /// `ref_count == 1`, no side-effecting statement between the
     /// `Call` and its use.
     pub(super) inlineable_calls: std::collections::HashSet<naga::Handle<naga::Expression>>,
+    /// `Load` expressions that MUST be `let`-bound rather than inlined,
+    /// because the place they read is written between the `Load`'s
+    /// `Emit` and a use.  Inlining such a load relocates its memory read
+    /// past the write, yielding the post-write value - a silent
+    /// miscompile (e.g. the classic swap `let t=x;x=y;y=t`).  Computed
+    /// once per function by `module_emit::compute_must_bind_loads`.
+    pub(super) must_bind_loads: std::collections::HashSet<naga::Handle<naga::Expression>>,
     /// Display name for the current function, used to decorate
     /// diagnostic messages.
     pub(super) display_name: String,
@@ -1052,6 +1065,7 @@ impl<'a> Generator<'a> {
             layouter,
             layouter_complete,
             ref_count_cache: Vec::new(),
+            pure_functions: Vec::new(),
             tok_separator,
             tok_assign,
             tok_colon,

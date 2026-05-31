@@ -37,6 +37,12 @@ impl<'a> Generator<'a> {
             )
             .collect();
 
+        // Per-function purity, computed once: `find_inlineable_calls` inlines a
+        // single-use call result only when its callee is pure (no observable
+        // side effect), so an impure call is never relocated past a read of the
+        // memory it writes.
+        self.pure_functions = compute_pure_functions(self.module);
+
         // Pre-scan for repeated literals to extract as shared consts.
         self.scan_and_extract_literals();
 
@@ -834,8 +840,14 @@ impl<'a> Generator<'a> {
     ) -> Result<(), Error> {
         let ref_counts = std::mem::take(&mut self.ref_count_cache[cache_idx].ref_counts);
         let (deferred_vars, dead_vars) = find_deferrable_vars(func);
-        let for_loop_vars = find_for_loop_vars(func);
-        let inlineable_calls = find_inlineable_calls(&func.body, &ref_counts, &func.expressions);
+        // Compute the must-bind loads first: `find_for_loop_vars` consults them
+        // so its counter-var suppression stays in lockstep with
+        // `try_emit_for_loop`'s for-conversion decision (both reject a loop
+        // whose update clause would inline a must-bind load).
+        let must_bind_loads = compute_must_bind_loads(func, self.module);
+        let for_loop_vars = find_for_loop_vars(func, &must_bind_loads);
+        let inlineable_calls =
+            find_inlineable_calls(&func.body, &ref_counts, &func.expressions, &self.pure_functions);
         let mut ctx = FunctionCtx {
             func,
             info: finfo,
@@ -850,6 +862,7 @@ impl<'a> Generator<'a> {
             module_names: module_used_names,
             local_used_names: std::collections::HashSet::new(),
             inlineable_calls,
+            must_bind_loads,
             display_name: displayed_name.to_string(),
         };
 
@@ -1274,6 +1287,14 @@ fn local_var_in_stmt(
             matches!(&expressions[h], E::Load { pointer }
                     if resolve_local_var(*pointer, expressions) == Some(local))
         }),
+        // These statement-level arms resolve only the bare POINTER/place operand
+        // (a write target or taken address).  A local used BY VALUE - an atomic
+        // `value`/`compare`, a call/image/ray operand - is a `Load(LocalVariable)`
+        // expression, which `resolve_local_var` does not see through (it returns
+        // `None` for a `Load`); such reads are already caught by the `Emit` arm
+        // above.  So intentionally omitting value/compare operands here cannot
+        // miss a reference - the same place/value split the sibling
+        // `collect_block_local_refs` relies on.
         S::Store { pointer, .. }
         | S::WorkGroupUniformLoad { pointer, .. }
         | S::Atomic { pointer, .. } => resolve_local_var(*pointer, expressions) == Some(local),
@@ -1304,6 +1325,65 @@ fn local_var_in_stmt(
                 || local_var_in_block(continuing, local, expressions)
         }
         S::Block(inner) => local_var_in_block(inner, local, expressions),
+        // Pointer/operand-bearing statements that the sibling
+        // `collect_block_local_refs` also handles.  Without these arms a
+        // post-loop reference to the absorbed induction local through one of
+        // them would be missed, leaving the for-init-scoped local referenced
+        // out of scope (invalid WGSL).  The genuinely-reachable case for a
+        // function-local is `CooperativeStore`'s `data.pointer`.
+        S::ImageAtomic {
+            image,
+            coordinate,
+            array_index,
+            value,
+            ..
+        } => [Some(*image), Some(*coordinate), *array_index, Some(*value)]
+            .into_iter()
+            .flatten()
+            .any(|e| resolve_local_var(e, expressions) == Some(local)),
+        S::SubgroupBallot {
+            predicate: Some(p), ..
+        } => resolve_local_var(*p, expressions) == Some(local),
+        S::SubgroupGather { mode, argument, .. } => {
+            let hits = |e| resolve_local_var(e, expressions) == Some(local);
+            hits(*argument)
+                || match mode {
+                    naga::GatherMode::Broadcast(h)
+                    | naga::GatherMode::Shuffle(h)
+                    | naga::GatherMode::ShuffleDown(h)
+                    | naga::GatherMode::ShuffleUp(h)
+                    | naga::GatherMode::ShuffleXor(h)
+                    | naga::GatherMode::QuadBroadcast(h) => hits(*h),
+                    naga::GatherMode::BroadcastFirst | naga::GatherMode::QuadSwap(_) => false,
+                }
+        }
+        S::SubgroupCollectiveOperation { argument, .. } => {
+            resolve_local_var(*argument, expressions) == Some(local)
+        }
+        S::RayPipelineFunction(naga::RayPipelineFunction::TraceRay {
+            acceleration_structure,
+            descriptor,
+            payload,
+        }) => [*acceleration_structure, *descriptor, *payload]
+            .into_iter()
+            .any(|e| resolve_local_var(e, expressions) == Some(local)),
+        S::CooperativeStore { target, data } => [*target, data.pointer, data.stride]
+            .into_iter()
+            .any(|e| resolve_local_var(e, expressions) == Some(local)),
+        S::RayQuery { query, fun } => {
+            let hits = |e| resolve_local_var(e, expressions) == Some(local);
+            hits(*query)
+                || match fun {
+                    naga::RayQueryFunction::Initialize {
+                        acceleration_structure,
+                        descriptor,
+                    } => hits(*acceleration_structure) || hits(*descriptor),
+                    naga::RayQueryFunction::GenerateIntersection { hit_t } => hits(*hit_t),
+                    naga::RayQueryFunction::Proceed { .. }
+                    | naga::RayQueryFunction::ConfirmIntersection
+                    | naga::RayQueryFunction::Terminate => false,
+                }
+        }
         _ => false,
     }
 }
@@ -1482,46 +1562,314 @@ fn collect_block_local_refs(
     }
 }
 
-/// Identify Call results that can be safely inlined at their single use site
-/// instead of being bound to a `let` variable.
+/// A single-use `Call` result that may still be inlined into a later use
+/// site, paired with the set of function-locals its arguments load.  The
+/// locals set is what lets a Store to a local invalidate only the pending
+/// calls that actually read that local (see the `Store` arm).
+struct PendingCall {
+    result: naga::Handle<naga::Expression>,
+    reads_locals: std::collections::HashSet<naga::Handle<naga::LocalVariable>>,
+}
+
+/// Collect every function-local whose VALUE a call argument's evaluation
+/// depends on, so a Store to that local cannot be reordered before the
+/// pending call's (re-)evaluation at a later use site.  Two dependency kinds:
 ///
-/// A result is inlineable when:
+/// * a `Load` rooted at a local reads the local's value directly; and
+/// * a POINTER argument rooted at a local (`&d`, `&d.f`, `&arr[i]` -
+///   i.e. a bare `LocalVariable` / `Access` / `AccessIndex` reference) lets
+///   the callee read the pointee at call time, so the result still depends on
+///   the local's value when the call is evaluated.
 ///
-/// 1. its `ref_count` is exactly 1 (used once); and
-/// 2. the statement that consumes the result is reached from the
-///    `Call` without crossing a potentially-interfering
-///    side-effecting statement (another `Call`, non-local `Store`,
-///    `Atomic` / `ImageStore` / `RayQuery` and so on, or any
-///    control-flow boundary: `If` / `Loop` / `Switch` / `Block`).
+/// Missing the pointer case lets a single-use `let c = g(&d); d = ...;` call
+/// be inlined past the store, so the callee derefs the post-store value -
+/// a silent reorder miscompilation.
+fn collect_loaded_locals(
+    expr: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+    out: &mut std::collections::HashSet<naga::Handle<naga::LocalVariable>>,
+    visited: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+) {
+    // A common subexpression shared across argument positions forms a diamond
+    // in the expression DAG; without a visited set it would be re-walked once
+    // per incoming edge (super-linear).  `out` is a set so re-inserting is
+    // harmless - only the traversal cost is saved.
+    if !visited.insert(expr) {
+        return;
+    }
+    match &expressions[expr] {
+        naga::Expression::Load { pointer } => {
+            if let Some(local) = resolve_local_var(*pointer, expressions) {
+                out.insert(local);
+            }
+        }
+        // A reference/pointer to a local (or a component of one).  Whether it
+        // is passed by pointer to a callee or loaded later, the local's value
+        // is observed at evaluation time.
+        naga::Expression::LocalVariable(_)
+        | naga::Expression::Access { .. }
+        | naga::Expression::AccessIndex { .. } => {
+            if let Some(local) = resolve_local_var(expr, expressions) {
+                out.insert(local);
+            }
+        }
+        _ => {}
+    }
+    visit_expr_children(&expressions[expr], |child| {
+        collect_loaded_locals(child, expressions, out, visited)
+    });
+}
+
+/// The root a pointer expression resolves to, for the write-effect analysis.
+enum PointerRoot {
+    /// A function-local variable (a write here is contained in the function).
+    Local,
+    /// A module-scope global (a write here escapes to every caller).
+    Global,
+    /// The function's own pointer PARAMETER `idx` (a write through it lands in
+    /// whatever the caller passed - escapes to the caller).
+    Param(u32),
+    /// An exotic pointer expression - conservatively treated as escaping.
+    Other,
+}
+
+fn resolve_pointer_root(
+    ptr: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+) -> PointerRoot {
+    match &expressions[ptr] {
+        naga::Expression::LocalVariable(_) => PointerRoot::Local,
+        naga::Expression::GlobalVariable(_) => PointerRoot::Global,
+        naga::Expression::FunctionArgument(i) => PointerRoot::Param(*i),
+        naga::Expression::Access { base, .. } | naga::Expression::AccessIndex { base, .. } => {
+            resolve_pointer_root(*base, expressions)
+        }
+        _ => PointerRoot::Other,
+    }
+}
+
+/// The memory effects of a function that are observable OUTSIDE a call to it.
 ///
-/// Stores to local variables are exempt because locals are function-scoped
-/// and cannot interfere with the call's execution.
+/// Writes to the function's own locals never escape; the two ways an effect
+/// reaches the caller are tracked separately so a caller that supplies its OWN
+/// local to a param-writing helper stays pure (the helper's write lands in the
+/// caller's local, not the caller's caller):
+/// * `escapes` - a write to a global, an atomic / image store / barrier / ray /
+///   subgroup / cooperative op / `discard`, or such an effect transitively via
+///   a callee.  Always observable, regardless of how the function is called.
+/// * `written_params` - the function writes through these of its OWN pointer
+///   parameters (directly, or by forwarding them to a param-writing callee).
+///   Whether THAT escapes depends on what each caller passes.
+#[derive(Clone)]
+struct FnEffects {
+    escapes: bool,
+    written_params: std::collections::HashSet<u32>,
+}
+
+/// Fold the effect of one statement into `eff`.  Nested control-flow blocks are
+/// walked by [`accumulate_block_effects`].
+fn accumulate_statement_effects(
+    stmt: &naga::Statement,
+    expressions: &naga::Arena<naga::Expression>,
+    module: &naga::Module,
+    memo: &mut [Option<FnEffects>],
+    eff: &mut FnEffects,
+) {
+    use naga::Statement as S;
+    match stmt {
+        S::Store { pointer, .. } | S::Atomic { pointer, .. } => {
+            match resolve_pointer_root(*pointer, expressions) {
+                PointerRoot::Local => {}
+                PointerRoot::Param(i) => {
+                    eff.written_params.insert(i);
+                }
+                PointerRoot::Global | PointerRoot::Other => eff.escapes = true,
+            }
+        }
+        S::ImageStore { .. } | S::ImageAtomic { .. } | S::CooperativeStore { .. } => {
+            eff.escapes = true
+        }
+        S::ControlBarrier(_) | S::MemoryBarrier(_) | S::WorkGroupUniformLoad { .. } => {
+            eff.escapes = true
+        }
+        S::RayQuery { .. } | S::RayPipelineFunction(_) => eff.escapes = true,
+        S::SubgroupBallot { .. }
+        | S::SubgroupGather { .. }
+        | S::SubgroupCollectiveOperation { .. } => eff.escapes = true,
+        S::Kill => eff.escapes = true,
+        S::Call {
+            function,
+            arguments,
+            ..
+        } => {
+            let callee = function_effects(*function, module, memo);
+            if callee.escapes {
+                eff.escapes = true;
+            }
+            // Each global/local write the callee performs THROUGH a pointer
+            // parameter lands in whatever WE passed for that parameter: our own
+            // local stays contained, our own param forwards the escape outward,
+            // a global (or an exotic pointer) escapes here and now.
+            for &p in &callee.written_params {
+                match arguments.get(p as usize) {
+                    Some(&arg) => match resolve_pointer_root(arg, expressions) {
+                        PointerRoot::Local => {}
+                        PointerRoot::Param(i) => {
+                            eff.written_params.insert(i);
+                        }
+                        PointerRoot::Global | PointerRoot::Other => eff.escapes = true,
+                    },
+                    None => eff.escapes = true, // arity mismatch - stay conservative
+                }
+            }
+        }
+        S::Block(inner) => accumulate_block_effects(inner, expressions, module, memo, eff),
+        S::If { accept, reject, .. } => {
+            accumulate_block_effects(accept, expressions, module, memo, eff);
+            accumulate_block_effects(reject, expressions, module, memo, eff);
+        }
+        S::Switch { cases, .. } => {
+            for case in cases {
+                accumulate_block_effects(&case.body, expressions, module, memo, eff);
+            }
+        }
+        S::Loop {
+            body, continuing, ..
+        } => {
+            accumulate_block_effects(body, expressions, module, memo, eff);
+            accumulate_block_effects(continuing, expressions, module, memo, eff);
+        }
+        S::Emit(_) | S::Return { .. } | S::Break | S::Continue => {}
+    }
+}
+
+fn accumulate_block_effects(
+    block: &naga::Block,
+    expressions: &naga::Arena<naga::Expression>,
+    module: &naga::Module,
+    memo: &mut [Option<FnEffects>],
+    eff: &mut FnEffects,
+) {
+    for stmt in block.iter() {
+        accumulate_statement_effects(stmt, expressions, module, memo, eff);
+    }
+}
+
+/// Memoised [`FnEffects`] of `module.functions[h]`.  The call graph is acyclic
+/// (naga forbids recursion); the in-progress marker (`escapes = true`) both
+/// memoises and makes any unexpected cycle resolve to the conservative
+/// "escapes everything", so the recursion always terminates.
+fn function_effects(
+    h: naga::Handle<naga::Function>,
+    module: &naga::Module,
+    memo: &mut [Option<FnEffects>],
+) -> FnEffects {
+    if let Some(known) = &memo[h.index()] {
+        return known.clone();
+    }
+    memo[h.index()] = Some(FnEffects {
+        escapes: true,
+        written_params: std::collections::HashSet::new(),
+    });
+    let func = &module.functions[h];
+    let mut eff = FnEffects {
+        escapes: false,
+        written_params: std::collections::HashSet::new(),
+    };
+    accumulate_block_effects(&func.body, &func.expressions, module, memo, &mut eff);
+    memo[h.index()] = Some(eff.clone());
+    eff
+}
+
+/// Per-`module.functions` inline-purity bitmap, computed once per module and
+/// shared by every `find_inlineable_calls` invocation: a single-use `Call` is
+/// only ever relocated to an arbitrary use site when its callee is inline-pure,
+/// i.e. its only effect observable by the caller is its return value.  That is
+/// exactly `!escapes && written_params.is_empty()` - a function writing through
+/// one of its OWN params is NOT inline-pure (the write reaches the caller), but
+/// a function that merely calls such a helper with its OWN local is.
+pub(super) fn compute_pure_functions(module: &naga::Module) -> Vec<bool> {
+    let mut memo: Vec<Option<FnEffects>> = vec![None; module.functions.len()];
+    for (h, _) in module.functions.iter() {
+        function_effects(h, module, &mut memo);
+    }
+    memo.into_iter()
+        .map(|e| match e {
+            Some(eff) => !eff.escapes && eff.written_params.is_empty(),
+            None => false,
+        })
+        .collect()
+}
+
+/// Identify `Call` results that can be safely inlined at their single use
+/// site instead of being bound to a `let`.  A result is inlineable when:
 ///
-/// Consumption detection: as we walk, each statement is inspected for direct
-/// handle references (Store value, If condition, Emit-range expression
-/// children, etc.).  When a statement references a pending Call result, that
-/// handle is moved from `pending` to the inlineable set immediately - so any
-/// later clearing event cannot undo a use that has already happened.  This is
-/// the key correctness property: evaluation order is preserved because the
-/// use site is fixed in program order and any side effect after it is
-/// unaffected by inlining at the (pure-expression) use site.
+/// 1. its `ref_count` is exactly 1 (used once);
+/// 2. its callee is PURE (`pure_functions[callee]`), OR it is an impure call
+///    consumed as the DIRECT value of the immediately-following `Store`/`Return`
+///    (see `last_impure`): an impure call writes memory, and relocating it to an
+///    arbitrary use site would re-order that write against an intervening read
+///    OR an operand-evaluation-order sibling read of the same memory - a silent
+///    miscompile.  Operand order is invisible here, so purity is the gate for
+///    the general case; the one exception is an adjacent direct-value use, where
+///    the call provably neither moves nor gains a sibling; and
+/// 3. the consuming statement is reached from the `Call` without crossing a
+///    potentially-interfering side-effecting statement (another `Call`,
+///    `Atomic` / `ImageStore` / `RayQuery` and the like, a non-local `Store`,
+///    or any control-flow boundary: `If` / `Loop` / `Switch` / `Block`).
 ///
-/// This turns `let C = A(b.x); return C;` into `return A(b.x);`, and more
-/// importantly preserves inlining across subsequent control-flow/side-effects
-/// whose only previous effect was to wipe the pending set.
-/// Identify `Call` results with exactly one downstream use that can
-/// be safely inlined at the call site.  The heuristic requires the
-/// result to be consumed before the next side-effecting statement so
-/// inlining never re-orders observable effects.
+/// A pure call still depends on its arguments' VALUES at evaluation time, so a
+/// `Store` to a function-local does NOT unconditionally clear the pending set;
+/// it invalidates only the pending calls whose arguments read that local
+/// (tracked per-local via [`PendingCall`]'s `reads_locals`; see the `Store`
+/// arm).  Consumption is recorded the moment a statement references a pending
+/// result - the handle moves to the inlineable set immediately, so a later
+/// clearing event cannot undo a use already made.  Evaluation order is thus
+/// preserved: the use site stays in program order and the (pure) call's
+/// re-evaluation reads the same argument values it would have at the call site.
 fn find_inlineable_calls(
     block: &naga::Block,
     ref_counts: &[usize],
     expressions: &naga::Arena<naga::Expression>,
+    pure_functions: &[bool],
 ) -> std::collections::HashSet<naga::Handle<naga::Expression>> {
     let mut result = std::collections::HashSet::new();
-    let mut pending: Vec<naga::Handle<naga::Expression>> = Vec::new();
+    let mut pending: Vec<PendingCall> = Vec::new();
+    // The result of an IMPURE call from the immediately-previous statement.  It
+    // may be inlined ONLY if THIS statement consumes it as a *direct* value (a
+    // `Store` value or `Return` value): then the call is emitted at the adjacent
+    // store/return - it neither moves nor gains a sibling operand, so no read
+    // can be re-ordered across its side effect, regardless of what it writes
+    // (`out = atomicAdd(&c, 1)`, `return f()`).  Any other next statement (an
+    // `Emit` that wraps it in a larger expression, or an intervening statement)
+    // would move or re-order it, so it stays bound.
+    let mut last_impure: Option<naga::Handle<naga::Expression>> = None;
 
     for stmt in block.iter() {
+        // Adjacent direct-value inline of the previous statement's impure call.
+        if let Some(h) = last_impure.take() {
+            let direct = match stmt {
+                // `<place> = call()`: safe only when the store TARGET reads no
+                // memory to evaluate (a bare variable).  An `arr[idx]` place
+                // could read `idx` from memory the call writes, and WGSL's
+                // pointer-vs-value evaluation order would then decide whether
+                // that read sees the pre- or post-call value - a reorder we must
+                // not depend on.
+                naga::Statement::Store { pointer, value } if *value == h => matches!(
+                    expressions[*pointer],
+                    naga::Expression::LocalVariable(_)
+                        | naga::Expression::GlobalVariable(_)
+                        | naga::Expression::FunctionArgument(_)
+                ),
+                // `return call()`: no place, no sibling - always safe.
+                naga::Statement::Return { value: Some(v) } if *v == h => true,
+                _ => false,
+            };
+            if direct {
+                result.insert(h);
+            }
+        }
+
         // Phase 1: record any pending handles consumed by this statement.
         // Order matters: we must detect consumption BEFORE applying the
         // statement's clearing rules, so a later control-flow statement
@@ -1534,7 +1882,10 @@ fn find_inlineable_calls(
         // recurse into nested blocks.
         match stmt {
             naga::Statement::Call {
-                result: Some(h), ..
+                result: Some(h),
+                function,
+                arguments,
+                ..
             } if ref_counts[h.index()] == 1 => {
                 // A new Call is itself a side-effecting statement.  Any
                 // *prior* pending handle that was NOT consumed by this
@@ -1542,40 +1893,68 @@ fn find_inlineable_calls(
                 // dropped: inlining it at a later use site would reorder
                 // its evaluation past this Call's side effects.
                 pending.clear();
-                pending.push(*h);
+                // Only a PURE callee may be relocated to an arbitrary later use
+                // site: an impure call's write would be re-ordered against an
+                // intervening read - or, since operand evaluation order is not
+                // visible here, against a sibling read in the use expression
+                // itself.  A pure call still depends on its argument VALUES at
+                // evaluation time, so track the locals its args read for the
+                // `Store`-interference check below.
+                if pure_functions[function.index()] {
+                    let mut reads_locals = std::collections::HashSet::new();
+                    let mut visited = std::collections::HashSet::new();
+                    for &arg in arguments {
+                        collect_loaded_locals(arg, expressions, &mut reads_locals, &mut visited);
+                    }
+                    pending.push(PendingCall {
+                        result: *h,
+                        reads_locals,
+                    });
+                } else {
+                    // Impure: eligible only for an adjacent direct-value inline
+                    // by the IMMEDIATELY-following statement (see `last_impure`),
+                    // where the call cannot move or gain a sibling.
+                    last_impure = Some(*h);
+                }
             }
             naga::Statement::Emit(_) | naga::Statement::Return { .. } => {
                 // Non-side-effecting: keep pending calls
             }
             naga::Statement::Store { pointer, .. } => {
-                // Stores to local variables cannot interfere with pending
-                // call results - locals are function-scoped and inaccessible
-                // to callees.  Only clear pending for non-local stores.
-                if resolve_local_var(*pointer, expressions).is_none() {
+                // A Store to local `L` only interferes with a pending call
+                // whose ARGUMENTS load `L`: inlining the call to a later use
+                // site re-evaluates its argument text after the store, so a
+                // `Load(L)` argument would read the post-store value.  Drop
+                // exactly those pending calls; calls whose args don't read
+                // `L` stay inlineable.  A non-local Store (storage / workgroup
+                // global) can be observed by any callee, so clear everything.
+                if let Some(stored) = resolve_local_var(*pointer, expressions) {
+                    pending.retain(|p| !p.reads_locals.contains(&stored));
+                } else {
                     pending.clear();
                 }
             }
             naga::Statement::If { accept, reject, .. } => {
                 pending.clear();
-                result.extend(find_inlineable_calls(accept, ref_counts, expressions));
-                result.extend(find_inlineable_calls(reject, ref_counts, expressions));
+                result.extend(find_inlineable_calls(accept, ref_counts, expressions, pure_functions));
+                result.extend(find_inlineable_calls(reject, ref_counts, expressions, pure_functions));
             }
             naga::Statement::Loop {
                 body, continuing, ..
             } => {
                 pending.clear();
-                result.extend(find_inlineable_calls(body, ref_counts, expressions));
-                result.extend(find_inlineable_calls(continuing, ref_counts, expressions));
+                result.extend(find_inlineable_calls(body, ref_counts, expressions, pure_functions));
+                result.extend(find_inlineable_calls(continuing, ref_counts, expressions, pure_functions));
             }
             naga::Statement::Switch { cases, .. } => {
                 pending.clear();
                 for case in cases {
-                    result.extend(find_inlineable_calls(&case.body, ref_counts, expressions));
+                    result.extend(find_inlineable_calls(&case.body, ref_counts, expressions, pure_functions));
                 }
             }
             naga::Statement::Block(inner) => {
                 pending.clear();
-                result.extend(find_inlineable_calls(inner, ref_counts, expressions));
+                result.extend(find_inlineable_calls(inner, ref_counts, expressions, pure_functions));
             }
             _ => {
                 pending.clear();
@@ -1583,7 +1962,7 @@ fn find_inlineable_calls(
         }
     }
 
-    result.extend(pending);
+    result.extend(pending.into_iter().map(|p| p.result));
     result
 }
 
@@ -1596,15 +1975,15 @@ fn find_inlineable_calls(
 fn consume_pending_for_statement(
     stmt: &naga::Statement,
     expressions: &naga::Arena<naga::Expression>,
-    pending: &mut Vec<naga::Handle<naga::Expression>>,
+    pending: &mut Vec<PendingCall>,
     result: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
 ) {
     let check =
         |h: naga::Handle<naga::Expression>,
-         pending: &mut Vec<naga::Handle<naga::Expression>>,
+         pending: &mut Vec<PendingCall>,
          result: &mut std::collections::HashSet<naga::Handle<naga::Expression>>| {
-            if let Some(pos) = pending.iter().position(|&p| p == h) {
-                result.insert(pending.swap_remove(pos));
+            if let Some(pos) = pending.iter().position(|p| p.result == h) {
+                result.insert(pending.swap_remove(pos).result);
             }
         };
 
@@ -1745,6 +2124,542 @@ fn consume_pending_for_statement(
     }
 }
 
+// MARK: Mutated-load binding analysis
+
+/// The memory location a pointer refers to, resolved to a root variable
+/// plus one level of refinement off that root.  Two places that share a
+/// root but carry distinct *constant* first-level indices are provably
+/// disjoint; anything coarser (`Whole` or a dynamic `Opaque` index)
+/// conservatively aliases everything in the root.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlaceRoot {
+    Local(naga::Handle<naga::LocalVariable>),
+    Global(naga::Handle<naga::GlobalVariable>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refine {
+    /// The whole variable (no access applied off the root).
+    Whole,
+    /// A single statically-known field / element index off the root.
+    Field(u32),
+    /// A dynamically-indexed (or otherwise unknown) location in the root.
+    Opaque,
+}
+
+#[derive(Clone, Copy)]
+struct Place {
+    root: PlaceRoot,
+    refine: Refine,
+}
+
+/// Conservative may-alias test.  Sound direction: returns `true` whenever
+/// the two places *might* name overlapping memory.  Only proven-disjoint
+/// pairs (same root, distinct constant first-level indices) return `false`.
+fn places_may_alias(a: Place, b: Place) -> bool {
+    if a.root != b.root {
+        return false;
+    }
+    match (a.refine, b.refine) {
+        (Refine::Field(x), Refine::Field(y)) => x == y,
+        // `Whole` contains every field; `Opaque` could be any field.
+        _ => true,
+    }
+}
+
+/// Lower a pointer expression to its [`Place`], walking `Access` /
+/// `AccessIndex` chains down to the root variable.  The refinement is the
+/// access applied DIRECTLY to the root (the first level); deeper accesses
+/// keep that first-level refinement (conservative - sub-locations of the
+/// same first-level component are treated as aliasing).
+///
+/// Returns `None` when the root is not a concrete variable (a
+/// function-argument pointer, or an exotic pointer expression).  Such a
+/// place is treated as "Unknown" by the caller and aliases everything.
+fn resolve_place(
+    pointer: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+) -> Option<Place> {
+    match &expressions[pointer] {
+        naga::Expression::LocalVariable(l) => Some(Place {
+            root: PlaceRoot::Local(*l),
+            refine: Refine::Whole,
+        }),
+        naga::Expression::GlobalVariable(g) => Some(Place {
+            root: PlaceRoot::Global(*g),
+            refine: Refine::Whole,
+        }),
+        naga::Expression::AccessIndex { base, index } => {
+            let base_place = resolve_place(*base, expressions)?;
+            if matches!(base_place.refine, Refine::Whole) {
+                Some(Place {
+                    root: base_place.root,
+                    refine: Refine::Field(*index),
+                })
+            } else {
+                Some(base_place)
+            }
+        }
+        naga::Expression::Access { base, index } => {
+            let base_place = resolve_place(*base, expressions)?;
+            if matches!(base_place.refine, Refine::Whole) {
+                let refine = const_index_value(*index, expressions)
+                    .map(Refine::Field)
+                    .unwrap_or(Refine::Opaque);
+                Some(Place {
+                    root: base_place.root,
+                    refine,
+                })
+            } else {
+                Some(base_place)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The constant value of an index expression, if it is a non-negative
+/// integer `Literal`; otherwise `None` (a dynamic or non-integer index).
+fn const_index_value(
+    index: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+) -> Option<u32> {
+    let naga::Expression::Literal(lit) = &expressions[index] else {
+        return None;
+    };
+    match lit {
+        naga::Literal::U32(v) => Some(*v),
+        naga::Literal::I32(v) => u32::try_from(*v).ok(),
+        naga::Literal::U64(v) => u32::try_from(*v).ok(),
+        naga::Literal::I64(v) => u32::try_from(*v).ok(),
+        naga::Literal::AbstractInt(v) => u32::try_from(*v).ok(),
+        _ => None,
+    }
+}
+
+/// `true` when a callee or another invocation could write this global
+/// (so a load of it can become stale).  Immutable address spaces
+/// (`uniform`, resource handles, immediate/push-constant, read-only
+/// storage) can never change and never produce a hazard.
+fn global_is_writable(module: &naga::Module, g: naga::Handle<naga::GlobalVariable>) -> bool {
+    match module.global_variables[g].space {
+        naga::AddressSpace::Uniform
+        | naga::AddressSpace::Handle
+        | naga::AddressSpace::Immediate => false,
+        naga::AddressSpace::Storage { access } => access.contains(naga::StorageAccess::STORE),
+        // Function (locals), Private, WorkGroup, ray/task payloads: writable.
+        _ => true,
+    }
+}
+
+/// A write a statement performs, as seen by the load-hazard analysis.
+///
+/// Every `naga::Statement` variant is classified exhaustively in
+/// [`statement_write_effects`] (no wildcard arm), so a future statement
+/// kind that can write memory forces a compile error there rather than a
+/// silent miss - this enum needs no catch-all "writes everything" case.
+enum WriteEffect {
+    /// Writes a specific resolved place.
+    Place(Place),
+    /// May write some writable global (a callee, barrier, or
+    /// param-pointer store): invalidates loads rooted at a global, plus
+    /// any Unknown-place load (a param pointer may itself target a global).
+    Globals,
+}
+
+impl WriteEffect {
+    /// Whether this write could invalidate a tracked load whose place is
+    /// `load` (`None` = an Unknown place that aliases everything).
+    fn invalidates(&self, load: &Option<Place>) -> bool {
+        match self {
+            WriteEffect::Globals => match load {
+                None => true,
+                Some(p) => matches!(p.root, PlaceRoot::Global(_)),
+            },
+            WriteEffect::Place(w) => match load {
+                // A `None` (function-argument pointer) load reads caller memory
+                // or a global - NEVER a named local of THIS function (the caller
+                // cannot hold a pointer to a local that does not exist in its
+                // scope).  So a store to a resolved LOCAL place can never alias
+                // it; a store to a GLOBAL still might (the param could point
+                // there), so stay conservative for globals.
+                None => !matches!(w.root, PlaceRoot::Local(_)),
+                Some(p) => places_may_alias(*w, *p),
+            },
+        }
+    }
+}
+
+/// Record the pointer-to-LOCAL write place a call argument exposes: a callee
+/// taking `ptr<function, T>` may write the pointee.  A naga pointer argument is
+/// a root variable (`LocalVariable` / `GlobalVariable` / `FunctionArgument`)
+/// with optional `Access`/`AccessIndex` refinement, which `resolve_place` walks
+/// to the root - so the pointee is exactly the argument's own place.  Pointers
+/// are non-storable (no loadable pointer values, no pointer aggregates), so no
+/// sub-expression can carry a second writable pointee, and an index
+/// sub-expression is a value the callee reads, never writes; hence NO recursion
+/// into children.  Only a LOCAL root is recorded - pointers to globals, and
+/// param-pointer roots (which resolve to `None`), are already covered by the
+/// blanket [`WriteEffect::Globals`] every `Call` records.
+fn collect_ptr_local_writes(
+    arg: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+    out: &mut Vec<WriteEffect>,
+) {
+    if matches!(
+        expressions[arg],
+        naga::Expression::LocalVariable(_)
+            | naga::Expression::Access { .. }
+            | naga::Expression::AccessIndex { .. }
+    ) && let Some(p) = resolve_place(arg, expressions)
+        && matches!(p.root, PlaceRoot::Local(_))
+    {
+        out.push(WriteEffect::Place(p));
+    }
+}
+
+/// Append every [`WriteEffect`] a single statement performs to `out`.
+/// Control-flow statements (`Block`/`If`/`Switch`/`Loop`) contribute
+/// nothing here - their nested blocks are walked separately.
+fn statement_write_effects(
+    stmt: &naga::Statement,
+    expressions: &naga::Arena<naga::Expression>,
+    out: &mut Vec<WriteEffect>,
+) {
+    use naga::Statement as S;
+    match stmt {
+        S::Store { pointer, .. } | S::Atomic { pointer, .. } => {
+            match resolve_place(*pointer, expressions) {
+                Some(p) => out.push(WriteEffect::Place(p)),
+                // A store through an unresolved (function-argument) pointer
+                // could land in any global; it cannot reach our own locals.
+                None => out.push(WriteEffect::Globals),
+            }
+        }
+        // The write is through `data.pointer` (the destination); `target` is the
+        // matrix VALUE being stored, a read - not a written place.  (Latent today:
+        // the generator cannot yet emit CooperativeStore; kept correct so the
+        // exhaustive match holds no silent miss.)
+        S::CooperativeStore { data, .. } => match resolve_place(data.pointer, expressions) {
+            Some(p) => out.push(WriteEffect::Place(p)),
+            None => out.push(WriteEffect::Globals),
+        },
+        S::Call { arguments, .. } => {
+            // A callee may write any global, plus any local it receives by pointer.
+            out.push(WriteEffect::Globals);
+            for &arg in arguments {
+                collect_ptr_local_writes(arg, expressions, out);
+            }
+        }
+        // Memory-synchronisation points make other invocations' prior stores
+        // to shared globals observable, so a pre-barrier load of such a global
+        // can differ from a post-barrier re-read.  (Conservatively `Globals`;
+        // this also over-invalidates private-space loads - harmless over-binding,
+        // since a barrier cannot change a per-invocation private value.)
+        S::ControlBarrier(_) | S::MemoryBarrier(_) | S::WorkGroupUniformLoad { .. } => {
+            out.push(WriteEffect::Globals)
+        }
+        S::RayQuery { query, .. } => {
+            out.push(WriteEffect::Globals);
+            if let Some(p) = resolve_place(*query, expressions) {
+                out.push(WriteEffect::Place(p));
+            }
+        }
+        S::RayPipelineFunction(fun) => {
+            out.push(WriteEffect::Globals);
+            let naga::RayPipelineFunction::TraceRay { payload, .. } = fun;
+            if let Some(p) = resolve_place(*payload, expressions) {
+                out.push(WriteEffect::Place(p));
+            }
+        }
+        // Image stores write only textures (resource handles), which are
+        // never reached by a `Load` expression - no alias with any tracked load.
+        S::ImageStore { .. } | S::ImageAtomic { .. } => {}
+        // Subgroup operations exchange already-computed values across lanes via
+        // registers; they perform NO memory access and impose no memory
+        // ordering, so they cannot stale any load.  (Their argument operands
+        // are still seen as uses via the leaf use-detection path.)
+        S::SubgroupBallot { .. }
+        | S::SubgroupGather { .. }
+        | S::SubgroupCollectiveOperation { .. } => {}
+        // No memory write of their own (control flow handled by recursion).
+        S::Emit(_)
+        | S::Block(_)
+        | S::If { .. }
+        | S::Switch { .. }
+        | S::Loop { .. }
+        | S::Return { .. }
+        | S::Break
+        | S::Continue
+        | S::Kill => {}
+    }
+}
+
+/// Accumulate every [`WriteEffect`] performed anywhere inside `block`,
+/// recursing through nested control flow.  Used to pre-mark loads that
+/// outlive a loop's back-edge.
+fn collect_block_write_effects(
+    block: &naga::Block,
+    expressions: &naga::Arena<naga::Expression>,
+    out: &mut Vec<WriteEffect>,
+) {
+    for stmt in block.iter() {
+        statement_write_effects(stmt, expressions, out);
+        match stmt {
+            naga::Statement::Block(inner) => collect_block_write_effects(inner, expressions, out),
+            naga::Statement::If { accept, reject, .. } => {
+                collect_block_write_effects(accept, expressions, out);
+                collect_block_write_effects(reject, expressions, out);
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases {
+                    collect_block_write_effects(&case.body, expressions, out);
+                }
+            }
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => {
+                collect_block_write_effects(body, expressions, out);
+                collect_block_write_effects(continuing, expressions, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A `Load` that has been emitted and is still in flight: its place plus
+/// whether a write to that place has been observed since its `Emit`.
+#[derive(Clone)]
+struct PendingLoad {
+    /// `None` = an Unknown place (function-argument pointer) - aliases all.
+    place: Option<Place>,
+    written: bool,
+}
+
+type Pending = std::collections::HashMap<naga::Handle<naga::Expression>, PendingLoad>;
+
+/// Merge two control-flow successor states: a load is "written" after the
+/// join if it was written on EITHER path (conservative).  Keys from both
+/// sides are kept so a branch-local load that (legally) outlives its
+/// branch is still tracked downstream.
+fn merge_pending(mut a: Pending, b: Pending) -> Pending {
+    for (h, pl) in b {
+        a.entry(h)
+            .and_modify(|e| e.written |= pl.written)
+            .or_insert(pl);
+    }
+    a
+}
+
+/// Walk the operand cone of `root`, flagging every in-flight load that is
+/// (a) reachable from `root` and (b) already marked written.  Such a load
+/// is read AFTER its place was overwritten, so it must be bound.  The
+/// `visited` set keeps the walk linear over shared sub-DAGs.
+fn flag_used_loads(
+    root: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+    pending: &Pending,
+    must_bind: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+    visited: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+) {
+    if !visited.insert(root) {
+        return;
+    }
+    if let Some(pl) = pending.get(&root)
+        && pl.written
+    {
+        must_bind.insert(root);
+    }
+    visit_expr_children(&expressions[root], |child| {
+        flag_used_loads(child, expressions, pending, must_bind, visited);
+    });
+}
+
+/// Forward dataflow over one block, threading `pending` (in-flight loads)
+/// and accumulating into `must_bind`.  See [`compute_must_bind_loads`].
+fn analyze_block(
+    block: &naga::Block,
+    expressions: &naga::Arena<naga::Expression>,
+    module: &naga::Module,
+    pending: &mut Pending,
+    must_bind: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+) {
+    for stmt in block.iter() {
+        analyze_statement(stmt, expressions, module, pending, must_bind);
+    }
+}
+
+/// Mark every in-flight load `written` whose place a write effect of `stmt` may
+/// alias.  Monotone (only flips unwritten -> written) and skips already-written
+/// loads, so it is idempotent across the loop pre-mark and the linear pass.
+fn apply_writes(
+    stmt: &naga::Statement,
+    expressions: &naga::Arena<naga::Expression>,
+    pending: &mut Pending,
+) {
+    let mut effects = Vec::new();
+    statement_write_effects(stmt, expressions, &mut effects);
+    if effects.is_empty() {
+        return;
+    }
+    for pl in pending.values_mut() {
+        if !pl.written && effects.iter().any(|e| e.invalidates(&pl.place)) {
+            pl.written = true;
+        }
+    }
+}
+
+fn analyze_statement(
+    stmt: &naga::Statement,
+    expressions: &naga::Arena<naga::Expression>,
+    module: &naga::Module,
+    pending: &mut Pending,
+    must_bind: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+) {
+    use naga::Statement as S;
+    match stmt {
+        S::Emit(range) => {
+            // Uses first (a write never occurs within an Emit): a load defined
+            // in this same range is not yet pending, so a sibling consuming it
+            // is correctly not flagged.
+            let mut visited = std::collections::HashSet::new();
+            for h in range.clone() {
+                flag_used_loads(h, expressions, pending, must_bind, &mut visited);
+            }
+            // Then register the loads this Emit introduces.
+            for h in range.clone() {
+                if let naga::Expression::Load { pointer } = &expressions[h] {
+                    let place = resolve_place(*pointer, expressions);
+                    let track = match &place {
+                        Some(p) => match p.root {
+                            PlaceRoot::Global(g) => global_is_writable(module, g),
+                            PlaceRoot::Local(_) => true,
+                        },
+                        // Unknown place (function-argument pointer): track it -
+                        // any later write may alias the pointee.
+                        None => true,
+                    };
+                    if track {
+                        pending.insert(h, PendingLoad {
+                            place,
+                            written: false,
+                        });
+                    }
+                }
+            }
+        }
+        S::Block(inner) => analyze_block(inner, expressions, module, pending, must_bind),
+        S::If {
+            condition,
+            accept,
+            reject,
+        } => {
+            let mut visited = std::collections::HashSet::new();
+            flag_used_loads(*condition, expressions, pending, must_bind, &mut visited);
+            let mut accept_state = pending.clone();
+            analyze_block(accept, expressions, module, &mut accept_state, must_bind);
+            let mut reject_state = pending.clone();
+            analyze_block(reject, expressions, module, &mut reject_state, must_bind);
+            *pending = merge_pending(accept_state, reject_state);
+        }
+        S::Switch { selector, cases } => {
+            let mut visited = std::collections::HashSet::new();
+            flag_used_loads(*selector, expressions, pending, must_bind, &mut visited);
+            if cases.iter().any(|c| c.fall_through) {
+                // A fall-through case chains into the next, so a write in one
+                // case can reach a use in a later one.  WGSL source never
+                // produces fall-through, but handle it soundly by threading the
+                // SAME state sequentially through the cases (a conservative
+                // over-approximation: it also assumes a directly-entered case
+                // ran after its predecessors, which only ever over-binds).
+                for case in cases {
+                    analyze_block(&case.body, expressions, module, pending, must_bind);
+                }
+            } else {
+                // Cases are mutually exclusive: analyse each from the pre-switch
+                // state and union (OR) their post-states.  Every case is
+                // reachable (WGSL switches are exhaustive).
+                let mut merged: Option<Pending> = None;
+                for case in cases {
+                    let mut case_state = pending.clone();
+                    analyze_block(&case.body, expressions, module, &mut case_state, must_bind);
+                    merged = Some(match merged {
+                        None => case_state,
+                        Some(m) => merge_pending(m, case_state),
+                    });
+                }
+                if let Some(m) = merged {
+                    *pending = m;
+                }
+            }
+        }
+        S::Loop {
+            body,
+            continuing,
+            break_if,
+        } => {
+            // Back-edge: a write anywhere in the loop can execute before an
+            // earlier-or-later use (next iteration) and after a load emitted
+            // before the loop.  Pre-mark every outer load the loop may write.
+            let mut loop_writes = Vec::new();
+            collect_block_write_effects(body, expressions, &mut loop_writes);
+            collect_block_write_effects(continuing, expressions, &mut loop_writes);
+            if !loop_writes.is_empty() {
+                for pl in pending.values_mut() {
+                    if !pl.written && loop_writes.iter().any(|e| e.invalidates(&pl.place)) {
+                        pl.written = true;
+                    }
+                }
+            }
+            // Loads emitted INSIDE the loop are re-evaluated each iteration
+            // (expression values never cross the back-edge - only memory does),
+            // so a single linear pass over body+continuing is exact for them.
+            analyze_block(body, expressions, module, pending, must_bind);
+            analyze_block(continuing, expressions, module, pending, must_bind);
+            if let Some(h) = break_if {
+                let mut visited = std::collections::HashSet::new();
+                flag_used_loads(*h, expressions, pending, must_bind, &mut visited);
+            }
+        }
+        // Leaf statements: their operands are uses, then their writes apply.
+        _ => {
+            let mut visited = std::collections::HashSet::new();
+            crate::passes::expr_util::visit_statement_expression_handles(stmt, false, &mut |h| {
+                flag_used_loads(h, expressions, pending, must_bind, &mut visited);
+            });
+            apply_writes(stmt, expressions, pending);
+        }
+    }
+}
+
+/// Identify every `Load` expression in `func` that must be bound to a
+/// `let` rather than inlined, because the place it reads is written
+/// between the `Load`'s `Emit` and a use of its value.  Inlining such a
+/// load relocates the memory read past the write and yields the
+/// post-write value - a silent miscompile.
+///
+/// The analysis is a single forward pass over the structured statement
+/// tree (`analyze_*`).  It deliberately OVER-approximates the hazard
+/// (binding a load is always semantically safe; the only cost is a few
+/// bytes), so unresolved places, branches, loops, and call/barrier write
+/// effects are all handled conservatively.  Read-only globals and pure
+/// read-only locals are never flagged, so the common case stays inlined.
+pub(super) fn compute_must_bind_loads(
+    func: &naga::Function,
+    module: &naga::Module,
+) -> std::collections::HashSet<naga::Handle<naga::Expression>> {
+    let mut pending: Pending = std::collections::HashMap::new();
+    let mut must_bind = std::collections::HashSet::new();
+    analyze_block(
+        &func.body,
+        &func.expressions,
+        module,
+        &mut pending,
+        &mut must_bind,
+    );
+    must_bind
+}
+
 // MARK: Deferred-variable analysis
 
 /// Identify locals whose declaration can be deferred to the site of
@@ -1763,7 +2678,7 @@ fn consume_pending_for_statement(
 /// 3. all of its references are confined to that block, so the
 ///    `var` declaration emitted at the store site stays in scope
 ///    for every use.
-fn find_deferrable_vars(func: &naga::Function) -> (Vec<bool>, Vec<bool>) {
+pub(super) fn find_deferrable_vars(func: &naga::Function) -> (Vec<bool>, Vec<bool>) {
     use naga::Expression as E;
 
     let expr_len = func.expressions.len();
@@ -2141,7 +3056,10 @@ fn scan_block_deferrable_vars(
 /// Return the per-local bitmap of init-once locals whose uses stay
 /// confined to a single `Loop` and can therefore be absorbed into
 /// that loop's `for (var ...; ...; ...)` header.
-fn find_for_loop_vars(func: &naga::Function) -> Vec<bool> {
+fn find_for_loop_vars(
+    func: &naga::Function,
+    must_bind_loads: &std::collections::HashSet<naga::Handle<naga::Expression>>,
+) -> Vec<bool> {
     use naga::Expression as E;
 
     let expr_len = func.expressions.len();
@@ -2173,6 +3091,7 @@ fn find_for_loop_vars(func: &naga::Function) -> Vec<bool> {
         &expr_reads,
         &candidates,
         &mut result,
+        must_bind_loads,
     );
     result
 }
@@ -2394,35 +3313,25 @@ fn compute_block_ownership(
 ///
 /// - `break_if` is `None`;
 /// - `continuing` has at most one non-`Emit` statement (the update);
-/// - the update, when present, is a `Store` or `Call`;
+/// - the update, when present, is a `Store`, `Call`, or `ImageStore`;
 /// - `body` starts with an if-break guard.
 fn is_for_loop_candidate(
     body: &naga::Block,
     continuing: &naga::Block,
     break_if: &Option<naga::Handle<naga::Expression>>,
+    expressions: &naga::Arena<naga::Expression>,
+    must_bind_loads: &std::collections::HashSet<naga::Handle<naga::Expression>>,
 ) -> bool {
-    if break_if.is_some() {
+    // Parse via the SHARED parser so this var-suppression decision and
+    // `try_emit_for_loop`'s emission decision can never drift.  `None` => not
+    // for-convertible (break_if present, no if-break guard, or >1 continuing
+    // core update statement).
+    let Some(shape) = super::stmt_emit::parse_for_loop_shape(body, continuing, break_if) else {
         return false;
-    }
-    // Continuing may start with `WorkGroupUniformLoad` preloads and then
-    // have at most 1 core update statement.
-    let mut non_emit_count = 0;
-    let mut update_stmt = None;
-    for s in continuing.iter() {
-        match s {
-            naga::Statement::Emit(_) => continue,
-            naga::Statement::WorkGroupUniformLoad { .. } if update_stmt.is_none() => continue,
-            _ => {
-                non_emit_count += 1;
-                if non_emit_count > 1 {
-                    return false;
-                }
-                update_stmt = Some(s);
-            }
-        }
-    }
-    // Update must be Store or Call (matching try_emit_for_loop's pre-validation).
-    if let Some(stmt) = update_stmt
+    };
+    // Update must be Store / Call / ImageStore, matching try_emit_for_loop's
+    // pre-validation.
+    if let Some(stmt) = shape.update_stmt
         && !matches!(
             stmt,
             naga::Statement::Store { .. }
@@ -2432,27 +3341,16 @@ fn is_for_loop_candidate(
     {
         return false;
     }
-    // Body must start with an If-break guard (after leading Emits and optional
-    // WorkGroupUniformLoad preloads).
-    let mut body_iter = body.iter();
-    let first_guard = loop {
-        match body_iter.next() {
-            Some(naga::Statement::Emit(_)) => continue,
-            Some(naga::Statement::WorkGroupUniformLoad { .. }) => continue,
-            other => break other,
-        }
-    };
-    match first_guard {
-        Some(naga::Statement::If { accept, reject, .. }) => {
-            (accept.is_empty()
-                && reject.len() == 1
-                && matches!(reject.iter().next(), Some(naga::Statement::Break)))
-                || (reject.is_empty()
-                    && accept.len() == 1
-                    && matches!(accept.iter().next(), Some(naga::Statement::Break)))
-        }
-        _ => false,
-    }
+    // And the preloads must be safe to inline into the for-header, else
+    // try_emit_for_loop bails to plain `loop` emission and the suppressed
+    // counter `var` would be left undeclared.
+    super::stmt_emit::for_loop_preload_inlining_is_safe(
+        &shape,
+        body,
+        continuing,
+        expressions,
+        must_bind_loads,
+    )
 }
 
 /// Recursively scan a block (and its nested sub-blocks) looking for
@@ -2471,6 +3369,7 @@ fn scan_block_for_loop_vars(
     expr_reads: &[Option<naga::Handle<naga::LocalVariable>>],
     candidates: &[bool],
     result: &mut Vec<bool>,
+    must_bind_loads: &std::collections::HashSet<naga::Handle<naga::Expression>>,
 ) {
     let local_len = result.len();
     if !candidates.iter().any(|&b| b) {
@@ -2495,7 +3394,7 @@ fn scan_block_for_loop_vars(
                 continuing,
                 break_if,
             } = stmts[owner]
-                && is_for_loop_candidate(body, continuing, break_if)
+                && is_for_loop_candidate(body, continuing, break_if, expressions, must_bind_loads)
             {
                 let has_update = continuing.iter().any(|s| {
                     if let naga::Statement::Store { pointer, .. } = s {
@@ -2555,6 +3454,7 @@ fn scan_block_for_loop_vars(
                     expr_reads,
                     &a_cands,
                     result,
+                    must_bind_loads,
                 );
                 scan_block_for_loop_vars(
                     reject,
@@ -2563,6 +3463,7 @@ fn scan_block_for_loop_vars(
                     expr_reads,
                     &r_cands,
                     result,
+                    must_bind_loads,
                 );
             }
             naga::Statement::Switch { cases, .. } => {
@@ -2591,6 +3492,7 @@ fn scan_block_for_loop_vars(
                         expr_reads,
                         &cands,
                         result,
+                        must_bind_loads,
                     );
                 }
             }
@@ -2605,6 +3507,7 @@ fn scan_block_for_loop_vars(
                     expr_reads,
                     &cands,
                     result,
+                    must_bind_loads,
                 );
             }
             naga::Statement::Loop {
@@ -2634,6 +3537,7 @@ fn scan_block_for_loop_vars(
                     expr_reads,
                     &b_cands,
                     result,
+                    must_bind_loads,
                 );
             }
             _ => {}

@@ -33,7 +33,7 @@ impl<'a> Generator<'a> {
         // Helper: count textual literal emissions in a single function.
         //
         // Two IR shapes produce literal text in a function body:
-        //   1. `Expression::Literal(lit)`               - direct literal use.
+        //   1. `Expression::Literal(lit)` - direct literal use.
         //   2. `Expression::Constant(h)` where the constant is *unnamed*
         //      and its init in `global_expressions` is `Literal(lit)` -
         //      naga inlines the literal text at every reference.
@@ -253,6 +253,107 @@ impl<'a> Generator<'a> {
                     }
                 });
 
+                // Two more statement-context paths force a *direct* `Literal`
+                // operand to its typed form via `literal_to_wgsl`, bypassing
+                // `extracted_literals` substitution:
+                //   * the FIRST Store to a deferred local (`var X = <lit>;`,
+                //     and the absorbed for-init form) - stmt_emit's deferred /
+                //     for-init handlers; and
+                //   * a literal Switch selector (`switch <lit>`), forced to
+                //     match the typed case labels.
+                // Each over-counts the literal's emission-shrinking uses by 1.
+                // Unlike the atomic walk these force ALL literal kinds, so no
+                // `is_int_lit` filter; and unlike that walk they fire only for
+                // direct `Literal` (an unnamed `Constant` value/selector takes
+                // the normal, extraction-aware `emit_expr` path), so do NOT use
+                // `literal_lit` (which also matches Constants).  Only the first
+                // store to a deferred local emits the declaration; later stores
+                // are extraction-aware, hence the first-touch `consumed` gate.
+                fn walk_typed_form_lits<F: FnMut(naga::Handle<naga::Expression>)>(
+                    block: &naga::Block,
+                    expressions: &naga::Arena<naga::Expression>,
+                    deferrable: &[bool],
+                    consumed: &mut [bool],
+                    visit: &mut F,
+                ) {
+                    for stmt in block {
+                        match stmt {
+                            naga::Statement::Store { pointer, value } => {
+                                if let naga::Expression::LocalVariable(lh) = expressions[*pointer]
+                                    && deferrable[lh.index()]
+                                    && !consumed[lh.index()]
+                                {
+                                    consumed[lh.index()] = true;
+                                    visit(*value);
+                                }
+                            }
+                            naga::Statement::Switch { selector, cases } => {
+                                visit(*selector);
+                                for case in cases {
+                                    walk_typed_form_lits(
+                                        &case.body,
+                                        expressions,
+                                        deferrable,
+                                        consumed,
+                                        visit,
+                                    );
+                                }
+                            }
+                            naga::Statement::Block(b) => {
+                                walk_typed_form_lits(b, expressions, deferrable, consumed, visit);
+                            }
+                            naga::Statement::If { accept, reject, .. } => {
+                                walk_typed_form_lits(
+                                    accept,
+                                    expressions,
+                                    deferrable,
+                                    consumed,
+                                    visit,
+                                );
+                                walk_typed_form_lits(
+                                    reject,
+                                    expressions,
+                                    deferrable,
+                                    consumed,
+                                    visit,
+                                );
+                            }
+                            naga::Statement::Loop {
+                                body, continuing, ..
+                            } => {
+                                walk_typed_form_lits(
+                                    body,
+                                    expressions,
+                                    deferrable,
+                                    consumed,
+                                    visit,
+                                );
+                                walk_typed_form_lits(
+                                    continuing,
+                                    expressions,
+                                    deferrable,
+                                    consumed,
+                                    visit,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let (deferrable, _) = super::module_emit::find_deferrable_vars(func);
+                let mut deferred_consumed = vec![false; func.local_variables.len()];
+                walk_typed_form_lits(
+                    &func.body,
+                    &func.expressions,
+                    &deferrable,
+                    &mut deferred_consumed,
+                    &mut |h| {
+                        if matches!(func.expressions[h], naga::Expression::Literal(_)) {
+                            adjust[h.index()] += 1;
+                        }
+                    },
+                );
+
                 for (h, _expr) in func.expressions.iter() {
                     let refs = ref_counts[h.index()];
                     if refs == 0 {
@@ -389,7 +490,7 @@ impl<'a> Generator<'a> {
         //    bound name length (estimated as 1 for the initial filter),
         //    and `D` the declaration text length.  The boilerplate term
         //    differs by output style:
-        //      compact:  `const N=D;`    = 6 + 1 + 1 = 8 fixed chars
+        //      compact:  `const N=D;`     = 6 + 1 + 1 = 8 fixed chars
         //      beautify: `const N = D;\n` = 6 + 3 + 2 = 11 fixed chars
         //    Mis-pricing in beautify mode wrongly accepts borderline
         //    extractions that net-cost two bytes per use.

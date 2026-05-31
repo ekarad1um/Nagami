@@ -251,40 +251,22 @@ fn collect_stmt_expr_roots(block: &naga::Block, roots: &mut Vec<naga::Handle<nag
 /// therefore must not be removed by this pass.
 ///
 /// The rewrite turns each removed `FunctionArgument(ty)` into
-/// `ZeroValue(ty)` to keep surviving uses well-typed.  naga's IR
-/// validator rejects `ZeroValue` for:
-///
-/// - [`TypeInner::Pointer`] / [`TypeInner::ValuePointer`]: pointers
-///   reference concrete memory and are not constructible.
-/// - [`TypeInner::Sampler`]: samplers are opaque resource handles.
-/// - [`TypeInner::Image`]: textures are opaque resource handles.
-/// - [`TypeInner::AccelerationStructure`] / [`TypeInner::RayQuery`]:
-///   opaque ray-tracing resources.
-/// - [`TypeInner::Atomic`]: must be backed by a storage or workgroup
-///   variable and is not value-constructible.
-/// - [`TypeInner::BindingArray`]: binding arrays are resource bundles
-///   scoped to globals and never appear as function-argument values.
-///
-/// Aggregates (`Struct`, `Array`) are not recursed into: WGSL
-/// already rejects opaque-leaf-bearing aggregates as function
-/// parameters at the front-end, so any aggregate reaching this
-/// predicate is constructible by naga's rules.  Flat check avoids a
-/// recursive type-arena walk per invocation.
+/// `ZeroValue(ty)` to keep surviving uses well-typed, and the validator
+/// rejects `ZeroValue` of any type lacking the `CONSTRUCTIBLE` flag.  We
+/// defer to naga's own [`TypeInner::is_constructible`], which exactly mirrors
+/// that flag: it rejects the opaque leaves (pointers, samplers, images,
+/// atomics, acceleration structures, binding arrays) AND, crucially,
+/// recurses into aggregates - so an override- or runtime-sized array
+/// (`ArraySize::Pending` / `Dynamic`), or a struct containing one, is
+/// correctly rejected.  Such arrays carry the `ARGUMENT` flag (naga accepts
+/// them as parameters) but NOT `CONSTRUCTIBLE`, so a hand-rolled flat
+/// deny-list that treats every `Array` as constructible would emit an
+/// invalid `ZeroValue` and force a whole-pass rollback.
 fn is_non_constructible_type(
     ty_handle: naga::Handle<naga::Type>,
     types: &naga::UniqueArena<naga::Type>,
 ) -> bool {
-    matches!(
-        types[ty_handle].inner,
-        naga::TypeInner::Pointer { .. }
-            | naga::TypeInner::ValuePointer { .. }
-            | naga::TypeInner::Sampler { .. }
-            | naga::TypeInner::Image { .. }
-            | naga::TypeInner::AccelerationStructure { .. }
-            | naga::TypeInner::RayQuery { .. }
-            | naga::TypeInner::Atomic(_)
-            | naga::TypeInner::BindingArray { .. }
-    )
+    !types[ty_handle].inner.is_constructible(types)
 }
 
 // MARK: Tests
@@ -493,6 +475,37 @@ fn helper(unused: ptr<function, f32>, v: f32) -> f32 {
             func.arguments.len(),
             2,
             "pointer parameter must not be removed"
+        );
+    }
+
+    #[test]
+    fn preserves_unused_override_sized_array_param() {
+        // An override-sized array (`ArraySize::Pending`) carries naga's
+        // ARGUMENT flag (accepted as a parameter) but NOT CONSTRUCTIBLE, so
+        // `ZeroValue` of it is invalid.  The pass must KEEP such a dead param
+        // rather than rewrite its refs to an invalid `ZeroValue` (which
+        // `run_pass`'s post-pass validation would reject).
+        let src = r#"
+override N: u32 = 4u;
+var<workgroup> wg: array<f32, N>;
+fn helper(unused_arr: array<f32, N>, used: f32) -> f32 {
+    return used;
+}
+@compute @workgroup_size(1) fn cs() {
+    let r = helper(wg, 1.0);
+}
+"#;
+        let (_changed, module) = run_pass(src);
+        let helper = module
+            .functions
+            .iter()
+            .map(|(_, f)| f)
+            .find(|f| f.arguments.len() == 2)
+            .expect("helper with both params must survive");
+        assert_eq!(
+            helper.arguments.len(),
+            2,
+            "override-sized array param has no valid ZeroValue and must be kept"
         );
     }
 }

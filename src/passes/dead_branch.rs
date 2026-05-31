@@ -1104,12 +1104,57 @@ fn eliminate_redundant_else_stores_in_function(
     {
         known_values.insert(lh, kv);
     }
+    // Tracks, per local, the handle of its most recently materialised
+    // `Load(LocalVariable)` that is still *fresh* - i.e. no store to that
+    // local has happened since.  Condition narrowing is only sound when the
+    // condition's `Load` is fresh; a stale forwarded load (e.g. `let t = d;
+    // d = false; if t {...}`) reflects the value BEFORE the store, so
+    // narrowing on it would clobber the correct post-store known value and
+    // drop a live branch.  See `condition_load_is_fresh`.
+    let mut fresh_loads = HashMap::new();
     eliminate_redundant_else_stores(
         &mut function.body,
         &function.expressions,
         const_lits,
         &mut known_values,
+        &mut fresh_loads,
     )
+}
+
+/// `true` when `condition`'s underlying `Load(LocalVariable)` is still the
+/// freshest load of that local recorded in `fresh_loads` - meaning no store
+/// to the local has intervened since the load was materialised, so the
+/// loaded value equals the local's current value.  Covers the bare
+/// `Load(d)` (Pattern A) and `!Load(d)` (Pattern A'') condition shapes that
+/// [`narrow_for_accept`] / [`narrow_for_reject`] act on; returns `false` for
+/// any other shape (which those helpers ignore anyway).
+fn condition_load_is_fresh(
+    condition: &naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+    fresh_loads: &HashMap<naga::Handle<naga::LocalVariable>, naga::Handle<naga::Expression>>,
+) -> bool {
+    match &expressions[*condition] {
+        naga::Expression::Load { pointer } => {
+            if let naga::Expression::LocalVariable(d) = expressions[*pointer] {
+                fresh_loads.get(&d) == Some(condition)
+            } else {
+                false
+            }
+        }
+        naga::Expression::Unary {
+            op: naga::UnaryOperator::LogicalNot,
+            expr: inner,
+        } => {
+            if let naga::Expression::Load { pointer } = &expressions[*inner]
+                && let naga::Expression::LocalVariable(d) = expressions[*pointer]
+            {
+                fresh_loads.get(&d) == Some(inner)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Recursively walk a block, tracking known values of locals, and clear
@@ -1119,6 +1164,7 @@ fn eliminate_redundant_else_stores(
     expressions: &naga::Arena<naga::Expression>,
     const_lits: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
     known_values: &mut ScopedMap<naga::Handle<naga::LocalVariable>, KnownValue>,
+    fresh_loads: &mut HashMap<naga::Handle<naga::LocalVariable>, naga::Handle<naga::Expression>>,
 ) -> usize {
     let mut changed = 0usize;
 
@@ -1138,13 +1184,26 @@ fn eliminate_redundant_else_stores(
                 //   4. Roll back fully, then permanently drop any
                 //      locals modified in either branch (logged for an
                 //      outer scope's rollback).
+                // Condition narrowing is sound only when the condition's
+                // `Load` reflects the local's CURRENT value (no store since
+                // the load was materialised).  Decide this once, before
+                // recursing, so an accept-branch store cannot perturb the
+                // reject-phase decision.
+                let cond_fresh = condition_load_is_fresh(condition, expressions, fresh_loads);
                 let cp_pre_if = known_values.checkpoint();
 
                 // Accept phase
-                narrow_for_accept(condition, expressions, known_values);
+                if cond_fresh {
+                    narrow_for_accept(condition, expressions, known_values);
+                }
                 let cp_accept_entry = known_values.checkpoint();
-                changed +=
-                    eliminate_redundant_else_stores(accept, expressions, const_lits, known_values);
+                changed += eliminate_redundant_else_stores(
+                    accept,
+                    expressions,
+                    const_lits,
+                    known_values,
+                    fresh_loads,
+                );
                 known_values.rollback_to(cp_accept_entry);
                 let accept_redundant = !accept.is_empty()
                     && block_only_has_redundant_known_stores(
@@ -1156,10 +1215,17 @@ fn eliminate_redundant_else_stores(
                 known_values.rollback_to(cp_pre_if);
 
                 // Reject phase
-                narrow_for_reject(condition, expressions, known_values);
+                if cond_fresh {
+                    narrow_for_reject(condition, expressions, known_values);
+                }
                 let cp_reject_entry = known_values.checkpoint();
-                changed +=
-                    eliminate_redundant_else_stores(reject, expressions, const_lits, known_values);
+                changed += eliminate_redundant_else_stores(
+                    reject,
+                    expressions,
+                    const_lits,
+                    known_values,
+                    fresh_loads,
+                );
                 known_values.rollback_to(cp_reject_entry);
                 let reject_redundant = !reject.is_empty()
                     && block_only_has_redundant_known_stores(
@@ -1181,17 +1247,38 @@ fn eliminate_redundant_else_stores(
 
                 // Permanent update: conservatively remove any locals
                 // modified in either branch.  Logged so outer scopes can
-                // roll back if needed.
+                // roll back if needed.  A branch may conditionally store a
+                // local, so any prior load of it is no longer fresh.
                 let mut modified = HashSet::new();
                 collect_modified_locals(accept, expressions, &mut modified);
                 collect_modified_locals(reject, expressions, &mut modified);
                 for lh in modified {
                     known_values.remove(&lh);
+                    fresh_loads.remove(&lh);
+                }
+            }
+
+            naga::Statement::Emit(range) => {
+                // Materialising a `Load(LocalVariable)` records it as the
+                // freshest load of that local; the entry is invalidated by
+                // any subsequent store to the local (below and in the branch
+                // / call / atomic arms).  This is what lets condition
+                // narrowing tell a fresh `if d {...}` from a stale forwarded
+                // `let t = d; d = ...; if t {...}`.
+                for h in range.clone() {
+                    if let naga::Expression::Load { pointer } = expressions[h]
+                        && let naga::Expression::LocalVariable(d) = expressions[pointer]
+                    {
+                        fresh_loads.insert(d, h);
+                    }
                 }
             }
 
             naga::Statement::Store { pointer, value } => {
                 if let naga::Expression::LocalVariable(lh) = expressions[*pointer] {
+                    // The store changes the local, so any earlier load of it
+                    // is no longer fresh for narrowing.
+                    fresh_loads.remove(&lh);
                     if let Some(lit) = resolve_to_literal(expressions, *value, const_lits) {
                         if is_zero_literal(&lit) {
                             known_values.insert(lh, KnownValue::Zero);
@@ -1206,6 +1293,7 @@ fn eliminate_redundant_else_stores(
                 } else if let Some(lh) = get_stored_local(expressions, *pointer) {
                     // Partial store - conservatively remove.
                     known_values.remove(&lh);
+                    fresh_loads.remove(&lh);
                 }
             }
 
@@ -1217,6 +1305,7 @@ fn eliminate_redundant_else_stores(
                         expressions,
                         const_lits,
                         known_values,
+                        fresh_loads,
                     );
                     known_values.rollback_to(cp);
                 }
@@ -1226,6 +1315,7 @@ fn eliminate_redundant_else_stores(
                 }
                 for lh in modified {
                     known_values.remove(&lh);
+                    fresh_loads.remove(&lh);
                 }
             }
 
@@ -1243,22 +1333,34 @@ fn eliminate_redundant_else_stores(
 
                 for lh in &modified {
                     known_values.remove(lh);
+                    fresh_loads.remove(lh);
                 }
                 let cp_loop = known_values.checkpoint();
-                changed +=
-                    eliminate_redundant_else_stores(body, expressions, const_lits, known_values);
+                changed += eliminate_redundant_else_stores(
+                    body,
+                    expressions,
+                    const_lits,
+                    known_values,
+                    fresh_loads,
+                );
                 changed += eliminate_redundant_else_stores(
                     continuing,
                     expressions,
                     const_lits,
                     known_values,
+                    fresh_loads,
                 );
                 known_values.rollback_to(cp_loop);
             }
 
             naga::Statement::Block(inner) => {
-                changed +=
-                    eliminate_redundant_else_stores(inner, expressions, const_lits, known_values);
+                changed += eliminate_redundant_else_stores(
+                    inner,
+                    expressions,
+                    const_lits,
+                    known_values,
+                    fresh_loads,
+                );
             }
 
             naga::Statement::Call { arguments, .. } => {
@@ -1266,6 +1368,7 @@ fn eliminate_redundant_else_stores(
                 for &arg in arguments.iter() {
                     if let Some(lh) = get_stored_local(expressions, arg) {
                         known_values.remove(&lh);
+                        fresh_loads.remove(&lh);
                     }
                 }
             }
@@ -1273,12 +1376,14 @@ fn eliminate_redundant_else_stores(
             naga::Statement::Atomic { pointer, .. } => {
                 if let Some(lh) = get_stored_local(expressions, *pointer) {
                     known_values.remove(&lh);
+                    fresh_loads.remove(&lh);
                 }
             }
 
             naga::Statement::RayQuery { query, .. } => {
                 if let Some(lh) = get_stored_local(expressions, *query) {
                     known_values.remove(&lh);
+                    fresh_loads.remove(&lh);
                 }
             }
 
@@ -1286,6 +1391,7 @@ fn eliminate_redundant_else_stores(
                 let naga::RayPipelineFunction::TraceRay { payload, .. } = fun;
                 if let Some(lh) = get_stored_local(expressions, *payload) {
                     known_values.remove(&lh);
+                    fresh_loads.remove(&lh);
                 }
             }
 
@@ -1296,6 +1402,7 @@ fn eliminate_redundant_else_stores(
                 // the local rooted at the write side.
                 if let Some(lh) = get_stored_local(expressions, data.pointer) {
                     known_values.remove(&lh);
+                    fresh_loads.remove(&lh);
                 }
             }
 
@@ -1304,10 +1411,9 @@ fn eliminate_redundant_else_stores(
             // future naga release adding a new pointer-bearing variant
             // breaks the build here instead of silently leaving a
             // known_values entry stale across the new statement type.
-            // `Emit` is in this group: it declares expressions but
-            // does not modify locals directly (only Stores do).
-            naga::Statement::Emit(_)
-            | naga::Statement::Break
+            // (`Emit` has its own arm above: it materialises loads that
+            // feed condition narrowing.)
+            naga::Statement::Break
             | naga::Statement::Continue
             | naga::Statement::Return { .. }
             | naga::Statement::Kill
@@ -2324,6 +2430,59 @@ fn f(a: bool, b: bool) -> bool {
         }
     }
 
+    // Regression: condition narrowing must NOT fire on a STALE forwarded
+    // load.  `let t = d; d = false; if t { d = true; }` - the condition `t`
+    // captured d's value BEFORE the `d = false` store, so the loaded value
+    // (true) does not reflect d's current value (false).  Narrowing would
+    // clobber the correct post-store known value and wrongly classify the
+    // live `d = true` store as redundant, dropping it and returning false
+    // instead of true.  The fresh-load tracking must keep the branch.
+    #[test]
+    fn narrowing_skips_stale_forwarded_load() {
+        let src = r#"
+fn f() -> bool {
+    var d: bool = true;
+    let t = d;
+    d = false;
+    if t { d = true; }
+    return d;
+}
+@fragment fn fs() -> @location(0) vec4f { return vec4f(f32(f())); }
+"#;
+        let (_, module) = run_pass(src);
+        // The `if t { d = true; }` accept must survive: the store is live.
+        let total_non_empty_accepts: usize = module
+            .functions
+            .iter()
+            .map(|(_, func)| count_non_empty_accepts(&func.body))
+            .sum();
+        assert!(
+            total_non_empty_accepts >= 1,
+            "live `d = true` store behind a stale-load condition must be preserved"
+        );
+    }
+
+    // Positive companion: when the SAME local is re-loaded fresh for the
+    // condition (no intervening store), narrowing still fires.  Distinguishes
+    // the fix from a blanket disable of load-condition narrowing.
+    #[test]
+    fn narrowing_fires_on_fresh_load_after_store() {
+        let src = r#"
+fn f(a: bool) -> bool {
+    var d: bool = true;
+    if a { d = false; } else { d = true; }
+    if d { d = true; }
+    return d;
+}
+@fragment fn fs() -> @location(0) vec4f { return vec4f(f32(f(true))); }
+"#;
+        let (changed, _) = run_pass(src);
+        assert!(
+            changed,
+            "fresh `if d {{ d = true; }}` after a branch write should still be eliminated"
+        );
+    }
+
     #[test]
     fn short_circuit_chained_and_with_non_literal_value() {
         // Both ifs match the && pattern (reject stores false to same local).
@@ -2599,10 +2758,9 @@ fn fs(@location(0) v: f32) -> @location(0) vec4f {
     /// Else-elision fires even when both arms terminate with
     /// value-bearing returns - the saved `else{...}` scaffolding
     /// outweighs the residual `if c { return v1; }`.  Gating on
-    /// `!reject.terminates` made the corpus strictly larger on
-    /// real shaders (e.g. `bug/tint/922.wgsl` lost 196 bytes); the
-    /// only collapse the elision misses is symmetric `return;` arms,
-    /// which we don't fold anyway.
+    /// `!reject.terminates` made the corpus strictly larger on real
+    /// shaders; the only collapse the elision misses is symmetric
+    /// `return;` arms, which we don't fold anyway.
     #[test]
     fn else_elision_fires_when_both_arms_return_values() {
         let src = r#"
@@ -2794,12 +2952,12 @@ fn f(a: bool) -> i32 {
     }
 
     // Regression: dead_branch_elimination must not treat a switch where all
-    // cases end with `break` as a terminator of the outer block.
-    // Pattern from spv-atomic_exchange.wgsl: phi variables are assigned inside
-    // the switch cases, then captured with `let ev = phi;` after the switch.
-    // The continuing block stores `phi = ev` (phi-assignment), which forces naga
-    // to emit the `ev` expressions in the loop body scope (not lazily in continuing).
-    // With the old bug, the Emit covering those let-bindings was dropped, causing
+    // cases end with `break` as a terminator of the outer block.  Pattern: phi
+    // variables are assigned inside the switch cases, then captured with
+    // `let ev = phi;` after the switch.  The continuing block stores `phi = ev`
+    // (phi-assignment), forcing naga to emit the `ev` expressions in the loop
+    // body scope (not lazily in continuing).  Treating the switch as a
+    // terminator drops the Emit covering those let-bindings, causing
     // `Expression NotInScope` in the continuing block on naga validation.
     #[test]
     fn switch_with_all_break_cases_does_not_drop_continuing_emits() {

@@ -641,6 +641,92 @@ fn atomic_store_roundtrip() {
 }
 
 #[test]
+fn atomic_store_in_for_update_lowers_to_atomic_store_builtin() {
+    // An `atomicStore` landing in a for-loop update slot must still lower to
+    // the `atomicStore` builtin.  The inline-update Store path previously
+    // emitted a plain `counter = i` assignment, a WGSL type error against
+    // `atomic<T>` that naga accepts (so no fallback) but strict consumers
+    // reject.
+    let src = r#"
+        @group(0) @binding(0)
+        var<storage, read_write> counter: atomic<u32>;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            for (var i: u32 = 0u; i < 10u; atomicStore(&counter, i)) {
+            }
+        }
+    "#;
+    let out = compact(src);
+    assert!(
+        out.contains("for("),
+        "loop should reconstruct as a for-loop so the inline update path is \
+         exercised: {out}"
+    );
+    assert!(
+        out.contains("atomicStore(&"),
+        "atomicStore in a for-update slot must lower to the atomicStore \
+         builtin, not a `=` assignment to atomic<T>: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn atomic_load_emits_atomic_load_builtin() {
+    // The load counterpart of `atomic_store_*`: reading an atomic must lower to
+    // the `atomicLoad` builtin, NOT a bare atomic identifier.  naga lowers both
+    // `atomicLoad(&a)` and a direct read to the SAME `Load`, so it accepts either
+    // (no fallback fires), but emitting the bare atomic is a WGSL spec violation
+    // that strict consumers (tint/Dawn) reject.
+    let src = r#"
+        @group(0) @binding(0)
+        var<storage, read_write> a: atomic<i32>;
+        @group(0) @binding(1)
+        var<storage, read_write> out: array<i32>;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            out[0] = atomicLoad(&a);
+        }
+    "#;
+    let out = compact(src);
+    assert!(
+        out.contains("atomicLoad(&"),
+        "atomic loads must lower to atomicLoad, not a bare atomic identifier: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn atomic_load_in_for_condition_emits_atomic_load_builtin() {
+    // An atomic `Load` inlined into a reconstructed `for(...)` condition must
+    // still lower to `atomicLoad(&p)`; the bare-atomic form `i < a` is a spec
+    // violation strict consumers reject (naga accepts it, so no fallback flags it).
+    let src = r#"
+        @group(0) @binding(0)
+        var<storage, read_write> a: atomic<i32>;
+        @group(0) @binding(1)
+        var<storage, read_write> out: array<i32>;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            for (var i = 0; i < atomicLoad(&a); i = i + 1) { out[i] = i; }
+        }
+    "#;
+    let out = compact(src);
+    assert!(
+        out.contains("for("),
+        "the loop should reconstruct as a for-loop so the inline-condition path is \
+         exercised: {out}"
+    );
+    assert!(
+        out.contains("atomicLoad(&"),
+        "an atomic load in a for-condition must remain an atomicLoad call: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
 fn ray_hit_stages_emit_incoming_payload_attr() {
     let src = r#"
         enable wgpu_ray_tracing_pipeline;

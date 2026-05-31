@@ -33,16 +33,40 @@ fn get_opt(obj: &JsValue, key: &str) -> Option<JsValue> {
     }
 }
 
-fn get_string(obj: &JsValue, key: &str) -> Option<String> {
-    get_opt(obj, key)?.as_string()
+// The scalar getters return `Ok(None)` only when the key is ABSENT
+// (undefined/null).  A present-but-wrong-typed value is an `Err`, not a
+// silently-dropped `None` - otherwise a stringly-typed `{ mangle: "false" }`
+// would be ignored and the default silently used.  This mirrors
+// `get_string_array` / `parse_float_precision`, which the file twice hardens
+// against the same "silently misinterpret bad input" trap.
+fn get_string(obj: &JsValue, key: &str) -> Result<Option<String>, JsError> {
+    match get_opt(obj, key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_string()
+            .map(Some)
+            .ok_or_else(|| JsError::new(&format!("\"{key}\" must be a string"))),
+    }
 }
 
-fn get_bool(obj: &JsValue, key: &str) -> Option<bool> {
-    get_opt(obj, key)?.as_bool()
+fn get_bool(obj: &JsValue, key: &str) -> Result<Option<bool>, JsError> {
+    match get_opt(obj, key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| JsError::new(&format!("\"{key}\" must be a boolean"))),
+    }
 }
 
-fn get_f64(obj: &JsValue, key: &str) -> Option<f64> {
-    get_opt(obj, key)?.as_f64()
+fn get_f64(obj: &JsValue, key: &str) -> Result<Option<f64>, JsError> {
+    match get_opt(obj, key) {
+        None => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .map(Some)
+            .ok_or_else(|| JsError::new(&format!("\"{key}\" must be a number"))),
+    }
 }
 
 /// Read `obj[key]` as an array of strings.  Returns `Ok(None)` when
@@ -142,8 +166,11 @@ fn parse_precision_mode(val: &JsValue, field_path: &str) -> Result<PrecisionMode
         return Ok(PrecisionMode::DecimalPlaces(p));
     }
     if val.is_object() {
-        let dp = get_f64(val, "decimalPlaces");
-        let sf = get_f64(val, "significantFigures").or_else(|| get_f64(val, "sigFigs"));
+        let dp = get_f64(val, "decimalPlaces")?;
+        let sf = match get_f64(val, "significantFigures")? {
+            Some(s) => Some(s),
+            None => get_f64(val, "sigFigs")?,
+        };
         return match (dp, sf) {
             (Some(_), Some(_)) => Err(JsError::new(&format!(
                 "{field_path}: decimalPlaces and significantFigures are mutually exclusive"
@@ -237,7 +264,7 @@ fn parse_config(config: JsValue) -> Result<Config, JsError> {
 
     let mut cfg = Config::default();
 
-    if let Some(p) = get_string(&config, "profile") {
+    if let Some(p) = get_string(&config, "profile")? {
         cfg.profile = match p.as_str() {
             "baseline" => Profile::Baseline,
             "aggressive" => Profile::Aggressive,
@@ -248,26 +275,26 @@ fn parse_config(config: JsValue) -> Result<Config, JsError> {
     if let Some(symbols) = get_string_array(&config, "preserveSymbols")? {
         cfg.preserve_symbols = symbols;
     }
-    if let Some(mangle) = get_bool(&config, "mangle") {
+    if let Some(mangle) = get_bool(&config, "mangle")? {
         cfg.mangle = Some(mangle);
     }
-    if let Some(beautify) = get_bool(&config, "beautify") {
+    if let Some(beautify) = get_bool(&config, "beautify")? {
         cfg.beautify = beautify;
     }
-    if let Some(indent) = get_f64(&config, "indent") {
+    if let Some(indent) = get_f64(&config, "indent")? {
         cfg.indent = require_u8(indent, "indent")?;
     }
     cfg.float_precision = parse_float_precision(&config)?;
-    if let Some(v) = get_f64(&config, "maxInlineNodeCount") {
+    if let Some(v) = get_f64(&config, "maxInlineNodeCount")? {
         cfg.max_inline_node_count = Some(require_usize(v, "maxInlineNodeCount")?);
     }
-    if let Some(v) = get_f64(&config, "maxInlineCallSites") {
+    if let Some(v) = get_f64(&config, "maxInlineCallSites")? {
         cfg.max_inline_call_sites = Some(require_usize(v, "maxInlineCallSites")?);
     }
-    if let Some(preamble) = get_string(&config, "preamble") {
+    if let Some(preamble) = get_string(&config, "preamble")? {
         cfg.preamble = Some(preamble);
     }
-    if let Some(validate) = get_bool(&config, "validateEachPass") {
+    if let Some(validate) = get_bool(&config, "validateEachPass")? {
         cfg.trace.validate_each_pass = validate;
     }
 

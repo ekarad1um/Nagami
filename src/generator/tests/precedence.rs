@@ -142,6 +142,47 @@ fn bitwise_xor_with_additive_child_keeps_parens() {
 }
 
 #[test]
+fn bitwise_and_with_multiplicative_child_keeps_parens() {
+    // WGSL `&`/`|`/`^` take `unary_expression` operands, so a
+    // higher-precedence multiplicative/shift child is still grammatically
+    // ill-formed bare even though naga's permissive parser groups it
+    // correctly (and round-trips it, so no fallback fires).
+    for (src, want) in [
+        ("fn f(a:u32,b:u32,c:u32)->u32{return a&(b*c);}", "a&(b*c)"),
+        ("fn f(a:u32,b:u32,c:u32)->u32{return a&(b%c);}", "a&(b%c)"),
+        ("fn f(a:u32,b:u32,c:u32)->u32{return a|(b<<c);}", "a|(b<<c)"),
+        ("fn f(a:u32,b:u32,c:u32)->u32{return a^(b<<c);}", "a^(b<<c)"),
+    ] {
+        let out = compact(src);
+        assert!(
+            out.contains(want),
+            "bitwise parent must parenthesise its non-additive binary child: want {want} in {out}"
+        );
+        assert_valid_wgsl(&out);
+    }
+}
+
+#[test]
+fn bitwise_same_operator_left_child_drops_parens() {
+    // The grammar's left-recursion (`binary_and_expression '&'
+    // unary_expression`) permits a same-operator LEFT child unparenthesised,
+    // so `a&b&c` must stay bare (minification), while the right child still
+    // needs parens.
+    let out = compact("fn f(a:u32,b:u32,c:u32)->u32{return (a&b)&c;}");
+    assert!(
+        out.contains("a&b&c") && !out.contains("(a&b)&c"),
+        "same-operator left bitwise child should drop parens: {out}"
+    );
+    assert_valid_wgsl(&out);
+    let rhs = compact("fn f(a:u32,b:u32,c:u32)->u32{return a&(b&c);}");
+    assert!(
+        rhs.contains("a&(b&c)"),
+        "right bitwise child must keep parens (operands must be unary): {rhs}"
+    );
+    assert_valid_wgsl(&rhs);
+}
+
+#[test]
 fn bitwise_xor_additive_child_inside_comparison_keeps_parens() {
     let out = compact("fn f(t:u32,a:u32,b:u32)->bool{return t==(a^(b-1u));}");
     assert!(

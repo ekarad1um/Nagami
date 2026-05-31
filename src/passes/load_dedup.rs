@@ -864,11 +864,26 @@ fn remove_dead_stores_in_block(
     }
 
     if !dead_indices.is_empty() {
-        // Remove in descending order so earlier indices stay valid.
+        // Remove in descending order so earlier indices stay valid, and
+        // coalesce contiguous runs into a single `cull(lo..=hi)`.  Each
+        // `cull` is a `Vec::drain` (O(N) tail shift), so culling one index at
+        // a time was O(D*N); the natural dead-store pattern (`var x; x=a;
+        // x=b;`) produces a single contiguous run, making this O(N).
         dead_indices.sort_unstable_by(|a, b| b.cmp(a));
-        for idx in dead_indices {
-            block.cull(idx..=idx);
+        let mut iter = dead_indices.iter().copied();
+        let mut hi = iter.next().expect("non-empty checked above");
+        let mut lo = hi;
+        for idx in iter {
+            if idx + 1 == lo {
+                // Extends the current descending run downward.
+                lo = idx;
+            } else {
+                block.cull(lo..=hi);
+                hi = idx;
+                lo = idx;
+            }
         }
+        block.cull(lo..=hi);
         changed = true;
     }
 
@@ -1062,8 +1077,8 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         // rebind to the newer Load handle.  Producer-Loads must stay
         // out of `replacements` so their Stores stay alive against
         // this guard; rebinding would drag them in and silently mark
-        // the producer Store dead, re-introducing the 2026-04-17
-        // round-7 meet-over-branches bug.
+        // the producer Store dead, re-introducing the meet-over-branches
+        // miscompile this guard prevents.
         //
         // Two orderings combine:
         // 1. `load_pos > store_pos` (statement DFS positions, source
@@ -1487,13 +1502,24 @@ fn collect_redundant_loads<'body>(
         match statement {
             naga::Statement::Emit(range) => {
                 for handle in range.clone() {
-                    if let naga::Expression::Load { pointer } = &expressions[handle]
-                        && let Some(key) = get_pointer_key(expressions, *pointer)
-                    {
-                        // Track all live loads per local variable.
-                        if let Some(local) = get_stored_local(expressions, *pointer) {
-                            all_loads.entry(local).or_default().push(handle);
-                        }
+                    let naga::Expression::Load { pointer } = &expressions[handle] else {
+                        continue;
+                    };
+                    // Track EVERY load rooted at a local for the liveness
+                    // sets - independent of `get_pointer_key`.  A depth>=2
+                    // nested chain (`e.a.x`) is not forwardable (its base is
+                    // itself an Access), so `get_pointer_key` returns `None`;
+                    // but `get_stored_local` still resolves the root local.
+                    // Recording it keeps the local out of `dead_locals` (its
+                    // load is never replaced) and keeps its backing Store out
+                    // of `dead_store_ids`, so the surviving nested load is not
+                    // left reading the zero-default after the Store is dropped.
+                    if let Some(local) = get_stored_local(expressions, *pointer) {
+                        all_loads.entry(local).or_default().push(handle);
+                    }
+                    // Forwarding / dedup only applies to the depth-1 pointer
+                    // shapes `get_pointer_key` can describe as a cache key.
+                    if let Some(key) = get_pointer_key(expressions, *pointer) {
                         if let Some(&canonical) = cache.get(&key) {
                             replacements.insert(handle, canonical);
                             // Track whether this replacement was seeded by a Store.
@@ -2388,6 +2414,43 @@ mod tests {
             } => is_handle_in_any_emit(body, target) || is_handle_in_any_emit(continuing, target),
             _ => false,
         })
+    }
+
+    #[test]
+    fn nested_load_keeps_backing_store_alive() {
+        // A local read through a depth>=2 nested pointer chain (`e.a.x`) must
+        // keep its backing Store alive.  The liveness scan previously ignored
+        // such loads (`get_pointer_key` can't forward them), so `e` was wrongly
+        // marked dead and `e = s` removed - leaving the nested load reading the
+        // WGSL zero-default instead of the stored value (silent miscompile).
+        let source = r#"
+struct Inner { x: f32, y: f32 }
+struct Outer { a: Inner, b: f32 }
+@fragment
+fn fs(@location(0) k: f32) -> @location(0) vec4f {
+    var e: Outer;
+    var s: Outer;
+    s.a.x = k;
+    s.a.y = k;
+    s.b = k;
+    e = s;
+    let whole = e;
+    let nested = e.a.x;
+    return vec4f(whole.b, nested, 0.0, 1.0);
+}
+"#;
+        let (_changed, module) = run_pass(source);
+        let func = &module.entry_points[0].function;
+        let e = func
+            .local_variables
+            .iter()
+            .find(|(_, lv)| lv.name.as_deref() == Some("e"))
+            .map(|(h, _)| h)
+            .expect("local `e` must exist");
+        assert!(
+            count_stores_to_local(func, e) >= 1,
+            "the `e = s` store must survive: `e` is still read via the nested `e.a.x`"
+        );
     }
 
     #[test]
@@ -4340,19 +4403,17 @@ fn f(c: bool) -> i32 {
     //
     // Each of these shaders sets up a value that is bound by an `Emit`
     // inside a `Statement::Block` / `Statement::If` / `Statement::Switch`,
-    // then reads the variable that received it from outside the block.
-    // Before the scope-leak fix the pass forwarded the post-block load
-    // to the in-block value handle, producing IR that the validator
-    // rejects ("expression used outside its scope"); `run_pass`'s
-    // post-pass `validate_module` call asserts this never happens.
+    // then reads the variable that received it from outside the block.  The
+    // pass must NOT forward the post-block load to the in-block value handle:
+    // that produces IR the validator rejects ("expression used outside its
+    // scope").  `run_pass`'s post-pass `validate_module` call asserts this
+    // never happens.
 
     #[test]
     fn block_scope_leak_regression_statement_block() {
-        // Reduced from the empirical reproducer in the review:
-        // the inner brace forces the Compose's `let temp` binding to
-        // be lexically scoped to the block, but the post-block load of
-        // `x` would have been forwarded to that binding without the
-        // scope-aware filter.
+        // The inner brace forces the Compose's `let temp` binding to be
+        // lexically scoped to the block; the post-block load of `x` would be
+        // forwarded to that binding without the scope-aware filter.
         let source = r#"
 fn f(a: f32, b: f32, c: f32) -> vec3<f32> {
     var x: vec3<f32>;
@@ -4454,8 +4515,8 @@ fn f(c: bool, a: f32, b: f32, d: f32) -> vec3<f32> {
 
     #[test]
     fn scope_index_recurses_into_control_flow() {
-        // Body: Store(p,v)              pos 0
-        //       If {                    pos 1
+        // Body: Store(p,v)               pos 0
+        //       If {                     pos 1
         //         accept: Emit(a)        pos 2
         //         reject: Emit(b)        pos 3
         //       }
@@ -4828,10 +4889,9 @@ fn f() -> u32 {
     /// modified inside the block - mirrors the existing invalidation
     /// step in the `If`, `Switch`, and `Loop` arms.
     ///
-    /// Empirically reproduced by `data/extra-test3/validate_draw.wgsl`,
-    /// where the input has the same `var failed = false; { failed |= ...; }`
-    /// shape and pre-fix output dropped accumulator state at three of
-    /// five F-writes.
+    /// This `var failed = false; { failed |= ...; }` shape occurs in real
+    /// shaders, where pre-fix output dropped accumulator state at several of
+    /// the nested-block writes.
     ///
     /// Signal: emit the optimised IR back to WGSL and check that the
     /// pattern `failed=false|` does NOT appear in writes inside nested

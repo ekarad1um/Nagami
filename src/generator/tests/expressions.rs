@@ -389,6 +389,82 @@ fn full_swizzle_identity_vec4_eliminates_constructor() {
 }
 
 #[test]
+fn identity_swizzle_collapse_in_constructor_arg_is_not_parenthesized() {
+    // A matrix column written as a full identity swizzle of a BINARY value -
+    // `mat3x3f(vec3f(c.x,c.y,c.z), ..)` where `c` is `col*s` - collapses to the
+    // bare base `col*s`.  As a comma-delimited constructor argument nothing is
+    // appended, so the base must stay UNPARENTHESIZED: `mat3x3f(a*b, ..)`, not
+    // `mat3x3f((a*b), ..)`.  (Regression: the identity collapse routed through
+    // the postfix-aware emitter, which over-wrapped the loose argument.)
+    //
+    // The full pipeline is needed: CSE must unify the three `col*s` swizzle
+    // components onto a single shared base before the identity collapse fires.
+    let src = r#"
+        @fragment fn fs(@location(0) col: vec3f, @location(1) s: f32) -> @location(0) vec4f {
+            let m = mat3x3f(
+                vec3f((col * s).x, (col * s).y, (col * s).z),
+                vec3f((col + col).x, (col + col).y, (col + col).z),
+                col,
+            );
+            return vec4f(m[0], 1.);
+        }
+    "#;
+    let out = compact_with_passes(src, crate::config::Profile::Max);
+    let flat: String = out.split_whitespace().collect();
+    // Isolate the `mat3x3(` / `mat3x3f(` constructor argument list and assert
+    // each operator column is bare (`a*b`, `a+a`), not wrapped (`(a*b)`).
+    let ctor = flat
+        .split_once("mat3x3")
+        .and_then(|(_, rest)| rest.split_once('('))
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(args, _)| args)
+        .unwrap_or_else(|| panic!("expected a mat3x3 constructor: {out}"));
+    assert!(
+        !ctor.contains('('),
+        "identity-collapsed binary columns must be bare in the constructor \
+         arg list, found wrapping parens: {out}"
+    );
+    assert!(ctor.contains('*') || ctor.contains('+'), "sanity: {out}");
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn identity_swizzle_collapse_as_postfix_base_keeps_parens() {
+    // Tight-context guard for the fix above: when an identity-collapsed binary
+    // is the base of a postfix swizzle/index, the parens ARE required -
+    // `(a-b).x` must not degrade to `a-b.x` (parsed as `a-(b.x)`).  Build the
+    // collapse with the full pipeline, then index the result vector.
+    let src = r#"
+        @fragment fn fs(@location(0) p: vec3f, @location(1) q: vec3f) -> @location(0) vec4f {
+            let r = vec3f((p - q).x, (p - q).y, (p - q).z);
+            return vec4f(r.x, 0., 0., 1.);
+        }
+    "#;
+    let out = compact_with_passes(src, crate::config::Profile::Max);
+    let flat: String = out.split_whitespace().collect();
+    // Confirm this is the OPTIMISED generator emission, not naga's verbose
+    // fallback (which spells `vec4<f32>` and would mask a generator regression
+    // behind a still-valid `vec3<f32>(...).x` that also contains `).x`).  The
+    // generator emits the short `vec4f`; naga's writer never does.
+    assert!(
+        flat.contains("vec4f"),
+        "expected the optimised generator emission (short `vec4f`), not the \
+         naga fallback: {out}"
+    );
+    // `Profile::Max` mangles `p`/`q`, so assert STRUCTURALLY: the collapsed
+    // binary base `(p - q)` carries a `.x` swizzle and must stay parenthesised -
+    // `(A-a).x` contains `).x`; the miscompiled bare form `A-a.x` (which parses
+    // as `A-(a.x)`) does not.  Both are valid WGSL, so this structural check -
+    // not `assert_valid_wgsl` - is what guards the fix.
+    assert!(
+        flat.contains(").x"),
+        "the binary base of a postfix `.x` swizzle must stay parenthesised \
+         (`(a-b).x`, not the miscompiled `a-b.x`): {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
 fn full_swizzle_reorder_vec4() {
     // vec4f(v.w, v.z, v.y, v.x) -> v.wzyx
     let src = r#"
@@ -530,6 +606,43 @@ fn swizzle_non_sequential_indices() {
     assert!(
         out.contains(".wx"),
         "non-sequential same-base should group: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn swizzle_base_binary_keeps_parens() {
+    // When a single-use `let d = a - b` is inlined as the shared base of a
+    // swizzle, the base carries a `.swizzle` suffix and so must be
+    // parenthesised: `(a-b).yx`, NOT `a-b.yx` (which parses as `a-(b.yx)`,
+    // a DIFFERENT value that still validates -> silent miscompilation).
+    let full = compact("fn f(a:vec2f,b:vec2f)->vec2f{ let d=a-b; return vec2f(d.y,d.x); }");
+    assert!(
+        full.contains("(a-b).yx") && !full.contains("a-b.yx"),
+        "full swizzle of a binary base must keep parens: {full}"
+    );
+    assert_valid_wgsl(&full);
+
+    // Partial-group path (emit_compose_grouped): the grouped swizzle base
+    // must be parenthesised too.
+    let grouped =
+        compact("fn f(a:vec3f,b:vec3f)->vec4f{ let d=a-b; return vec4f(d.x,d.y,0.,1.); }");
+    assert!(
+        grouped.contains("(a-b).xy"),
+        "grouped swizzle of a binary base must keep parens: {grouped}"
+    );
+    assert_valid_wgsl(&grouped);
+}
+
+#[test]
+fn swizzle_identity_collapse_of_binary_keeps_parens() {
+    // Identity swizzle (`vec2f(d.x, d.y)` over a 2-component base) collapses
+    // to the bare base; when that base is a binary used in an operator
+    // context, it must still carry parens so it does not re-associate.
+    let out = compact("fn f(a:vec2f,b:vec2f,k:f32)->vec2f{ let d=a-b; return vec2f(d.x,d.y)*k; }");
+    assert!(
+        out.contains("(a-b)*k") && !out.contains("a-b*k"),
+        "identity-collapsed binary base in operator context must keep parens: {out}"
     );
     assert_valid_wgsl(&out);
 }

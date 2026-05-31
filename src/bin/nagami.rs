@@ -294,7 +294,16 @@ fn run_cli() -> Result<bool, Box<dyn std::error::Error>> {
         write_atomic(&args.input, &output.source)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", args.input.display())))?;
     } else if let Some(path) = args.output.as_deref() {
-        write_output(path, &output.source)?;
+        // Prefix the offending path on failure, matching read_input / the
+        // preamble read / the in-place write above - EXCEPT for explicit
+        // `-o -` (stdout), where `-` is not a meaningful path to report, so
+        // the error stays bare (consistent with the no-`-o` stdout branch).
+        let r = write_output(path, &output.source);
+        if is_dash_path(path) {
+            r?;
+        } else {
+            r.map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+        }
     } else {
         write_output(Path::new("-"), &output.source)?;
     }

@@ -675,9 +675,7 @@ fn fs_main() -> @location(0) vec4f {
     fn clears_named_expressions_and_reports_change_even_when_nothing_renamed() {
         // INVERSE regression: a tempting "perf" fix gated this clear
         // on `changed > 0` so a preserve-all pass would not report a
-        // change.  Real-world test corpus
-        // (data/extra-test4/bug/{tint/1737, chromium/1449474}.wgsl,
-        // data/extra-test3/glsl-fma.frag.wgsl) showed the convergence
+        // change.  Google Tint test corpus showed the convergence
         // loop exits one sweep too early in that mode and downstream
         // DCE never gets a chance to remove orphaned globals.  This
         // test pins the "always clear and report changed" behaviour

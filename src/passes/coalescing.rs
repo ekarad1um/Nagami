@@ -228,7 +228,15 @@ fn element_count_for_type(
     match types[ty].inner {
         naga::TypeInner::Scalar(_) => 1,
         naga::TypeInner::Vector { size, .. } => size as u32,
-        naga::TypeInner::Matrix { columns, rows, .. } => (columns as u32) * (rows as u32),
+        // A matrix is addressed by COLUMN: `AccessIndex(LocalVariable(m), i)`
+        // has `i` in `0..columns` and `resolve_local_and_element` maps it to
+        // `ElementSpec::Index(i)`, setting bit `i`.  Tracking `columns` (not
+        // `columns * rows`) lets a matrix built column-by-column
+        // (`m[0]=..; m[1]=..;`) reach full coverage; using `columns * rows`
+        // made full coverage unreachable via column writes, so column-built
+        // matrices were never coalescable.  Sub-column writes (`m[i].x`) are
+        // depth-2 and resolve to `Dynamic`, which still demands full coverage.
+        naga::TypeInner::Matrix { columns, .. } => columns as u32,
         naga::TypeInner::Array {
             size: naga::ArraySize::Constant(n),
             ..
@@ -253,8 +261,7 @@ fn element_count_for_type(
 }
 
 /// Walk a pointer-expression chain back to its root `LocalVariable`
-/// AND classify which part of the local the chain targets.  This is
-/// the element-aware sibling of [`resolve_ptr_to_local`].
+/// AND classify which part of the local the chain targets.
 ///
 /// One-level constant chains (`AccessIndex(LocalVariable(L), i)`)
 /// give [`ElementSpec::Index`]; runtime-indexed `Access` chains and
@@ -458,24 +465,6 @@ fn collect_local_usage(
     usage
 }
 
-/// Walk a pointer-expression chain back to its root `LocalVariable`
-/// handle, unwrapping `AccessIndex` and `Access` wrappers.  Returns
-/// `None` if the pointer does not root in a local (function argument
-/// pointer, global, etc.), which conservatively excludes the expression
-/// from coalescing.
-fn resolve_ptr_to_local(
-    expr: naga::Handle<naga::Expression>,
-    expressions: &naga::Arena<naga::Expression>,
-) -> Option<naga::Handle<naga::LocalVariable>> {
-    match expressions[expr] {
-        naga::Expression::LocalVariable(lh) => Some(lh),
-        naga::Expression::AccessIndex { base, .. } | naga::Expression::Access { base, .. } => {
-            resolve_ptr_to_local(base, expressions)
-        }
-        _ => None,
-    }
-}
-
 /// Record a use of `local` at position `pos`, widening the running
 /// `(first, last)` window.  The first touch also flips `used` so the
 /// lane packer can skip locals that never appear.  The
@@ -654,39 +643,63 @@ fn scan_block_usage(
                 // The callee may load through the pointer before
                 // storing (or never store at all); the slot's prior
                 // value can reach the callee.  Conservative: treat as
-                // a read.  This is independent of element tracking
-                // (the callee can read or write any bytes).
+                // a read of the addressed element(s), AND gate on
+                // coverage exactly like the `Emit` Load arm - otherwise
+                // a partial-Store-then-escape leaks the predecessor
+                // local's residue once the slot is coalesced.  The
+                // first-touch gate alone misses this because the partial
+                // Store is the first touch, so it never fires.
                 for &arg in arguments {
-                    if let Some(local) = resolve_ptr_to_local(arg, expressions) {
+                    if let Some((local, spec)) = resolve_local_and_element(arg, expressions) {
                         mark_used(usage, local, current);
                         mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
+                        if !load_covers(local_init.get(&local), spec)
+                            && let Some(info) = usage.get_mut(&local)
+                        {
+                            info.coalesce_safe = false;
+                        }
                     }
                 }
             }
             naga::Statement::Atomic { pointer, .. } => {
                 // Atomic ops are read-modify-write; the prior value is
-                // observed.  Conservative: treat as a read.
-                if let Some(local) = resolve_ptr_to_local(*pointer, expressions) {
+                // observed.  Conservative read + coverage gate (see the
+                // `Call` arm).
+                if let Some((local, spec)) = resolve_local_and_element(*pointer, expressions) {
                     mark_used(usage, local, current);
                     mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
+                    if !load_covers(local_init.get(&local), spec)
+                        && let Some(info) = usage.get_mut(&local)
+                    {
+                        info.coalesce_safe = false;
+                    }
                 }
             }
             naga::Statement::RayQuery { query, .. } => {
                 // The ray-query state object's prior bytes can matter
-                // for subsequent ops; conservative read.
-                if let Some(local) = resolve_ptr_to_local(*query, expressions) {
+                // for subsequent ops; conservative read + coverage gate.
+                if let Some((local, spec)) = resolve_local_and_element(*query, expressions) {
                     mark_used(usage, local, current);
                     mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
+                    if !load_covers(local_init.get(&local), spec)
+                        && let Some(info) = usage.get_mut(&local)
+                    {
+                        info.coalesce_safe = false;
+                    }
                 }
             }
             naga::Statement::RayPipelineFunction(fun) => {
                 // `TraceRay` reads the payload pointer as input and may
-                // write it; conservative read (the prior value reaches
-                // the callee).
+                // write it; conservative read + coverage gate.
                 let naga::RayPipelineFunction::TraceRay { payload, .. } = fun;
-                if let Some(local) = resolve_ptr_to_local(*payload, expressions) {
+                if let Some((local, spec)) = resolve_local_and_element(*payload, expressions) {
                     mark_used(usage, local, current);
                     mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
+                    if !load_covers(local_init.get(&local), spec)
+                        && let Some(info) = usage.get_mut(&local)
+                    {
+                        info.coalesce_safe = false;
+                    }
                 }
             }
             naga::Statement::CooperativeStore { target, data } => {
@@ -1422,8 +1435,7 @@ fn fs_main(@location(0) cond: f32) -> @location(0) vec4f {
         // parent ledger.
         //
         // Without that propagation, this shader regressed by ~90 bytes
-        // versus baseline on real shader corpora (e.g.
-        // data/extra-test4/bug/tint/913.wgsl) because none of `b` /
+        // versus baseline on real shader corpora because none of `b` /
         // similar locals could share slots.
         let source = r#"
 @fragment
@@ -1500,6 +1512,129 @@ fn fs_main() -> @location(0) vec4f {
              read via `arr[2]` must not share a slot with `l_full`, \
              whose fully-written bytes would leak into the supposed \
              zero-init read"
+        );
+    }
+
+    #[test]
+    fn no_coalesce_partial_write_then_pointer_escape_via_call() {
+        // Same hazard as the direct-Load case above, but the uncovered
+        // read happens INSIDE a callee reached through a pointer argument.
+        // The pointer-escape arms must apply the coverage gate too: a
+        // partial Store is the block's first touch, so the first-touch gate
+        // alone never fires and `arr` would coalesce onto `l_full`, leaking
+        // its residue into the callee's zero-init read of `arr[2]`.
+        let source = r#"
+fn sink(p: ptr<function, array<f32, 4>>) -> f32 { return (*p)[2]; }
+@fragment
+fn fs_main(@location(0) idx: f32) -> @location(0) vec4f {
+    var l_full: array<f32, 4>;
+    l_full = array<f32, 4>(10.0, 20.0, 30.0, 40.0);
+    let l_sum = l_full[0] + l_full[1] + l_full[2] + l_full[3];
+
+    var arr: array<f32, 4>;
+    arr[i32(idx)] = 1.0;
+    let v = sink(&arr);
+    return vec4f(l_sum + v, 0.0, 0.0, 1.0);
+}
+"#;
+        let (_, module) = run_pass(source);
+        assert_eq!(
+            distinct_local_handles_referenced(&module),
+            2,
+            "partially-written `arr` escaping by pointer to `sink` must not \
+             coalesce onto `l_full` (the callee would read l_full's residue \
+             where WGSL guarantees zero-init)"
+        );
+    }
+
+    #[test]
+    fn coalesces_fully_written_aggregate_escaping_by_pointer() {
+        // Companion to the negative test: the coverage gate is precise, not
+        // a blanket disable.  A FULLY-written aggregate escaping by pointer
+        // exposes no residue, so it must still coalesce onto a dead
+        // predecessor's slot.
+        let source = r#"
+fn sink(p: ptr<function, array<f32, 4>>) -> f32 { return (*p)[2]; }
+@fragment
+fn fs_main() -> @location(0) vec4f {
+    var l_full: array<f32, 4>;
+    l_full = array<f32, 4>(10.0, 20.0, 30.0, 40.0);
+    let l_sum = l_full[0] + l_full[1] + l_full[2] + l_full[3];
+
+    var arr: array<f32, 4>;
+    arr = array<f32, 4>(1.0, 2.0, 3.0, 4.0);
+    let v = sink(&arr);
+    return vec4f(l_sum + v, 0.0, 0.0, 1.0);
+}
+"#;
+        let (changed, module) = run_pass(source);
+        assert!(
+            changed,
+            "fully-written aggregate escaping by pointer should still coalesce"
+        );
+        assert_eq!(
+            distinct_local_handles_referenced(&module),
+            1,
+            "fully-written `arr` exposes no residue, so it should share \
+             `l_full`'s slot"
+        );
+    }
+
+    #[test]
+    fn coalesces_matrix_fully_written_by_columns() {
+        // Matrices are addressed by column.  With column-granular coverage a
+        // matrix written column-by-column (`m[0]=..; m[1]=..`) reaches full
+        // coverage and can coalesce onto a dead same-typed predecessor -
+        // impossible under the old `columns * rows` count.
+        let source = r#"
+@fragment
+fn fs_main() -> @location(0) vec4f {
+    var p: mat2x2<f32>;
+    p[0] = vec2<f32>(10.0, 20.0);
+    p[1] = vec2<f32>(30.0, 40.0);
+    let s1 = p[0].x + p[1].y;
+
+    var m: mat2x2<f32>;
+    m[0] = vec2<f32>(1.0, 2.0);
+    m[1] = vec2<f32>(3.0, 4.0);
+    let s2 = m[0].x + m[1].y;
+
+    return vec4f(s1 + s2, 0.0, 0.0, 1.0);
+}
+"#;
+        let (_, module) = run_pass(source);
+        assert_eq!(
+            distinct_local_handles_referenced(&module),
+            1,
+            "matrix fully written via per-column Stores should coalesce"
+        );
+    }
+
+    #[test]
+    fn no_coalesce_matrix_partially_written_by_columns() {
+        // Safety companion: only column 0 is written, then column 1 is read,
+        // so `m[1]` observes the WGSL zero-init.  Coalescing onto a written
+        // predecessor would leak its residue - must refuse.
+        let source = r#"
+@fragment
+fn fs_main() -> @location(0) vec4f {
+    var p: mat2x2<f32>;
+    p[0] = vec2<f32>(10.0, 20.0);
+    p[1] = vec2<f32>(30.0, 40.0);
+    let s1 = p[0].x + p[1].y;
+
+    var m: mat2x2<f32>;
+    m[0] = vec2<f32>(1.0, 2.0);
+    let s2 = m[0].x + m[1].y;
+
+    return vec4f(s1 + s2, 0.0, 0.0, 1.0);
+}
+"#;
+        let (_, module) = run_pass(source);
+        assert_eq!(
+            distinct_local_handles_referenced(&module),
+            2,
+            "partially-column-written matrix must not coalesce (m[1] reads zero-init)"
         );
     }
 

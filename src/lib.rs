@@ -263,6 +263,38 @@ fn has_enable_f16_directive(source: &str) -> bool {
 /// text stops being spec-compliant.  Extracting the leading directives
 /// here lets the caller splice them in front of the preamble before
 /// concatenation so the result remains valid.
+/// If `bytes[i..]` begins a `//` line comment or a (nesting-aware) `/* */`
+/// block comment, return the byte index just past it; otherwise `None`.  An
+/// unterminated block comment returns `len`.  Shared by [`split_directives`]'
+/// leading-trivia skip and its `;`-terminator scan so both treat comments
+/// identically - a `;` inside a comment must never terminate a directive.
+fn skip_comment(bytes: &[u8], i: usize, len: usize) -> Option<usize> {
+    if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+        let mut j = i + 2;
+        while j < len && bytes[j] != b'\n' {
+            j += 1;
+        }
+        return Some(j);
+    }
+    if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+        let mut j = i + 2;
+        let mut depth = 1usize;
+        while j + 1 < len && depth > 0 {
+            if bytes[j] == b'/' && bytes[j + 1] == b'*' {
+                depth += 1;
+                j += 2;
+            } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+                depth -= 1;
+                j += 2;
+            } else {
+                j += 1;
+            }
+        }
+        return Some(if depth > 0 { len } else { j });
+    }
+    None
+}
+
 fn split_directives(source: &str) -> (&str, &str) {
     let bytes = source.as_bytes();
     let len = bytes.len();
@@ -287,29 +319,8 @@ fn split_directives(source: &str) -> (&str, &str) {
             while scan < len && bytes[scan].is_ascii_whitespace() {
                 scan += 1;
             }
-            if scan + 1 < len && bytes[scan] == b'/' && bytes[scan + 1] == b'/' {
-                let mut j = scan + 2;
-                while j < len && bytes[j] != b'\n' {
-                    j += 1;
-                }
-                scan = j;
-                continue;
-            }
-            if scan + 1 < len && bytes[scan] == b'/' && bytes[scan + 1] == b'*' {
-                let mut j = scan + 2;
-                let mut depth = 1usize;
-                while j + 1 < len && depth > 0 {
-                    if bytes[j] == b'/' && bytes[j + 1] == b'*' {
-                        depth += 1;
-                        j += 2;
-                    } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
-                        depth -= 1;
-                        j += 2;
-                    } else {
-                        j += 1;
-                    }
-                }
-                scan = if depth > 0 { len } else { j };
+            if let Some(next) = skip_comment(bytes, scan, len) {
+                scan = next;
                 continue;
             }
             break;
@@ -337,9 +348,15 @@ fn split_directives(source: &str) -> (&str, &str) {
         if !is_directive {
             break;
         }
-        // Consume through the terminating `;`.
+        // Consume through the terminating `;`, skipping comments so a `;`
+        // inside a `//` or `/* */` comment between the directive keyword and
+        // its real terminator does not split the directive mid-comment.
         let mut j = scan;
         while j < len && bytes[j] != b';' {
+            if let Some(next) = skip_comment(bytes, j, len) {
+                j = next;
+                continue;
+            }
             j += 1;
         }
         if j >= len {
@@ -736,10 +753,16 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                 };
                 let valid = match &validation_result {
                     Ok(()) => true,
-                    Err(e)
-                        if emitted.source.contains("enable subgroups;")
-                            && is_known_text_validation_limitation(e) =>
-                    {
+                    // Key the bypass on the validator's own message, not on the
+                    // emitted source text.  The custom generator never
+                    // synthesises `enable subgroups;` (it emits the builtins
+                    // bare), so an `emitted.source.contains("enable subgroups;")`
+                    // guard was unsatisfiable - it made this whole arm dead.
+                    // naga's text front-end accepts the bare subgroup builtins
+                    // today, so this still does not fire; it remains as forward
+                    // defence for a naga release that reports the subgroups
+                    // round-trip limitation through text re-validation.
+                    Err(e) if is_known_text_validation_limitation(e) => {
                         if config.trace.enabled {
                             eprintln!(
                                 "warning: skipping text-validation rollback due to known naga subgroup parser limitation"
@@ -1475,6 +1498,32 @@ mod tests {
     }
 
     #[test]
+    fn split_directives_terminator_scan_ignores_semicolon_in_block_comment() {
+        // A `;` inside a comment BETWEEN the directive keyword and its real
+        // terminator must not split the directive mid-comment (which would
+        // splice a preamble into the broken comment region).
+        let src = "diagnostic /* a;b */ (off, derivative_uniformity);\n\
+                   @fragment fn main() -> @location(0) vec4f { return vec4f(0.); }\n";
+        let (dirs, rest) = split_directives(src);
+        assert_eq!(dirs, "diagnostic /* a;b */ (off, derivative_uniformity);\n");
+        assert!(
+            rest.starts_with("@fragment"),
+            "body must start at the real declaration, not inside the comment: {rest:?}"
+        );
+    }
+
+    #[test]
+    fn split_directives_terminator_scan_ignores_semicolon_in_line_comment() {
+        let src = "enable f16; // trailing ; comment\nstruct S { x: f16 }\n";
+        let (dirs, rest) = split_directives(src);
+        // The directive's own `;` terminates it; the line comment is body
+        // trivia.  (The point is the line-comment `;` is not mistaken for a
+        // second directive terminator.)
+        assert!(dirs.starts_with("enable f16;"));
+        assert!(rest.contains("struct S"));
+    }
+
+    #[test]
     fn split_directives_no_directives() {
         let src = "struct S { x: f32 }\nfn f() {}\n";
         let (dirs, rest) = split_directives(src);
@@ -1921,7 +1970,7 @@ mod tests {
             preamble: Some(preamble.to_string()),
             ..Default::default()
         };
-        // Default config => compact mode: the F1 failure path.
+        // Default config => compact mode.
         let output = run(source, &config)
             .expect("enable f16; in preamble + f16 source must minify in compact mode");
         assert!(
@@ -2010,11 +2059,10 @@ mod tests {
 
     #[test]
     fn folds_f64_vector_narrowing_cast_to_valid_constructor() {
-        // Residual issue #1: a const f64 VECTOR narrowing cast
-        // (`vec2<f32>(vec2<f64>(.5lf,1.5lf))`) is rejected by naga on re-parse,
-        // and const_fold can't materialize the converted vector (the converted
-        // F32 component literals don't exist as arena handles), so it used to
-        // hard-error.  The generator now folds it to a converted constructor.
+        // A const f64 VECTOR narrowing cast (`vec2<f32>(vec2<f64>(.5lf,1.5lf))`)
+        // is rejected by naga on re-parse, and const_fold can't materialize the
+        // converted vector (the converted F32 component literals don't exist as
+        // arena handles).  The generator folds it to a converted constructor.
         for (store_ty, decl_a, cast) in [
             ("vec2<f32>", "vec2<f64>(0.5lf, 1.5lf)", "vec2<f32>(a)"),
             (

@@ -291,9 +291,9 @@ fn mangle_no_preserve_still_mangles_everything() {
 #[test]
 fn mangle_preserve_short_type_no_collision_with_next_struct() {
     // Regression: preserved struct type name "A" must not collide with the
-    // mangled name assigned to another struct.  Before the fix, "A" was
-    // not added to the generator's `used_names`, so the counter could
-    // generate "A" for struct B -> duplicate struct definitions -> invalid WGSL.
+    // mangled name assigned to another struct.  The preserved "A" must be in
+    // the generator's `used_names`, else the counter can generate "A" for
+    // struct B -> duplicate struct definitions -> invalid WGSL.
     //
     // Struct B is declared BEFORE struct A so that the counter reaches "A"
     // first, then the preserved "A" duplicates it.
@@ -402,12 +402,12 @@ fn no_extraction_for_short_or_rare_literal() {
 
 #[test]
 fn extracts_typed_only_f64_literal_at_lower_break_even() {
-    // Issue D: a needs-typed literal (F64) used only in standalone (typed)
-    // positions emits the longer `123.456lf` form (9 chars), so its per-use
-    // cost is priced there.  Three such uses now break even
-    // (3*(9-1) - (8+1+9) = 6 > 0) and extract; the old bare-length estimate
-    // (3*(7-1) - 18 = 0) missed it.  Each `return` is a standalone (non-
-    // constructor) position, so `has_bare` is false and the typed price applies.
+    // A needs-typed literal (F64) used only in standalone (typed) positions
+    // emits the longer `123.456lf` form (9 chars), so its per-use cost is priced
+    // there.  Three such uses break even (3*(9-1) - (8+1+9) = 6 > 0) and extract;
+    // pricing them at the bare length (3*(7-1) - 18 = 0) would miss it.  Each
+    // `return` is a standalone (non-constructor) position, so `has_bare` is false
+    // and the typed price applies.
     let src = r#"
             fn a() -> f64 { return 123.456lf; }
             fn b() -> f64 { return 123.456lf; }
@@ -428,7 +428,7 @@ fn extracts_typed_only_f64_literal_at_lower_break_even() {
 
 #[test]
 fn does_not_over_extract_bare_heavy_needs_typed_literal() {
-    // Issue D regression guard: an F64 literal used only BARE inside
+    // Regression guard: an F64 literal used only BARE inside
     // constructors emits the short `1.5` (3 chars), so pricing it at the typed
     // `1.5lf` length (the UNSAFE naive fix) would over-extract and GROW the
     // output.  With any bare use present the model keeps the bare price, so
@@ -588,6 +588,38 @@ fn count_literals_does_not_extract_splat_only_literal() {
     assert!(
         !out.contains("=1.234567") && !out.contains("= 1.234567"),
         "literal should NOT have been extracted into a const decl: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn count_literals_does_not_over_extract_deferred_var_store_literal() {
+    // A deferred local's FIRST store emits `var acc = 3.333333f` in typed
+    // form, bypassing `extracted_literals`.  Naive counting sees 3 uses of
+    // `3.333333` (the deferred store + two extraction-aware storage writes)
+    // and extracts a `const`; but only 2 uses actually shrink, which is below
+    // break-even, so extraction yields a NET-LARGER output.  The deferred-store
+    // typed-form adjustment must drop the count to 2 so no const is created.
+    let src = r#"
+            @group(0) @binding(0) var<storage, read_write> buf: array<f32, 4>;
+            @compute @workgroup_size(1)
+            fn main() {
+                var acc: f32;
+                acc = 3.333333;
+                buf[0] = 3.333333;
+                buf[1] = 3.333333;
+                buf[2] = acc;
+            }
+        "#;
+    let out = compact(src);
+    assert!(
+        !out.contains("const"),
+        "deferred-var-store literal must not be counted as an extraction-\
+         shrinking use; 2 real uses are below break-even, so no const: {out}"
+    );
+    assert!(
+        out.contains("3.333333"),
+        "literal should still appear inline: {out}"
     );
     assert_valid_wgsl(&out);
 }

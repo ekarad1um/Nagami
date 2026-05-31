@@ -49,8 +49,10 @@ const fn const_str_lt(a: &str, b: &str) -> bool {
 ///   skips atomic loads, first-call init branches, and heap allocation.
 ///
 /// The `WGSL_RESERVED` and `WGSL_PREDECLARED` source arrays stay in
-/// human-curated, categorised order for review-friendliness; the sort
-/// invariant is guarded by `reserved_table_is_sorted_and_unique`.
+/// human-curated, categorised order for review-friendliness; the
+/// sort/uniqueness invariant of the merged table is enforced at compile time
+/// by the `const _` assertion below and additionally exercised at runtime by
+/// `reserved_table_is_sorted_and_unique`.
 const RESERVED_SORTED: [&str; RESERVED_SORTED_LEN] = {
     // Concatenate both source slices into a fixed-size array.
     let mut arr: [&str; RESERVED_SORTED_LEN] = [""; RESERVED_SORTED_LEN];
@@ -81,6 +83,24 @@ const RESERVED_SORTED: [&str; RESERVED_SORTED_LEN] = {
         k += 1;
     }
     arr
+};
+
+/// Compile-time guard for [`RESERVED_SORTED`]'s binary-search precondition:
+/// every adjacent pair must be strictly ascending, which simultaneously
+/// proves the table is sorted AND duplicate-free.  A violation (a mis-ordered
+/// or duplicate entry added to either source array) fails the build here
+/// instead of silently degrading `binary_search` at run time.  This is
+/// strictly stronger than the test [`reserved_table_is_sorted_and_unique`]
+/// and costs nothing at run time.
+const _: () = {
+    let mut i = 1;
+    while i < RESERVED_SORTED_LEN {
+        assert!(
+            const_str_lt(RESERVED_SORTED[i - 1], RESERVED_SORTED[i]),
+            "RESERVED_SORTED must be strictly ascending and duplicate-free"
+        );
+        i += 1;
+    }
 };
 
 const FIRST_LETTERS: [char; 52] = [
@@ -557,8 +577,9 @@ fn name_from_counter(counter: usize) -> String {
 
 /// Return `true` when `name` appears in [`RESERVED_SORTED`].  Binary
 /// search is safe because the table's ascending, duplicate-free ordering
-/// is locked at compile time and re-checked at runtime by
-/// `reserved_table_is_sorted_and_unique`.
+/// is built and then enforced at compile time by the `const _` assertion
+/// next to [`RESERVED_SORTED`] (and additionally exercised by the test
+/// `reserved_table_is_sorted_and_unique`).
 fn is_reserved(name: &str) -> bool {
     RESERVED_SORTED.binary_search(&name).is_ok()
 }

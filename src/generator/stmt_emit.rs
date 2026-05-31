@@ -2,78 +2,442 @@
 //!
 //! Drives the body of every function by walking its
 //! [`naga::Block`] in source order and dispatching to the matching
-//! emitter.  The file also hosts the "does expression `h` still have
-//! a pending use inside this block?" helpers used by the inliner
-//! heuristic that decides whether a `Call` result can be folded into
-//! its single caller.
+//! emitter.  The file also hosts the expression use-detection helpers
+//! (`stmt_uses_expr` / `stmts_use_expr`) that back the for-loop preload
+//! tail-use scan in [`for_loop_preload_inlining_is_safe`]; the call-inlining
+//! decision itself lives in `module_emit::find_inlineable_calls`.
 
 use crate::error::Error;
 
 use super::core::{FunctionCtx, Generator};
 
-// MARK: Expression use detection
-
-/// `true` when any statement in `block` still references `target`.
-/// Used by the call-inlining heuristic to confirm a `Call`'s result
-/// is consumed exactly once and nothing between the `Call` and its
-/// use would see a stale value.
-fn block_uses_expr(block: &naga::Block, target: naga::Handle<naga::Expression>) -> bool {
-    block.iter().any(|s| stmt_uses_expr(s, target))
+/// Count how many times emitting the expression tree rooted at `root` will
+/// materialise `target`.  `target` is a for-loop preload result that the
+/// caller has bound to inline `workgroupUniformLoad(&p)` text; every distinct
+/// path from `root` to `target` through the expression DAG re-emits that
+/// text, because loop-body-dependent intermediates cannot be hoisted to a
+/// `let` and so are inlined on each visit.  Memoised (paths-to-`target` is a
+/// per-node property) so a shared sub-DAG is counted in linear time.
+fn count_inline_emissions(
+    root: naga::Handle<naga::Expression>,
+    target: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+    cache: &mut std::collections::HashMap<naga::Handle<naga::Expression>, usize>,
+) -> usize {
+    if root == target {
+        return 1;
+    }
+    if let Some(&c) = cache.get(&root) {
+        return c;
+    }
+    let mut total = 0usize;
+    crate::passes::expr_util::visit_expression_children(&expressions[root], |child| {
+        total += count_inline_emissions(child, target, expressions, cache);
+    });
+    cache.insert(root, total);
+    total
 }
 
-/// Slice variant of [`block_uses_expr`] used when scanning a subset
-/// of statements (for example the tail of a block).
-fn stmts_use_expr(stmts: &[&naga::Statement], target: naga::Handle<naga::Expression>) -> bool {
-    stmts.iter().any(|s| stmt_uses_expr(s, target))
-}
-
-/// `true` when `stmt` references `target` in any of its operand
-/// positions, recursing into nested blocks.  Exhaustive per statement
-/// variant so a new naga statement forces an explicit decision.
-fn stmt_uses_expr(stmt: &naga::Statement, target: naga::Handle<naga::Expression>) -> bool {
-    use naga::Statement as S;
+/// Sum [`count_inline_emissions`] over the operand expressions of a for-loop
+/// update statement (`Store` / `Call` / `ImageStore`), so a preload reused
+/// across the update (e.g. `out[w] = w`) is detected as multi-emit.  The
+/// cache is shared across operands (same `target`).
+fn count_update_stmt_emissions(
+    stmt: &naga::Statement,
+    target: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+    cache: &mut std::collections::HashMap<naga::Handle<naga::Expression>, usize>,
+) -> usize {
+    let mut total = 0usize;
+    let mut add =
+        |h: naga::Handle<naga::Expression>,
+         cache: &mut std::collections::HashMap<naga::Handle<naga::Expression>, usize>| {
+            total += count_inline_emissions(h, target, expressions, cache);
+        };
     match stmt {
-        S::Emit(range) => range.clone().any(|h| h == target),
-        S::Store { pointer, value } => *pointer == target || *value == target,
-        S::Call { arguments, .. } => arguments.contains(&target),
-        S::Return { value: Some(v) } => *v == target,
-        S::Atomic { pointer, value, .. } => *pointer == target || *value == target,
-        S::WorkGroupUniformLoad { pointer, result } => *pointer == target || *result == target,
-        S::ImageStore {
+        naga::Statement::Store { pointer, value } => {
+            add(*pointer, cache);
+            add(*value, cache);
+        }
+        naga::Statement::Call { arguments, .. } => {
+            for a in arguments {
+                add(*a, cache);
+            }
+        }
+        naga::Statement::ImageStore {
             image,
             coordinate,
             array_index,
             value,
+            ..
         } => {
-            *image == target
-                || *coordinate == target
-                || array_index.is_some_and(|a| a == target)
-                || *value == target
+            add(*image, cache);
+            add(*coordinate, cache);
+            if let Some(ai) = array_index {
+                add(*ai, cache);
+            }
+            add(*value, cache);
         }
-        S::If {
+        _ => {}
+    }
+    total
+}
+
+/// Parsed for-loop shape shared by the emitter, the preload-safety predicate,
+/// and the candidate check, so they cannot drift.  Holds the leading body
+/// `WorkGroupUniformLoad` guard preloads, the if-break guard, and the
+/// `continuing` update preloads plus the single core update statement.
+pub(super) struct ForLoopShape<'a> {
+    /// `(pointer, result)` for each leading body `WorkGroupUniformLoad`.
+    pub(super) guard_preloads:
+        Vec<(naga::Handle<naga::Expression>, naga::Handle<naga::Expression>)>,
+    /// Body statement indices of those preloads (excluded from the for-body).
+    pub(super) guard_preload_stmt_indices: Vec<usize>,
+    /// Body index of the if-break guard statement.
+    pub(super) guard_idx: usize,
+    /// The guard's condition expression.
+    pub(super) condition: naga::Handle<naga::Expression>,
+    /// `true` when the guard is `if cond { break; }` (exit form; negate for `for`).
+    pub(super) needs_negation: bool,
+    /// `(pointer, result)` for each leading `continuing` `WorkGroupUniformLoad`.
+    pub(super) update_preloads:
+        Vec<(naga::Handle<naga::Expression>, naga::Handle<naga::Expression>)>,
+    /// The single core update statement in `continuing`, if any.  Its KIND
+    /// (Store / Call / ImageStore) is NOT validated here - callers that emit it
+    /// check that separately.
+    pub(super) update_stmt: Option<&'a naga::Statement>,
+}
+
+/// Parse a `Loop` into a [`ForLoopShape`], or `None` when it is not
+/// for-convertible: it carries a `break_if`, lacks a leading if-break guard
+/// (after optional `Emit` / `WorkGroupUniformLoad` preloads), or its
+/// `continuing` block holds more than one core (non-`Emit`, non-leading-
+/// preload) statement.  Purely structural - applies no preload-inlining
+/// safety check and no update-statement-kind check, so every consumer shares
+/// exactly one parse and layers its own policy on top.
+pub(super) fn parse_for_loop_shape<'a>(
+    body: &'a naga::Block,
+    continuing: &'a naga::Block,
+    break_if: &Option<naga::Handle<naga::Expression>>,
+) -> Option<ForLoopShape<'a>> {
+    if break_if.is_some() {
+        return None;
+    }
+
+    let body_stmts: Vec<_> = body.iter().collect();
+    let mut guard_preloads = Vec::new();
+    let mut guard_preload_stmt_indices = Vec::new();
+    let mut guard_idx = 0;
+    while guard_idx < body_stmts.len() {
+        match body_stmts[guard_idx] {
+            naga::Statement::Emit(_) => guard_idx += 1,
+            naga::Statement::WorkGroupUniformLoad { pointer, result } => {
+                guard_preloads.push((*pointer, *result));
+                guard_preload_stmt_indices.push(guard_idx);
+                guard_idx += 1;
+            }
+            _ => break,
+        }
+    }
+    if guard_idx >= body_stmts.len() {
+        return None;
+    }
+    let (condition, needs_negation) = match body_stmts[guard_idx] {
+        // `if cond {} else { break; }` - cond is the continue condition.
+        naga::Statement::If {
             condition,
             accept,
             reject,
-        } => {
-            *condition == target
-                || block_uses_expr(accept, target)
-                || block_uses_expr(reject, target)
+        } if accept.is_empty()
+            && reject.len() == 1
+            && matches!(reject.iter().next(), Some(naga::Statement::Break)) =>
+        {
+            (*condition, false)
         }
-        S::Switch { selector, cases } => {
-            *selector == target || cases.iter().any(|c| block_uses_expr(&c.body, target))
+        // `if cond { break; }` - cond is the exit condition (negate for `for`).
+        naga::Statement::If {
+            condition,
+            accept,
+            reject,
+        } if reject.is_empty()
+            && accept.len() == 1
+            && matches!(accept.iter().next(), Some(naga::Statement::Break)) =>
+        {
+            (*condition, true)
         }
-        S::Loop {
-            body,
-            continuing,
-            break_if,
-        } => {
-            break_if.is_some_and(|b| b == target)
-                || block_uses_expr(body, target)
-                || block_uses_expr(continuing, target)
+        _ => return None,
+    };
+
+    let mut update_preloads = Vec::new();
+    let mut update_stmt: Option<&naga::Statement> = None;
+    for s in continuing.iter() {
+        match s {
+            naga::Statement::Emit(_) => continue,
+            naga::Statement::WorkGroupUniformLoad { pointer, result } if update_stmt.is_none() => {
+                update_preloads.push((*pointer, *result));
+            }
+            _ => {
+                if update_stmt.is_some() {
+                    return None; // more than one core update statement
+                }
+                update_stmt = Some(s);
+            }
         }
-        S::Block(inner) => block_uses_expr(inner, target),
-        _ => false,
     }
+
+    Some(ForLoopShape {
+        guard_preloads,
+        guard_preload_stmt_indices,
+        guard_idx,
+        condition,
+        needs_negation,
+        update_preloads,
+        update_stmt,
+    })
+}
+
+/// Single source of truth for "can a for-shaped loop's `WorkGroupUniformLoad`
+/// preloads be safely inlined into the `for(...)` header?".  Both
+/// [`Generator::try_emit_for_loop`] (which emits) and
+/// `module_emit::is_for_loop_candidate` (which decides whether to suppress
+/// the counter's top-level `var`) call this on the SAME [`ForLoopShape`], so
+/// the two never disagree (a disagreement would leave the counter undeclared).
+/// Returns `false` only when inlining a preload would be wrong.
+///
+/// A `WorkGroupUniformLoad` preload carries a barrier side effect, so it must
+/// execute EXACTLY ONCE per iteration.  When the loop becomes a `for(...)`,
+/// a preload is materialised only where its `result` is emitted (inlined into
+/// the condition for a guard preload, into the update statement for an update
+/// preload); it has no statement of its own.  Three hazards are checked:
+/// * tail use - a guard preload result used AFTER the guard (in the body tail
+///   or the `continuing` block, both in scope for it) would lose its `let`
+///   binding when the preload is inlined into the condition;
+/// * multi-emit - a preload reused within the condition or update expression
+///   would execute the barrier more than once per iteration;
+/// * dropped - a preload whose `result` is NOT referenced by the condition /
+///   update (count 0) would never be emitted at all, silently deleting the
+///   barrier.  This also covers a `continuing` block that holds preloads but
+///   no core update statement (no update clause to carry them).
+///
+/// Each preload must therefore be emitted exactly once (`count == 1`); any
+/// other count refuses the for-loop conversion so plain-loop emission - which
+/// keeps the preload as its own statement - preserves the barrier.
+pub(super) fn for_loop_preload_inlining_is_safe(
+    shape: &ForLoopShape,
+    body: &naga::Block,
+    continuing: &naga::Block,
+    expressions: &naga::Arena<naga::Expression>,
+    must_bind_loads: &std::collections::HashSet<naga::Handle<naga::Expression>>,
+) -> bool {
+    // The update clause is RELOCATED into the `for(...; ...; update)` header,
+    // which is emitted BEFORE the body.  A `Load` that must be bound (its place
+    // is overwritten between its `Emit` and its use) has its `let` emitted at
+    // its body `Emit` - which comes AFTER the header.  So if a relocated clause
+    // references such a load it is inlined as the bare (post-write) place,
+    // re-introducing the very miscompile the must-bind analysis prevents.  Fall
+    // back to plain `loop` emission, where the body binding precedes the
+    // `continuing` use.  Two relocated clauses are at risk:
+    // * the update statement itself, and
+    // * each `continuing` `workgroupUniformLoad` preload, whose POINTER (e.g.
+    //   `&A[snap]`) is hoisted into the for-update slot - its index expression
+    //   is emitted as bare place text there.
+    // A condition with NO relocated barrier is safe: evaluated at iteration top, it
+    // coincides with the body-top load position, so an inlined must-bind load reads
+    // the value its body `let` would; outer loads it reads are already `let`-bound
+    // before the loop, and back-edge writes are covered by the must-bind loop
+    // pre-marking.  But a `workgroupUniformLoad` GUARD PRELOAD relocated into the
+    // condition IS a barrier - that third hazard is handled in the guard-preload
+    // block below.
+    if !must_bind_loads.is_empty()
+        && let Some(stmt) = shape.update_stmt
+    {
+        let update_hazard = stmt_references_must_bind_load(stmt, must_bind_loads, expressions)
+            || shape.update_preloads.iter().any(|&(pointer, _)| {
+                let mut visited = std::collections::HashSet::new();
+                cone_intersects_set(pointer, must_bind_loads, expressions, &mut visited)
+            });
+        if update_hazard {
+            return false;
+        }
+    }
+
+    if !shape.guard_preloads.is_empty() {
+        let body_stmts: Vec<_> = body.iter().collect();
+        // Guard-preload barrier hazard: a `workgroupUniformLoad` guard preload is
+        // inlined into the condition, which `for` evaluates at iteration top - BEFORE
+        // the body - and it carries a barrier (a peer invocation's store becomes
+        // visible only across it).  A must-bind load DEFINED in the pre-guard region
+        // (`body_stmts[..guard_idx]`, which holds only `Emit` / `WorkGroupUniformLoad`)
+        // is snapshotted there to capture the PRE-barrier value, but for-reconstruction
+        // re-emits its `let` in the body (after the relocated barrier) and/or inlines
+        // it into the condition after the barrier operand - either way reading the
+        // POST-barrier value, plain-loop emission keeps the snapshot before the barrier,
+        // so bail.
+        if !must_bind_loads.is_empty()
+            && body_stmts[..shape.guard_idx].iter().any(|s| {
+                matches!(s, naga::Statement::Emit(range)
+                    if range.clone().any(|h| must_bind_loads.contains(&h)))
+            })
+        {
+            return false;
+        }
+        let tail = if shape.guard_idx + 1 < body_stmts.len() {
+            &body_stmts[shape.guard_idx + 1..]
+        } else {
+            &[]
+        };
+        let continuing_stmts: Vec<_> = continuing.iter().collect();
+        let mut cache = std::collections::HashMap::new();
+        for &(_, result) in &shape.guard_preloads {
+            if stmts_use_expr(tail, result, expressions)
+                || stmts_use_expr(&continuing_stmts, result, expressions)
+            {
+                return false;
+            }
+            cache.clear();
+            // Must be inlined into the condition exactly once: 0 drops the
+            // barrier, >1 duplicates it.
+            if count_inline_emissions(shape.condition, result, expressions, &mut cache) != 1 {
+                return false;
+            }
+        }
+    }
+
+    match shape.update_stmt {
+        // No core update statement: any leading `WorkGroupUniformLoad` preload
+        // in `continuing` has nowhere to be emitted (the for-update clause is
+        // empty), so it would be dropped along with its barrier.
+        None => {
+            if !shape.update_preloads.is_empty() {
+                return false;
+            }
+        }
+        Some(stmt) => {
+            let mut cache = std::collections::HashMap::new();
+            for &(_, result) in &shape.update_preloads {
+                cache.clear();
+                if count_update_stmt_emissions(stmt, result, expressions, &mut cache) != 1 {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
+}
+
+// MARK: Expression use detection
+
+/// `true` when any handle in `set` appears anywhere in the operand cone of
+/// `stmt` (the transitive children of every expression the statement
+/// references).  Used to detect a `for`-update clause that would inline a
+/// load which the must-bind analysis requires be `let`-bound.
+fn stmt_references_must_bind_load(
+    stmt: &naga::Statement,
+    set: &std::collections::HashSet<naga::Handle<naga::Expression>>,
+    expressions: &naga::Arena<naga::Expression>,
+) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    let mut found = false;
+    crate::passes::expr_util::visit_statement_expression_handles(stmt, false, &mut |root| {
+        if !found {
+            found = cone_intersects_set(root, set, expressions, &mut visited);
+        }
+    });
+    found
+}
+
+/// `true` when `root` or any of its transitive children is in `set`.  Mirrors
+/// [`expr_subtree_contains`] but tests membership in a set; `visited` memoises
+/// proven-absent nodes so a shared sub-DAG is walked once.
+fn cone_intersects_set(
+    root: naga::Handle<naga::Expression>,
+    set: &std::collections::HashSet<naga::Handle<naga::Expression>>,
+    expressions: &naga::Arena<naga::Expression>,
+    visited: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+) -> bool {
+    if set.contains(&root) {
+        return true;
+    }
+    if !visited.insert(root) {
+        return false;
+    }
+    let mut found = false;
+    crate::passes::expr_util::visit_expression_children(&expressions[root], |child| {
+        if !found {
+            found = cone_intersects_set(child, set, expressions, visited);
+        }
+    });
+    found
+}
+
+/// `true` when `target` appears anywhere in the expression subtree rooted at
+/// `root` (including `root` itself).  A use of `target` almost always reaches
+/// a statement through an enclosing expression (`w + 1`, `f(w)`), so a flat
+/// handle-equality check on statement operands misses it - the recursion here
+/// is what makes [`stmt_uses_expr`] sound.
+fn expr_subtree_contains(
+    root: naga::Handle<naga::Expression>,
+    target: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+    // Nodes already proven NOT to contain `target` (per fixed `target`), so a
+    // shared sub-DAG is explored once - without this the path count through a
+    // diamond-shaped expression DAG is super-linear.  Mirrors the memo in the
+    // sibling `count_inline_emissions`.
+    visited: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+) -> bool {
+    if root == target {
+        return true;
+    }
+    if visited.contains(&root) {
+        return false;
+    }
+    let mut found = false;
+    crate::passes::expr_util::visit_expression_children(&expressions[root], |child| {
+        if !found {
+            found = expr_subtree_contains(child, target, expressions, visited);
+        }
+    });
+    // Only memoise the absent result; if `found`, the caller short-circuits the
+    // whole walk so `root` is never revisited.
+    if !found {
+        visited.insert(root);
+    }
+    found
+}
+
+/// `true` when `stmt` references `target` in ANY operand position - including
+/// nested inside an emitted expression (`out[i] = w + 1` uses `w`) and inside
+/// nested control-flow blocks.  Built on the exhaustive
+/// [`crate::passes::expr_util::visit_statement_expression_handles`], so every
+/// handle-bearing statement variant is covered and a new naga variant forces
+/// an update there rather than silently returning a false negative here.
+fn stmt_uses_expr(
+    stmt: &naga::Statement,
+    target: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+) -> bool {
+    // One memo per (target) query, shared across this statement's operands.
+    let mut visited = std::collections::HashSet::new();
+    let mut found = false;
+    crate::passes::expr_util::visit_statement_expression_handles(
+        stmt,
+        /*include_emit_handles=*/ true,
+        &mut |h| {
+            found = found || expr_subtree_contains(h, target, expressions, &mut visited);
+        },
+    );
+    found
+}
+
+/// Slice variant of [`stmt_uses_expr`] used when scanning a subset of
+/// statements (for example the tail of a loop body).
+fn stmts_use_expr(
+    stmts: &[&naga::Statement],
+    target: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+) -> bool {
+    stmts.iter().any(|s| stmt_uses_expr(s, target, expressions))
 }
 
 // MARK: Block emission
@@ -208,7 +572,13 @@ impl<'a> Generator<'a> {
             S::Emit(range) => {
                 let mut emitted_any = false;
                 for h in range.clone() {
-                    if !self.should_bind_expression(h, ctx) {
+                    // A `Load` whose place is written between this `Emit` and a
+                    // use MUST be bound; inlining it would read the post-write
+                    // value (silent miscompile).  This overrides BOTH the
+                    // bare-local/global short-name skip in `should_bind_expression`
+                    // and the `min_binding_refs` size threshold below.
+                    let force_bind = ctx.must_bind_loads.contains(&h);
+                    if !force_bind && !self.should_bind_expression(h, ctx) {
                         continue;
                     }
                     // Skip binding when the expression has too few references
@@ -216,7 +586,7 @@ impl<'a> Generator<'a> {
                     // expressions (e.g. `-x`, `v.y`, `a*b`) the threshold is
                     // higher because inlining them at each use site is cheaper.
                     let refs = ctx.ref_counts[h.index()];
-                    if refs < self.min_binding_refs(h, ctx) {
+                    if !force_bind && refs < self.min_binding_refs(h, ctx) {
                         continue;
                     }
                     // For subsequent bindings, start a new indented line.
@@ -389,31 +759,8 @@ impl<'a> Generator<'a> {
             }
             S::Store { pointer, value } => {
                 if let Some(atomic_scalar) = self.atomic_scalar_for_expr(*pointer, ctx) {
-                    let sep = self.comma_sep();
-                    // `atomicStore` requires `ptr<>`.  In WGSL text
-                    // scope, `var<>` identifiers (and access chains
-                    // rooted at them) are refs that need `&` to become
-                    // ptrs, but a function parameter declared `ptr<...>`
-                    // is already a ptr value - emitting `&p` against it
-                    // is a type error.  Same gate as call-arg lowering.
-                    let pointer_is_already_ptr = matches!(
-                        ctx.func.expressions[*pointer],
-                        naga::Expression::FunctionArgument(idx)
-                        if matches!(
-                            self.module.types[ctx.func.arguments[idx as usize].ty].inner,
-                            naga::TypeInner::Pointer { .. }
-                        )
-                    );
-                    if pointer_is_already_ptr {
-                        self.out.push_str("atomicStore(");
-                    } else {
-                        self.out.push_str("atomicStore(&");
-                    }
-                    self.out.push_str(&self.emit_expr(*pointer, ctx)?);
-                    self.out.push_str(sep);
-                    self.out
-                        .push_str(&self.emit_expr_for_atomic(*value, atomic_scalar, ctx)?);
-                    self.out.push_str(");");
+                    self.emit_atomic_store(*pointer, *value, atomic_scalar, ctx)?;
+                    self.out.push(';');
                     return Ok(());
                 }
 
@@ -955,108 +1302,18 @@ impl<'a> Generator<'a> {
             return Ok(false);
         }
 
-        // Find the If-break guard, skipping leading Emit statements.
-        // naga always places Emit ranges before the expressions they cover,
-        // so the condition's Emit precedes the If statement.
-        let body_stmts: Vec<_> = body.iter().collect();
-        // Optional leading `WorkGroupUniformLoad` statements feeding the guard.
-        let mut guard_preloads: Vec<(
-            naga::Handle<naga::Expression>,
-            naga::Handle<naga::Expression>,
-        )> = Vec::new();
-        let mut guard_preload_stmt_indices: Vec<usize> = Vec::new();
-        let mut guard_idx = 0;
-        while guard_idx < body_stmts.len() {
-            match body_stmts[guard_idx] {
-                naga::Statement::Emit(_) => {
-                    guard_idx += 1;
-                }
-                naga::Statement::WorkGroupUniformLoad { pointer, result } => {
-                    guard_preloads.push((*pointer, *result));
-                    guard_preload_stmt_indices.push(guard_idx);
-                    guard_idx += 1;
-                }
-                _ => break,
-            }
-        }
-        if guard_idx >= body_stmts.len() {
+        // Parse the loop into its for-loop shape via the shared parser, so the
+        // emitter, the preload-safety predicate, and `is_for_loop_candidate`
+        // all read the SAME structure and never drift.  `None` => not
+        // for-convertible.
+        let Some(shape) = parse_for_loop_shape(body, continuing, break_if) else {
             return Ok(false);
-        }
-
-        let condition = match body_stmts[guard_idx] {
-            // Pattern 1: `if cond {} else { break; }` - cond is the continue condition.
-            naga::Statement::If {
-                condition,
-                accept,
-                reject,
-            } if accept.is_empty()
-                && reject.len() == 1
-                && matches!(reject.iter().next(), Some(naga::Statement::Break)) =>
-            {
-                (*condition, false) // (handle, needs_negation)
-            }
-            // Pattern 2: `if cond { break; }` - cond is the exit condition (negate).
-            naga::Statement::If {
-                condition,
-                accept,
-                reject,
-            } if reject.is_empty()
-                && accept.len() == 1
-                && matches!(accept.iter().next(), Some(naga::Statement::Break)) =>
-            {
-                (*condition, true) // (handle, needs_negation)
-            }
-            _ => return Ok(false),
         };
 
-        // If we are going to drop leading preload `let` bindings and inline
-        // them in the `for` condition, their result handles must not be used
-        // anywhere after the guard.
-        if !guard_preloads.is_empty() {
-            let tail = if guard_idx + 1 < body_stmts.len() {
-                &body_stmts[guard_idx + 1..]
-            } else {
-                &[]
-            };
-            for (_, result) in &guard_preloads {
-                if stmts_use_expr(tail, *result) {
-                    return Ok(false);
-                }
-            }
-        }
-
-        // Continuing may start with `WorkGroupUniformLoad` preloads and then
-        // have at most one core update statement.
-        let mut update_preloads: Vec<(
-            naga::Handle<naga::Expression>,
-            naga::Handle<naga::Expression>,
-        )> = Vec::new();
-        let update_stmt = {
-            let mut found = None;
-            for s in continuing.iter() {
-                match s {
-                    naga::Statement::Emit(_) => continue,
-                    naga::Statement::WorkGroupUniformLoad { pointer, result }
-                        if found.is_none() =>
-                    {
-                        update_preloads.push((*pointer, *result));
-                    }
-                    _ => {
-                        if found.is_some() {
-                            // More than 1 core update statement - can't fit in for-header.
-                            return Ok(false);
-                        }
-                        found = Some(s);
-                    }
-                }
-            }
-            found
-        };
-
-        // Pre-validate: Store / Call / ImageStore are supported in the for-loop
-        // update slot.  Bail out *before* writing any output so the caller
-        // can fall back to normal `loop` emission cleanly.
-        if let Some(stmt) = update_stmt
+        // Pre-validate: only Store / Call / ImageStore fit the for-loop update
+        // slot.  Bail out *before* writing any output so the caller can fall
+        // back to normal `loop` emission cleanly.
+        if let Some(stmt) = shape.update_stmt
             && !matches!(
                 stmt,
                 naga::Statement::Store { .. }
@@ -1066,6 +1323,31 @@ impl<'a> Generator<'a> {
         {
             return Ok(false);
         }
+
+        // Reject when inlining a guard/update preload into the for-header would
+        // be unsafe (tail use, or reuse that duplicates the barrier).  The SAME
+        // predicate gates `is_for_loop_candidate`'s counter-var suppression, so
+        // the two never disagree (else a suppressed counter is left undeclared).
+        if !for_loop_preload_inlining_is_safe(
+            &shape,
+            body,
+            continuing,
+            &ctx.func.expressions,
+            &ctx.must_bind_loads,
+        ) {
+            return Ok(false);
+        }
+
+        let body_stmts: Vec<_> = body.iter().collect();
+        let ForLoopShape {
+            guard_preloads,
+            guard_preload_stmt_indices,
+            guard_idx,
+            condition,
+            needs_negation,
+            update_preloads,
+            update_stmt,
+        } = shape;
 
         // If no init was provided (from deferred-var absorption), try to
         // absorb an initialized local whose refs are confined to this loop.
@@ -1115,7 +1397,8 @@ impl<'a> Generator<'a> {
         self.push_indent();
         self.push_for_open();
 
-        // Init clause.
+        // Init clause.  A local declared here is no longer deferred (see below).
+        let mut deferred_for_init_local: Option<naga::Handle<naga::LocalVariable>> = None;
         if let Some((pointer, value)) = init {
             if let naga::Expression::LocalVariable(lh) = ctx.func.expressions[pointer] {
                 self.out.push_str("var ");
@@ -1133,6 +1416,15 @@ impl<'a> Generator<'a> {
                 } else {
                     self.out.push_str(&self.emit_expr(value, ctx)?);
                 }
+                // The `var <lh> = ...` for-init declares `lh`, so it is no longer
+                // deferred: a later Store to `lh` in the body (e.g. a counter
+                // update `b = b + 1` that stayed in the body rather than the
+                // continuing block) must emit a plain assignment, not a second
+                // `var` that shadows the for-init copy and freezes the counter.
+                // Clearing here (not at the Path-2 absorption site, which only
+                // runs after this whole call returns) is what the body emission
+                // sees.
+                deferred_for_init_local = Some(lh);
             } else {
                 self.out.push_str(&self.emit_lvalue(pointer, ctx)?);
                 self.push_assign();
@@ -1146,6 +1438,11 @@ impl<'a> Generator<'a> {
             let ty = ctx.func.local_variables[lh].ty;
             self.out.push(':');
             self.out.push_str(&self.type_ref(ty)?);
+            // Declared in the for-init: see the note above.
+            deferred_for_init_local = Some(lh);
+        }
+        if let Some(lh) = deferred_for_init_local {
+            ctx.deferred_vars[lh.index()] = false;
         }
         self.push_for_sep();
 
@@ -1160,12 +1457,11 @@ impl<'a> Generator<'a> {
             preload_old_bindings.push((*result, old));
         }
 
-        let (cond_handle, needs_negation) = condition;
         if needs_negation {
             self.out
-                .push_str(&self.emit_negated_condition(cond_handle, ctx)?);
+                .push_str(&self.emit_negated_condition(condition, ctx)?);
         } else {
-            self.out.push_str(&self.emit_expr(cond_handle, ctx)?);
+            self.out.push_str(&self.emit_expr(condition, ctx)?);
         }
 
         for (result, old) in preload_old_bindings {
@@ -1290,6 +1586,52 @@ impl<'a> Generator<'a> {
         Ok(true)
     }
 
+    /// Emit `atomicStore(&p, v)` (or `atomicStore(p, v)` when the pointer is
+    /// already a `ptr<>` value) WITHOUT a trailing terminator.  Shared by the
+    /// top-level `Store` handler and the for-loop-update inline `Store`
+    /// handler so an atomic-pointer `Store` lowers to the `atomicStore` builtin
+    /// in either position; assigning a scalar directly to `atomic<T>` (`p = v`)
+    /// is a WGSL type error that strict consumers reject.
+    fn emit_atomic_store(
+        &mut self,
+        pointer: naga::Handle<naga::Expression>,
+        value: naga::Handle<naga::Expression>,
+        atomic_scalar: naga::Scalar,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        let sep = self.comma_sep();
+        if self.pointer_is_ptr_value(pointer, ctx) {
+            self.out.push_str("atomicStore(");
+        } else {
+            self.out.push_str("atomicStore(&");
+        }
+        self.out.push_str(&self.emit_expr(pointer, ctx)?);
+        self.out.push_str(sep);
+        self.out
+            .push_str(&self.emit_expr_for_atomic(value, atomic_scalar, ctx)?);
+        self.out.push(')');
+        Ok(())
+    }
+
+    /// `true` when `pointer` is ALREADY a `ptr<>` value - a function parameter
+    /// declared `ptr<...>` - so the atomic builtins (`atomicLoad` /
+    /// `atomicStore`) take it directly; a `var<>`-rooted place needs `&` to form
+    /// the pointer, but emitting `&p` against a `ptr` value is a type error.
+    pub(super) fn pointer_is_ptr_value(
+        &self,
+        pointer: naga::Handle<naga::Expression>,
+        ctx: &FunctionCtx<'a, '_>,
+    ) -> bool {
+        matches!(
+            ctx.func.expressions[pointer],
+            naga::Expression::FunctionArgument(idx)
+            if matches!(
+                self.module.types[ctx.func.arguments[idx as usize].ty].inner,
+                naga::TypeInner::Pointer { .. }
+            )
+        )
+    }
+
     /// Emit a single statement's text without indent/newline/trailing semicolon.
     /// Used for for-loop update clauses.
     fn emit_statement_inline(
@@ -1299,7 +1641,12 @@ impl<'a> Generator<'a> {
     ) -> Result<(), Error> {
         match stmt {
             naga::Statement::Store { pointer, value } => {
-                if let Some((cop, other)) = self.try_compound_assign(*pointer, *value, ctx) {
+                if let Some(atomic_scalar) = self.atomic_scalar_for_expr(*pointer, ctx) {
+                    // For-loop update slot can hold an `atomicStore`; lower it
+                    // the same way the top-level Store handler does (see the
+                    // for-loop pre-validation that accepts atomic Stores).
+                    self.emit_atomic_store(*pointer, *value, atomic_scalar, ctx)?;
+                } else if let Some((cop, other)) = self.try_compound_assign(*pointer, *value, ctx) {
                     self.out.push_str(&self.emit_lvalue(*pointer, ctx)?);
                     let sp = self.bin_op_sep();
                     self.out.push_str(sp);
@@ -1443,7 +1790,7 @@ impl<'a> Generator<'a> {
 }
 
 impl<'a> Generator<'a> {
-    fn atomic_scalar_for_expr(
+    pub(super) fn atomic_scalar_for_expr(
         &self,
         expr: naga::Handle<naga::Expression>,
         ctx: &FunctionCtx<'a, '_>,

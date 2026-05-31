@@ -324,7 +324,7 @@ fn inline_in_function(
     function: &mut naga::Function,
     templates: &HashMap<naga::Handle<naga::Function>, InlineTemplate>,
 ) -> usize {
-    let changed = inline_in_block(
+    let (changed, _) = inline_in_block(
         &mut function.body,
         &mut function.expressions,
         templates,
@@ -339,6 +339,14 @@ fn inline_in_function(
     changed
 }
 
+/// Inline eligible calls in `block`, returning the change count AND the
+/// expression-replacement map this scope accumulated (inherited entries plus
+/// every `CallResult -> inlined-root` mapping recorded here).  The returned
+/// map lets a loop thread its `body`'s replacements into its `continuing`
+/// block and `break_if`, which naga permits to reference body-defined
+/// expressions; without it, inlining a body call leaves the continuing /
+/// break_if references pointing at an orphaned `CallResult` (invalid IR that
+/// forces a whole-module rollback).
 fn inline_in_block(
     block: &mut naga::Block,
     expressions: &mut naga::Arena<naga::Expression>,
@@ -347,7 +355,10 @@ fn inline_in_block(
         naga::Handle<naga::Expression>,
         naga::Handle<naga::Expression>,
     >,
-) -> usize {
+) -> (
+    usize,
+    HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+) {
     let mut changed = 0usize;
     let mut replacements = inherited_replacements.clone();
 
@@ -408,7 +419,7 @@ fn inline_in_block(
                 );
             }
             naga::Statement::Block(mut inner) => {
-                changed += inline_in_block(&mut inner, expressions, templates, &replacements);
+                changed += inline_in_block(&mut inner, expressions, templates, &replacements).0;
                 rebuilt.push(naga::Statement::Block(inner), span);
             }
             naga::Statement::If {
@@ -416,8 +427,8 @@ fn inline_in_block(
                 mut accept,
                 mut reject,
             } => {
-                changed += inline_in_block(&mut accept, expressions, templates, &replacements);
-                changed += inline_in_block(&mut reject, expressions, templates, &replacements);
+                changed += inline_in_block(&mut accept, expressions, templates, &replacements).0;
+                changed += inline_in_block(&mut reject, expressions, templates, &replacements).0;
                 rebuilt.push(
                     naga::Statement::If {
                         condition,
@@ -433,17 +444,39 @@ fn inline_in_block(
             } => {
                 for case in cases.iter_mut() {
                     changed +=
-                        inline_in_block(&mut case.body, expressions, templates, &replacements);
+                        inline_in_block(&mut case.body, expressions, templates, &replacements).0;
                 }
                 rebuilt.push(naga::Statement::Switch { selector, cases }, span);
             }
             naga::Statement::Loop {
                 mut body,
                 mut continuing,
-                break_if,
+                mut break_if,
             } => {
-                changed += inline_in_block(&mut body, expressions, templates, &replacements);
-                changed += inline_in_block(&mut continuing, expressions, templates, &replacements);
+                // naga lets the `continuing` block and `break_if` reference
+                // expressions defined in `body`, so the continuing recursion
+                // (and the break_if handle) must see the replacements `body`
+                // produced - otherwise a body-inlined call leaves them
+                // referencing an orphaned `CallResult`.
+                let (cb, body_replacements) =
+                    inline_in_block(&mut body, expressions, templates, &replacements);
+                changed += cb;
+                // `break_if` may reference a `CallResult` defined in the
+                // `continuing` block itself (naga allows it), so resolve it
+                // against the map the continuing recursion returned - which is
+                // seeded from `body_replacements`, hence a superset.  Using
+                // only `body_replacements` would leave a continuing-inlined
+                // call's result orphaned in `break_if` -> invalid IR -> rollback.
+                let (cc, continuing_replacements) = inline_in_block(
+                    &mut continuing,
+                    expressions,
+                    templates,
+                    &body_replacements,
+                );
+                changed += cc;
+                if let Some(handle) = break_if {
+                    break_if = Some(resolve_replacement(handle, &continuing_replacements));
+                }
                 rebuilt.push(
                     naga::Statement::Loop {
                         body,
@@ -458,7 +491,7 @@ fn inline_in_block(
     }
 
     *block = rebuilt;
-    changed
+    (changed, replacements)
 }
 
 /// Emit `Emit` statements covering every expression appended to
@@ -761,6 +794,35 @@ fn rebuild_block_expressions(
             continue;
         }
 
+        // Handle `Loop` BEFORE the generic remap.  A loop's `break_if`
+        // expression is emitted inside `body`/`continuing`, so those blocks
+        // must be rebuilt first; then `clone_expression_handle(break_if)`
+        // memo-hits the copy its owning Emit just produced.  If we instead let
+        // the generic remap below clone break_if first, it appends an
+        // un-emitted duplicate and leaves break_if pointing at an expression
+        // that is in no Emit range - invalid IR.
+        if matches!(statement, naga::Statement::Loop { .. }) {
+            if let naga::Statement::Loop {
+                body,
+                continuing,
+                break_if,
+            } = &mut statement
+            {
+                rebuild_block_expressions(body, old_expressions, new_expressions, handle_map);
+                rebuild_block_expressions(continuing, old_expressions, new_expressions, handle_map);
+                if let Some(handle) = break_if {
+                    *handle = clone_expression_handle(
+                        *handle,
+                        old_expressions,
+                        new_expressions,
+                        handle_map,
+                    );
+                }
+            }
+            rebuilt.push(statement, span);
+            continue;
+        }
+
         remap_statement_handles(&mut statement, &mut |h| {
             clone_expression_handle(h, old_expressions, new_expressions, handle_map)
         });
@@ -783,11 +845,9 @@ fn rebuild_block_expressions(
                     );
                 }
             }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                rebuild_block_expressions(body, old_expressions, new_expressions, handle_map);
-                rebuild_block_expressions(continuing, old_expressions, new_expressions, handle_map);
+            // `Loop` is fully handled above, before the generic remap.
+            naga::Statement::Loop { .. } => {
+                unreachable!("Loop is handled before the generic remap")
             }
             // Leaf statements - `remap_statement_handles` above
             // already rewrote every Expression-handle this statement
@@ -1155,6 +1215,71 @@ fn fs_main() -> @location(0) vec4f {
         assert_eq!(
             after_calls, 0,
             "both helper calls should be replaced by inlined expressions"
+        );
+    }
+
+    #[test]
+    fn inlines_call_in_loop_body_used_in_continuing() {
+        // A call in the loop BODY whose result is consumed in the CONTINUING
+        // block.  naga lets `continuing` reference body-defined expressions,
+        // so the continuing recursion must receive the body's inlining
+        // replacements; otherwise it references an orphaned `CallResult`
+        // (invalid IR), which `run_pass`'s post-pass validation would reject.
+        let source = r#"
+fn helper(x: i32) -> i32 {
+    return x + 1;
+}
+@compute @workgroup_size(1)
+fn cs_main() {
+    var i: i32 = 0;
+    loop {
+        let x = helper(i);
+        if (i > 10) { break; }
+        continuing {
+            i = i + x;
+        }
+    }
+}
+"#;
+        let (changed, module) = run_pass(source);
+        assert!(changed, "helper call in the loop body should be inlined");
+        let helper = find_function_handle_by_name(&module, "helper");
+        let body = &module.entry_points[0].function.body;
+        assert_eq!(
+            count_calls_to_function(body, helper),
+            0,
+            "the body call to helper must be inlined (result threads into continuing)"
+        );
+    }
+
+    #[test]
+    fn inlines_call_in_loop_body_used_in_break_if() {
+        // Same hazard via `break_if`, which can also reference body-defined
+        // expressions.
+        let source = r#"
+fn limit(x: i32) -> i32 {
+    return x + 5;
+}
+@compute @workgroup_size(1)
+fn cs_main() {
+    var i: i32 = 0;
+    loop {
+        let lim = limit(i);
+        i = i + 1;
+        continuing {
+            break if i >= lim;
+        }
+    }
+}
+"#;
+        let (changed, module) = run_pass(source);
+        assert!(changed, "limit call in the loop body should be inlined");
+        let limit = find_function_handle_by_name(&module, "limit");
+        let body = &module.entry_points[0].function.body;
+        assert_eq!(
+            count_calls_to_function(body, limit),
+            0,
+            "the body call to limit must be inlined (result threads into break_if)"
         );
     }
 }

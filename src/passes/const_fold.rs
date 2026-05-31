@@ -1481,8 +1481,12 @@ fn eval_binary(
         (B::And, L::U64(a), L::U64(b)) => Some(L::U64(a & b)),
         (B::ExclusiveOr, L::U64(a), L::U64(b)) => Some(L::U64(a ^ b)),
         (B::InclusiveOr, L::U64(a), L::U64(b)) => Some(L::U64(a | b)),
-        (B::ShiftLeft, L::U64(a), L::U64(b)) if b < 64 => Some(L::U64(a.wrapping_shl(b as u32))),
-        (B::ShiftRight, L::U64(a), L::U64(b)) if b < 64 => Some(L::U64(a.wrapping_shr(b as u32))),
+        // The shift amount is ALWAYS `u32`: naga's WGSL front-end concretises
+        // the right operand of `<<`/`>>` to `u32` regardless of the left
+        // operand's width, so the right literal is `U32`, never `U64`.  (A
+        // `U64`-right pattern here would be dead - it can never match.)
+        (B::ShiftLeft, L::U64(a), L::U32(b)) if b < 64 => Some(L::U64(a.wrapping_shl(b))),
+        (B::ShiftRight, L::U64(a), L::U32(b)) if b < 64 => Some(L::U64(a.wrapping_shr(b))),
 
         (B::And, L::I32(a), L::I32(b)) => Some(L::I32(a & b)),
         (B::ExclusiveOr, L::I32(a), L::I32(b)) => Some(L::I32(a ^ b)),
@@ -1503,12 +1507,14 @@ fn eval_binary(
         (B::And, L::I64(a), L::I64(b)) => Some(L::I64(a & b)),
         (B::ExclusiveOr, L::I64(a), L::I64(b)) => Some(L::I64(a ^ b)),
         (B::InclusiveOr, L::I64(a), L::I64(b)) => Some(L::I64(a | b)),
-        (B::ShiftLeft, L::I64(a), L::U64(b)) if b < 64 => {
-            let wide = (a as i128).wrapping_shl(b as u32);
+        // Shift amount is `u32` (see the U64 note above); decline the fold on
+        // i64 overflow via the i128 round-trip, mirroring the i32 path.
+        (B::ShiftLeft, L::I64(a), L::U32(b)) if b < 64 => {
+            let wide = (a as i128).wrapping_shl(b);
             let narrowed = wide as i64;
             (narrowed as i128 == wide).then_some(L::I64(narrowed))
         }
-        (B::ShiftRight, L::I64(a), L::U64(b)) if b < 64 => Some(L::I64(a.wrapping_shr(b as u32))),
+        (B::ShiftRight, L::I64(a), L::U32(b)) if b < 64 => Some(L::I64(a.wrapping_shr(b))),
 
         (B::And, L::AbstractInt(a), L::AbstractInt(b)) => Some(L::AbstractInt(a & b)),
         (B::ExclusiveOr, L::AbstractInt(a), L::AbstractInt(b)) => Some(L::AbstractInt(a ^ b)),
@@ -3115,14 +3121,60 @@ mod tests {
         assert_eq!(result, None, "shift >= bit_width should not be folded");
     }
 
+    // Note: the shift amount is always `u32` for WGSL-sourced IR (naga
+    // concretises the right operand of `<<`/`>>` to u32), so 64-bit-base
+    // shifts present as `U64/I64 << U32`, never `<< U64`.
+
+    #[test]
+    fn shift_left_u64_in_range_folds() {
+        let result = eval_binary(
+            naga::BinaryOperator::ShiftLeft,
+            naga::Literal::U64(1),
+            naga::Literal::U32(40),
+        );
+        assert_eq!(result, Some(naga::Literal::U64(1u64 << 40)));
+    }
+
+    #[test]
+    fn shift_right_u64_in_range_folds() {
+        let result = eval_binary(
+            naga::BinaryOperator::ShiftRight,
+            naga::Literal::U64(1u64 << 40),
+            naga::Literal::U32(8),
+        );
+        assert_eq!(result, Some(naga::Literal::U64(1u64 << 32)));
+    }
+
     #[test]
     fn shift_left_u64_out_of_range_not_folded() {
         let result = eval_binary(
             naga::BinaryOperator::ShiftLeft,
             naga::Literal::U64(1),
-            naga::Literal::U64(64),
+            naga::Literal::U32(64),
         );
         assert_eq!(result, None, "shift >= bit_width should not be folded");
+    }
+
+    #[test]
+    fn shift_left_i64_in_range_folds() {
+        let result = eval_binary(
+            naga::BinaryOperator::ShiftLeft,
+            naga::Literal::I64(1),
+            naga::Literal::U32(40),
+        );
+        assert_eq!(result, Some(naga::Literal::I64(1i64 << 40)));
+    }
+
+    #[test]
+    fn shift_left_i64_overflow_not_folded() {
+        // `1i64 << 63` flips the sign bit and does not round-trip through i64,
+        // so it must NOT fold (stays a compile-time error in WGSL).
+        let result = eval_binary(
+            naga::BinaryOperator::ShiftLeft,
+            naga::Literal::I64(1),
+            naga::Literal::U32(63),
+        );
+        assert_eq!(result, None, "i64 sign-bit overflow must not be folded");
     }
 
     #[test]
@@ -3130,7 +3182,7 @@ mod tests {
         let result = eval_binary(
             naga::BinaryOperator::ShiftLeft,
             naga::Literal::I64(1),
-            naga::Literal::U64(64),
+            naga::Literal::U32(64),
         );
         assert_eq!(result, None, "shift >= bit_width should not be folded");
     }
@@ -3221,11 +3273,16 @@ mod tests {
 
     #[test]
     fn shift_left_i64_sign_bit_overflow_not_folded() {
+        // RHS must be `U32` to reach the `(ShiftLeft, I64, U32)` arm: a WGSL
+        // shift amount is always `u32`, and that arm is where the i128
+        // round-trip overflow check declines `1_i64 << 63`.  (A `U64` RHS would
+        // match no arm and return `None` for the wrong reason - vacuously
+        // passing this test.)
         assert_eq!(
             eval_binary(
                 naga::BinaryOperator::ShiftLeft,
                 naga::Literal::I64(1),
-                naga::Literal::U64(63),
+                naga::Literal::U32(63),
             ),
             None,
             "1_i64 << 63 must not fold (sign-bit overflow)"
@@ -4474,9 +4531,9 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn absorbing_fold_mul_zero_param_not_rewritten() {
-        // Prior to the C1 fix, `param * 0.0` (param = FunctionArgument) was
-        // rewritten to the scalar literal `0.0` regardless of param's type.
-        // That produced invalid IR whenever param was a vector or matrix.
+        // `param * 0.0` (param = FunctionArgument) must NOT be rewritten to the
+        // scalar literal `0.0` regardless of param's type: that would produce
+        // invalid IR whenever param is a vector or matrix.
         //
         // The new gate requires BOTH operands be scalar Literal for the
         // simplify-loop absorbing rewrite to fire.  A non-literal operand
@@ -4518,7 +4575,7 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn absorbing_fold_and_zero_u32_param_not_rewritten() {
-        // Same C1 case for integer `&` absorbing.
+        // Same absorbing case for integer `&`.
         let mut arena = naga::Arena::new();
         let zero = arena.append(
             naga::Expression::Literal(naga::Literal::U32(0)),
@@ -4591,8 +4648,8 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn absorbing_fold_logical_and_false_with_non_literal_rhs_rewritten() {
-        // C1-refinement regression: `LogicalAnd`/`LogicalOr` are strictly
-        // scalar-bool in valid WGSL IR (no vector broadcasting possible),
+        // `LogicalAnd`/`LogicalOr` are strictly scalar-bool in valid WGSL IR
+        // (no vector broadcasting possible),
         // so absorbing is type-safe even when the other operand is NOT a
         // literal.  This is the pattern produced by dead_branch Phase 0 when
         // re-sugaring `var tmp = false && (j < -8)` from its lowered form;
@@ -4673,12 +4730,11 @@ fn fs_main() -> @location(0) vec4f {
     }
 
     /// End-to-end regression for the `0<0 && j<-8` pattern inside a dead
-    /// `for` loop (chromium/1403752.wgsl).  Before the C1 refinement the
-    /// minified output GREW from 66 bytes to 87 bytes because the absorbing
-    /// rewrite declined to fold `false && (j < -8)` and the dead loop
-    /// survived into the emitter as `loop { var a = false && A<-8; if !(a)
-    /// { break; } }`.  After the refinement the loop collapses and the
-    /// output stays at or below input size.
+    /// `for` loop.  If the absorbing rewrite declines to fold `false && (j < -8)`,
+    /// the dead loop survives into the emitter as
+    /// `loop { var a = false && A<-8; if !(a) { break; } }` and the minified
+    /// output GROWS (66 -> 87 bytes); folding collapses the loop so the output
+    /// stays at or below input size.
     #[test]
     fn e2e_dead_for_loop_with_short_circuit_condition_does_not_grow() {
         let source = "@compute @workgroup_size(1) fn d(){var j:i32;for(;0<0&&j<0-8;){}}\n";

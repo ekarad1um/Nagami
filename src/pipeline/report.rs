@@ -50,10 +50,17 @@ pub struct Report {
 
 impl Report {
     /// Initialise a report with `input_bytes` as both the recorded input
-    /// size and the initial output size.  `output_bytes` is overwritten
-    /// by the driver after emission; seeding it with the input length
-    /// keeps the invariant `output_bytes <= input_bytes` true even if
-    /// the pipeline short-circuits before emitting anything.
+    /// size and the initial output size.  Seeding `output_bytes` with the
+    /// input length gives a sensible value if the pipeline short-circuits
+    /// before emitting anything; the driver then overwrites it with the true
+    /// emitted size.
+    ///
+    /// `output_bytes <= input_bytes` is NOT an enforced invariant: in the
+    /// source-to-source [`crate::run`] path `input_bytes` is the raw user
+    /// source length while `output_bytes` is the generator's complete,
+    /// validity-required emission, which can exceed it for an already-minified
+    /// input.  Callers must guard `input_bytes - output_bytes` against
+    /// unsigned underflow (as the CLI's `print_summary` does).
     pub fn new(input_bytes: usize) -> Self {
         Self {
             input_bytes,
