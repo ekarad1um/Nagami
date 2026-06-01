@@ -50,12 +50,14 @@
     }
     highlightedHtml = "";
     highlightedCode = "";
-    highlight(code).then((html) => {
-      if (seq === highlightSeq) {
-        highlightedHtml = html;
-        highlightedCode = code;
-      }
-    });
+    highlight(code)
+      .then((html) => {
+        if (seq === highlightSeq) {
+          highlightedHtml = html;
+          highlightedCode = code;
+        }
+      })
+      .catch(() => {}); // fall back to the plain <pre> below
   });
 
   // Input highlighting (editable mode) - coalesced via rAF so rapid typing
@@ -90,12 +92,14 @@
         inputHighlightedCode = code;
         return;
       }
-      highlight(code).then((html) => {
-        if (seq === inputHighlightSeq) {
-          inputHighlightedHtml = html;
-          inputHighlightedCode = code;
-        }
-      });
+      highlight(code)
+        .then((html) => {
+          if (seq === inputHighlightSeq) {
+            inputHighlightedHtml = html;
+            inputHighlightedCode = code;
+          }
+        })
+        .catch(() => {});
     });
 
     return () => {

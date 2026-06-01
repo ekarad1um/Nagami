@@ -56,12 +56,56 @@ function handleError(e: Event): void {
   worker = null;
 }
 
+// URL of the wasm the document preloads. Fetching this exact URL consumes the
+// <link rel="preload"> instead of wasting it. Absent in dev -> worker self-fetches.
+function getPreloadedWasmUrl(): string | null {
+  if (typeof document === "undefined") return null;
+  const link = document.querySelector<HTMLLinkElement>(
+    'link[rel="preload"][as="fetch"][href$=".wasm"]',
+  );
+  return link?.href ?? null;
+}
+
+// Fetch + compile the wasm on the main thread (consuming the preload, one download)
+// and hand the compiled Module to the worker.
+function primeWorkerWasm(w: Worker, url: string): void {
+  void (async () => {
+    try {
+      // mode/credentials must match the crossorigin="anonymous" preload key.
+      const resp = await fetch(url, { mode: "cors", credentials: "same-origin" });
+      if (!resp.ok) throw new Error(`wasm fetch failed: ${resp.status}`);
+      const ct = resp.headers.get("content-type") ?? "";
+      const canStream =
+        typeof WebAssembly.compileStreaming === "function" &&
+        ct.includes("application/wasm");
+      const module = canStream
+        ? await WebAssembly.compileStreaming(resp)
+        : await WebAssembly.compile(await resp.arrayBuffer());
+      w.postMessage({ type: "init-module", module });
+    } catch {
+      // Couldn't compile on the main thread: let the worker fetch it itself.
+      try {
+        w.postMessage({ type: "init-fallback" });
+      } catch {
+        // Worker already torn down; nothing to do.
+      }
+    }
+  })();
+}
+
 function ensureWorker(): Worker {
   if (worker) return worker;
   worker = new MinifyWorker();
   worker.addEventListener("message", handleMessage);
   worker.addEventListener("error", handleError);
   worker.addEventListener("messageerror", handleError);
+  const wasmUrl = getPreloadedWasmUrl();
+  if (wasmUrl) {
+    primeWorkerWasm(worker, wasmUrl);
+  } else {
+    // No preload (dev mode): tell the worker to self-fetch the wasm.
+    worker.postMessage({ type: "init-fallback" });
+  }
   return worker;
 }
 

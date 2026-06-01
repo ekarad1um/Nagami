@@ -1,19 +1,27 @@
-import { createHighlighterCore, type HighlighterCore, type ShikiTransformer } from "shiki/core";
-import { createJavaScriptRegexEngine } from "@shikijs/engine-javascript";
-import wgsl from "shiki/langs/wgsl.mjs";
-import githubDarkDimmed from "shiki/themes/github-dark-dimmed.mjs";
+import type { HighlighterCore, ShikiTransformer } from "shiki/core";
 
 let highlighter: HighlighterCore | null = null;
 let initPromise: Promise<HighlighterCore> | null = null;
 
+async function loadHighlighter(): Promise<HighlighterCore> {
+    const [{ createHighlighterCore }, { createJavaScriptRegexEngine }, wgsl, theme] =
+        await Promise.all([
+            import("shiki/core"),
+            import("@shikijs/engine-javascript"),
+            import("shiki/langs/wgsl.mjs"),
+            import("shiki/themes/github-dark-dimmed.mjs"),
+        ]);
+    return createHighlighterCore({
+        engine: createJavaScriptRegexEngine(),
+        themes: [theme.default],
+        langs: [wgsl.default],
+    });
+}
+
 function ensureHighlighter(): Promise<HighlighterCore> {
     if (highlighter) return Promise.resolve(highlighter);
     if (!initPromise) {
-        initPromise = createHighlighterCore({
-            engine: createJavaScriptRegexEngine(),
-            themes: [githubDarkDimmed],
-            langs: [wgsl],
-        }).then(
+        initPromise = loadHighlighter().then(
             (h) => {
                 highlighter = h;
                 return h;
@@ -38,17 +46,25 @@ const shikiOpts = {
     transformers: [noTabindex],
 };
 
-// Returns highlighted HTML synchronously if the highlighter is ready, otherwise null
+// Highlighted HTML if the highlighter is already loaded, else null.
 export function highlightSync(code: string): string | null {
     if (!highlighter || !code) return null;
     return highlighter.codeToHtml(code, shikiOpts);
 }
 
-// Ensures shiki is loaded; returns highlighted HTML
+// Loads shiki if needed, then returns highlighted HTML.
 export async function highlight(code: string): Promise<string> {
     const h = await ensureHighlighter();
     return h.codeToHtml(code, shikiOpts);
 }
 
-// Eagerly start loading the highlighter in the background
-ensureHighlighter();
+// Warm shiki up on idle so the first highlight is instant. Failures are swallowed;
+// highlight() retries on demand.
+export function warmupHighlighter(): void {
+    const start = () => ensureHighlighter().catch(() => { });
+    if (typeof requestIdleCallback === "function") {
+        requestIdleCallback(start, { timeout: 2000 });
+    } else {
+        setTimeout(start, 200);
+    }
+}
