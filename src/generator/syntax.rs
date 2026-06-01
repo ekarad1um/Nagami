@@ -83,60 +83,66 @@ fn compact_float_literal_token(token: String) -> String {
     format!("{sign}{compact_mantissa}{exponent}{suffix}")
 }
 
-/// Round an `f64` to `sig_figs` significant figures, half-away-from-zero.
-/// `sig_figs` must be `>= 1` (callers map `0 -> 1`) and `v` must be
-/// finite and non-zero (callers short-circuit both).
+/// Round an `f64` to `sig_figs` significant figures.  `sig_figs` must be
+/// `>= 1` (callers map `0 -> 1`) and `v` must be finite and non-zero
+/// (callers short-circuit both).
 ///
-/// Scales the value so the requested figures sit just left of the
-/// decimal point, rounds, then scales back.  The scale-back is exact
-/// only while `10^scale_exp` is - i.e. for `scale_exp` in `0..=22`
-/// (powers of ten above `10^22` are not representable in binary, and
-/// negative powers never are).  Outside that window the down-scale can
-/// be undone two ways - multiply by the positive power `10^-scale_exp`,
-/// or divide by `scale` - and each leaves binary noise on a *different*
-/// magnitude range (dividing by a sub-unity power bloats clean small
-/// powers, e.g. `1e5 -> 99999.99999999999`; multiplying by a big power
-/// bloats large magnitudes, e.g. `2.5e25 -> 3.0000000000000005e25`; the
-/// divide also bloats tiny magnitudes, e.g. `9e-25 -> 8.999...e-25`).
-/// Neither direction is universally exact there, so the candidate whose
-/// shortest rendering is shorter - i.e. closer to the intended round
-/// value - is chosen.
+/// In the *exact* range - `scale_exp` in `0..=22`, where `10^scale_exp` is
+/// representable - the value is scaled so the requested figures sit just
+/// left of the decimal point, rounded half-away-from-zero, then scaled back
+/// exactly.
 ///
-/// The scale-back can overflow to infinity for magnitudes near
-/// `f64::MAX`; callers must treat a non-finite result as "leave the
-/// value unrounded" and fall back to the original.
+/// Outside that window (`scale_exp < 0` or `> 22`) `10^scale_exp` is NOT
+/// representable, so BOTH the forward `v * scale` and any scale-back leave
+/// binary noise that mis-rounds the value (e.g. `1.495e-308` to 2 figs gave
+/// `~1.0e-308` instead of `1.5e-308`) and bloats the mantissa with noise
+/// digits (`1.23456e300` to 3 figs gave `1.2300000000000007e300` instead of
+/// `1.23e300`), defeating the size goal of this lossy mode.  There the
+/// rounding is done through a decimal string,
+/// which `core::fmt` computes correctly: `{:.*e}` with `sig_figs - 1`
+/// fractional mantissa digits yields exactly `sig_figs` significant figures
+/// (round-half-to-even, which only differs from half-away on exact ties that
+/// this extreme range never hits in practice).  The parse-back is the nearest
+/// `f64` to that rounded value.
+///
+/// The scale-back can overflow to infinity for magnitudes near `f64::MAX`;
+/// callers must treat a non-finite result as "leave the value unrounded" and
+/// fall back to the original.  A lossy round must also never collapse a
+/// nonzero value to exactly zero, so both paths fall back to `v` if they do.
 fn round_sig_figs_f64(v: f64, sig_figs: i32) -> f64 {
+    // Enforce the `>= 1` precondition in the function itself: `sig_figs - 1`
+    // is used as an unsigned fractional-digit count below, so a `0` (or
+    // negative) would underflow to an astronomically large width.  Callers
+    // already clamp, but this keeps the helper safe against a future one.
+    let sig_figs = sig_figs.max(1);
     let e = v.abs().log10().floor() as i32;
     // Clamp to f64's representable power-of-ten range (not the tighter
     // f32 range, even when the caller is an f32): the math runs in f64,
     // and clamping at f32's exponent limit would strip significant
     // digits from f32 subnormals and values near `f32::MIN_POSITIVE`.
     let scale_exp = ((sig_figs - 1) - e).clamp(-f64::MAX_10_EXP, f64::MAX_10_EXP);
+
+    if !(0..=22).contains(&scale_exp) {
+        // Inexact-power range: round via a correctly-computed decimal string
+        // rather than the noise-prone multiply/divide by an inexact `10^k`.
+        let rounded: f64 = format!("{:.*e}", (sig_figs - 1) as usize, v)
+            .parse()
+            .unwrap_or(v);
+        return if rounded.is_finite() && rounded != 0.0 {
+            rounded
+        } else {
+            v
+        };
+    }
+
+    // Exact-power range: `10^scale_exp` is exact and `>= 1`, so the forward
+    // scale and the divide-back are both clean (half-away-from-zero).
     let scale = 10f64.powi(scale_exp);
     let mantissa = (v * scale).round();
     if mantissa == 0.0 {
-        // The +/-308 scale clamp can leave the up-scaled mantissa below 0.5
-        // for a genuine nonzero f64 subnormal (e.g. `1e-310`), rounding it
-        // to zero.  A lossy round must never turn a nonzero value into
-        // exactly zero, so fall back to the original (callers already
-        // short-circuit a true zero before reaching here).
         return v;
     }
-    if (0..=22).contains(&scale_exp) {
-        // `10^scale_exp` is exact and `>= 1`, so dividing back is clean.
-        return mantissa / scale;
-    }
-    // Inexact-power range (scale_exp < 0 or > 22): pick whichever
-    // scale-back renders shorter.  Prefer a finite candidate; if both
-    // overflow, the caller's `is_finite` guard falls back to the original.
-    let mul = mantissa * 10f64.powi(-scale_exp);
-    let div = mantissa / scale;
-    match (mul.is_finite(), div.is_finite()) {
-        (true, false) => mul,
-        (false, true) => div,
-        _ if format!("{mul:e}").len() <= format!("{div:e}").len() => mul,
-        _ => div,
-    }
+    mantissa / scale
 }
 
 /// Round an `f32` according to a [`PrecisionMode`].  `Full` and
@@ -1242,7 +1248,8 @@ pub(super) fn math_name(fun: naga::MathFunction) -> &'static str {
 mod tests {
     use super::{
         FloatPrecision, PrecisionMode, compact_float_literal_token, ensure_bare_float,
-        literal_extract_key, literal_to_wgsl, literal_to_wgsl_bare, scalar_zero,
+        literal_extract_key, literal_to_wgsl, literal_to_wgsl_bare, round_sig_figs_f64,
+        scalar_zero,
     };
     use half::f16;
 
@@ -1629,6 +1636,46 @@ mod tests {
         assert_eq!(literal_to_wgsl(naga::Literal::F32(0.0), &sf(4)), "0f");
         // Integer literals unaffected by float-precision mode.
         assert_eq!(literal_to_wgsl(naga::Literal::I32(42), &sf(2)), "42i");
+    }
+
+    /// In the inexact-power range the old `10^k` scaling both mis-rounded the
+    /// value and bloated the mantissa with binary noise; the decimal-string
+    /// path rounds correctly and stays short.  The `.max(1)` guard keeps
+    /// `sig_figs <= 0` from underflowing the fractional-digit count.
+    #[test]
+    fn round_sig_figs_f64_extreme_magnitudes() {
+        // Value correctness: the old code mis-rounded these by ~a decade.
+        let tiny = round_sig_figs_f64(1.495e-308, 2);
+        assert!(
+            (1.4e-308..=1.6e-308).contains(&tiny),
+            "1.495e-308 @ 2sf should be ~1.5e-308, got {tiny:e}"
+        );
+        let min_pos = round_sig_figs_f64(f64::MIN_POSITIVE, 2); // 2.225e-308
+        assert!(
+            (2.1e-308..=2.3e-308).contains(&min_pos),
+            "f64::MIN_POSITIVE @ 2sf should be ~2.2e-308, got {min_pos:e}"
+        );
+        // Cleanliness: the rounded value must render SHORT, not as a 20+ char
+        // noise mantissa (old gave `1.2300000000000007e300`).
+        let clean = round_sig_figs_f64(1.23456e300, 3);
+        assert!(
+            format!("{clean:e}").len() <= 10,
+            "1.23456e300 @ 3sf should render short, got {clean:e}"
+        );
+        // Large magnitude rounds correctly (9.5e307's nearest f64 is < 9.5,
+        // so 1 sig fig is 9e307) and stays clean.
+        let big = round_sig_figs_f64(9.5e307, 1);
+        assert!(
+            big.is_finite() && format!("{big:e}").len() <= 8,
+            "9.5e307 @ 1sf should be a clean finite value, got {big:e}"
+        );
+        // Robustness: a rounded form that overflows falls back to the finite
+        // original, never infinity; `sig_figs <= 0` must not underflow the
+        // fractional-digit width (no OOM/panic).
+        assert!(round_sig_figs_f64(f64::MAX, 1).is_finite());
+        assert!(round_sig_figs_f64(123.0, 0).is_finite());
+        // Exact-range path unchanged: 1.23456 @ 3sf -> 1.23.
+        assert_eq!(round_sig_figs_f64(1.23456, 3), 1.23);
     }
 
     #[test]

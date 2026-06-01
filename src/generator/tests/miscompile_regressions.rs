@@ -282,3 +282,98 @@ fn enable_f16_emitted_for_surviving_f16_literal_in_conversion() {
         "output uses an f16 literal but dropped `enable f16;`: {out}"
     );
 }
+
+/// `lhs = rhs * lhs` must NOT fold to the compound `lhs *= rhs` when the
+/// product is a non-commutative linear-algebra product (matrix*matrix,
+/// matrix*vector, vector*matrix): `*=` desugars to `lhs = lhs * rhs`, the
+/// opposite (transposed) product.  A matrix `m = n * m` must stay `m = n * m`.
+#[test]
+fn matrix_compound_assign_preserves_non_commutative_order() {
+    // mat*mat, rhs-self: the swapped fold would be a silent miscompile.
+    let mm = minify(
+        "@group(0)@binding(0) var<storage,read_write> m: mat3x3<f32>;\
+         @group(0)@binding(1) var<storage,read> n: mat3x3<f32>;\
+         @compute @workgroup_size(1) fn main() { m = n * m; }",
+    );
+    assert!(
+        mm.contains("A=a*A;") && !mm.contains("*="),
+        "mat*mat `m = n*m` was folded to a swapped `*=` (transposed product): {mm}"
+    );
+    // mat*vec, rhs-self: `v = M * v` must keep the column-vector product.
+    let mv = minify(
+        "@group(0)@binding(0) var<storage,read_write> v: vec3<f32>;\
+         @group(0)@binding(1) var<storage,read> M: mat3x3<f32>;\
+         @compute @workgroup_size(1) fn main() { v = M * v; }",
+    );
+    assert!(
+        mv.contains("A=a*A;") && !mv.contains("*="),
+        "mat*vec `v = M*v` was folded to a swapped `*=`: {mv}"
+    );
+    // The left-self matrix fold IS order-preserving and must still apply.
+    let ls = minify(
+        "@group(0)@binding(0) var<storage,read_write> m: mat3x3<f32>;\
+         @group(0)@binding(1) var<storage,read> n: mat3x3<f32>;\
+         @compute @workgroup_size(1) fn main() { m = m * n; }",
+    );
+    assert!(
+        ls.contains("A*=a;"),
+        "left-self matrix `m = m*n` should still fold to `m *= n`: {ls}"
+    );
+    // A genuinely commutative matrix*scalar must still fold (no over-restrict).
+    let ms = minify(
+        "@group(0)@binding(0) var<storage,read_write> m: mat3x3<f32>;\
+         @group(0)@binding(1) var<storage,read> k: f32;\
+         @compute @workgroup_size(1) fn main() { m = k * m; }",
+    );
+    assert!(
+        ms.contains("A*=a;"),
+        "commutative matrix*scalar `m = k*m` should still fold to `m *= k`: {ms}"
+    );
+}
+
+/// A both-literal F16 multiply by zero (`x * 0.0h`) must NOT be folded by the
+/// absorbing rule, because `eval_binary` has no F16 arm to compute the IEEE
+/// sign of the product: cloning the matched `0.0h` would take its sign, not
+/// the product's (`-2.0h * 0.0h` is `-0.0h`, not `+0.0h`).  The fold is
+/// declined so the bare product survives and re-parses to the right signed
+/// zero.  Guards the `is_integer_zero` gate on the absorbing-Multiply arm.
+#[test]
+fn f16_multiply_by_zero_is_not_mis_signed() {
+    let out = minify(
+        "enable f16;\
+         @group(0)@binding(0) var<storage,read_write> out: array<f16, 4>;\
+         @compute @workgroup_size(1) fn main() { let a = -2.0h; out[0] = a * 0.0h; }",
+    );
+    // The signed product must survive as `-2h*0h` (re-parses to -0.0h), never
+    // collapse to a positive-zero store `A[0]=0h;`.
+    assert!(
+        out.contains("-2h*0h"),
+        "f16 `-2.0h * 0.0h` must keep the signed product, not fold to +0.0h: {out}"
+    );
+    assert!(
+        !out.contains("A[0]=0h"),
+        "f16 `-2.0h * 0.0h` was mis-signed to +0.0h: {out}"
+    );
+}
+
+/// An override-sized array (`array<i32, O*2>`) must round-trip without
+/// aborting the process.  naga 29's own WGSL back-end hits `unreachable!()`
+/// on the override size expression; under the release `panic = "abort"`
+/// strategy that crashes (SIGABRT).  nagami emits these types with its own
+/// generator, so `run` must detect the override-sized array and skip the
+/// naga baseline/fallback emit rather than invoke it.
+#[test]
+fn override_sized_array_does_not_abort() {
+    let out = minify(
+        "override O = 123;\
+         alias A = array<i32, O*2>;\
+         var<workgroup> W: A;\
+         @compute @workgroup_size(1) fn main() { let p: ptr<workgroup, A> = &W; (*p)[0] = 42; }",
+    );
+    // `minify` re-parses + validates, so reaching here means no abort and a
+    // valid override-sized array survived.
+    assert!(
+        out.contains("array<i32,") && out.contains("var<workgroup>"),
+        "override-sized workgroup array must survive minification: {out}"
+    );
+}

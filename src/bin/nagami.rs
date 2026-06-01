@@ -308,7 +308,17 @@ fn run_cli() -> Result<bool, Box<dyn std::error::Error>> {
         // preamble read / the in-place write above - EXCEPT for explicit
         // `-o -` (stdout), where `-` is not a meaningful path to report, so
         // the error stays bare (consistent with the no-`-o` stdout branch).
-        let r = write_output(path, &output.source);
+        //
+        // When `-o` targets the input file itself, write atomically (like
+        // --in-place) so a crash mid-write cannot corrupt the source.  The
+        // input was fully read into memory before any write, so there is no
+        // read-after-write hazard either way; this only closes the crash
+        // window the plain `fs::write` would otherwise leave open.
+        let r = if !is_dash_path(path) && same_file(path, &args.input) {
+            write_atomic(path, &output.source)
+        } else {
+            write_output(path, &output.source)
+        };
         if is_dash_path(path) {
             r?;
         } else {

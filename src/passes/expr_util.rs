@@ -576,9 +576,9 @@ pub fn map_cooperative_data_handles(
 /// Exhaustive match - a future naga variant breaks the build here.
 ///
 /// Per-statement only: callers walk nested blocks themselves.
-/// Read-only recursive counterpart is
-/// [`visit_block_expression_handles`]; any new handle-bearing
-/// `Statement` variant must be added to both.
+/// Read-only counterpart is [`visit_statement_expression_handles`]
+/// (the per-statement visitor kept in lockstep with this fn); any new
+/// handle-bearing `Statement` variant must be added to both.
 pub fn remap_statement_handles(
     statement: &mut naga::Statement,
     remap: &mut impl FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,

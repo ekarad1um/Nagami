@@ -1732,16 +1732,45 @@ impl<'a> Generator<'a> {
             return Some((cop, *right));
         }
 
-        // For commutative ops, also check the right side.
+        // For commutative ops, also check the right side — but a `Multiply`
+        // must additionally be type-commutative, or swapping a matrix product
+        // would silently transpose it.  The left-self fold above preserves
+        // operand order unconditionally and needs no such guard.
         if commutative
             && !ctx.expr_names.contains_key(right)
             && let naga::Expression::Load { pointer: p } = &ctx.func.expressions[*right]
             && ptrs_structurally_equal(*p, pointer, &ctx.func.expressions)
+            && (*op != naga::BinaryOperator::Multiply
+                || self.multiply_is_commutative(*left, *right, ctx))
         {
             return Some((cop, *left));
         }
 
         None
+    }
+
+    /// WGSL `*` is commutative for scalar and component-wise products
+    /// (`s*t`, `v*v`, `s*v`, `s*m`, ...) but NOT for linear-algebra products
+    /// (`mat*mat`, `mat*vec`, `vec*mat`).  Swapping operands when folding
+    /// `lhs = rhs * lhs` into `lhs *= rhs` only preserves meaning for the
+    /// commutative cases; for a matrix product it would compute the opposite
+    /// (transposed) product.  Resolve both operand value types to decide.
+    fn multiply_is_commutative(
+        &self,
+        left: naga::Handle<naga::Expression>,
+        right: naga::Handle<naga::Expression>,
+        ctx: &FunctionCtx<'a, '_>,
+    ) -> bool {
+        use naga::TypeInner as TI;
+        let l = ctx.info[left].ty.inner_with(&self.module.types);
+        let r = ctx.info[right].ty.inner_with(&self.module.types);
+        let l_mat = matches!(l, TI::Matrix { .. });
+        let r_mat = matches!(r, TI::Matrix { .. });
+        let l_vec = matches!(l, TI::Vector { .. });
+        let r_vec = matches!(r, TI::Vector { .. });
+        // Non-commutative exactly when a matrix multiplies another matrix or a
+        // vector (on either side); matrix*scalar and scalar*matrix stay safe.
+        !((l_mat && (r_mat || r_vec)) || (r_mat && l_vec))
     }
 
     /// Emit the right-hand side of a compound assignment, applying splat
@@ -1925,10 +1954,12 @@ impl<'a> Generator<'a> {
 
 // MARK: Statement-level helpers
 
-/// Return the WGSL compound-assignment token (`+=`, `*=`, and so on)
-/// for a binary operator, along with a boolean flagging operators
-/// whose compound form preserves NaN-safety only for integer types.
-/// Returns `None` when the operator has no compound form.
+/// Return the WGSL compound-assignment token (`+=`, `*=`, and so on) for a
+/// binary operator, plus whether the operator is commutative — i.e. whether a
+/// `lhs = rhs <op> lhs` store may also fold by matching the right operand.
+/// (`Multiply` is flagged commutative here, but the caller further excludes
+/// non-commutative matrix products.)  `None` when the operator has no
+/// compound form.
 fn compound_assign_info(op: naga::BinaryOperator) -> Option<(&'static str, bool)> {
     use naga::BinaryOperator as B;
     match op {

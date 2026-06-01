@@ -579,7 +579,10 @@ impl<'a> Generator<'a> {
                             } else if literal_needs_typed_form_outside_constructor(*lit) {
                                 literal_to_wgsl(*lit, &self.options.float_precision)
                             } else {
-                                self.emit_global_expr(c.init)?
+                                // Bare-safe literal: emit the bare token like
+                                // the `Literal` arm does (one suffix byte
+                                // cheaper than the typed `emit_global_expr`).
+                                key.expr_text
                             }
                         }
                     } else {
@@ -1093,8 +1096,16 @@ impl<'a> Generator<'a> {
                 let name = match fun {
                     naga::RelationalFunction::All => "all",
                     naga::RelationalFunction::Any => "any",
-                    naga::RelationalFunction::IsNan => "isNan",
-                    naga::RelationalFunction::IsInf => "isInf",
+                    // `isNan`/`isInf` are not WGSL builtins; naga's WGSL
+                    // front-end never produces these (only `all`/`any`), so
+                    // this is unreachable from a WGSL->IR->WGSL pipeline.
+                    // Refuse rather than emit an identifier no WGSL consumer
+                    // recognises (which would slip past round-trip checks).
+                    naga::RelationalFunction::IsNan | naga::RelationalFunction::IsInf => {
+                        return Err(Error::Emit(format!(
+                            "relational function {fun:?} has no WGSL spelling"
+                        )));
+                    }
                 };
                 let mut s = String::from(name);
                 s.push('(');
@@ -1474,6 +1485,12 @@ impl<'a> Generator<'a> {
                     s.insert(0, '(');
                     s.push(')');
                 }
+                // Mirror the function-local arm: a `Negate` over a child that
+                // already renders with a leading `-` would lex as the reserved
+                // `--` token; a single space disambiguates (cheaper than parens).
+                if matches!(op, naga::UnaryOperator::Negate) && !wrap && s.starts_with('-') {
+                    s.insert(0, ' ');
+                }
                 s.insert_str(0, op_str);
                 s
             }
@@ -1687,8 +1704,16 @@ impl<'a> Generator<'a> {
                 let name = match fun {
                     naga::RelationalFunction::All => "all",
                     naga::RelationalFunction::Any => "any",
-                    naga::RelationalFunction::IsNan => "isNan",
-                    naga::RelationalFunction::IsInf => "isInf",
+                    // `isNan`/`isInf` are not WGSL builtins; naga's WGSL
+                    // front-end never produces these (only `all`/`any`), so
+                    // this is unreachable from a WGSL->IR->WGSL pipeline.
+                    // Refuse rather than emit an identifier no WGSL consumer
+                    // recognises (which would slip past round-trip checks).
+                    naga::RelationalFunction::IsNan | naga::RelationalFunction::IsInf => {
+                        return Err(Error::Emit(format!(
+                            "relational function {fun:?} has no WGSL spelling"
+                        )));
+                    }
                 };
                 let mut s = String::from(name);
                 s.push('(');

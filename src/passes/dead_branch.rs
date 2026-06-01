@@ -788,7 +788,7 @@ fn definitely_terminates(stmt: &naga::Statement) -> bool {
         // but the rebuilders could; without the guard those switches
         // mis-classify as terminating.
         naga::Statement::Switch { cases, .. } => {
-            let last_falls_through = cases.iter().last().is_some_and(|c| c.fall_through);
+            let last_falls_through = cases.last().is_some_and(|c| c.fall_through);
             cases
                 .iter()
                 .all(|c| c.fall_through || case_body_terminates_beyond_switch(&c.body))

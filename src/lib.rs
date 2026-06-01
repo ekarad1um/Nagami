@@ -43,6 +43,28 @@ fn emit_wgsl_with_naga_safe(
         .map_err(|e| Error::Emit(e.to_string()))
 }
 
+/// `true` when `module` contains an override-sized array
+/// (`ArraySize::Pending`, e.g. `array<i32, O*2>`).  naga 29's own WGSL
+/// back-end hits an `unreachable!()` while emitting the override size
+/// expression, which under the release `panic = "abort"` strategy aborts the
+/// process instead of returning an error.  nagami's generator emits these
+/// types itself, so callers skip the naga baseline/fallback emit for such
+/// modules rather than invoke the panicking path.
+fn module_has_override_sized_array(module: &naga::Module) -> bool {
+    module.types.iter().any(|(_, ty)| {
+        matches!(
+            ty.inner,
+            naga::TypeInner::Array {
+                size: naga::ArraySize::Pending(_),
+                ..
+            } | naga::TypeInner::BindingArray {
+                size: naga::ArraySize::Pending(_),
+                ..
+            }
+        )
+    })
+}
+
 /// `true` when `line` is exactly one of the `wgpu_*` enable directives
 /// that naga rejects.  Matched against the trimmed line so surrounding
 /// whitespace is irrelevant.
@@ -762,8 +784,17 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     pipeline::run_ir_passes(&mut module, &effective_config, &mut report)?;
 
     let info = io::validate_module(&module)?;
-    let naga_output = emit_wgsl_with_naga_safe(&module, &info)?;
-    let before_bytes = naga_output.len();
+    // Skip the naga baseline/fallback emit for override-sized arrays (its
+    // back-end aborts on them); nagami's generator emits them, and the
+    // baseline byte count falls back to the input length.
+    let naga_output: Option<String> = if module_has_override_sized_array(&module) {
+        None
+    } else {
+        Some(emit_wgsl_with_naga_safe(&module, &info)?)
+    };
+    let before_bytes = naga_output
+        .as_ref()
+        .map_or_else(|| source.len(), String::len);
 
     let gen_result = generate(
         &module,
@@ -791,7 +822,8 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         match gen_result {
             Ok(emitted) => {
                 let after_bytes = emitted.source.len();
-                let changed = before_bytes != after_bytes || naga_output != emitted.source;
+                let changed = before_bytes != after_bytes
+                    || naga_output.as_deref() != Some(emitted.source.as_str());
                 // With a preamble active the emitted source is
                 // incomplete on its own; validate by re-prepending the
                 // preamble with directives properly hoisted.
@@ -856,7 +888,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                         "generator output failed validation; \
                          cannot fall back safely when a preamble is active: {underlying}",
                     )));
-                } else {
+                } else if let Some(naga_output) = naga_output {
                     if config.trace.enabled {
                         if let Err(e) = &validation_result {
                             eprintln!("warning: generator WGSL validation error: {e}");
@@ -886,28 +918,43 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                         false,
                         emitted.duration_us,
                     )
-                }
-            }
-            Err(e) => {
-                if has_preamble {
-                    return Err(e);
-                }
-                if config.trace.enabled {
-                    eprintln!(
-                        "warning: generator emit failed ({}); falling back to naga emitter",
-                        e
-                    );
-                }
-                // Re-validate the naga fallback (see above) so a doubly-invalid
-                // case errors instead of shipping invalid WGSL.
-                if let Err(ve) = io::validate_wgsl_text(&naga_output) {
+                } else {
+                    // No naga baseline (override-sized array): the generator
+                    // output is invalid and there is no fallback emitter.
+                    let underlying = match validation_result {
+                        Err(e) => e.to_string(),
+                        Ok(()) => "(no underlying error)".to_string(),
+                    };
                     return Err(Error::Emit(format!(
-                        "generator emit failed ({e}) and the naga-emitter \
-                         fallback is also invalid: {ve}"
+                        "generator output failed validation and no naga fallback \
+                         is available (override-sized array): {underlying}"
                     )));
                 }
-                (naga_output, before_bytes, false, true, false, 0)
             }
+            Err(e) => match naga_output {
+                Some(naga_output) => {
+                    if has_preamble {
+                        return Err(e);
+                    }
+                    if config.trace.enabled {
+                        eprintln!(
+                            "warning: generator emit failed ({e}); falling back to naga emitter"
+                        );
+                    }
+                    // Re-validate the naga fallback (see above) so a doubly-invalid
+                    // case errors instead of shipping invalid WGSL.
+                    if let Err(ve) = io::validate_wgsl_text(&naga_output) {
+                        return Err(Error::Emit(format!(
+                            "generator emit failed ({e}) and the naga-emitter \
+                             fallback is also invalid: {ve}"
+                        )));
+                    }
+                    (naga_output, before_bytes, false, true, false, 0)
+                }
+                // No naga fallback available (override-sized array): the
+                // generator's own error is the only diagnosis.
+                None => return Err(e),
+            },
         };
 
     report.pass_reports.push(PassReport {

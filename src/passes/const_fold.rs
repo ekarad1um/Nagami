@@ -2256,6 +2256,16 @@ fn is_additive_identity_zero(
     arena: &naga::Arena<naga::Expression>,
     h: naga::Handle<naga::Expression>,
 ) -> bool {
+    is_integer_zero(arena, h)
+}
+
+/// `true` when `h` is a literal INTEGER zero.  Integers carry neither a
+/// signed zero nor NaN/Inf, so an integer zero can be folded or substituted
+/// without preserving an IEEE result sign — unlike a float zero.
+fn is_integer_zero(
+    arena: &naga::Arena<naga::Expression>,
+    h: naga::Handle<naga::Expression>,
+) -> bool {
     matches!(
         arena[h],
         naga::Expression::Literal(
@@ -2458,14 +2468,20 @@ fn check_absorbing_operand(
 
     match op {
         B::Multiply => {
-            // Permissive on floats by design: the caller's
-            // `both_literal` gate routes `x * 0.0` through
-            // `eval_binary` (IEEE sign-of-product); without that
-            // gate, cloning the matched zero would mis-sign the
-            // product.  The caller-side gate is load-bearing.
-            if is_zero(arena, left) {
+            // Only INTEGER zeros absorb here.  A float `x * 0.0` must carry
+            // the IEEE sign of the product (and is NaN when `x` is
+            // non-finite), so cloning the matched zero verbatim is correct
+            // only when the sign-aware result was already computed by
+            // `eval_binary` — which folds F32/F64/AbstractFloat both-literal
+            // products before this arm runs.  F16 has NO `eval_binary` arm,
+            // so a both-literal F16 `x * 0.0h` reaches here unfolded; cloning
+            // the zero would take its sign, not the product's (e.g.
+            // `-2.0h * 0.0h` -> `+0.0h`, but the true value is `-0.0h`).
+            // Declining floats keeps that case as a bare product, which naga
+            // re-parses to the correctly-signed zero.
+            if is_integer_zero(arena, left) {
                 Some(left)
-            } else if is_zero(arena, right) {
+            } else if is_integer_zero(arena, right) {
                 Some(right)
             } else {
                 None
@@ -4252,22 +4268,49 @@ fn fs_main() -> @location(0) vec4f {
     #[test]
     fn absorbing_mul_zero_left() {
         let a = make_identity_arena();
-        // 0 * param -> 0
+        // Integer `0 * param -> 0` (no signed zero / NaN: always absorbs).
         assert_eq!(
             check_absorbing_operand(
                 naga::BinaryOperator::Multiply,
-                a.zero_f32,
+                a.zero_i32,
                 a.param,
                 &a.arena
             ),
-            Some(a.zero_f32)
+            Some(a.zero_i32)
         );
     }
 
     #[test]
     fn absorbing_mul_zero_right() {
         let a = make_identity_arena();
-        // param * 0 -> 0
+        // Integer `param * 0 -> 0`.
+        assert_eq!(
+            check_absorbing_operand(
+                naga::BinaryOperator::Multiply,
+                a.param,
+                a.zero_i32,
+                &a.arena
+            ),
+            Some(a.zero_i32)
+        );
+    }
+
+    /// A FLOAT zero must NOT absorb in a multiply: `x * 0.0` carries the
+    /// product's IEEE sign (and is NaN for non-finite `x`), which the
+    /// absorbing arm cannot reconstruct by cloning the matched zero.  Only
+    /// `eval_binary` (sign-aware, for the both-literal case) may fold it.
+    #[test]
+    fn absorbing_mul_float_zero_declined() {
+        let a = make_identity_arena();
+        assert_eq!(
+            check_absorbing_operand(
+                naga::BinaryOperator::Multiply,
+                a.zero_f32,
+                a.param,
+                &a.arena
+            ),
+            None
+        );
         assert_eq!(
             check_absorbing_operand(
                 naga::BinaryOperator::Multiply,
@@ -4275,7 +4318,7 @@ fn fs_main() -> @location(0) vec4f {
                 a.zero_f32,
                 &a.arena
             ),
-            Some(a.zero_f32)
+            None
         );
     }
 
