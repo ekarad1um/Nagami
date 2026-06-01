@@ -97,9 +97,16 @@ fn cse_does_not_share_body_let_into_continuing_past_continue() {
         }";
     let out = minify(src);
     // The continuing-block store recomputes its own `sin(...)` chain rather
-    // than referencing a body binding the `continue` skips.
+    // than referencing a body binding the `continue` skips.  Name-agnostic and
+    // emission-shape-agnostic: a recompute leaves a `sin(` inside the
+    // continuing block (whether inlined into the store or rebound), whereas a
+    // buggy reuse would reference the body binding and emit no `sin(` there.
+    let continuing = out
+        .split_once("continuing{")
+        .map(|(_, rest)| rest)
+        .expect("a continuing block must be emitted");
     assert!(
-        out.contains("continuing{A[0]=sin("),
+        continuing.contains("sin("),
         "continuing must recompute the shared expression, not reuse a body let: {out}"
     );
 }
@@ -113,8 +120,14 @@ fn neg_zero_conditional_store_is_not_dropped() {
         var x: f32 = -0.0; if c > 0.5 { x = 0.0; } let r = x + d; return vec4f(r); }";
     let out = minify(src);
     // The `if` and its `x = 0.0` store survive; `x` is not hardcoded to -0.0.
+    // Name-agnostic: the `-0f` init keeps its sign (not folded to +0.0), and
+    // both the guard (`>.5{`) and the conditional `=0` store survive.
     assert!(
-        out.contains("var B=-0f;if A>.5{B=0;}"),
+        out.contains("=-0f"),
+        "the -0.0 initializer must keep its sign: {out}"
+    );
+    assert!(
+        out.contains(">.5{") && out.contains("=0;}"),
         "the +0.0-vs--0.0 conditional store was wrongly eliminated: {out}"
     );
 }
@@ -210,11 +223,17 @@ fn inlined_pointee_load_postfix_base_is_parenthesized() {
         fn f(d: ptr<function, M>, s: f32) { let e = (*d); (*d).mx = e.mx + vec4f(s); }\
         @fragment fn main() -> @location(0) vec4f { var m: M; m.my = vec4f(1.0); f(&m, 2.0); return m.mx; }";
     let out = minify(src);
-    // The inlined `(*d).mx` postfix is parenthesised; the member access binds
-    // to the deref, not to the pointer name.
+    // Names are mangled, so assert the structural invariant rather than exact
+    // ids: the inlined deref is parenthesised as `(*ptr).member`, never the
+    // WGSL-invalid `*ptr.member` (which parses as `*(ptr.member)`).  The
+    // deref'd pointer is the function's first argument, `a`.
     assert!(
-        out.contains("(*a).c=(*a).c+B"),
-        "inlined pointee-Load postfix base must be (*p).field: {out}"
+        out.contains("(*a)."),
+        "inlined pointee-Load postfix base must be parenthesised `(*p).field`: {out}"
+    );
+    assert!(
+        !out.contains("*a."),
+        "must not emit the WGSL-invalid unparenthesised `*ptr.field`: {out}"
     );
     // It must NOT have fallen back to naga's verbose multi-line emitter (which
     // the pre-fix invalid `*a.mx` forced).

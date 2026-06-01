@@ -734,14 +734,14 @@ fn for_loop_guard_preload_must_not_read_must_bind_load_post_barrier() {
         "a guard-preload loop reading a must-bind load post-barrier must bail to plain loop: {out}"
     );
     let snap = out
-        .find("= A[0]")
-        .expect("the A[0] snapshot must be let-bound");
+        .find("[0]")
+        .expect("the workgroup-array element snapshot must be emitted");
     let barrier = out
         .find("workgroupUniformLoad")
         .expect("the barrier must be preserved");
     assert!(
         snap < barrier,
-        "the A[0] snapshot must be bound BEFORE the workgroupUniformLoad barrier: {out}"
+        "the workgroup-array snapshot must be bound BEFORE the workgroupUniformLoad barrier: {out}"
     );
     assert_valid_wgsl(&out);
 }
@@ -774,14 +774,14 @@ fn for_loop_guard_preload_body_only_must_bind_load_snapshotted_before_barrier() 
         "a body-only must-bind load defined before a guard-preload barrier must bail to plain loop: {out}"
     );
     let snap = out
-        .find("= A[0]")
-        .expect("the A[0] snapshot must be let-bound");
+        .find("[0]")
+        .expect("the workgroup-array element snapshot must be emitted");
     let barrier = out
         .find("workgroupUniformLoad")
         .expect("the barrier must be preserved");
     assert!(
         snap < barrier,
-        "the A[0] snapshot must precede the barrier even when the condition does not read it: {out}"
+        "the workgroup-array snapshot must precede the barrier even when the condition does not read it: {out}"
     );
     assert_valid_wgsl(&out);
 }

@@ -269,8 +269,27 @@ fn run_ir_passes_with(
                 (Some(before), Some(after)) => before != after,
                 _ => false,
             };
+            // Convergence is driven SOLELY by each pass's own `declared_changed`
+            // return.  `changed_by_text` requires `before_text`, which exists
+            // only under `--trace`, so folding it into the loop signal would
+            // make a deterministic minifier's convergence depth depend on a
+            // debug flag (an under-reporting pass would sweep one extra time
+            // only when traced).  It is kept solely to enrich the per-pass
+            // report below.
+            any_changed |= !rolled_back && declared_changed;
+            // Debug guard: a pass that mutated the IR yet returned `Ok(false)`
+            // is an under-reporter - its emitted text differs here while
+            // `declared_changed` is false.  Catch it loudly in tests rather
+            // than letting traced and production convergence silently fork.
+            #[cfg(debug_assertions)]
+            if trace_enabled && !rolled_back && !declared_changed {
+                debug_assert!(
+                    !changed_by_text,
+                    "pass '{}' under-reports: emitted text changed but it returned Ok(false)",
+                    pass.name()
+                );
+            }
             let changed = !rolled_back && (declared_changed || changed_by_text);
-            any_changed |= changed;
 
             let pass_report = PassReport {
                 pass_name: pass.name().to_string(),

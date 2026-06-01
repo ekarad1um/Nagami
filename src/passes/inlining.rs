@@ -23,6 +23,7 @@ use super::expr_util::{
     expression_needs_emit, is_disallowed_inline_expression, map_atomic_function_handles,
     map_cooperative_data_handles, map_gather_mode_handles, map_ray_pipeline_function_handles,
     map_ray_query_function_handles, remap_statement_handles, try_map_expression_handles_in_place,
+    visit_expression_children,
 };
 
 /// Default inlining budgets (used by [`super::Profile::Aggressive`]).
@@ -304,14 +305,23 @@ fn analyze_inline_expression(
         return ((*index as usize) < argument_count).then_some(1);
     }
 
+    // Sum the node counts of every child sub-expression.  Read-only walk
+    // (no clone of the node just to traverse it); `ok` propagates a child's
+    // `None` (disallowed / out-of-range argument) and stops descending
+    // siblings, so the per-template `visited` marks match an early-return
+    // walk exactly.
     let mut total = 1usize;
-    let mut cloned = expr.clone();
-    try_map_expression_handles_in_place(&mut cloned, &mut |child| {
-        total += analyze_inline_expression(child, expressions, argument_count, visited)?;
-        Some(child)
-    })?;
-
-    Some(total)
+    let mut ok = true;
+    visit_expression_children(expr, |child| {
+        if !ok {
+            return;
+        }
+        match analyze_inline_expression(child, expressions, argument_count, visited) {
+            Some(n) => total += n,
+            None => ok = false,
+        }
+    });
+    ok.then_some(total)
 }
 
 // MARK: Call-site rewriting

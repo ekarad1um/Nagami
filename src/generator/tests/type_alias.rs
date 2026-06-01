@@ -9,6 +9,33 @@ use super::helpers::{assert_valid_wgsl, compact, compact_aliased, compact_mangle
 
 // MARK: Basic alias thresholds
 
+/// A type referenced ONLY by dead-eliminated locals must not be aliased.
+/// `generate_function` never prints a dead local, so an `alias X=T;` for
+/// that type would be referenced zero times - pure overhead.  Without the
+/// dead-local gate in `count_type_handle_refs`, the six unused `vec4<f32>`
+/// locals below tip `vec4<f32>` over the alias break-even and emit a dead
+/// `alias`.  Guards that gate.
+#[test]
+fn no_alias_for_type_used_only_by_dead_locals() {
+    let src = r#"
+        fn helper() {
+            var a: vec4<f32>;
+            var b: vec4<f32>;
+            var c: vec4<f32>;
+            var d: vec4<f32>;
+            var e: vec4<f32>;
+            var f: vec4<f32>;
+        }
+        @compute @workgroup_size(1) fn main() { helper(); }
+    "#;
+    let out = compact_aliased(src);
+    assert_valid_wgsl(&out);
+    assert!(
+        !out.contains("alias"),
+        "vec4<f32> appears only in dead locals; it must not be aliased: {out}"
+    );
+}
+
 #[test]
 fn no_alias_when_single_use() {
     // A single use of an array type - aliasing costs more than it saves.

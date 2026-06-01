@@ -279,7 +279,18 @@ fn count_type_handle_refs(
         }
     }
 
-    // Functions and entry points.
+    // Functions and entry points.  Skip a LOCAL's type when the local is
+    // dead-eliminated: `generate_function` never prints a dead local, yet DCE
+    // leaves it in `local_variables`, so counting its type credits the cost
+    // model with a type that appears zero times in the output and yields an
+    // `alias X=T;` used nowhere.  (Argument / result types are always printed
+    // in the signature; `Compose`/`ZeroValue` arena entries are still counted
+    // wholesale - the live-only gate that would also exclude their dead twins
+    // proved unsound here because `collect_emitted_handles` under-marks some
+    // expressions the emitter does print.)  The alias planner is greedy, so
+    // perturbing any count can flip a marginal choice; this is net-positive
+    // across real shaders but not regression-free - a few shaders trade one
+    // marginal alias for a slightly worse one.  All outputs stay valid.
     let all_funcs = module
         .functions
         .iter()
@@ -292,8 +303,11 @@ fn count_type_handle_refs(
         if let Some(result) = &func.result {
             inc(result.ty);
         }
-        for (_, local) in func.local_variables.iter() {
-            inc(local.ty);
+        let (_, dead_locals) = super::module_emit::find_deferrable_vars(func);
+        for (h, local) in func.local_variables.iter() {
+            if !dead_locals[h.index()] {
+                inc(local.ty);
+            }
         }
         for (_, expr) in func.expressions.iter() {
             match expr {
