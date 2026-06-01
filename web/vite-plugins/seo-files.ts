@@ -1,4 +1,4 @@
-import type { Plugin } from 'vite'
+import type { Plugin, HtmlTagDescriptor } from 'vite'
 import { execSync } from 'node:child_process'
 
 export type Changefreq =
@@ -191,6 +191,14 @@ export function seoFiles(options: SeoFilesOptions): Plugin {
     buildStart() {
       sitemapCache = null
       robotsCache = null
+    },
+
+    transformIndexHtml(): HtmlTagDescriptor[] {
+      const canonical = joinUrl(origin, '/')
+      return [
+        { tag: 'link', attrs: { rel: 'canonical', href: canonical }, injectTo: 'head' },
+        { tag: 'meta', attrs: { property: 'og:url', content: canonical }, injectTo: 'head' },
+      ]
     },
 
     configureServer(server) {
