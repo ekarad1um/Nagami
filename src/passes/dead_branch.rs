@@ -612,8 +612,9 @@ fn eliminate_dead_branches(
                     // every sweep (also discarding unrelated dead_branch work).
                     // Keep the switch intact when any case body carries a result
                     // producer, mirroring the `if`-arm guard.  (The degenerate
-                    // sole-`default` splice below drops nothing, so needs no
-                    // guard.)
+                    // splice below emits the default body and drops only empty
+                    // prefix cases, orphaning no result producer, so it needs no
+                    // such guard.)
                     if cases.iter().any(|c| block_has_result_producer(&c.body)) {
                         rebuilt.push(naga::Statement::Switch { selector, cases }, span);
                     } else {
@@ -636,14 +637,24 @@ fn eliminate_dead_branches(
                         }
                     }
                 } else {
-                    // Degenerate switch: exactly one case that is Default.
-                    // The body always executes, so splice it directly
-                    // (unless it contains a bare Break targeting the switch).
-                    if cases.len() == 1
-                        && cases[0].value == naga::SwitchValue::Default
-                        && !contains_bare_break(&cases[0].body)
-                    {
-                        let body = cases.into_iter().next().unwrap().body;
+                    // Degenerate switch: a trailing `default` reached by every
+                    // selector because each preceding case is an empty
+                    // fall-through - naga lowers `case X[, Y..], default: {body}`
+                    // (and a sole `default`) to empty `fall_through` prefix cases
+                    // plus the `default` carrying the body, so the body always
+                    // runs exactly once and the switch wrapper is dead.  Splice
+                    // it, unless the body holds a bare Break targeting the switch
+                    // (which would mis-target once the wrapper is gone).  A
+                    // non-empty or non-fall-through prefix case means some
+                    // selector runs a different (or no) body - then the switch is
+                    // meaningful and is kept.
+                    let degenerate = cases.split_last().is_some_and(|(last, prefix)| {
+                        last.value == naga::SwitchValue::Default
+                            && !last.fall_through
+                            && prefix.iter().all(|c| c.fall_through && c.body.is_empty())
+                    });
+                    if degenerate && !contains_bare_break(&cases.last().unwrap().body) {
+                        let body = cases.into_iter().next_back().unwrap().body;
                         splice_block(&mut rebuilt, body);
                         changed += 1;
                     }
@@ -1968,6 +1979,75 @@ fn fs() -> @location(0) vec4f {
         let (changed, module) = run_pass(src);
         assert!(changed);
         assert_eq!(count_switches(&module.entry_points[0].function.body), 0);
+    }
+
+    // Switch: degenerate `case X, default` splicing and its safety guards.
+
+    #[test]
+    fn degenerate_case_list_to_default_is_spliced() {
+        // `case 0, default {...}` lowers to an empty fall-through `case 0` plus
+        // the `default` carrying the body, so every selector value runs the body
+        // once - the switch wrapper is dead.
+        let src = r#"
+@fragment
+fn fs(@location(0) v: f32) -> @location(0) vec4f {
+    var x = 0.0;
+    switch i32(v) {
+        case 0, default { x = 5.0; }
+    }
+    return vec4f(x);
+}
+"#;
+        let (changed, module) = run_pass(src);
+        assert!(changed);
+        assert_eq!(count_switches(&module.entry_points[0].function.body), 0);
+    }
+
+    #[test]
+    fn non_fallthrough_empty_case_is_not_degenerate() {
+        // `case 1 {}` does NOT fall through, so selector==1 runs the empty body
+        // and EXITS the switch (x stays 0); only other values hit the default.
+        // The switch distinguishes selector 1 from the rest and must be kept -
+        // splicing the default body would wrongly run it for selector 1.
+        let src = r#"
+@fragment
+fn fs(@location(0) v: f32) -> @location(0) vec4f {
+    var x = 0.0;
+    switch i32(v) {
+        case 1 { }
+        default { x = 9.0; }
+    }
+    return vec4f(x);
+}
+"#;
+        let (_, module) = run_pass(src);
+        assert_eq!(
+            count_switches(&module.entry_points[0].function.body),
+            1,
+            "non-fall-through empty case must keep the switch (distinguishes its selector)"
+        );
+    }
+
+    #[test]
+    fn degenerate_default_with_bare_break_keeps_switch() {
+        // The default body holds a bare `break` targeting the switch; splicing it
+        // into the parent block would mis-target the break, so the switch is kept.
+        let src = r#"
+@fragment
+fn fs(@location(0) v: f32) -> @location(0) vec4f {
+    var x = 0.0;
+    switch i32(v) {
+        case 0, default { x = 1.0; if v > 0.5 { break; } x = 2.0; }
+    }
+    return vec4f(x);
+}
+"#;
+        let (_, module) = run_pass(src);
+        assert_eq!(
+            count_switches(&module.entry_points[0].function.body),
+            1,
+            "default body with a bare break must keep the switch"
+        );
     }
 
     // Pass reports no change when nothing to do
