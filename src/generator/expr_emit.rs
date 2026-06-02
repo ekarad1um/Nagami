@@ -1270,7 +1270,41 @@ impl<'a> Generator<'a> {
                     return Ok(folded);
                 }
                 let target = self.type_name_for_inner(&target_inner)?;
-                let source = self.emit_expr(*expr, ctx)?;
+                // A scalar `bitcast<T>` reinterprets its operand's BITS, so an
+                // inline literal operand must be emitted in TYPED (suffixed) form
+                // to pin its concrete type.  The bare form drops the suffix and
+                // re-parses as an abstract literal that materialises to a
+                // different concrete type than the source had: a whole-number
+                // float collapses to an int token (`1.0f` -> `1` -> `AbstractInt`
+                // -> default i32), so `bitcast<u32>(1.0f)` reinterprets `0x1` and
+                // not the float's `0x3F800000` (a silent VALUE miscompile); and a
+                // `u32` above `i32::MAX` (`bitcast<f32>(3212836864u)` ->
+                // `3212836864`) overflows the i32 default and is rejected outright
+                // by spec-conformant consumers.  Vector bitcasts and
+                // `convert.is_some()` conversions pin the operand via their
+                // constructor, so only the scalar-bitcast case is forced.
+                //
+                // This also bypasses `extracted_literals`: a hoisted
+                // `const N = <bare>;` is abstract-typed (the bare form merges
+                // types, so `F32(1024.0)` and `I32(1024)` share one
+                // `const N=1024;`), and `bitcast<u32>(N)` would reinterpret the
+                // abstract-int default - the same miscompile via a reference.  The
+                // extraction counter MUST subtract this same occurrence (the
+                // `As { convert: None }` arm in `literal_extract`) or it leaves a
+                // dangling const.  Abstract literals are excluded: `emit_expr`'s
+                // concretization already yields the correct typed form.
+                let source = if convert.is_none()
+                    && vec_size.is_none()
+                    && !ctx.expr_names.contains_key(expr)
+                    && let E::Literal(lit) = &ctx.func.expressions[*expr]
+                    && !matches!(
+                        lit,
+                        naga::Literal::AbstractInt(_) | naga::Literal::AbstractFloat(_)
+                    ) {
+                    literal_to_wgsl(*lit, &self.options.float_precision)
+                } else {
+                    self.emit_expr(*expr, ctx)?
+                };
                 let mut s = if convert.is_some() {
                     target
                 } else {
@@ -2413,6 +2447,7 @@ enum ComposeGroup {
 // around child expressions of a Binary operator.
 // Source: <https://www.w3.org/TR/WGSL/#operator-precedence>
 
+const PREC_SHIFT: u8 = 8;
 const PREC_ADDITIVE: u8 = 9;
 const PREC_MULTIPLICATIVE: u8 = 10;
 const PREC_UNARY: u8 = 11;
@@ -2433,7 +2468,7 @@ fn binary_precedence(op: naga::BinaryOperator) -> u8 {
         B::And => 5,
         B::Equal | B::NotEqual => 6,
         B::Less | B::LessEqual | B::Greater | B::GreaterEqual => 7,
-        B::ShiftLeft | B::ShiftRight => 8,
+        B::ShiftLeft | B::ShiftRight => PREC_SHIFT,
         B::Add | B::Subtract => PREC_ADDITIVE,
         B::Multiply | B::Divide | B::Modulo => PREC_MULTIPLICATIVE,
     }
@@ -2523,13 +2558,18 @@ fn child_needs_parens(
         return child_prec < PREC_UNARY;
     }
 
-    // WGSL relational and equality operators are non-chainable: their
-    // operands must syntactically resolve to a strictly lower-precedence
-    // expression on either side, so a same-precedence child must be
-    // parenthesised regardless of associativity.  This covers
-    // `(a == b) == c` (operands of `==`/`!=` must be `relational_expression`,
-    // per WGSL (https://www.w3.org/TR/WGSL/#composite-value-decomposition-expr)
-    // as well as the relational quartet.
+    // WGSL puts all six comparison operators (`< <= > >= == !=`) at a single
+    // non-associative grammar level whose operands must each be a
+    // `shift_expression` (WGSL https://www.w3.org/TR/WGSL/#operator-precedence-associativity
+    // and https://www.w3.org/TR/WGSL/#syntax-relational_expression),
+    // so any comparison child needs parens here - `a<b==c<d` is the ill-formed
+    // shape Dawn/Tint reject ("mixing '<' and '==' requires parenthesis") even
+    // though naga's permissive frontend round-trips it.  Hence `< PREC_SHIFT`
+    // rather than the more obvious `<= parent_prec`: `==`/`!=` (6) and the
+    // relational quartet (7) differ in this table yet share one grammar level,
+    // so a relational child of an equality parent must still be wrapped.
+    // Always meaning-preserving - the parenthesised grouping is the only
+    // well-typed one.
     if matches!(
         parent_op,
         naga::BinaryOperator::Less
@@ -2539,7 +2579,7 @@ fn child_needs_parens(
             | naga::BinaryOperator::Equal
             | naga::BinaryOperator::NotEqual
     ) {
-        return child_prec <= parent_prec;
+        return child_prec < PREC_SHIFT;
     }
 
     // Left-associative: left child needs parens if strictly lower,

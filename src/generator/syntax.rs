@@ -493,17 +493,17 @@ pub(super) fn literal_to_wgsl(literal: naga::Literal, precision: &FloatPrecision
 ///    and the global-expression Compose/Splat arms in
 ///    [`super::module_emit`].
 /// 2. As the RHS of an extracted `const NAME = ...;` declaration.  The
-///    constant takes the literal's (possibly abstract) type, and every
-///    use of `NAME` re-binds via normal abstract coercion.  This is
-///    [`literal_extract_key`]'s decl path.
+///    const is abstract-typed (a bare form merges across concrete types),
+///    so it is valid only where each use pins a concrete type by coercion;
+///    a use that cannot (a scalar `bitcast` source) bypasses the const and
+///    emits the typed inline form instead.  This is [`literal_extract_key`]'s
+///    decl path.
 ///
 /// All other sites must use [`literal_to_wgsl`] (typed form).  In
 /// particular: binary operands where either side is itself a literal,
 /// overload-resolution arguments (e.g. `atan2(1.0, x)`), and standalone
 /// `let` / `var` initializers must NOT receive a bare-form literal -
-/// an abstract-coercion surprise could flip overload resolution.  See
-/// `lib.rs::e2e_concrete_float_literals_round_trip_after_minification`
-/// for the round-trip regression test.
+/// an abstract-coercion surprise could flip overload resolution.
 ///
 /// Float literals are rounded per `precision`'s per-type
 /// [`PrecisionMode`] (`Full` preserves the original value).
@@ -823,7 +823,17 @@ pub(super) fn type_inner_name(
                 }
             }
         }
-        naga::TypeInner::AccelerationStructure { .. } => "acceleration_structure".to_string(),
+        // Mirror naga's own WGSL writer: the `vertex_return` capability
+        // (getCommittedHitVertexPositions / candidate-hit vertex positions) is
+        // part of the type and must be rendered, or the emitted type silently
+        // re-parses as the non-vertex-return form (a capability loss).
+        naga::TypeInner::AccelerationStructure { vertex_return } => {
+            if *vertex_return {
+                "acceleration_structure<vertex_return>".to_string()
+            } else {
+                "acceleration_structure".to_string()
+            }
+        }
         _ => {
             return Err(Error::Emit(format!("unsupported type: {:?}", inner,)));
         }

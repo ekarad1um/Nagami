@@ -527,3 +527,92 @@ fn override_sized_array_survives_per_pass_text_emit() {
         out.source
     );
 }
+
+/// A scalar `bitcast<T>` whose operand is an inline literal must pin the
+/// operand's concrete type (emit the typed/suffixed form), because bitcast
+/// reinterprets BITS and a bare token re-types as an abstract literal.
+/// `bitcast<u32>(1.0f)` collapsing to `bitcast<u32>(1)` is a silent VALUE
+/// miscompile (f32 1.0 is `0x3F800000`, but bare `1` is i32 `0x1`), and
+/// `bitcast<f32>(<u32 > i32::MAX>)` losing its `u` overflows the i32 default
+/// and is rejected by spec-conformant consumers.
+#[test]
+fn bitcast_scalar_literal_source_keeps_concrete_type() {
+    // Whole-number float source must NOT collapse to a bare int.
+    let out = minify(
+        "@group(0)@binding(0) var<storage,read_write> o:array<u32>;\
+         @compute @workgroup_size(1) fn main(){ o[0]=bitcast<u32>(1.0f); o[1]=bitcast<u32>(2.0f); }",
+    );
+    assert!(
+        !out.contains("bitcast<u32>(1)") && !out.contains("bitcast<u32>(2)"),
+        "whole-number float bitcast source collapsed to a bare int (value miscompile): {out}"
+    );
+    assert!(
+        out.contains("bitcast<u32>(1f)") && out.contains("bitcast<u32>(2f)"),
+        "float bitcast source did not keep its concrete f32 form: {out}"
+    );
+    // Unsigned source above i32::MAX must keep its `u` suffix.
+    let out2 = minify(
+        "@group(0)@binding(0) var<storage,read_write> r:array<f32>;\
+         @compute @workgroup_size(1) fn main(){ r[0]=bitcast<f32>(3212836864u); }",
+    );
+    assert!(
+        out2.contains("3212836864u"),
+        "out-of-i32-range u32 bitcast source lost its `u` suffix (strict-parser reject): {out2}"
+    );
+}
+
+/// The bitcast type-pinning must hold even when the literal is ALSO repeated
+/// enough to be hoisted into a shared `const` by literal extraction.  That
+/// const is abstract-typed (the bare form merges across types), so a
+/// `bitcast<u32>(C)` reference would reinterpret the abstract-int default
+/// instead of the float - the same value miscompile through a const.  The
+/// bitcast use must stay inline-typed (`1024f`), while the const still serves
+/// its other (type-pinning) uses; and the extraction counter must not leave a
+/// dangling const when ALL uses are bitcasts.
+#[test]
+fn bitcast_scalar_literal_pinned_even_when_extracted() {
+    // 1024.0 repeated: one bitcast + eight f32 stores -> extracted to a const
+    // for the stores, but the bitcast stays inline-typed.
+    let out = minify(
+        "@group(0)@binding(0) var<storage,read_write> o:array<u32>;\
+         @group(0)@binding(1) var<storage,read_write> f:array<f32>;\
+         @compute @workgroup_size(1) fn main(){ o[0]=bitcast<u32>(1024.0);\
+            f[0]=1024.0; f[1]=1024.0; f[2]=1024.0; f[3]=1024.0;\
+            f[4]=1024.0; f[5]=1024.0; f[6]=1024.0; f[7]=1024.0; }",
+    );
+    assert!(
+        out.contains("bitcast<u32>(1024f)"),
+        "extracted-literal bitcast source was not pinned to its concrete type: {out}"
+    );
+    // All-bitcast: every use is a bitcast, so extraction must decline (no
+    // substitutable uses) rather than leave a dangling `const`.
+    let out2 = minify(
+        "@group(0)@binding(0) var<storage,read_write> o:array<u32>;\
+         @compute @workgroup_size(1) fn main(){\
+            o[0]=bitcast<u32>(1024.0); o[1]=bitcast<u32>(1024.0);\
+            o[2]=bitcast<u32>(1024.0); o[3]=bitcast<u32>(1024.0);\
+            o[4]=bitcast<u32>(1024.0); o[5]=bitcast<u32>(1024.0); }",
+    );
+    assert!(
+        out2.contains("bitcast<u32>(1024f)") && !out2.contains("const"),
+        "all-bitcast extraction left a dangling const or failed to pin: {out2}"
+    );
+}
+
+/// A relational child of an equality operator (and any comparison child of a
+/// comparison parent) must stay parenthesised: WGSL puts all six comparisons
+/// at one non-associative grammar level requiring `shift_expression` operands,
+/// so `a<b==c<d` is a parse error in spec-conformant consumers (Dawn/Tint:
+/// "mixing '<' and '==' requires parenthesis"), though naga round-trips it.
+#[test]
+fn chained_comparison_keeps_required_parens() {
+    let out = minify(
+        "@group(0)@binding(0) var<storage,read_write> o:array<u32>;\
+         @group(0)@binding(1) var<storage,read> i:array<i32>;\
+         @compute @workgroup_size(1) fn main(){ o[0]=u32(i[0]<i[1] == i[2]<i[3]); }",
+    );
+    assert!(
+        out.contains(")==(") || out.contains(") == ("),
+        "chained comparison must parenthesise its relational children: {out}"
+    );
+}

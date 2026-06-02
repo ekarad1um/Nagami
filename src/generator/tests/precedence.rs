@@ -253,17 +253,19 @@ fn divide_followed_by_pointer_deref_does_not_form_block_comment() {
 }
 
 #[test]
-fn equality_with_relational_child_does_not_need_extra_parens() {
-    // WGSL relational operators (`<`, `<=`, `>`, `>=`) bind more
-    // tightly than equality, so `a<b==c` already parses as
-    // `(a<b)==c`.  The non-chainable rule for `==`/`!=` exists to
-    // prevent same-precedence chaining, not to force parens around
-    // strictly-higher-precedence children.  This regression pins
-    // that the emitter still drops these (redundant) parens.
+fn equality_with_relational_child_keeps_parens() {
+    // WGSL puts all six comparison operators (`< <= > >= == !=`) at ONE
+    // non-associative grammar level whose operands must each be a
+    // `shift_expression` (WGSL https://www.w3.org/TR/WGSL/#operator-precedence-associativity
+    // and https://www.w3.org/TR/WGSL/#syntax-relational_expression).  A relational
+    // child is therefore NOT a valid bare operand of `==`: `a<b==c` is a parse
+    // error in spec-conformant consumers (Dawn/Tint: "mixing '<' and '=='
+    // requires parenthesis"), even though naga's permissive frontend
+    // round-trips it.  The emitter must KEEP the parens: `(a<b)==c`.
     let out = compact("fn f(a:i32,b:i32,c:bool)->bool{return (a<b)==c;}");
     assert!(
-        !out.contains("(a<b)") && !out.contains("(a < b)"),
-        "relational child of equality should drop the redundant parens: {out}"
+        out.contains("(a<b)==") || out.contains("(a < b) =="),
+        "relational child of equality must stay parenthesised: {out}"
     );
     assert_valid_wgsl(&out);
 }

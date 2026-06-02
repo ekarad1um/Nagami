@@ -115,6 +115,11 @@ impl<'a> Generator<'a> {
                 //   * `emit_expr::Derivative` - a direct `Expression::Literal`
                 //     `expr` arg is forced to typed form to avoid i32 inference
                 //     for derivatives (which require float).
+                //   * `emit_expr::As` scalar `bitcast` (`convert: None`) - a
+                //     direct CONCRETE `Literal` operand is forced to typed form
+                //     so the reinterpreted bits keep the source's concrete type
+                //     (a bare token re-types as abstract); abstract operands are
+                //     not forced.
                 //   * `stmt_emit::emit_expr_for_atomic` - INTEGER literal/unnamed
                 //     constant args of atomic statements are forced to the
                 //     atomic's scalar type (handled in the second walk below).
@@ -246,6 +251,27 @@ impl<'a> Generator<'a> {
                         naga::Expression::Derivative { expr: e, .. } => {
                             if matches!(func.expressions[*e], naga::Expression::Literal(_)) {
                                 adjust[e.index()] += 1;
+                            }
+                        }
+                        // Scalar `bitcast` forces a CONCRETE literal operand to
+                        // typed form, bypassing `extracted_literals` (see the
+                        // bypass list above), so subtract its over-count.  An
+                        // abstract operand is NOT forced, so it is left eligible.
+                        naga::Expression::As {
+                            expr: src,
+                            convert: None,
+                            ..
+                        } => {
+                            if matches!(
+                                func.expressions[*src],
+                                naga::Expression::Literal(l)
+                                    if !matches!(
+                                        l,
+                                        naga::Literal::AbstractInt(_)
+                                            | naga::Literal::AbstractFloat(_)
+                                    )
+                            ) {
+                                adjust[src.index()] += 1;
                             }
                         }
                         // A Splat's scalar value is emitted bare inside the
