@@ -1,6 +1,6 @@
 [package]
 name = "nagami"
-version = "2026.6.3"
+version = "2026.6.4"
 edition = "2024"
 license = "MIT"
 description = "Shrinks WGSL shaders via Naga IR optimization passes"

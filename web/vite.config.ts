@@ -80,10 +80,10 @@ export default defineConfig({
         ],
       },
       manifest: {
-        name: 'Nagami — WGSL Shader Minifier',
+        name: 'Nagami - WGSL Shader Minifier',
         short_name: 'Nagami',
         description:
-          'IR-level WGSL shader minifier — DCE, constant folding, inlining, and mangling. Runs entirely in the browser via WebAssembly.',
+          'IR-level WGSL shader minifier - DCE, constant folding, inlining, and mangling. Runs entirely in the browser via WebAssembly.',
         theme_color: '#0c0c0c',
         background_color: '#0c0c0c',
         display: 'standalone',
