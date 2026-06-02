@@ -63,6 +63,16 @@ fn emit_wgsl_with_info(
     module: &naga::Module,
     info: &naga::valid::ModuleInfo,
 ) -> Result<String, Error> {
+    // naga's WGSL backend hits `unreachable!()` emitting an override-sized
+    // array size, which aborts the process under release `panic = "abort"`.
+    // `--trace` and `--validate-each-pass` run this on every intermediate IR,
+    // so return a placeholder rather than the panicking backend.  The
+    // placeholder is comment-only WGSL that re-parses as an empty module, so
+    // the `validate_each_pass` text check below MUST skip these modules or it
+    // would record a spurious clean round-trip.
+    if crate::module_has_override_sized_array(module) {
+        return Ok("// (override-sized array: naga WGSL backend skipped)\n".to_string());
+    }
     // Debug-only drift guard: re-validate so a future caller that
     // forgets to refresh after mutating `module` sees a clean panic
     // here instead of a cryptic crash inside the backend.  Release
@@ -246,7 +256,14 @@ fn run_ir_passes_with(
             };
             let after_bytes = after_text.as_ref().map(|text| text.len());
 
-            if !rolled_back && needs_text_validation {
+            // Override-sized-array modules emit a comment-only placeholder
+            // (the backend would abort), which re-parses as a valid empty
+            // module; skip the check so a spurious clean round-trip is not
+            // recorded, leaving `text_validation_ok` as `None`.
+            if !rolled_back
+                && needs_text_validation
+                && !crate::module_has_override_sized_array(module)
+            {
                 let ok = io::validate_wgsl_text(
                     after_text
                         .as_deref()

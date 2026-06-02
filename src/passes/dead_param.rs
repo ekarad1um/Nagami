@@ -17,8 +17,9 @@ use std::collections::{HashMap, HashSet};
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
 
-/// Remove unused parameters from non-entry-point functions and their
-/// call sites.  Entry points are left untouched.
+/// Remove unused parameters from ordinary functions and their call
+/// sites.  Entry points and preserve-listed functions are left untouched
+/// (both export a fixed signature).
 #[derive(Debug, Default)]
 pub struct DeadParamPass;
 
@@ -27,7 +28,7 @@ impl Pass for DeadParamPass {
         "dead_param_elimination"
     }
 
-    fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
+    fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
         // Phase 1: identify every unused parameter.  A parameter is
         // unused when its `FunctionArgument` expression handle is not
         // transitively reachable from any statement root.
@@ -35,6 +36,19 @@ impl Pass for DeadParamPass {
 
         for (fh, func) in module.functions.iter() {
             if func.arguments.is_empty() {
+                continue;
+            }
+
+            // A preserved function's signature is an external contract:
+            // `--preserve-symbol` callers and stripped-then-re-prepended
+            // `--preamble` definitions (auto-added to `preserve_symbols`)
+            // pass the ORIGINAL arity, so stripping a parameter here would
+            // fail re-validation or silently break those unseen callers.
+            if func
+                .name
+                .as_deref()
+                .is_some_and(|n| ctx.config.preserve_symbols.iter().any(|p| p == n))
+            {
                 continue;
             }
 

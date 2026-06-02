@@ -50,7 +50,10 @@ fn emit_wgsl_with_naga_safe(
 /// process instead of returning an error.  nagami's generator emits these
 /// types itself, so callers skip the naga baseline/fallback emit for such
 /// modules rather than invoke the panicking path.
-fn module_has_override_sized_array(module: &naga::Module) -> bool {
+///
+/// Crate-visible because the pipeline driver's trace / `validate_each_pass`
+/// text-emission path (`pipeline::emit_wgsl_with_info`) needs the same guard.
+pub(crate) fn module_has_override_sized_array(module: &naga::Module) -> bool {
     module.types.iter().any(|(_, ty)| {
         matches!(
             ty.inner,

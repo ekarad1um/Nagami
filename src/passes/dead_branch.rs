@@ -794,6 +794,15 @@ fn definitely_terminates(stmt: &naga::Statement) -> bool {
                 .all(|c| c.fall_through || case_body_terminates_beyond_switch(&c.body))
                 && cases.iter().any(|c| c.value == naga::SwitchValue::Default)
                 && !last_falls_through
+                // A reachable bare `break` ANYWHERE in a case body (not just as
+                // the case's last statement) exits the switch and falls through
+                // to the statement after it, so the switch does NOT terminate
+                // the outer block.  `case_body_terminates_beyond_switch` only
+                // inspects `block.last()` and so misses a break nested inside an
+                // earlier `if` (e.g. `case 1: { if (c) { break; } return; }`);
+                // guard against it here, mirroring the `!contains_bare_loop_control`
+                // guard on the `Loop` arm above.
+                && !cases.iter().any(|c| contains_bare_break(&c.body))
         }
         _ => false,
     }
@@ -847,6 +856,11 @@ fn case_body_terminates_beyond_switch(block: &naga::Block) -> bool {
                 .all(|c| c.fall_through || case_body_terminates_beyond_switch(&c.body))
                 && cases.iter().any(|c| c.value == naga::SwitchValue::Default)
                 && !last_falls_through
+                // A bare `break` reachable in any nested case body exits THIS
+                // nested switch and falls through to whatever follows it within
+                // the outer case body, so the nested switch does not terminate
+                // beyond.  See the identical guard in `definitely_terminates`.
+                && !cases.iter().any(|c| contains_bare_break(&c.body))
         }
         _ => false,
     })
@@ -1574,6 +1588,24 @@ fn block_only_has_redundant_known_stores(
                     && let Some(known) = known_values.get(&lh)
                     && expr_matches_known(expressions, *value, known, const_lits)
                 {
+                    has_store = true;
+                    continue;
+                }
+                return false;
+            }
+            // A brace-wrapped sub-block (`if (c) { { d = false; } }`) is a
+            // flat passthrough at the IR level: recurse so its redundant
+            // stores are recognised too.  The recursive call's own
+            // "at least one store" requirement makes an empty inner block
+            // yield `false`, keeping the conservative behaviour for a
+            // branch that does nothing observable.
+            naga::Statement::Block(inner) => {
+                if block_only_has_redundant_known_stores(
+                    inner,
+                    expressions,
+                    known_values,
+                    const_lits,
+                ) {
                     has_store = true;
                     continue;
                 }

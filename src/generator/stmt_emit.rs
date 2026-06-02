@@ -578,10 +578,13 @@ impl<'a> Generator<'a> {
                 for h in range.clone() {
                     // A `Load` whose place is written between this `Emit` and a
                     // use MUST be bound; inlining it would read the post-write
-                    // value (silent miscompile).  This overrides BOTH the
-                    // bare-local/global short-name skip in `should_bind_expression`
-                    // and the `min_binding_refs` size threshold below.
-                    let force_bind = ctx.must_bind_loads.contains(&h);
+                    // value (silent miscompile).  `is_uniformity_pinned` shares
+                    // this force-bind for its own reason (see its doc).  Both
+                    // override the bare-local/global short-name skip in
+                    // `should_bind_expression` and the `min_binding_refs`
+                    // threshold below.
+                    let force_bind =
+                        ctx.must_bind_loads.contains(&h) || self.is_uniformity_pinned(h, ctx);
                     if !force_bind && !self.should_bind_expression(h, ctx) {
                         continue;
                     }
@@ -1175,6 +1178,36 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// Whether `h` must stay in uniform control flow per the WGSL
+    /// uniformity rules: an implicit derivative (`dpdx`/`dpdy`/`fwidth`)
+    /// or an implicit-LOD texture sample (`textureSample` /
+    /// `textureSampleBias` / `textureSampleCompare` - a non-gather sample
+    /// whose LOD is `Auto` or `Bias`).  Such an expression is force-bound
+    /// at its naga-placed Emit site so single-use inlining cannot sink it
+    /// into a deeper, possibly non-uniform branch.  naga's validator does
+    /// not enforce derivative uniformity, but strict downstream compilers
+    /// (Tint/Dawn/browsers) reject the violation, so the un-pinned form
+    /// would ship a shader that fails to compile there.
+    ///
+    /// Explicit forms (`textureSampleLevel` / `Grad` / `CompareLevel` /
+    /// `BaseClampToEdge`) and all gathers use no implicit derivatives and
+    /// stay freely inlinable.
+    fn is_uniformity_pinned(
+        &self,
+        h: naga::Handle<naga::Expression>,
+        ctx: &FunctionCtx<'a, '_>,
+    ) -> bool {
+        use naga::Expression as E;
+        match &ctx.func.expressions[h] {
+            E::Derivative { .. } => true,
+            E::ImageSample { gather, level, .. } => {
+                gather.is_none()
+                    && matches!(level, naga::SampleLevel::Auto | naga::SampleLevel::Bias(_))
+            }
+            _ => false,
+        }
+    }
+
     fn should_bind_expression(
         &self,
         h: naga::Handle<naga::Expression>,
@@ -1732,7 +1765,7 @@ impl<'a> Generator<'a> {
             return Some((cop, *right));
         }
 
-        // For commutative ops, also check the right side — but a `Multiply`
+        // For commutative ops, also check the right side - but a `Multiply`
         // must additionally be type-commutative, or swapping a matrix product
         // would silently transpose it.  The left-self fold above preserves
         // operand order unconditionally and needs no such guard.
@@ -1955,7 +1988,7 @@ impl<'a> Generator<'a> {
 // MARK: Statement-level helpers
 
 /// Return the WGSL compound-assignment token (`+=`, `*=`, and so on) for a
-/// binary operator, plus whether the operator is commutative — i.e. whether a
+/// binary operator, plus whether the operator is commutative - i.e. whether a
 /// `lhs = rhs <op> lhs` store may also fold by matching the right operand.
 /// (`Multiply` is flagged commutative here, but the caller further excludes
 /// non-commutative matrix products.)  `None` when the operator has no

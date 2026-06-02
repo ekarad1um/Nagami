@@ -12,7 +12,7 @@
 //! init value would have to be re-materialised at every alias site.
 //!
 //! On top of the live-range check, a per-block first-touch gate
-//! (`coalesce_safe`, set by [`mark_block_first`]) refuses to coalesce
+//! (`coalesce_safe`, set by `mark_block_first`) refuses to coalesce
 //! any local whose first observed action in some control-flow scope
 //! is a non-`Store` operation.  Such a local reads the slot's prior
 //! contents on at least one runtime path (either via zero-init on the
@@ -32,7 +32,7 @@
 //! element, leaving the rest at WGSL's promised zero-init.  Without
 //! per-element tracking, coalescing such a local with a prior local
 //! L would leak L's residue into the unwritten bytes.  The
-//! [`ElementInit`] state attached to each local tracks which
+//! `ElementInit` state attached to each local tracks which
 //! elements have been written by which kind of Store; the gate
 //! at every Load site then refuses to coalesce locals reading
 //! elements that are not provably written on every reaching path.

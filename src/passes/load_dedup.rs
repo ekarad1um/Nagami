@@ -1141,6 +1141,22 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
     // level, so we flatten chains here to avoid dangling references.
     flatten_replacement_chains(&mut replacements);
 
+    // Keep only replacements that take effect at EVERY use.  The arena walk
+    // below rewrites a load to its target only where `target < use`, and a use
+    // always outranks the load it reads, so `target < load` is exactly the
+    // condition for the rewrite to reach every use.  A target that does not
+    // precede the load - e.g. an init expression `inlining` appended to the
+    // arena after the load - applies nowhere; retaining it would drop the
+    // load's `let` while its uses still read the bare, possibly since-mutated
+    // load (a miscompile when a use sits past a write to the place, e.g. a
+    // loop `break_if`), and would also make this pass report a change every
+    // sweep and never converge.  This is the same effectiveness test
+    // `dead_locals` and `dead_store_ids` already apply.
+    replacements.retain(|load, target| *target < *load);
+    if replacements.is_empty() {
+        return false;
+    }
+
     // Apply replacements to all expression children in the arena.
     // Guard: skip a replacement if the target handle is >= the current
     // expression's handle, which would create an illegal forward reference.
@@ -2233,6 +2249,10 @@ fn apply_to_block(
     for (mut statement, span) in original.span_into_iter() {
         match &mut statement {
             naga::Statement::Emit(range) => {
+                // Every entry in `replacements` is effective (target precedes
+                // the load; see the retain in `dedup_loads_in_function`), so a
+                // load that is a replacement key is rewritten at all its uses
+                // and its binding can be dropped.
                 let surviving: Vec<_> = range
                     .clone()
                     .filter(|h| !replacements.contains_key(h))

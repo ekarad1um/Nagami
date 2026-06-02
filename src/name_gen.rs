@@ -473,6 +473,7 @@ const WGSL_PREDECLARED: &[&str] = &[
     "textureNumLevels",
     "textureNumSamples",
     "textureSample",
+    "textureSampleBaseClampToEdge",
     "textureSampleBias",
     "textureSampleCompare",
     "textureSampleCompareLevel",
@@ -485,11 +486,17 @@ const WGSL_PREDECLARED: &[&str] = &[
     "pack2x16unorm",
     "pack4x8snorm",
     "pack4x8unorm",
+    "pack4xI8",
+    "pack4xI8Clamp",
+    "pack4xU8",
+    "pack4xU8Clamp",
     "unpack2x16float",
     "unpack2x16snorm",
     "unpack2x16unorm",
     "unpack4x8snorm",
     "unpack4x8unorm",
+    "unpack4xI8",
+    "unpack4xU8",
     // Built-in functions - synchronization
     "storageBarrier",
     "textureBarrier",
@@ -766,6 +773,14 @@ mod tests {
             "RayIntersection",
             // synchronization
             "textureBarrier",
+            // data packing (8-bit packed integer ops) + clamp-to-edge sample
+            "pack4xI8",
+            "pack4xI8Clamp",
+            "pack4xU8",
+            "pack4xU8Clamp",
+            "unpack4xI8",
+            "unpack4xU8",
+            "textureSampleBaseClampToEdge",
         ] {
             assert!(
                 is_reserved(name),

@@ -735,6 +735,16 @@ impl<'a> Generator<'a> {
             let expected_offset = natural_align.round_up(default_offset);
 
             // Does the actual offset require a different alignment?
+            //
+            // `need_align` is in practice never true: `expected_offset ==
+            // member.offset` for every member, because naga lays each one at
+            // `round_up(running_offset, natural_align)` - exactly the
+            // `expected_offset` computed here - and any wider gap from an
+            // explicit `@align` is reproduced by `@size` on the prior member
+            // (below), which advances `default_offset` to that forced offset.
+            // Kept as a defensive net (it `Err`s to the alternate emitter)
+            // rather than deleted: a wrong offset is a silent layout
+            // miscompile, so provably-dead code beats an unproven deletion.
             let need_align = member.offset != expected_offset && member.offset > expected_offset;
 
             if need_align {
@@ -1178,12 +1188,9 @@ fn count_block_refs(block: &naga::Block, counts: &mut Vec<usize>) {
             } => {
                 bump(counts, *pointer);
                 bump(counts, *value);
-                if let naga::AtomicFunction::Exchange {
-                    compare: Some(compare),
-                } = fun
-                {
-                    bump(counts, *compare);
-                }
+                crate::passes::expr_util::visit_atomic_function_handles(fun, &mut |h| {
+                    bump(counts, h)
+                });
             }
             naga::Statement::ImageAtomic {
                 image,
@@ -1198,12 +1205,9 @@ fn count_block_refs(block: &naga::Block, counts: &mut Vec<usize>) {
                     bump(counts, *i);
                 }
                 bump(counts, *value);
-                if let naga::AtomicFunction::Exchange {
-                    compare: Some(compare),
-                } = fun
-                {
-                    bump(counts, *compare);
-                }
+                crate::passes::expr_util::visit_atomic_function_handles(fun, &mut |h| {
+                    bump(counts, h)
+                });
             }
             naga::Statement::WorkGroupUniformLoad { pointer, .. } => {
                 bump(counts, *pointer);
@@ -2175,11 +2179,16 @@ fn consume_pending_for_statement(
         }
         naga::Statement::If { condition, .. } => check(*condition, pending, result),
         naga::Statement::Switch { selector, .. } => check(*selector, pending, result),
-        naga::Statement::Loop { break_if, .. } => {
-            if let Some(h) = break_if {
-                check(*h, pending, result);
-            }
-        }
+        // A loop's `break_if` is re-evaluated each iteration, but a pending
+        // call from the ENCLOSING block was emitted once before the loop;
+        // consuming it into `break_if` would recompute it per iteration - a
+        // silent miscompile when a call argument reads a local the loop
+        // mutates (the intra-block Store-interference guard cannot see those
+        // nested writes).  Left unconsumed it falls to `pending.clear()` in
+        // `find_inlineable_calls`'s Loop arm and emits as a pre-loop `let`;
+        // calls emitted INSIDE the loop still inline via that function's
+        // recursion into body/continuing with a fresh pending set.
+        naga::Statement::Loop { .. } => {}
         naga::Statement::Return { value: Some(h) } => check(*h, pending, result),
         naga::Statement::Store { pointer, value } => {
             check(*pointer, pending, result);
@@ -2211,9 +2220,9 @@ fn consume_pending_for_statement(
         } => {
             check(*pointer, pending, result);
             check(*value, pending, result);
-            if let naga::AtomicFunction::Exchange { compare: Some(cmp) } = fun {
-                check(*cmp, pending, result);
-            }
+            crate::passes::expr_util::visit_atomic_function_handles(fun, &mut |h| {
+                check(h, pending, result)
+            });
         }
         naga::Statement::ImageAtomic {
             image,
@@ -2228,9 +2237,9 @@ fn consume_pending_for_statement(
                 check(*i, pending, result);
             }
             check(*value, pending, result);
-            if let naga::AtomicFunction::Exchange { compare: Some(cmp) } = fun {
-                check(*cmp, pending, result);
-            }
+            crate::passes::expr_util::visit_atomic_function_handles(fun, &mut |h| {
+                check(h, pending, result)
+            });
         }
         naga::Statement::WorkGroupUniformLoad { pointer, .. } => {
             check(*pointer, pending, result);
@@ -2681,6 +2690,16 @@ fn flag_used_loads(
         && pl.written
     {
         must_bind.insert(root);
+        // Stop here.  A written `root` is added to `must_bind`, so it emits as
+        // a `let` at its own Emit site, freezing its WHOLE operand cone
+        // (unbound children inlined, bound children naming their own earlier
+        // `let`s) lexically before the write that marked it `written` -
+        // including any nested written load reachable only via `root`.
+        // Re-pinning a child would therefore change nothing.  A child also used
+        // OUTSIDE this parent is still pinned at that other use: the early
+        // return records only `root` in `visited` (children stay walkable), and
+        // each statement walk starts a fresh `visited`.
+        return;
     }
     visit_expr_children(&expressions[root], |child| {
         flag_used_loads(child, expressions, pending, must_bind, visited);
@@ -2917,17 +2936,23 @@ pub(super) fn compute_must_bind_loads(
 /// out to be entirely dead.  The returned vectors are indexed by
 /// local handle.
 ///
-/// A variable is deferrable when:
+/// A variable is deferrable when BOTH of these hold (the analysis does
+/// NOT inspect `local.init` directly):
 ///
-/// 1. it has no initialiser in the `LocalVariable` arena (or its
-///    init is dead, i.e. overwritten before any read);
-/// 2. its first reference in the enclosing block (considering both
+/// 1. its first reference in the enclosing block (considering both
 ///    reads in `Emit` ranges and writes in `Store` statements, plus
-///    any sub-block references) is a *direct* `Store` at that block
-///    level; and
-/// 3. all of its references are confined to that block, so the
+///    any sub-block references) is a *direct* whole-variable `Store`
+///    at that block level; and
+/// 2. all of its references are confined to that block, so the
 ///    `var` declaration emitted at the store site stays in scope
 ///    for every use.
+///
+/// Condition (1) is exactly what makes any initialiser dead-on-arrival:
+/// the first thing that happens to the variable is a full overwrite, so
+/// the init value is never observed.  The deferred `var` therefore drops
+/// the init and re-emits it as the store's value at the deferred site;
+/// a variable whose init IS live fails condition (1) (its first
+/// reference is a read) and is not deferred.
 pub(super) fn find_deferrable_vars(func: &naga::Function) -> (Vec<bool>, Vec<bool>) {
     use naga::Expression as E;
 

@@ -485,15 +485,55 @@ pub fn try_map_expression_handles_in_place(
 
 /// Remap the optional compare-exchange operand inside an
 /// [`naga::AtomicFunction`].  Every other variant is handle-free.
+///
+/// Written as an EXHAUSTIVE match (no `_` arm) so a future naga release
+/// that adds a handle-bearing `AtomicFunction` variant breaks the build
+/// here instead of silently leaving the new operand un-remapped (a
+/// dangling handle after an arena renumber == miscompile).  This mirrors
+/// the sibling `map_gather_mode_handles` / `map_ray_*_function_handles`
+/// contract.  The read-only [`visit_atomic_function_handles`] shares the
+/// same exhaustiveness so all atomic-handle walkers break together.
 pub fn map_atomic_function_handles(
     fun: &mut naga::AtomicFunction,
     remap: &mut impl FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
 ) {
-    if let naga::AtomicFunction::Exchange {
-        compare: Some(compare),
-    } = fun
-    {
-        *compare = remap(*compare);
+    match fun {
+        naga::AtomicFunction::Exchange {
+            compare: Some(compare),
+        } => {
+            *compare = remap(*compare);
+        }
+        naga::AtomicFunction::Exchange { compare: None }
+        | naga::AtomicFunction::Add
+        | naga::AtomicFunction::Subtract
+        | naga::AtomicFunction::And
+        | naga::AtomicFunction::ExclusiveOr
+        | naga::AtomicFunction::InclusiveOr
+        | naga::AtomicFunction::Min
+        | naga::AtomicFunction::Max => {}
+    }
+}
+
+/// Read-only counterpart of [`map_atomic_function_handles`]: visit the
+/// optional compare-exchange operand without mutating it.  Exhaustive for
+/// the same build-breaks-on-drift reason, so every read-only atomic-handle
+/// walk visits exactly the operand the mutable remap would touch.
+pub fn visit_atomic_function_handles(
+    fun: &naga::AtomicFunction,
+    visit: &mut impl FnMut(naga::Handle<naga::Expression>),
+) {
+    match fun {
+        naga::AtomicFunction::Exchange {
+            compare: Some(compare),
+        } => visit(*compare),
+        naga::AtomicFunction::Exchange { compare: None }
+        | naga::AtomicFunction::Add
+        | naga::AtomicFunction::Subtract
+        | naga::AtomicFunction::And
+        | naga::AtomicFunction::ExclusiveOr
+        | naga::AtomicFunction::InclusiveOr
+        | naga::AtomicFunction::Min
+        | naga::AtomicFunction::Max => {}
     }
 }
 
@@ -572,8 +612,18 @@ pub fn map_cooperative_data_handles(
 
 // MARK: Statement walkers
 
-/// Remap every expression handle referenced by `statement`.
-/// Exhaustive match - a future naga variant breaks the build here.
+/// Remap every expression handle referenced *directly* by `statement`'s
+/// own fields.  Exhaustive match - a future naga variant breaks the build
+/// here.
+///
+/// EXCEPTIONS (both deliberately no-ops): `Block` carries only a nested
+/// block (walked by the caller), and `Emit` carries an expression `Range`
+/// whose member handles are NOT remapped here - callers that renumber the
+/// arena rebuild Emit ranges themselves (`inlining` via
+/// `rebuild_block_expressions`; `cse` / `load_dedup` filter in place
+/// without renumbering).  This is the inverse of
+/// [`visit_statement_expression_handles`], whose `include_emit_handles`
+/// flag *can* iterate the Emit range for read-only liveness walks.
 ///
 /// Per-statement only: callers walk nested blocks themselves.
 /// Read-only counterpart is [`visit_statement_expression_handles`]
@@ -805,9 +855,7 @@ pub fn visit_statement_expression_handles<F>(
             result,
         } => {
             visit(*pointer);
-            if let naga::AtomicFunction::Exchange { compare: Some(c) } = fun {
-                visit(*c);
-            }
+            visit_atomic_function_handles(fun, visit);
             visit(*value);
             if let Some(handle) = result {
                 visit(*handle);
@@ -825,9 +873,7 @@ pub fn visit_statement_expression_handles<F>(
             if let Some(index) = array_index {
                 visit(*index);
             }
-            if let naga::AtomicFunction::Exchange { compare: Some(c) } = fun {
-                visit(*c);
-            }
+            visit_atomic_function_handles(fun, visit);
             visit(*value);
         }
         naga::Statement::WorkGroupUniformLoad { pointer, result } => {

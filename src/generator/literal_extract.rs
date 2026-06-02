@@ -308,9 +308,7 @@ impl<'a> Generator<'a> {
                     for stmt in block {
                         match stmt {
                             naga::Statement::Atomic { fun, value, .. } => {
-                                if let naga::AtomicFunction::Exchange { compare: Some(c) } = fun {
-                                    visit(*c);
-                                }
+                                crate::passes::expr_util::visit_atomic_function_handles(fun, visit);
                                 visit(*value);
                             }
                             // `atomicStore(&a, <int lit>)`: same typed-form force
@@ -323,9 +321,7 @@ impl<'a> Generator<'a> {
                             // `ImageAtomic` value (and Exchange compare) route
                             // through `emit_expr_for_atomic` too.
                             naga::Statement::ImageAtomic { fun, value, .. } => {
-                                if let naga::AtomicFunction::Exchange { compare: Some(c) } = fun {
-                                    visit(*c);
-                                }
+                                crate::passes::expr_util::visit_atomic_function_handles(fun, visit);
                                 visit(*value);
                             }
                             naga::Statement::Block(b) => {

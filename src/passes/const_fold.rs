@@ -528,12 +528,14 @@ fn fold_local_expressions(
                 //   * `LogicalAnd` / `LogicalOr` - WGSL pins these
                 //     to `bool x bool -> bool`, so the clone's type
                 //     matches by construction.
-                //   * Both operands are literals - then
-                //     `resolve_const_value` already handled it above
-                //     with full IEEE / wrapping semantics, so this
-                //     arm is a redundant safety net; a non-literal
-                //     other operand could be a vector and would
-                //     mis-type the result.
+                //   * Both operands are literals - the result is a scalar,
+                //     so cloning the absorbing operand is type-safe (a
+                //     non-literal operand could be a vector and mis-type the
+                //     result).  This admits the both-literal cases `eval_binary`
+                //     above leaves unfolded - notably F16, which has no
+                //     `eval_binary` arm - where `check_absorbing_operand` then
+                //     declines anything sign-sensitive (only integer zero
+                //     absorbs; `x * 0.0h` stays a correctly-signed bare product).
                 let both_literal = matches!(arena[left], naga::Expression::Literal(_))
                     && matches!(arena[right], naga::Expression::Literal(_));
                 let is_logical_op = matches!(
@@ -2261,7 +2263,7 @@ fn is_additive_identity_zero(
 
 /// `true` when `h` is a literal INTEGER zero.  Integers carry neither a
 /// signed zero nor NaN/Inf, so an integer zero can be folded or substituted
-/// without preserving an IEEE result sign — unlike a float zero.
+/// without preserving an IEEE result sign - unlike a float zero.
 fn is_integer_zero(
     arena: &naga::Arena<naga::Expression>,
     h: naga::Handle<naga::Expression>,
@@ -2472,7 +2474,7 @@ fn check_absorbing_operand(
             // the IEEE sign of the product (and is NaN when `x` is
             // non-finite), so cloning the matched zero verbatim is correct
             // only when the sign-aware result was already computed by
-            // `eval_binary` — which folds F32/F64/AbstractFloat both-literal
+            // `eval_binary` - which folds F32/F64/AbstractFloat both-literal
             // products before this arm runs.  F16 has NO `eval_binary` arm,
             // so a both-literal F16 `x * 0.0h` reaches here unfolded; cloning
             // the zero would take its sign, not the product's (e.g.

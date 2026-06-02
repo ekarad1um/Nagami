@@ -6,7 +6,11 @@
 //! * Literal formatting (shortest decimal / hex / scientific form
 //!   that still round-trips, plus per-type [`PrecisionMode`] rounding).
 //! * Type-to-string rendering for WGSL type constructors, including
-//!   alias lookup and `@align`/`@size` attribute printing.
+//!   alias lookup, plus binding-attribute printing
+//!   (`@location`/`@builtin`/`@interpolate`/`@invariant`/`@blend_src`/
+//!   `@per_primitive`) via `binding_attrs`.  (Struct-member `@align`/
+//!   `@size` LAYOUT reconstruction is NOT here - it lives in the struct
+//!   emitter in `super::module_emit`.)
 //! * Operator precedence and parenthesisation decisions.
 //! * Identifier classification (keywords, builtins, extractable
 //!   constants) shared between [`super::literal_extract`] and the
@@ -899,9 +903,10 @@ pub(super) fn storage_access(access: naga::StorageAccess) -> &'static str {
     }
 }
 
-/// Render `@location`, `@builtin`, `@interpolate`, and
-/// `@invariant` attributes attached to a struct member or function
-/// parameter, omitting defaults to keep the output compact.
+/// Render the binding attributes attached to a struct member or function
+/// parameter (`@location`, `@builtin`, `@interpolate`, `@invariant`,
+/// `@blend_src`, `@per_primitive`), omitting defaults to keep the output
+/// compact.
 pub(super) fn binding_attrs(binding: &naga::Binding) -> Result<String, Error> {
     Ok(match binding {
         naga::Binding::BuiltIn(bi) => {

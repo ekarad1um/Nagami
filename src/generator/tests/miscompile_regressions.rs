@@ -6,7 +6,7 @@
 //! reject - is back.
 
 use super::helpers::assert_valid_wgsl;
-use crate::config::Config;
+use crate::config::{Config, TraceConfig};
 
 /// Run the full pipeline at the default profile and return minified text.
 fn minify(src: &str) -> String {
@@ -375,5 +375,155 @@ fn override_sized_array_does_not_abort() {
     assert!(
         out.contains("array<i32,") && out.contains("var<workgroup>"),
         "override-sized workgroup array must survive minification: {out}"
+    );
+}
+
+/// A value computed BEFORE a loop and used in its `break_if` must stay bound
+/// there: load_dedup must not forward the load to a read inside the loop,
+/// which would observe the loop-mutated place across the back-edge.  Here
+/// `cond(n)` is loop-invariant (n=0 at the call), so the break condition must
+/// read the pre-loop value, never the `n` mutated each iteration - otherwise a
+/// loop that never breaks (`cond(0)==false`) wrongly terminates.
+#[test]
+fn loop_break_if_does_not_read_loop_mutated_load() {
+    let src = "@group(0)@binding(0) var<storage,read_write> out:array<i32>;\
+        fn cond(v: i32) -> bool { return v >= 500; }\
+        @compute @workgroup_size(1) fn main() {\
+            var n: i32 = 0; var count: i32 = 0; let c = cond(n);\
+            loop { count = count + 1; out[0] = count;\
+                continuing { n = n + 100; break if c; } } }";
+    let out = minify(src);
+    // The break value is bound immediately before the loop and the break uses
+    // that binding; it never re-reads the var mutated in `continuing`.
+    assert!(
+        out.contains("let b=A;loop{") && out.contains("break if b>=500"),
+        "loop-invariant break value was relocated into the loop: {out}"
+    );
+}
+
+/// A `switch` whose case contains a reachable bare `break` (not as the case's
+/// last statement) falls through to the code after the switch, so that code is
+/// live and must not be dropped.  Here `out[0]=x` after the switch is reached
+/// when `gid.x==1 && x>0` takes the bare break.
+#[test]
+fn switch_with_nested_bare_break_keeps_code_after_switch() {
+    let src = "@group(0)@binding(0) var<storage,read_write> out:array<i32>;\
+        @group(0)@binding(1) var<storage,read> inp:array<i32>;\
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\
+            let x = inp[gid.x];\
+            switch i32(gid.x) {\
+                case 1: { if (x > 0) { break; } out[0] = -1; return; }\
+                default: { out[0] = -2; return; }\
+            }\
+            out[0] = x; }";
+    let out = minify(src);
+    // The bare break survives AND the post-switch store is not eliminated.
+    assert!(
+        out.contains("if b>0{break;}"),
+        "the bare break inside the case was lost: {out}"
+    );
+    assert!(
+        out.contains("}A[0]=b;}"),
+        "post-switch store was wrongly dropped as unreachable: {out}"
+    );
+}
+
+/// An implicit-derivative expression (`dpdx`) in uniform control flow must not
+/// be sunk into a non-uniform branch by single-use inlining: that violates the
+/// WGSL uniformity rules and strict parsers (Tint/Dawn/browsers) reject it,
+/// even though naga's validator does not.  It must stay bound at its original
+/// (uniform) position before the non-uniform `if`.
+#[test]
+fn implicit_derivative_not_sunk_into_non_uniform_branch() {
+    let src = "@fragment fn main(@location(0) tc: vec2<f32>) -> @location(0) vec4<f32> {\
+        let d = dpdx(tc.x);\
+        if (tc.y > 0.5) { return vec4<f32>(d, 0.0, 0.0, 1.0); }\
+        return vec4<f32>(1.0); }";
+    let out = minify(src);
+    // `dpdx` is bound before the branch; the branch consumes the binding.
+    assert!(
+        out.contains("let a=dpdx(A.x);if "),
+        "dpdx was sunk out of uniform control flow: {out}"
+    );
+}
+
+/// `dead_param` must not strip a parameter from a `--preserve-symbol` function:
+/// its signature is an external contract, so the arity must survive even when a
+/// parameter is unused.  (Seven call sites keep the function from being inlined
+/// away, isolating the dead-param path.)
+#[test]
+fn preserve_symbol_keeps_unused_parameter_arity() {
+    let src = "@group(0)@binding(0) var<storage,read_write> out:array<f32>;\
+        fn kept_api(a: f32, unused: f32) -> f32 { return a * 2.0 + a; }\
+        @compute @workgroup_size(1) fn main() {\
+            out[0]=kept_api(out[1],out[2]); out[3]=kept_api(out[4],out[5]);\
+            out[6]=kept_api(out[7],out[8]); out[9]=kept_api(out[10],out[11]);\
+            out[12]=kept_api(out[13],out[14]); out[15]=kept_api(out[16],out[17]);\
+            out[18]=kept_api(out[19],out[20]); }";
+    let config = Config {
+        preserve_symbols: vec!["kept_api".to_string()],
+        ..Default::default()
+    };
+    let out = crate::run(src, &config).expect("run failed").source;
+    assert_valid_wgsl(&out);
+    assert!(
+        out.contains("fn kept_api(a:f32,B:f32)"),
+        "preserved function lost its unused parameter (arity changed): {out}"
+    );
+    assert!(
+        out.contains("kept_api(A[1],A[2])"),
+        "call site to a preserved function dropped an argument: {out}"
+    );
+}
+
+/// `flag_used_loads` stops recursing once it pins a written load, since the
+/// binding materialises its whole operand cone at the pin site.  That must not
+/// under-bind a NESTED load: here the outer `arr[kk]` is pinned before the
+/// store, and `kk` (a snapshot of `k`) is bound independently because `k` is
+/// later written - so `out[0]` reads the pre-store `arr[0]` and the separate
+/// `out[1] = kk` reads the pre-write `k` (0).
+#[test]
+fn pinned_load_does_not_under_bind_nested_index_load() {
+    let src = "@group(0)@binding(0) var<storage,read_write> arr:array<i32>;\
+        @group(0)@binding(1) var<storage,read_write> out:array<i32>;\
+        @compute @workgroup_size(1) fn main() {\
+            var k: i32 = 0; let kk = k; let av = arr[kk];\
+            k = 1; arr[0] = 99; out[0] = av; out[1] = kk; }";
+    let out = minify(src);
+    assert!(
+        out.contains("let B=A[0];A[0]=99;") && out.contains("a[0]=B;"),
+        "nested-load pinning under-bound the outer load: {out}"
+    );
+    assert!(
+        out.contains("a[1]=0;"),
+        "inner index load read the mutated k instead of its pre-write value: {out}"
+    );
+}
+
+/// `--validate-each-pass` re-emits WGSL text after every pass; for an
+/// override-sized array that path must not invoke naga's panicking backend.
+/// This guards the pipeline driver's per-pass emit, distinct from the
+/// crate-root baseline emit covered by `override_sized_array_does_not_abort`.
+#[test]
+fn override_sized_array_survives_per_pass_text_emit() {
+    let config = Config {
+        trace: TraceConfig {
+            validate_each_pass: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let src = "override O = 123;\
+         alias A = array<i32, O*2>;\
+         var<workgroup> W: A;\
+         @compute @workgroup_size(1) fn main() { let p: ptr<workgroup, A> = &W; (*p)[0] = 42; }";
+    // Reaching the assert means the per-pass text emit did not abort and the
+    // pipeline still converged (validate_each_pass turns any per-pass
+    // validation failure or non-convergence into an Err).
+    let out = crate::run(src, &config).expect("validate_each_pass must not abort or fail");
+    assert!(
+        out.source.contains("array<i32,"),
+        "override-sized array did not survive: {}",
+        out.source
     );
 }
