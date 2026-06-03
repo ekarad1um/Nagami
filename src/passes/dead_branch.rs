@@ -819,8 +819,15 @@ fn definitely_terminates(stmt: &naga::Statement) -> bool {
     }
 }
 
-/// Returns `true` when the last statement of `block` definitely terminates.
-fn block_definitely_terminates(block: &naga::Block) -> bool {
+/// Returns `true` when the last statement of `block` definitely terminates -
+/// i.e. control never falls through to the statement that would follow it.
+///
+/// `pub(crate)` so the generator can reuse this exact divergence judgement: it
+/// synthesises a trailing zero-value return only when the body provably never
+/// falls through (the appended return is then provably dead), and sharing the
+/// predicate keeps that soundness guard in lockstep with the return-stripping
+/// done here.
+pub(crate) fn block_definitely_terminates(block: &naga::Block) -> bool {
     block.last().is_some_and(definitely_terminates)
 }
 /// Returns `true` when a statement inside a switch case terminates control

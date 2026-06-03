@@ -1024,8 +1024,73 @@ impl<'a> Generator<'a> {
 
         self.generate_block_elide_trailing_return(&func.body, &mut ctx)?;
 
+        // On re-parse, naga's front-end (`proc::ensure_block_returns`) appends an
+        // implicit `return;` (value `None`) after a tail `loop` - it never proves
+        // a loop non-falling-through, even one whose body always returns - which
+        // is an `InvalidReturnType` in a non-void function. Dead-branch/DCE
+        // legally strip the unreachable trailing return after an always-returning
+        // loop, producing exactly that shape. naga inspects only a block's LAST
+        // statement, so one synthesised trailing return makes the tail a `Return`
+        // and suppresses the whole recursive injection (loops nested in if/switch
+        // arms included).
+        //
+        // Append ONLY when the body provably never falls through
+        // (`block_definitely_terminates`, the same judgement that authorised
+        // stripping the original return) so the synthesised return is provably
+        // dead. The guard keeps a body that CAN reach its end - a
+        // `Store`/`Call`/breakable-loop tail, reachable only if some pass wrongly
+        // dropped a *live* return - failing validation rather than silently
+        // returning zero: a fail-safe crash beats a masked miscompile.
+        if let Some(result) = &func.result
+            && !block_naga_terminates(&func.body)
+            && crate::passes::dead_branch::block_definitely_terminates(&func.body)
+        {
+            let zero = self.zero_value(result.ty)?;
+            self.push_indent();
+            self.out.push_str("return ");
+            self.out.push_str(&zero);
+            self.out.push(';');
+            self.push_newline();
+        }
+
         self.close_brace();
         Ok(())
+    }
+}
+
+/// Mirror of naga's `proc::ensure_block_returns`: `true` when naga's WGSL
+/// front-end would NOT inject an implicit `return;` at this block's tail.
+///
+/// naga appends `Statement::Return { value: None }` whenever a block tail is not
+/// a returning terminator - notably a `loop` (never proven non-falling-through,
+/// even when its body always returns), `Emit`, `Store`, `Call`, ... or an empty
+/// block - which is invalid in a non-void function, hence this guard on whether
+/// a trailing return must be synthesised.
+///
+/// Deliberately distinct from `dead_branch::definitely_terminates`, which asks
+/// whether control diverts past the enclosing scope and so counts an always-
+/// returning loop as terminating; naga's front-end never does, so the `Loop`
+/// arm is always `false` here.
+fn block_naga_terminates(block: &naga::Block) -> bool {
+    match block.last() {
+        Some(
+            naga::Statement::Return { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Kill,
+        ) => true,
+        Some(naga::Statement::Block(inner)) => block_naga_terminates(inner),
+        Some(naga::Statement::If { accept, reject, .. }) => {
+            block_naga_terminates(accept) && block_naga_terminates(reject)
+        }
+        // naga recurses only into non-fall-through cases; a fall-through case
+        // never triggers an append on its own.
+        Some(naga::Statement::Switch { cases, .. }) => cases
+            .iter()
+            .all(|c| c.fall_through || block_naga_terminates(&c.body)),
+        // `Loop`, `Emit`, `Store`, `Call`, `Atomic`, ... and the empty block
+        // (`None`) are exactly naga's "append `Return { None }`" arms.
+        _ => false,
     }
 }
 

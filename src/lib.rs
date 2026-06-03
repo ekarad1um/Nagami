@@ -68,6 +68,69 @@ pub(crate) fn module_has_override_sized_array(module: &naga::Module) -> bool {
     })
 }
 
+/// `true` when any `override` or module-scope `var` initializer contains an
+/// expression naga's WGSL back-end cannot write.
+///
+/// naga 29's `write_possibly_const_expression` (the writer for override and
+/// global-variable initializers) only handles `Literal`, `Constant`,
+/// `ZeroValue`, `Compose`, `Splat`, and `Override`; any other variant - e.g.
+/// the `Binary` in `override height = 2 * depth;` or the `gain * 10.` in
+/// `var<private> g: f32 = gain * 10.;` - falls through to `unreachable!()` and,
+/// under the release `panic = "abort"` strategy, aborts the process instead of
+/// returning an error.  (Fully-const initializers such as `2.0 * 3.0` are
+/// folded to a `Literal` by naga's front-end before they reach the writer, so
+/// only override-dependent initializers trip it.)  nagami's own generator emits
+/// these initializers correctly, so callers skip the naga baseline/fallback
+/// emit for such modules, exactly as for [`module_has_override_sized_array`].
+pub(crate) fn module_has_non_const_global_initializer(module: &naga::Module) -> bool {
+    use naga::Expression as E;
+
+    // Iterative DFS over every expression reachable from an override or
+    // global-var initializer, mirroring naga's `write_possibly_const_expression`
+    // recursion exactly.  `visited` dedupes shared sub-trees (init arenas are
+    // acyclic, so it is a memo, not a cycle guard).  Return on the first node
+    // outside naga's writable set.
+    let mut visited = vec![false; module.global_expressions.len()];
+    let mut stack: Vec<naga::Handle<naga::Expression>> = module
+        .overrides
+        .iter()
+        .filter_map(|(_, o)| o.init)
+        .chain(module.global_variables.iter().filter_map(|(_, g)| g.init))
+        .collect();
+
+    while let Some(handle) = stack.pop() {
+        if std::mem::replace(&mut visited[handle.index()], true) {
+            continue;
+        }
+        match &module.global_expressions[handle] {
+            E::Literal(_) | E::ZeroValue(_) | E::Override(_) => {}
+            // naga writes a *named* constant by name (safe leaf), but for an
+            // anonymous constant it recurses into the constant's own init - so
+            // a `Binary` there would still abort.  Mirror that descent.
+            E::Constant(c) => {
+                let konst = &module.constants[*c];
+                if konst.name.is_none() {
+                    stack.push(konst.init);
+                }
+            }
+            E::Compose { components, .. } => stack.extend(components.iter().copied()),
+            E::Splat { value, .. } => stack.push(*value),
+            // `Binary` / `Unary` / `Math` / `As` / `Access` / ... have no arm
+            // in naga's `write_possibly_const_expression` (`_ => unreachable!()`).
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// `true` when callers must skip the naga WGSL baseline/fallback emit because
+/// naga 29's back-end would abort (`panic = "abort"`) rather than error on this
+/// module.  Every site that emits via naga's WGSL backend gates on this so the
+/// abort-trigger set stays defined in one place.
+pub(crate) fn module_needs_naga_baseline_skip(module: &naga::Module) -> bool {
+    module_has_override_sized_array(module) || module_has_non_const_global_initializer(module)
+}
+
 /// `true` when `line` is exactly one of the `wgpu_*` enable directives
 /// that naga rejects.  Matched against the trimmed line so surrounding
 /// whitespace is irrelevant.
@@ -787,10 +850,11 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     pipeline::run_ir_passes(&mut module, &effective_config, &mut report)?;
 
     let info = io::validate_module(&module)?;
-    // Skip the naga baseline/fallback emit for override-sized arrays (its
-    // back-end aborts on them); nagami's generator emits them, and the
-    // baseline byte count falls back to the input length.
-    let naga_output: Option<String> = if module_has_override_sized_array(&module) {
+    // Skip the naga baseline/fallback emit for modules naga's back-end would
+    // abort on (override-sized arrays, non-const override/global initializers);
+    // nagami's generator emits these itself, and the baseline byte count falls
+    // back to the input length.
+    let naga_output: Option<String> = if module_needs_naga_baseline_skip(&module) {
         None
     } else {
         Some(emit_wgsl_with_naga_safe(&module, &info)?)
@@ -999,6 +1063,47 @@ mod tests {
             report.output_bytes <= report.input_bytes,
             "output should not exceed input for a trivial shader"
         );
+    }
+
+    #[test]
+    fn non_const_initializer_predicate_flags_binary_override_init() {
+        // `2.0 * d` (d is an override) cannot be const-folded, so it stays a
+        // `Binary` in the override's init - the variant naga's wgsl-out aborts
+        // on.  Must be flagged so the naga baseline is skipped.
+        let m = io::parse_wgsl(
+            "override d: f32;\
+             override h = 2.0 * d;\
+             @compute @workgroup_size(1) fn m(){ var t = h; }",
+        )
+        .unwrap();
+        assert!(module_has_non_const_global_initializer(&m));
+        assert!(module_needs_naga_baseline_skip(&m));
+    }
+
+    #[test]
+    fn non_const_initializer_predicate_flags_binary_global_var_init() {
+        let m = io::parse_wgsl(
+            "override k: f32;\
+             var<private> g: f32 = k * 10.0;\
+             @compute @workgroup_size(1) fn m(){ g = g + 1.0; _ = k; }",
+        )
+        .unwrap();
+        assert!(module_has_non_const_global_initializer(&m));
+    }
+
+    #[test]
+    fn non_const_initializer_predicate_ignores_const_foldable_inits() {
+        // `2.0 * 3.0` is folded to a `Literal` by the front-end, and `c`
+        // resolves to a `Constant` - both are in naga's writable set, so the
+        // module must NOT be flagged (the naga baseline stays available).
+        let m = io::parse_wgsl(
+            "const c = 2.0 * 3.0;\
+             var<private> g: f32 = c;\
+             override d: f32 = 1.5;\
+             @compute @workgroup_size(1) fn m(){ g = g + d; }",
+        )
+        .unwrap();
+        assert!(!module_has_non_const_global_initializer(&m));
     }
 
     #[test]

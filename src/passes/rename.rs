@@ -615,6 +615,27 @@ fn collect_reserved_names(
         }
     }
 
+    // Cooperative-matrix role enumerants `A`/`B`/`C` are predeclared names in
+    // the `coop_mat<T, role>` type-argument position.  nagami's generator
+    // cannot emit cooperative-matrix types, so such modules fall back to naga's
+    // own wgsl-out, which renders the role literally as `A`/`B`/`C`.  If the
+    // rename sweep mints one of those names for a global / local / function,
+    // naga re-reads the role position as that declaration ("identifier `B`
+    // resolves to a declaration" / "declaration of `B` is recursive") and
+    // rejects the fallback.  Reserve the three role names so no renamed
+    // identifier can collide.  Guarded on actual coop-matrix usage, so every
+    // non-coop module is unaffected (`A`/`B`/`C` are the cheapest names the
+    // counter would otherwise hand out).
+    if module
+        .types
+        .iter()
+        .any(|(_, ty)| matches!(ty.inner, naga::TypeInner::CooperativeMatrix { .. }))
+    {
+        reserved.insert("A".to_string());
+        reserved.insert("B".to_string());
+        reserved.insert("C".to_string());
+    }
+
     reserved
 }
 
@@ -790,6 +811,55 @@ fn fs_main() -> @location(0) vec4f {
         assert_eq!(
             module.entry_points[0].name, "fs_main",
             "entry point name should not change"
+        );
+    }
+
+    #[test]
+    fn cooperative_matrix_reserves_role_enumerants() {
+        // The generator cannot emit coop-matrix types, so such modules fall
+        // back to naga's wgsl-out, which renders the role literally as
+        // `A`/`B`/`C`.  Renaming a declaration onto one of those names collides
+        // with the role position, so they must be reserved.
+        let source = "enable wgpu_cooperative_matrix;\n\
+            var<private> a: coop_mat8x8<f32, A>;\n\
+            var<private> bb: coop_mat8x8<f32, B>;\n\
+            @group(0) @binding(0) var<storage, read_write> ext: array<f32>;\n\
+            @compute @workgroup_size(8, 8, 1) fn main() {\n\
+                var c = coopLoad<coop_mat8x8<f32, C>>(&ext[4]);\n\
+                var d = coopMultiplyAdd(a, bb, c);\n\
+                coopStore(d, &ext[0]);\n\
+            }";
+        let module = naga::front::wgsl::parse_str(source).expect("coop source should parse");
+        let reserved = collect_reserved_names(&module, &HashSet::new(), true);
+        for role in ["A", "B", "C"] {
+            assert!(
+                reserved.contains(role),
+                "coop role `{role}` must be reserved"
+            );
+        }
+
+        // End-to-end: the rename sweep must not mint a role name for any decl.
+        let (_, renamed) = run_pass(source, &[]);
+        let decl_names = collect_declaration_names(&renamed);
+        for role in ["A", "B", "C"] {
+            assert!(
+                !decl_names.iter().any(|n| n == role),
+                "no declaration may be renamed onto coop role `{role}`: {decl_names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_coop_module_leaves_role_enumerants_free() {
+        // `A`/`B`/`C` are the cheapest names; they are reserved ONLY for coop
+        // modules so the whole non-coop corpus keeps them in the rename pool.
+        let source = "var<private> some_long_global: f32 = 1.0;\n\
+            @compute @workgroup_size(1) fn main() { some_long_global = some_long_global + 1.0; }";
+        let module = naga::front::wgsl::parse_str(source).expect("source should parse");
+        let reserved = collect_reserved_names(&module, &HashSet::new(), true);
+        assert!(
+            !reserved.contains("A") && !reserved.contains("B") && !reserved.contains("C"),
+            "non-coop module must not auto-reserve A/B/C: {reserved:?}"
         );
     }
 

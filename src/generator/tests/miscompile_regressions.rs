@@ -616,3 +616,107 @@ fn chained_comparison_keeps_required_parens() {
         "chained comparison must parenthesise its relational children: {out}"
     );
 }
+
+/// naga's WGSL front-end (`proc::ensure_block_returns`) injects an implicit
+/// `return;` after a tail `loop`, so a non-void function whose dead-code-
+/// stripped trailing return leaves it ending in an always-returning loop
+/// round-trips into an invalid module ("return expression None does not match
+/// the declared return type").  The generator must synthesise a trailing
+/// zero-value return.
+#[test]
+fn terminal_loop_non_void_fn_synthesises_trailing_return() {
+    let out = minify(
+        "@group(0)@binding(0) var<storage,read_write> o:i32;\
+         fn f()->i32{ var i:i32; i=0; loop{ if (true) { return 7; } i=i+1; \
+            continuing{ break if i>3; } } return 9; }\
+         @compute @workgroup_size(1) fn m(){ o=f(); }",
+    );
+    // `if (true)` makes the loop body always return, so dead-branch strips the
+    // unreachable `return 9`; the synthesised `return 0i;` follows the loop.
+    assert!(
+        out.contains("}return 0i;}"),
+        "terminal loop in a non-void fn must gain a trailing zero return: {out}"
+    );
+}
+
+/// The `ensure_block_returns` injection recurses into `switch` cases, so a
+/// non-void function ending in a `switch` whose every case tails in a loop is
+/// also rejected.  One trailing top-level return suppresses the whole recursive
+/// injection (naga only inspects the block's last statement).
+#[test]
+fn terminal_loop_in_switch_case_synthesises_trailing_return() {
+    let out = minify(
+        "@group(0)@binding(0) var<storage,read_write> o:i32;\
+         fn f(p:i32)->i32{ switch p { case 0: { loop { return 1; } } \
+            default: { loop { return 2; } } } return 9; }\
+         @compute @workgroup_size(1) fn m(){ o=f(0); }",
+    );
+    assert!(
+        out.contains("return 0i;}"),
+        "switch-of-terminal-loops in a non-void fn must gain a trailing return: {out}"
+    );
+}
+
+/// Negative guard for the terminal-loop fix: a non-void function that already
+/// ends in real returns (here, an `if`-guarded pair, kept un-inlined by 7 call
+/// sites) must NOT gain a synthesised zero return - that would cost bytes and
+/// signals an over-broad terminating predicate.
+#[test]
+fn normal_returning_fn_not_padded_with_zero_return() {
+    let out = minify(
+        "@group(0)@binding(0) var<storage,read_write> o:array<i32>;\
+         fn g(x:i32)->i32{ if (x>0) { return x; } return -x; }\
+         @compute @workgroup_size(1) fn m(){ o[0]=g(1);o[1]=g(2);o[2]=g(3);\
+            o[3]=g(4);o[4]=g(5);o[5]=g(6);o[6]=g(7); }",
+    );
+    assert!(
+        !out.contains("return 0"),
+        "normal value-returning fn must not gain a synthesised zero return: {out}"
+    );
+}
+
+/// naga 29's WGSL back-end hits `unreachable!()` (and, under release
+/// `panic = "abort"`, SIGABRTs) when writing a non-const override / global-var
+/// initializer such as `override h = 2 * d;`.  Because nagami eagerly emits
+/// that naga baseline before its own generator runs, the baseline must be
+/// skipped for such modules (the generator emits them correctly).
+#[test]
+fn override_binary_initializer_minifies_without_abort() {
+    let out = minify(
+        "override d: f32;\
+         override h = 2.0 * d;\
+         var<private> g: f32 = d * 10.0;\
+         @group(0)@binding(0) var<storage,read_write> o:f32;\
+         @compute @workgroup_size(1) fn m(){ o = h + g; }",
+    );
+    assert!(
+        out.contains("override h") && out.contains("*d"),
+        "override binary initializer must survive minification: {out}"
+    );
+}
+
+/// Cooperative-matrix role enumerants `A`/`B`/`C` are predeclared in the
+/// `coop_mat<T, role>` type-argument position.  The generator cannot emit coop
+/// types, so the module falls back to naga's wgsl-out; if the rename sweep
+/// minted `A`/`B`/`C` for a global/local it collided with the role
+/// ("identifier `B` resolves to a declaration").  Reserving the role names when
+/// a coop type is present keeps the fallback valid.
+#[test]
+fn cooperative_matrix_minifies_without_role_collision() {
+    let out = minify(
+        "enable wgpu_cooperative_matrix;\
+         var<private> a: coop_mat8x8<f32, A>;\
+         var<private> bb: coop_mat8x8<f32, B>;\
+         @group(0) @binding(0) var<storage, read_write> ext: array<f32>;\
+         @compute @workgroup_size(8, 8, 1) fn main() {\
+            var c = coopLoad<coop_mat8x8<f32, C>>(&ext[4]);\
+            var d = coopMultiplyAdd(a, bb, c);\
+            coopStore(d, &ext[0]); }",
+    );
+    // `minify` already re-validates; assert the role keywords still render and
+    // no declaration was renamed onto them (round-trip would otherwise fail).
+    assert!(
+        out.contains("coop_mat8x8<f32, A>") || out.contains("coop_mat8x8<f32,A>"),
+        "coop role positions must survive: {out}"
+    );
+}
