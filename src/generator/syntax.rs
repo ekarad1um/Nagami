@@ -336,6 +336,26 @@ fn hex_float_f64(v: f64, suffix: &str) -> Option<String> {
     })
 }
 
+/// Bit-exact hex form of `v` for the single f32 magnitude whose shortest decimal
+/// is out of range, `f32::MAX`; `None` for every other value, leaving the common
+/// path to pick the shortest decimal/hex/scientific form.
+///
+/// `f32::MAX`'s shortest decimal, `3.4028235e38`, sits a fraction of a ULP above
+/// the true maximum.  naga rounds it back and accepts it (so nagami's naga-based
+/// self-check passes), but tint/Dawn reject any literal whose *exact* magnitude
+/// exceeds the maximum - so the decimal form is a silent portability miscompile.
+/// `±f32::MAX` is the only offender: as the largest finite f32 its upper
+/// neighbour is infinity, so its rounding interval reaches past MAX, whereas
+/// every smaller value's shortest decimal stays in an interval bounded below MAX.
+/// `f16::MAX` (65504) and `f64::MAX` have shortest decimals at or below their
+/// maxima, so no sibling type needs this guard.  The hex form is always exact,
+/// and `f32::MAX` is normal so it always has one.
+fn f32_overshoot_safe_hex(v: f32, suffix: &str) -> Option<String> {
+    (v.abs() == f32::MAX)
+        .then(|| hex_float_f32(v, suffix))
+        .flatten()
+}
+
 /// Scientific-notation candidate for a finite `f32` value, appending
 /// `suffix` (for example `f` or empty).  Returns `None` only for zero,
 /// infinity, and NaN - for zero the decimal `"0"` form always wins and
@@ -423,8 +443,10 @@ pub(super) fn literal_to_wgsl(literal: naga::Literal, precision: &FloatPrecision
         }
         naga::Literal::F32(v) => {
             let v = round_f32(v, precision.f32);
-            let dec = compact_float_literal_token(format!("{v}f"));
-            pick_shortest(dec, [hex_float_f32(v, "f"), scientific_float_f32(v, "f")])
+            f32_overshoot_safe_hex(v, "f").unwrap_or_else(|| {
+                let dec = compact_float_literal_token(format!("{v}f"));
+                pick_shortest(dec, [hex_float_f32(v, "f"), scientific_float_f32(v, "f")])
+            })
         }
         naga::Literal::F64(v) => {
             // F64 typed.  The decimal candidate uses Debug rendering so a
@@ -516,8 +538,10 @@ pub(super) fn literal_to_wgsl_bare(literal: naga::Literal, precision: &FloatPrec
         }
         naga::Literal::F32(v) => {
             let v = round_f32(v, precision.f32);
-            let dec = bare_float_decimal(format!("{v}"), v == 0.0 && v.is_sign_negative());
-            pick_shortest(dec, [hex_float_f32(v, ""), scientific_float_f32(v, "")])
+            f32_overshoot_safe_hex(v, "").unwrap_or_else(|| {
+                let dec = bare_float_decimal(format!("{v}"), v == 0.0 && v.is_sign_negative());
+                pick_shortest(dec, [hex_float_f32(v, ""), scientific_float_f32(v, "")])
+            })
         }
         naga::Literal::F64(v) => {
             // Mirror the F16/F32 siblings: `Display` collapses whole
@@ -1531,6 +1555,37 @@ mod tests {
     }
 
     #[test]
+    fn f32_max_emits_exact_hex_not_overshooting_decimal() {
+        // `f32::MAX`'s shortest decimal (`3.4028235e38`) overshoots the true
+        // maximum, which tint/Dawn reject; both the typed and bare paths must
+        // emit the bit-exact, in-range hex form instead.
+        assert_eq!(
+            literal_to_wgsl(naga::Literal::F32(f32::MAX), &full()),
+            "0x1.fffffep127f"
+        );
+        assert_eq!(
+            literal_to_wgsl_bare(naga::Literal::F32(f32::MAX), &full()),
+            "0x1.fffffep127"
+        );
+        // The negative boundary is equally affected.
+        assert_eq!(
+            literal_to_wgsl(naga::Literal::F32(-f32::MAX), &full()),
+            "-0x1.fffffep127f"
+        );
+        assert_eq!(
+            literal_to_wgsl_bare(naga::Literal::F32(-f32::MAX), &full()),
+            "-0x1.fffffep127"
+        );
+        // The guard is exactly `±f32::MAX`: the next value down keeps the
+        // ordinary shortest-form path (its decimal does not overshoot).
+        let below_max = f32::from_bits(f32::MAX.to_bits() - 1);
+        assert_ne!(
+            literal_to_wgsl(naga::Literal::F32(below_max), &full()),
+            "0x1.fffffep127f"
+        );
+    }
+
+    #[test]
     fn precision_hex_form_uses_rounded_value() {
         // Invariant: every candidate passed to `pick_shortest` must
         // encode the same numeric value.  Before the rounding was
@@ -1862,12 +1917,12 @@ mod tests {
             literal_to_wgsl(naga::Literal::F32(2.0_f32.powi(-14)), &full()),
             "0x1p-14f"
         );
-        // f32::MAX: decimal is 40 chars, hex "0x1.fffffep127f" (15),
-        // scientific "3.4028235e38f" (13).  Scientific wins because it is
-        // one of the candidates `pick_shortest` considers.
+        // f32::MAX is the exception to the shortest-form rule: its shorter
+        // decimal/scientific forms (`3.4028235e38f`) overshoot the maximum and
+        // tint rejects them, so the bit-exact hex form is forced.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(f32::MAX), &full()),
-            "3.4028235e38f"
+            "0x1.fffffep127f"
         );
         // f32::MIN_POSITIVE: decimal is 49 chars, hex "0x1p-126f" (9)
         assert_eq!(
@@ -2040,11 +2095,11 @@ mod tests {
                 "AbstractFloat::MAX sf={s} -> {abstr:?}"
             );
         }
-        // The fallback keeps the original value verbatim, which still emits
-        // a valid (full-precision) token.
+        // The fallback keeps the original value verbatim and still emits a
+        // valid, in-range token: the bit-exact hex form for `f32::MAX`.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(f32::MAX), &sf(4)),
-            "3.4028235e38f"
+            "0x1.fffffep127f"
         );
         // Negative extremes are symmetric: no inf, and the sign survives
         // the fallback (the overflow guard returns the original signed v).
