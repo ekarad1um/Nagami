@@ -23,16 +23,16 @@
     "@tailwindcss/vite": "^4.3.0",
     "@tsconfig/svelte": "^5.0.8",
     "@types/node": "^25.9.1",
-    "svelte": "^5.56.0",
-    "svelte-check": "^4.4.8",
+    "svelte": "^5.56.1",
+    "svelte-check": "^4.5.0",
     "tailwindcss": "^4.2.2",
     "typescript": "~6.0.2",
-    "vite": "^8.0.15",
+    "vite": "^8.0.16",
     "vite-plugin-minify": "^2.1.0",
     "vite-plugin-pwa": "^1.3.0"
   },
   "dependencies": {
     "nagami-rs": "^2026.6.6",
-    "shiki": "^4.1.0"
+    "shiki": "^4.2.0"
   }
 }

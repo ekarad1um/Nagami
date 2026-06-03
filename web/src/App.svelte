@@ -104,6 +104,7 @@
   }
 
   function handleGlobalKeydown(e: KeyboardEvent) {
+    if (e.repeat) return;
     if ((e.metaKey || e.ctrlKey) && e.key === "s") {
       e.preventDefault();
       downloadOutput();
