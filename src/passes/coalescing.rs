@@ -101,7 +101,7 @@ const MAX_TRACKED_ELEMENTS: u32 = 64;
 /// Which part of an aggregate local a pointer-expression chain
 /// touches.  Computed by [`resolve_local_and_element`].
 #[derive(Debug, Clone, Copy)]
-enum ElementSpec {
+pub(crate) enum ElementSpec {
     /// Direct pointer to the LocalVariable expression - the
     /// statement touches the entire local.  For a Store this is a
     /// full overwrite; for a Load it reads every byte.
@@ -269,7 +269,7 @@ fn element_count_for_type(
 /// the analysis treats them as "we don't know which element", so
 /// they don't contribute to per-element coverage and any subsequent
 /// Read requires full coverage.
-fn resolve_local_and_element(
+pub(crate) fn resolve_local_and_element(
     expr: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
 ) -> Option<(naga::Handle<naga::LocalVariable>, ElementSpec)> {

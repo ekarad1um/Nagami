@@ -12,6 +12,7 @@ use crate::pipeline::Pass;
 pub mod coalescing;
 pub mod compact;
 pub mod const_fold;
+pub mod const_hoist;
 pub mod cse;
 pub mod dead_branch;
 pub mod dead_param;
@@ -21,6 +22,7 @@ pub mod inlining;
 pub mod load_dedup;
 pub mod rename;
 pub mod scoped_map;
+pub mod struct_build;
 
 /// Build the pass pipeline for `config.profile`.
 ///
@@ -87,9 +89,18 @@ pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
                 Box::new(load_dedup::LoadDedupPass) as Box<dyn Pass>,
                 Box::new(const_fold::ConstFoldPass),
                 Box::new(dead_branch::DeadBranchPass),
+                // Collapse field-wise struct builds (`var X; X.a=..; X.b=..;`)
+                // into one whole-struct `Store(X, T(..))` before the final
+                // coalescing + rename, so a fully-built struct local emits as a
+                // single `T(..)` constructor rather than a run of member stores.
+                Box::new(struct_build::StructBuildPass),
                 Box::new(coalescing::CoalescingPass),
                 Box::new(dead_param::DeadParamPass),
                 Box::new(emit_merge::EmitMergePass),
+                // Hoist repeated all-literal vector constants into shared module
+                // consts BEFORE rename, so rename names them by frequency (this
+                // is what makes the optimization idempotent).
+                Box::new(const_hoist::ConstHoistPass),
                 rename,
             ]);
 

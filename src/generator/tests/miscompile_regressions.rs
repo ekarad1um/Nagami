@@ -1,9 +1,9 @@
-//! End-to-end regression tests for verified miscompiles and strict-WGSL
-//! emission bugs.  Each runs the full `parse -> IR passes -> generate`
-//! pipeline via [`crate::run`] at the default (`max`) profile and asserts a
-//! semantic invariant on the minified text; a failure means a previously
-//! reproduced defect - valid-but-wrong output, or a form strict WGSL parsers
-//! reject - is back.
+//! End-to-end regression tests over the full `parse -> IR passes -> generate`
+//! pipeline ([`crate::run`], default `max` profile), each asserting an
+//! invariant on the minified text.  A failure is either a CORRECTNESS
+//! regression - a verified miscompile (valid-but-wrong output) or a form
+//! strict WGSL parsers reject is back - or a MINIFICATION-QUALITY regression -
+//! an optimization stopped firing, or the output grew.
 
 use super::helpers::assert_valid_wgsl;
 use crate::config::{Config, TraceConfig};
@@ -725,5 +725,327 @@ fn cooperative_matrix_minifies_without_role_collision() {
     assert!(
         out.contains("coop_mat8x8<f32, A>") || out.contains("coop_mat8x8<f32,A>"),
         "coop role positions must survive: {out}"
+    );
+}
+
+/// Several single-use results of a pure, non-inlined function feeding one
+/// expression must ALL inline in a single pass; collapsing only the last one
+/// leaves the rest as `let`s that a *second* minify pass would inline - a
+/// non-idempotent size drift.
+#[test]
+fn pure_call_lets_inline_in_a_single_pass() {
+    let src = "fn bx(p:vec2f,b:vec2f)->f32{let d=abs(p)-b;\
+        return length(max(d,vec2f(0.0)))+min(max(d.x,d.y),0.0);}\
+        @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) f32{\
+        let p=pos.xy;let a=bx(p,vec2f(1.0));let b=bx(p,vec2f(2.0));\
+        let c=bx(p,vec2f(3.0));return min(min(a,b),c);}";
+    let out = minify(src);
+    assert!(
+        out.contains("return min(min(A("),
+        "pure-call lets were not all inlined in one pass: {out}"
+    );
+    assert!(
+        !out.contains("=A("),
+        "a pure call result is still let-bound (single-pass-only inline): {out}"
+    );
+    assert_eq!(
+        minify(&out),
+        out,
+        "minify must be idempotent on the pure-call chain"
+    );
+}
+
+/// A matrix built from explicit scalar columns emits in the shorter flat
+/// all-scalar form `mat2x2f(a,b,c,d)` rather than per-column `vec2f(...)`.
+#[test]
+fn matrix_scalar_columns_flatten() {
+    let src = "@fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{\
+        let m=mat2x2f(cos(p.x),sin(p.x),-sin(p.x),cos(p.x));return vec4f(m[0],m[1]);}";
+    let out = minify(src);
+    assert!(
+        out.contains("mat2x2f(a,B,-B,a)"),
+        "matrix scalar columns were not flattened to the shorter form: {out}"
+    );
+    assert!(
+        !out.contains("mat2x2f(vec2"),
+        "matrix kept the longer per-column constructor form: {out}"
+    );
+}
+
+/// Flattening must NOT expand a shared / let-bound vector column into N
+/// repeated scalars (that grows the output); the short shared name wins via the
+/// build-then-compare-shorter gate.
+#[test]
+fn matrix_shared_column_keeps_name_form() {
+    let src = "@fragment fn fs(@builtin(position) p:vec4f)->@location(0) f32{\
+        let a=vec3f(p.x);return mat3x3f(a,a,a)[0].x;}";
+    let out = minify(src);
+    assert!(
+        out.contains("mat3x3f(a,a,a)"),
+        "shared matrix column was wrongly expanded to scalars: {out}"
+    );
+}
+
+/// An array constructor whose element type is pinned by a concretely-typed
+/// component (here `vec2f(...)`) drops its template parameters to the shorter
+/// inferring form `array(...)`.
+#[test]
+fn array_type_params_elided_when_concretely_pinned() {
+    let src = "fn g(i:u32)->vec2f{var a=array(vec2f(-1.5,0.0),vec2f(1.0,2.0),vec2f(3.0,4.0));return a[i];}\
+        @fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{return vec4f(g(u32(p.x)),0,0);}";
+    let out = minify(src);
+    assert!(
+        out.contains("array(c("),
+        "concrete-element array constructor was not elided to array(...): {out}"
+    );
+}
+
+/// Critical soundness: an array of bare abstract literals must NEVER elide
+/// its template parameters - `array<u32,2>(7,9)` -> `array(7,9)` would silently
+/// re-infer the element type as i32.  The constructor keeps the explicit (or
+/// aliased) typed name; it never becomes a bare `array(7,...)`.
+#[test]
+fn array_type_params_kept_for_abstract_literal_elements() {
+    let src = "fn g(i:u32)->u32{var a=array<u32,2>(7u,9u);return a[i];}\
+        @fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{return vec4f(f32(g(u32(p.x))));}";
+    let out = minify(src);
+    assert!(
+        !out.contains("array(7"),
+        "abstract-literal array was wrongly elided (would retype u32 -> i32): {out}"
+    );
+}
+
+/// An all-literal vector constant constructed identically in 3+ live sites
+/// is hoisted into a shared module `const` by the pre-rename `const-hoist` IR
+/// pass, so the (now frequent) constant gets a short frequency-assigned name -
+/// and re-minification is a fixed point (the constant participates in renaming
+/// the same way every pass).
+#[test]
+fn repeated_vector_constant_is_hoisted_to_a_shared_const() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o:vec4f;\
+        fn f(v:vec4f){o=o+v;}\
+        @fragment fn fs(@builtin(position) p:vec4f)->@location(0) f32{\
+        switch u32(p.x){\
+        case 0u{f(vec4f(7.0,2.0,9.0,3.0));}\
+        case 1u{f(vec4f(7.0,2.0,9.0,3.0));}\
+        default{f(vec4f(7.0,2.0,9.0,3.0));}}return 0.0;}";
+    let out = minify(src);
+    assert!(
+        out.contains("const A=c(7,2,9,3);"),
+        "repeated vector constant was not hoisted to a shared const: {out}"
+    );
+    // The three sites all reference the hoisted name, not the inline vector.
+    assert!(
+        !out.contains("c(7,2,9,3)") || out.matches("c(7,2,9,3)").count() == 1,
+        "a use site still inlines the vector instead of the const: {out}"
+    );
+    assert_eq!(minify(&out), out, "const-hoist output must be idempotent");
+}
+
+/// A write-only local (stored to, never read / escaped / atomic-touched) is
+/// eliminated entirely - var, stores, and the dead value expressions all go -
+/// while a genuine side effect in the same function survives.
+#[test]
+fn write_only_local_is_eliminated() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o:f32;\
+        @compute @workgroup_size(1) fn main(){var d=1.0;d=2.0;o=5.0;}";
+    let out = minify(src);
+    assert!(
+        !out.contains("var "),
+        "write-only local was not eliminated: {out}"
+    );
+    assert!(
+        out.contains("=5"),
+        "the real store was wrongly removed: {out}"
+    );
+}
+
+/// Critical soundness: a local whose pointer ESCAPES to a callee must keep
+/// its stores - the callee can read the value through the pointer.
+#[test]
+fn escaped_local_stores_are_not_removed() {
+    let src = "fn sink(p:ptr<function,f32>){}\
+        @group(0)@binding(0) var<storage,read_write> o:f32;\
+        @compute @workgroup_size(1) fn main(){var d=1.0;d=2.0;sink(&d);o=5.0;}";
+    let out = minify(src);
+    assert!(
+        out.contains("var "),
+        "an escaped local (passed by pointer) was wrongly eliminated: {out}"
+    );
+}
+
+/// An INLINE (single-use) all-`+0` vector folds to the shorter zero-value
+/// constructor `vec2i()`.
+#[test]
+fn inline_all_zero_vector_folds_to_zero_value() {
+    let src = "@group(0)@binding(0) var t:texture_2d<f32>;\
+        @fragment fn fs()->@location(0) vec4f{return textureLoad(t,vec2i(0,0),0);}";
+    let out = minify(src);
+    assert!(
+        out.contains("vec2i()"),
+        "inline all-zero vec2i did not fold to vec2i(): {out}"
+    );
+}
+
+/// Idempotence gate: a
+/// MULTI-use zero vector is `let`-bound, and the bound value must stay
+/// `vec2f(0)`, NOT fold to `vec2f()`.  naga re-parses `vec2f()` as a
+/// non-emittable `ZeroValue` that can never be re-bound, so folding the bound
+/// case would force the generator to inline `vec2f()` at every use on
+/// re-minification - a non-idempotent size blow-up.  The bound `vec2f(0)`
+/// re-parses to a bindable `Splat` and stays bound; the output is a fixed point.
+#[test]
+fn bound_multi_use_zero_vector_stays_splat_and_is_idempotent() {
+    let src = "fn d(a:vec2f,b:vec2f)->f32{return distance(a,b);}\
+        @fragment fn fs(@builtin(position) p:vec4f)->@location(0) f32{\
+        let h=vec2f(0.0,0.0);return d(h,p.xy)+d(h,p.zw)+d(h,p.yx);}";
+    let out = minify(src);
+    assert!(
+        out.contains("=vec2f(0);"),
+        "bound multi-use zero was not kept as the round-trip-stable splat vec2f(0): {out}"
+    );
+    assert!(
+        !out.contains("=vec2f();"),
+        "bound zero was folded to vec2f() (would over-inline on re-minify): {out}"
+    );
+    assert_eq!(
+        minify(&out),
+        out,
+        "A3 bound-zero handling must be idempotent"
+    );
+}
+
+/// Critical soundness: `-0.0` has a non-zero bit pattern, so it must NEVER
+/// fold to a zero-value constructor (that would flip the sign bit:
+/// `1.0/-0.0 == -inf` vs `+inf`).
+#[test]
+fn negative_zero_vector_is_never_folded() {
+    let src = "fn g(x:f32)->vec2f{return vec2f(-0.0,-0.0)*x;}\
+        @fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{return vec4f(g(p.x),0,0);}";
+    let out = minify(src);
+    assert!(out.contains("-0."), "the -0.0 sign bit was lost: {out}");
+}
+
+/// A struct local built up member-by-member and then read is coalesced into
+/// a single struct constructor, with members in DECLARATION order (the pass
+/// reorders from source-assignment order - value-safe because every member
+/// value is a pre-materialised handle computed before its store).
+#[test]
+fn struct_field_build_coalesces_to_constructor() {
+    let src = "struct T{a:f32,b:f32,c:f32,}\
+        fn mk(x:f32,y:f32,z:f32)->T{var t:T;t.a=x*2.0;t.b=y*3.0;t.c=z*4.0;return t;}\
+        @fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{\
+        let r=mk(p.x,p.y,p.z);return vec4f(r.a,r.b,r.c,1.0);}";
+    let out = minify(src);
+    assert!(
+        out.contains("return a(") || out.contains("=a("),
+        "struct field-build was not coalesced into a constructor: {out}"
+    );
+    assert!(
+        !out.contains(".b="),
+        "member stores survived coalescing: {out}"
+    );
+}
+
+/// Critical soundness: a member value that READS a sibling member
+/// (`t.b = t.a + 1`) must NOT be coalesced - the constructor would read an
+/// unset member.  The field-by-field build is preserved.
+#[test]
+fn struct_build_with_sibling_read_is_not_coalesced() {
+    let src = "struct T{a:f32,b:f32,}\
+        fn mk(x:f32)->T{var t:T;t.a=x*2.0;t.b=t.a+1.0;return t;}\
+        @fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{\
+        let r=mk(p.x);return vec4f(r.a,r.b,0,0);}";
+    let out = minify(src);
+    // Not coalesced => the struct local survives as a `var` (a coalesced build
+    // is `return T(...)` with no local).  `minify` re-validates, so the staged
+    // build is also confirmed value-correct.
+    assert!(
+        out.contains("var "),
+        "a sibling-dependent struct build was wrongly coalesced (would read an unset member): {out}"
+    );
+}
+
+/// An identity swizzle (`.xy` on a vec2, `.xyz` on a vec3, `.xyzw` on a
+/// vec4 - selects every lane in order) is a no-op and is elided to the base.
+#[test]
+fn identity_swizzle_is_elided() {
+    let src = "@group(0)@binding(0) var<uniform> s:vec2f;\
+        @fragment fn fs()->@location(0) vec4f{let r=s.xy;return vec4f(r,0,0);}";
+    let out = minify(src);
+    assert!(
+        !out.contains(".xy"),
+        "identity swizzle `.xy` on a vec2 was not elided: {out}"
+    );
+}
+
+/// Parenthesisation safety: an identity swizzle whose base needs
+/// parentheses as an operand (a `Binary`) must NOT be elided - dropping it
+/// would leave the base unparenthesised in the parent expression.
+#[test]
+fn identity_swizzle_over_binary_base_is_kept() {
+    let src = "@group(0)@binding(0) var<uniform> s:vec2f;\
+        @fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{\
+        let r=(s+p.xy).xy*p.zw;return vec4f(r,0,0);}";
+    let out = minify(src);
+    assert!(
+        out.contains(").xy"),
+        "identity swizzle over a Binary base was wrongly elided (parenthesisation hazard): {out}"
+    );
+}
+
+/// A maximal run of >=2 equal scalar components collapses to a sub-vector
+/// splat when that is shorter: `vec4f(.333,.333,.333,1)` -> `vec4f(vec3f(.333),1)`.
+#[test]
+fn vector_subsplat_run_collapses_when_shorter() {
+    let src = "@fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{\
+        return vec4f(0.333,0.333,0.333,1.0)*p.x;}";
+    let out = minify(src);
+    assert!(
+        out.contains("vec3f(.333)"),
+        "a long-valued scalar run was not collapsed to a sub-vector splat: {out}"
+    );
+}
+
+/// No-grow gate: a sub-splat that would be LONGER than the inline form is
+/// discarded - `vec4f(0,0,0,2)` with no short `vec3f` alias stays inline, never
+/// grows to `vec4f(vec3f(),2)`.
+#[test]
+fn vector_subsplat_does_not_grow() {
+    let src = "@fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{\
+        return vec4f(0.0,0.0,0.0,2.0)*p.x;}";
+    let out = minify(src);
+    assert!(
+        !out.contains("vec3f()"),
+        "an unprofitable zero sub-splat grew the output: {out}"
+    );
+}
+
+/// When TWO struct locals are built interleaved in one function, collapsing
+/// both must not drop or misplace the unrelated statements between the two
+/// builds: every plan's store indices are positions in the *same* pre-mutation
+/// body, so the rebuild consults all of them in one pass rather than rewriting
+/// per local (which would shift later indices and silently drop the live
+/// `g = 7777;` store between the builds).
+#[test]
+fn interleaved_struct_builds_do_not_drop_live_statements() {
+    let src = "struct S{a:i32,b:i32,}struct R{x:i32,y:i32,}\
+        @group(0)@binding(0) var<storage,read_write> g:i32;\
+        @compute @workgroup_size(1) fn main(){\
+        var t:S;var u:R;\
+        t.a=1;u.x=100;u.y=200;g=7777;t.b=2;\
+        g=g+t.a+t.b*10+u.x*1000+u.y*100000;}";
+    let out = minify(src);
+    // The live store between the two interleaved builds must survive.
+    assert!(
+        out.contains("7777"),
+        "the live `g = 7777` store between two interleaved struct builds was dropped: {out}"
+    );
+    // Both structs must still collapse to a constructor (no leftover member
+    // stores re-introduced by a misplaced splice): the only `=` stores left to
+    // the struct locals are their constructor inits, so no `.<member>=` remains.
+    assert!(
+        !out.contains(".b=2") && !out.contains(".y=200"),
+        "an interleaved struct build left orphan member stores: {out}"
     );
 }

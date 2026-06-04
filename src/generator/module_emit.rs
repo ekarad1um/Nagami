@@ -1994,12 +1994,6 @@ fn find_inlineable_calls(
                 arguments,
                 ..
             } if ref_counts[h.index()] == 1 => {
-                // A new Call is itself a side-effecting statement.  Any
-                // *prior* pending handle that was NOT consumed by this
-                // Call's arguments (already handled by Phase 1) must be
-                // dropped: inlining it at a later use site would reorder
-                // its evaluation past this Call's side effects.
-                pending.clear();
                 // Only a PURE callee may be relocated to an arbitrary later use
                 // site: an impure call's write would be re-ordered against an
                 // intervening read - or, since operand evaluation order is not
@@ -2008,6 +2002,15 @@ fn find_inlineable_calls(
                 // evaluation time, so track the locals its args read for the
                 // `Store`-interference check below.
                 if pure_functions[function.index()] {
+                    // A pure callee writes no caller-visible memory, so it is
+                    // NOT a reordering barrier: any *prior* pending pure call
+                    // survives it (just as it survives an `Emit`/`Return`) and
+                    // stays inlineable at its own later use site, so several
+                    // adjacent pure-call `let`s collapse in ONE pass rather than
+                    // one-per-re-minify.  We therefore do NOT clear `pending`.
+                    // Phase 1 already moved any pending consumed by THIS call's
+                    // arguments into `result`, so the survivors are exactly the
+                    // ones whose evaluation is unaffected by this pure call.
                     let mut reads_locals = std::collections::HashSet::new();
                     let mut visited = std::collections::HashSet::new();
                     for &arg in arguments {
@@ -2018,10 +2021,15 @@ fn find_inlineable_calls(
                         reads_locals,
                     });
                 } else {
-                    // Impure: eligible to be inlined into its consuming
-                    // statement only where that statement evaluates no other
-                    // memory access (see `last_impure` /
-                    // `impure_call_inlines_safely`).
+                    // An impure call IS a side-effecting statement: any prior
+                    // pending pure call inlined past it would reorder its
+                    // evaluation against this call's write.  Drop them all
+                    // (Phase 1 already captured any consumed by this call's own
+                    // arguments).  The impure call itself is eligible to be
+                    // inlined into its consuming statement only where that
+                    // statement evaluates no other memory access (see
+                    // `last_impure` / `impure_call_inlines_safely`).
+                    pending.clear();
                     last_impure = Some(*h);
                 }
             }

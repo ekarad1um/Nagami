@@ -46,11 +46,13 @@ impl Pass for LoadDedupPass {
         for (_, function) in module.functions.iter_mut() {
             changed |= remove_dead_stores_in_function(function);
             changed |= dedup_loads_in_function(function);
+            changed |= eliminate_write_only_locals(function);
             changed |= remove_dead_inits(function);
         }
         for entry in module.entry_points.iter_mut() {
             changed |= remove_dead_stores_in_function(&mut entry.function);
             changed |= dedup_loads_in_function(&mut entry.function);
+            changed |= eliminate_write_only_locals(&mut entry.function);
             changed |= remove_dead_inits(&mut entry.function);
         }
         Ok(changed)
@@ -669,6 +671,195 @@ fn collect_touched_locals(
 /// [`remove_dead_stores_in_block`] which walks the control-flow tree.
 fn remove_dead_stores_in_function(function: &mut naga::Function) -> bool {
     remove_dead_stores_in_block(&mut function.body, &function.expressions)
+}
+
+/// Eliminate WRITE-ONLY locals: a local that is stored to but whose value is
+/// never observed (no `Load`, never passed by pointer, never an atomic/barrier
+/// target) is dead in its entirety, so every `Store` to it - whole-variable AND
+/// partial (`a.x = ...`, `a[i] = ...`) - can be dropped.
+///
+/// This is strictly more powerful than [`remove_dead_stores_in_block`] (which
+/// only kills a whole-var store overwritten before any read in the SAME block):
+/// it reasons over the whole function and removes the var entirely once its
+/// stores are gone (later DCE drops the now-unused declaration and the dead
+/// store-value expressions).
+///
+/// Soundness: a local is a candidate only when EVERY reference to it is the
+/// pointer of a `Store`.  Any `Load` or `CooperativeLoad` rooted at it, any
+/// pointer passed to a callee (the escape walk - the callee can read it), and
+/// any atomic / workgroup-uniform-load pointer mark it used.  Removing a `Store`
+/// keeps the call/atomic/etc. statements that produce its value's side effects
+/// (those are separate statements); only the dead write disappears.
+fn eliminate_write_only_locals(function: &mut naga::Function) -> bool {
+    let exprs = &function.expressions;
+    let mut used: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
+
+    // Reads: an expression that reads memory through a pointer rooting at a
+    // local marks it used.  `Load` and `CooperativeLoad` are the only such
+    // expressions (image reads address globals, not local pointers); both must
+    // be mirrored from `expr_util`'s read classification or a local read solely
+    // by the omitted one would be misjudged write-only and lose its stores.
+    for (_, expr) in exprs.iter() {
+        let read_ptr = match expr {
+            naga::Expression::Load { pointer } => Some(*pointer),
+            naga::Expression::CooperativeLoad { data, .. } => Some(data.pointer),
+            _ => None,
+        };
+        if let Some(ptr) = read_ptr
+            && let Some(local) = get_stored_local(exprs, ptr)
+        {
+            used.insert(local);
+        }
+    }
+    // Escapes (callee may read through the pointer) and other pointer uses.
+    // The shared helper also reports partially-stored locals, but that output is
+    // intentionally unused here: a local with zero `Load`s and zero escapes is
+    // dead whether its stores are whole or partial, so every store is removed
+    // regardless.  (The set is consumed only by the load-forwarding path.)
+    let mut partially_stored_unused = HashSet::new();
+    collect_escaped_and_partially_stored(
+        &function.body,
+        exprs,
+        &mut used,
+        &mut partially_stored_unused,
+    );
+    collect_nonstore_pointer_locals(&function.body, exprs, &mut used);
+
+    if used.len() == function.local_variables.len() {
+        // Every local is observed; nothing to eliminate (fast path).
+        return false;
+    }
+
+    remove_stores_to_dead_locals(&mut function.body, exprs, &used)
+}
+
+/// Mark locals referenced as the pointer of any statement OTHER than `Store`
+/// (atomics, workgroup-uniform-load, ...) as used.  `Store` is excluded - that
+/// is precisely the write [`eliminate_write_only_locals`] removes.  Call /
+/// ray / cooperative escapes are handled by the escape walk.
+fn collect_nonstore_pointer_locals(
+    block: &naga::Block,
+    expressions: &naga::Arena<naga::Expression>,
+    used: &mut HashSet<naga::Handle<naga::LocalVariable>>,
+) {
+    let mark = |ptr: naga::Handle<naga::Expression>,
+                used: &mut HashSet<naga::Handle<naga::LocalVariable>>| {
+        if let Some(local) = get_stored_local(expressions, ptr) {
+            used.insert(local);
+        }
+    };
+    for stmt in block {
+        match stmt {
+            naga::Statement::Atomic { pointer, .. } => mark(*pointer, used),
+            naga::Statement::WorkGroupUniformLoad { pointer, .. } => mark(*pointer, used),
+            naga::Statement::If { accept, reject, .. } => {
+                collect_nonstore_pointer_locals(accept, expressions, used);
+                collect_nonstore_pointer_locals(reject, expressions, used);
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases {
+                    collect_nonstore_pointer_locals(&case.body, expressions, used);
+                }
+            }
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => {
+                collect_nonstore_pointer_locals(body, expressions, used);
+                collect_nonstore_pointer_locals(continuing, expressions, used);
+            }
+            naga::Statement::Block(inner) => {
+                collect_nonstore_pointer_locals(inner, expressions, used)
+            }
+            // Statements that neither observe a local through a pointer nor
+            // carry a nested block.  `Store` is excluded by design (it is the
+            // write this analysis is proving dead); callee/atomic/cooperative
+            // pointer escapes are covered by `collect_escaped_and_partially_stored`.
+            // Enumerated (no `_`) per this file's forward-compat contract, so a
+            // future block- or pointer-bearing variant trips the build here.
+            naga::Statement::Emit(_)
+            | naga::Statement::Store { .. }
+            | naga::Statement::Call { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::CooperativeStore { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. } => {}
+        }
+    }
+}
+
+/// Drop every `Store` whose pointer roots at a local NOT in `used` (recursing
+/// into nested blocks).  Returns whether any statement was removed.
+fn remove_stores_to_dead_locals(
+    block: &mut naga::Block,
+    expressions: &naga::Arena<naga::Expression>,
+    used: &HashSet<naga::Handle<naga::LocalVariable>>,
+) -> bool {
+    let mut changed = false;
+    let original = std::mem::replace(block, naga::Block::new());
+    for (mut stmt, span) in original.span_into_iter() {
+        match &mut stmt {
+            naga::Statement::Store { pointer, .. } => {
+                if let Some(local) = get_stored_local(expressions, *pointer)
+                    && !used.contains(&local)
+                {
+                    changed = true;
+                    continue; // drop the dead store
+                }
+            }
+            naga::Statement::If { accept, reject, .. } => {
+                changed |= remove_stores_to_dead_locals(accept, expressions, used);
+                changed |= remove_stores_to_dead_locals(reject, expressions, used);
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases.iter_mut() {
+                    changed |= remove_stores_to_dead_locals(&mut case.body, expressions, used);
+                }
+            }
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => {
+                changed |= remove_stores_to_dead_locals(body, expressions, used);
+                changed |= remove_stores_to_dead_locals(continuing, expressions, used);
+            }
+            naga::Statement::Block(inner) => {
+                changed |= remove_stores_to_dead_locals(inner, expressions, used);
+            }
+            // Non-`Store`, non-block statements are passed through untouched.
+            // Enumerated (no `_`) per this file's forward-compat contract, so a
+            // future block-bearing variant trips the build rather than silently
+            // skipping recursion into it.
+            naga::Statement::Emit(_)
+            | naga::Statement::Call { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::CooperativeStore { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. } => {}
+        }
+        block.push(stmt, span);
+    }
+    changed
 }
 
 /// Remove dead stores: a whole-variable Store to a local that is overwritten
@@ -4060,7 +4251,7 @@ fn test_fn() -> f32 {
         let reparsed = naga::front::wgsl::parse_str(&wgsl);
         assert!(
             reparsed.is_ok(),
-            "emitted WGSL should re-parse, got error: {:?}\n--- emitted WGSL ---\n{}",
+            "emitted WGSL should re-parse, got error: {:?}\nemitted WGSL:\n{}",
             reparsed.err(),
             wgsl
         );

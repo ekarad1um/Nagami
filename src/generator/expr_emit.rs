@@ -593,6 +593,28 @@ impl<'a> Generator<'a> {
             E::Override(h) => self.override_names[h.index()].clone(),
             E::ZeroValue(ty) => self.zero_value(*ty)?,
             E::Compose { ty, components } => 'compose: {
+                // All-zero vector / matrix -> zero-value constructor
+                // (`vec2f(0,0)` -> `vec2f()`), but ONLY when this Compose is
+                // INLINED (ref count 1).  A multi-use Compose is `let`-bound, so
+                // folding its decl to `vec2f()` would round-trip badly: naga
+                // re-parses `vec2f()` as a `ZeroValue`, which is non-emittable
+                // and so can NEVER be re-bound, forcing the generator to inline
+                // it at every use (`vec2f()` x N) - a non-idempotent size blow-up.
+                // Leaving the bound case as the splat `vec2f(0)` re-parses to a
+                // bindable `Splat` and stays bound.  Strict `+0` only
+                // (compose_is_all_zero rejects -0.0); never array/struct.
+                if ctx.ref_counts[expr.index()] <= 1
+                    && matches!(
+                        self.module.types[*ty].inner,
+                        naga::TypeInner::Vector { .. } | naga::TypeInner::Matrix { .. }
+                    )
+                    && components
+                        .iter()
+                        .all(|&c| compose_is_all_zero(c, &ctx.func.expressions))
+                {
+                    break 'compose self.zero_value(*ty)?;
+                }
+
                 // For vector composes, try to emit as a bare swizzle
                 // (e.g. vec3f(v.x,v.y,v.z) -> v.xyz), eliminating the
                 // type constructor entirely.
@@ -603,7 +625,11 @@ impl<'a> Generator<'a> {
                 }
 
                 let mut s = String::new();
-                s.push_str(&self.vector_ctor_name(*ty, components, ctx)?);
+                let ctor_name = self.vector_ctor_name(*ty, components, ctx)?;
+                match self.array_ctor_name(*ty, components, &ctor_name, &ctx.func.expressions) {
+                    Some(bare) => s.push_str(bare),
+                    None => s.push_str(&ctor_name),
+                }
                 s.push('(');
                 // Collapse vector Compose with all-identical scalar components
                 // into splat form: vec3f(x,x,x) -> vec3f(x).
@@ -630,6 +656,40 @@ impl<'a> Generator<'a> {
                     }
                 }
                 s.push(')');
+                // A matrix built from explicit scalar columns can also be emitted
+                // in flat all-scalar form: mat2x2f(vec2f(a,b),vec2f(c,d)) ->
+                // mat2x2f(a,b,c,d).  Build it and keep whichever is shorter - the
+                // column form wins when a column is shared/let-bound (emitted as a
+                // short name, e.g. mat3x3f(a,a,a)) or splat-collapses to vecR(x).
+                if let Some(flat) = matrix_flatten_scalars(
+                    *ty,
+                    components,
+                    &self.module.types,
+                    &ctx.func.expressions,
+                ) {
+                    let mut sf = self.vector_ctor_name(*ty, components, ctx)?;
+                    sf.push('(');
+                    let sep = self.comma_sep();
+                    for (i, c) in flat.iter().enumerate() {
+                        if i > 0 {
+                            sf.push_str(sep);
+                        }
+                        sf.push_str(&self.emit_constructor_arg(*c, ctx)?);
+                    }
+                    sf.push(')');
+                    if sf.len() < s.len() {
+                        s = sf;
+                    }
+                }
+                // A vector built from scalar runs can collapse runs into
+                // sub-vector splats: vec4f(0,0,0,2) -> vec4f(vec3f(),2).  Kept
+                // only when strictly shorter (the sub-vector type often lacks a
+                // short alias, in which case it loses).
+                if let Some(sub) = self.try_subsplat_compose(*ty, components, ctx)?
+                    && sub.len() < s.len()
+                {
+                    s = sub;
+                }
                 s
             }
             E::Access { base, index } => {
@@ -654,8 +714,17 @@ impl<'a> Generator<'a> {
                 }
                 s
             }
-            E::Splat { size: _, value } => {
+            E::Splat { size: _, value } => 'splat: {
                 let target_ty = self.expr_type_name(expr, ctx)?;
+                // All-zero splat -> zero-value constructor (`vec3f(0)` ->
+                // `vec3f()`), gated on ref count <= 1: a bound `vec3f()`
+                // re-parses to a non-emittable `ZeroValue` that must re-inline
+                // at every use, a non-idempotent size blow-up.
+                if ctx.ref_counts[expr.index()] <= 1
+                    && compose_is_all_zero(*value, &ctx.func.expressions)
+                {
+                    break 'splat format!("{target_ty}()");
+                }
                 let lane = self.emit_constructor_arg(*value, ctx)?;
                 {
                     let mut s = target_ty;
@@ -669,10 +738,43 @@ impl<'a> Generator<'a> {
                 size,
                 vector,
                 pattern,
-            } => {
+            } => 'swizzle: {
+                let n = *size as u8 as usize;
+                // Identity swizzle: `.xy` on a vec2, `.xyz` on a vec3, `.xyzw`
+                // on a vec4 - selects component `i` at position `i` for all `i`
+                // AND the base vector has exactly `n` lanes (nothing dropped or
+                // reordered) - is a no-op, so emit just the base.  Only elide a
+                // base that `emit_postfix_base` would NOT wrap - i.e. not
+                // `Binary`/`Unary`/`Select` (the operand kinds it parenthesises):
+                // the parent's parenthesisation, computed for a postfix
+                // `Swizzle`, stays valid for the substituted base, AND a kept
+                // swizzle over such a base re-minifies identically (eliding a
+                // `Select` would drift to a parenthesised re-parse).
+                let is_identity = pattern[..n].iter().enumerate().all(|(i, c)| {
+                    let idx = match c {
+                        naga::SwizzleComponent::X => 0,
+                        naga::SwizzleComponent::Y => 1,
+                        naga::SwizzleComponent::Z => 2,
+                        naga::SwizzleComponent::W => 3,
+                    };
+                    idx == i
+                });
+                let base_is_full = match ctx.info[*vector].ty.inner_with(&self.module.types) {
+                    naga::TypeInner::Vector { size: bs, .. } => *bs as u8 as usize == n,
+                    _ => false,
+                };
+                let base_paren_free = !matches!(
+                    ctx.func.expressions[*vector],
+                    naga::Expression::Binary { .. }
+                        | naga::Expression::Unary { .. }
+                        | naga::Expression::Select { .. }
+                );
+                if is_identity && base_is_full && base_paren_free {
+                    break 'swizzle self.emit_expr(*vector, ctx)?;
+                }
+
                 let mut s = self.emit_postfix_base(*vector, ctx)?;
                 s.push('.');
-                let n = *size as u8 as usize;
                 for c in &pattern[..n] {
                     s.push(match c {
                         naga::SwizzleComponent::X => 'x',
@@ -1464,17 +1566,50 @@ impl<'a> Generator<'a> {
                     size: *size,
                     scalar,
                 })?;
-                let mut s = format!("{type_name}(");
-                if let E::Literal(lit) = &arena[*value] {
-                    s.push_str(&literal_to_wgsl_bare(*lit, &self.options.float_precision));
+                // All-zero global splat -> zero-value constructor (emitted once
+                // in a const/var initializer, so no over-inline risk).
+                if compose_is_all_zero(*value, arena) {
+                    format!("{type_name}()")
                 } else {
-                    s.push_str(&self.emit_global_expr(*value)?);
+                    let mut s = format!("{type_name}(");
+                    if let E::Literal(lit) = &arena[*value] {
+                        s.push_str(&literal_to_wgsl_bare(*lit, &self.options.float_precision));
+                    } else {
+                        s.push_str(&self.emit_global_expr(*value)?);
+                    }
+                    s.push(')');
+                    s
                 }
-                s.push(')');
-                s
             }
-            E::Compose { ty, components } => {
+            E::Compose { ty, components } => 'global_compose: {
+                // All-zero vector / matrix -> zero-value constructor.  No
+                // ref-count gate: a global expression is a const/var initializer
+                // emitted exactly ONCE (uses reference the const NAME), so the
+                // re-parse over-inline that gates the function-local arm cannot
+                // occur here.
+                if matches!(
+                    self.module.types[*ty].inner,
+                    naga::TypeInner::Vector { .. } | naga::TypeInner::Matrix { .. }
+                ) && components.iter().all(|&c| compose_is_all_zero(c, arena))
+                {
+                    break 'global_compose self.zero_value(*ty)?;
+                }
+                let emit_scalar =
+                    |this: &Self, c: naga::Handle<naga::Expression>| -> Result<String, Error> {
+                        if let naga::Expression::Literal(lit) = &arena[c] {
+                            Ok(literal_to_wgsl_bare(*lit, &this.options.float_precision))
+                        } else {
+                            this.emit_global_expr(c)
+                        }
+                    };
                 let mut s = String::new();
+                // NB: no `array(...)` elision in the GLOBAL arm.  A global
+                // expression is a const/override/var initializer, which carries
+                // a declared type annotation; naga's text front-end rejects an
+                // elided constructor whose inferred array type must match a
+                // declared annotation that resolves through a type alias
+                // ("expected array<T,N> but got array<T,N>").  Elision is safe
+                // only for the unannotated function-local constructors.
                 s.push_str(&self.type_ref(*ty)?);
                 s.push('(');
                 // Collapse vector Compose with all-identical scalar components
@@ -1486,25 +1621,37 @@ impl<'a> Generator<'a> {
                             && components.len() > 1
                 ) && compose_is_splat(components, arena);
                 if is_splat {
-                    if let naga::Expression::Literal(lit) = &arena[components[0]] {
-                        s.push_str(&literal_to_wgsl_bare(*lit, &self.options.float_precision));
-                    } else {
-                        s.push_str(&self.emit_global_expr(components[0])?);
-                    }
+                    s.push_str(&emit_scalar(self, components[0])?);
                 } else {
                     let sep = self.comma_sep();
                     for (i, c) in components.iter().enumerate() {
                         if i > 0 {
                             s.push_str(sep);
                         }
-                        if let naga::Expression::Literal(lit) = &arena[*c] {
-                            s.push_str(&literal_to_wgsl_bare(*lit, &self.options.float_precision));
-                        } else {
-                            s.push_str(&self.emit_global_expr(*c)?);
-                        }
+                        s.push_str(&emit_scalar(self, *c)?);
                     }
                 }
                 s.push(')');
+                // Matrix built from explicit scalar columns -> flat all-scalar
+                // form, kept only when strictly shorter (a shared / let-bound
+                // column emitted as a short name can beat the flat form).
+                if let Some(flat) =
+                    matrix_flatten_scalars(*ty, components, &self.module.types, arena)
+                {
+                    let mut sf = self.type_ref(*ty)?;
+                    sf.push('(');
+                    let sep = self.comma_sep();
+                    for (i, c) in flat.iter().enumerate() {
+                        if i > 0 {
+                            sf.push_str(sep);
+                        }
+                        sf.push_str(&emit_scalar(self, *c)?);
+                    }
+                    sf.push(')');
+                    if sf.len() < s.len() {
+                        s = sf;
+                    }
+                }
                 s
             }
             E::Unary { op, expr } => {
@@ -1953,6 +2100,134 @@ impl<'a> Generator<'a> {
             }
         }
         Ok(type_str)
+    }
+
+    /// Constructor name for an array `Compose`, eliding the template parameters
+    /// to the bare inferring form `array(...)` when provably safe and shorter.
+    ///
+    /// `array(...)` infers its element type from the components, so eliding is
+    /// sound only when inference is GUARANTEED to reproduce the declared element
+    /// type `base`.  A bare abstract literal would re-infer
+    /// (`array<u32,2>(1,2)` -> `array<i32,2>`, `array<f16,2>(1,2)` ->
+    /// `array<f32,2>`) - a silent retype both engines reject/miscompile - so the
+    /// gate requires at least one component that is a `Compose` / `ZeroValue` /
+    /// `Constant` / `Override` whose type is exactly `base`; such a component
+    /// always emits as a concretely-`base`-typed expression and pins inference
+    /// to `base`.  Returns `None` (keep the explicit / aliased `array<T,N>`
+    /// name) otherwise, including when the bare `array` is not shorter than the
+    /// full/aliased name (an aliased short array type must win).  This rewrites
+    /// the CONSTRUCTOR name only; type annotations are never touched.
+    fn array_ctor_name(
+        &self,
+        ty: naga::Handle<naga::Type>,
+        components: &[naga::Handle<naga::Expression>],
+        full_name: &str,
+        arena: &naga::Arena<naga::Expression>,
+    ) -> Option<&'static str> {
+        let naga::TypeInner::Array { base, .. } = self.module.types[ty].inner else {
+            return None;
+        };
+        if components.is_empty() || "array".len() >= full_name.len() {
+            return None;
+        }
+        let pins = components.iter().any(|&c| match &arena[c] {
+            naga::Expression::Compose { ty: cty, .. } => *cty == base,
+            naga::Expression::ZeroValue(zty) => *zty == base,
+            naga::Expression::Constant(h) => self.module.constants[*h].ty == base,
+            naga::Expression::Override(h) => self.module.overrides[*h].ty == base,
+            _ => false,
+        });
+        pins.then_some("array")
+    }
+
+    /// Collapse maximal runs of >=2 identical adjacent SCALAR components in a
+    /// vector `Compose` into sub-vector splats - `vec4f(0,0,0,2)` ->
+    /// `vec4f(vec3f(0),2)`, which folds to `vec4f(vec3f(),2)` for the zero run.
+    /// Returns the collapsed text only when at least one run (of length `2..N`)
+    /// was collapsed; the caller keeps it ONLY when it is strictly shorter, so
+    /// this never grows the output (the sub-vector type often has no short
+    /// alias, in which case the collapsed form loses and is discarded).
+    ///
+    /// Value-safe: each run's components compare equal under [`exprs_splat_eq`]
+    /// (literal bit pattern / structural identity), so emitting one shared value
+    /// `vecK(c)` reproduces the same lanes; sub-vector constructors are postfix,
+    /// so there is no parenthesisation hazard.
+    fn try_subsplat_compose(
+        &self,
+        ty: naga::Handle<naga::Type>,
+        components: &[naga::Handle<naga::Expression>],
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<Option<String>, Error> {
+        let naga::TypeInner::Vector { size, scalar } = self.module.types[ty].inner else {
+            return Ok(None);
+        };
+        let n = size as usize;
+        if components.len() != n {
+            return Ok(None);
+        }
+        // Every component must be a plain scalar so that a run forms a valid
+        // sub-vector `vecK(scalar)`.
+        if !components.iter().all(|&c| {
+            matches!(
+                ctx.info[c].ty.inner_with(&self.module.types),
+                naga::TypeInner::Scalar(_)
+            )
+        }) {
+            return Ok(None);
+        }
+        // Phase 1 (immutable): split components into maximal equal-value runs,
+        // and note which runs are all-zero.
+        let (runs, zero): (Vec<(usize, usize)>, Vec<bool>) = {
+            let arena = &ctx.func.expressions;
+            let mut runs = Vec::new();
+            let mut i = 0;
+            while i < n {
+                let mut j = i + 1;
+                while j < n && exprs_splat_eq(&arena[components[i]], &arena[components[j]]) {
+                    j += 1;
+                }
+                runs.push((i, j - i));
+                i = j;
+            }
+            let zero = runs
+                .iter()
+                .map(|&(s, _)| compose_is_all_zero(components[s], arena))
+                .collect();
+            (runs, zero)
+        };
+        if !runs.iter().any(|&(_, k)| k >= 2 && k < n) {
+            return Ok(None);
+        }
+        // Phase 2 (mutable): emit.
+        let mut parts: Vec<String> = Vec::with_capacity(n);
+        for (ri, &(s, k)) in runs.iter().enumerate() {
+            if k >= 2 && k < n {
+                let sub_size = match k {
+                    2 => naga::VectorSize::Bi,
+                    3 => naga::VectorSize::Tri,
+                    _ => naga::VectorSize::Quad,
+                };
+                let sub_name = self.type_name_for_inner(&naga::TypeInner::Vector {
+                    size: sub_size,
+                    scalar,
+                })?;
+                if zero[ri] {
+                    parts.push(format!("{sub_name}()"));
+                } else {
+                    parts.push(format!(
+                        "{sub_name}({})",
+                        self.emit_constructor_arg(components[s], ctx)?
+                    ));
+                }
+            } else {
+                for &c in &components[s..s + k] {
+                    parts.push(self.emit_constructor_arg(c, ctx)?);
+                }
+            }
+        }
+        let name = self.vector_ctor_name(ty, components, ctx)?;
+        let sep = self.comma_sep();
+        Ok(Some(format!("{name}({})", parts.join(sep))))
     }
 
     /// Emit an expression that is the base of a postfix operation in the
@@ -2891,10 +3166,100 @@ pub(super) fn compose_is_splat(
         .all(|&c| exprs_splat_eq(first_expr, &arena[c]))
 }
 
-/// Bit-exact comparison of two expressions for splat-collapse purposes.
-/// Structural equality check tailored for splat detection.  Allows
-/// literals to compare by bit pattern (handling `-0.0` vs `+0.0`
-/// correctly) while falling back to `==` for non-literals.
+/// When a matrix `Compose` is built from one explicit scalar-column `Compose`
+/// per column (`mat2x2f(vec2f(a,b), vec2f(c,d))`), return the flattened scalar
+/// component handles in column-major order so the matrix can be emitted in the
+/// shorter all-scalar form `mat2x2f(a,b,c,d)`.
+///
+/// Returns `None` (keep column form) unless EVERY column is an
+/// `Expression::Compose` of a `Vector` type whose component count equals the
+/// matrix row count.  A `vecR` built from exactly `R` Compose-components is
+/// necessarily `R` scalars - any vector sub-component (`vec3(v.xy, z)`) would
+/// lower the count below `R` - so this structural test alone guarantees scalar
+/// columns with no per-component type lookup, and it works for both the
+/// function-local and global-constant arenas.  Splat columns (`Splat`) and
+/// variable / let-bound / swizzle columns are deliberately excluded (not a
+/// scalar `Compose`), keeping the rewrite a strict value-preserving regroup of
+/// the same scalar leaves the column form already emits.  Both forms lower to
+/// byte-identical naga IR (incl. f16 and negative leaves).
+pub(super) fn matrix_flatten_scalars(
+    ty: naga::Handle<naga::Type>,
+    components: &[naga::Handle<naga::Expression>],
+    types: &naga::UniqueArena<naga::Type>,
+    arena: &naga::Arena<naga::Expression>,
+) -> Option<Vec<naga::Handle<naga::Expression>>> {
+    let naga::TypeInner::Matrix { columns, rows, .. } = types[ty].inner else {
+        return None;
+    };
+    if components.len() != columns as usize {
+        return None;
+    }
+    let rows = rows as usize;
+    let mut flat = Vec::with_capacity(columns as usize * rows);
+    for &col in components {
+        let naga::Expression::Compose {
+            ty: col_ty,
+            components: sub,
+        } = &arena[col]
+        else {
+            return None;
+        };
+        let naga::TypeInner::Vector { size, .. } = types[*col_ty].inner else {
+            return None;
+        };
+        if size as usize != rows || sub.len() != rows {
+            return None;
+        }
+        flat.extend_from_slice(sub);
+    }
+    Some(flat)
+}
+
+/// `true` only for a literal whose bit pattern is exactly `+0` (or integer
+/// `0`).  STRICTER than `literal_is_zero`: `-0.0` (bits `0x8000_0000` / `0x8000`)
+/// returns `false`, because folding it to a zero-value constructor (`vec2f()`)
+/// would silently flip the sign bit (`1.0/-0.0 == -inf` vs `+inf`).  `Bool`
+/// excluded so the fold never removes a `false` literal a constructor needs.
+fn literal_is_strict_numeric_zero(l: naga::Literal) -> bool {
+    use naga::Literal as L;
+    match l {
+        L::F16(v) => v.to_bits() == 0,
+        L::F32(v) => v.to_bits() == 0,
+        L::F64(v) => v.to_bits() == 0,
+        L::AbstractFloat(v) => v.to_bits() == 0,
+        L::I32(v) => v == 0,
+        L::U32(v) => v == 0,
+        L::I64(v) => v == 0,
+        L::U64(v) => v == 0,
+        L::AbstractInt(v) => v == 0,
+        L::Bool(_) => false,
+    }
+}
+
+/// `true` when `h` is a vector/matrix component tree that is provably all `+0`
+/// (strict-zero `Literal`, `ZeroValue`, or `Splat` / `Compose` of those).
+/// Drives the zero-value-constructor fold `vec2f(0,0)` -> `vec2f()`.
+fn compose_is_all_zero(
+    h: naga::Handle<naga::Expression>,
+    arena: &naga::Arena<naga::Expression>,
+) -> bool {
+    use naga::Expression as E;
+    match &arena[h] {
+        E::Literal(l) => literal_is_strict_numeric_zero(*l),
+        E::ZeroValue(_) => true,
+        E::Splat { value, .. } => compose_is_all_zero(*value, arena),
+        E::Compose { components, .. } => components.iter().all(|&c| compose_is_all_zero(c, arena)),
+        _ => false,
+    }
+}
+
+/// Value-equality of two expressions for splat/run-collapse purposes.
+/// Deliberately conservative: `true` ONLY for two `Literal`s with identical
+/// bit patterns (so `-0.0` and `+0.0` differ) or two `Constant`/`Override`/
+/// `ZeroValue`s with the same handle/type.  EVERY other pair - `Load`,
+/// `CallResult`, `Binary`, `FunctionArgument`, ... - returns `false`, so
+/// impure or reorder-sensitive components can never be collapsed into a single
+/// shared value.
 fn exprs_splat_eq(a: &naga::Expression, b: &naga::Expression) -> bool {
     use naga::Expression as E;
     match (a, b) {
