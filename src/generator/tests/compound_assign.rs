@@ -320,3 +320,158 @@ fn negated_float_equality_still_flips() {
     );
     assert_valid_wgsl(&out);
 }
+
+// MARK: Increment / decrement statements
+
+#[test]
+fn increment_i32_in_for_update() {
+    // `i = i + 1` in a for-update clause becomes the shorter `i++`.
+    let out = compact(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        @compute @workgroup_size(1) fn main() {
+            var s = 0i;
+            for (var i = 0i; i < 4; i = i + 1) { s = s + i; }
+            buf[0] = s;
+        }
+        "#,
+    );
+    assert!(
+        out.contains("i++"),
+        "for-update i=i+1 should become i++: {out}"
+    );
+    assert!(
+        !out.contains("i+=1") && !out.contains("i += 1"),
+        "no compound +=1 should remain: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn decrement_i32_in_for_update() {
+    let out = compact(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        @compute @workgroup_size(1) fn main() {
+            var s = 0i;
+            for (var i = 4i; i > 0; i = i - 1) { s = s + i; }
+            buf[0] = s;
+        }
+        "#,
+    );
+    assert!(
+        out.contains("i--"),
+        "for-update i=i-1 should become i--: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn increment_u32_in_loop_body() {
+    let out = compact(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<u32>;
+        @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) n: u32) {
+            var s = 0u;
+            for (var i = 0u; i < n; i = i + 1u) { s = s + 1u; }
+            buf[0] = s;
+        }
+        "#,
+    );
+    assert!(out.contains("s++"), "u32 s=s+1u should become s++: {out}");
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn increment_storage_array_element() {
+    let out = compact(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        @compute @workgroup_size(1) fn main() {
+            buf[0] = buf[0] + 1;
+            buf[1] = buf[1] - 1;
+        }
+        "#,
+    );
+    assert!(
+        out.contains("++"),
+        "buf[0]=buf[0]+1 should become buf[0]++: {out}"
+    );
+    assert!(
+        out.contains("--"),
+        "buf[1]=buf[1]-1 should become buf[1]--: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn no_increment_for_vector_plus_one() {
+    // `v + 1` broadcasts a scalar; `v++` is NOT valid WGSL for vectors.
+    let out = compact(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) g: vec3u) {
+            var v = vec2(i32(g.x), i32(g.y));
+            v = v + 1;
+            buf[0] = v.x + v.y;
+        }
+        "#,
+    );
+    assert!(!out.contains("++"), "vector += 1 must NOT become ++: {out}");
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn no_increment_for_float_plus_one() {
+    let out = compact(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<f32>;
+        @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) n: u32) {
+            var s = 0.0;
+            for (var i = 0u; i < n; i = i + 1u) { s = s + 1.0; }
+            buf[0] = s;
+        }
+        "#,
+    );
+    assert!(
+        !out.contains("s++"),
+        "float += 1.0 must NOT become ++: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn no_increment_for_step_of_two() {
+    let out = compact(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) n: u32) {
+            var s = 0i;
+            for (var i = 0u; i < n; i = i + 1u) { s = s + 2; }
+            buf[0] = s;
+        }
+        "#,
+    );
+    assert!(!out.contains("s++"), "+= 2 must NOT become ++: {out}");
+    assert!(
+        out.contains("s+=2") || out.contains("s += 2"),
+        "+= 2 should stay compound: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn atomic_add_one_not_incremented() {
+    let out = compact(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> a: atomic<i32>;
+        @compute @workgroup_size(1) fn main() { atomicAdd(&a, 1); }
+        "#,
+    );
+    assert!(
+        out.contains("atomicAdd"),
+        "atomicAdd must be preserved: {out}"
+    );
+    assert!(!out.contains("++"), "atomic add must not become ++: {out}");
+    assert_valid_wgsl(&out);
+}

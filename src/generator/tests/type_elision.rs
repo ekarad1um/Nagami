@@ -85,8 +85,19 @@ fn var_keeps_type_when_first_use_in_nested_block() {
     let out = compact(
         "fn f(c: bool) -> f32 { var x: f32; if c { x = 1.0; } else { x = 2.0; } return x; }",
     );
-    // var first used inside if-block - cannot be deferred.
-    assert!(out.contains("var x:f32;"), "should keep type: {out}");
+    assert_valid_wgsl(&out);
+    // var first used inside the if-block cannot be deferred into a branch
+    // (it would fall out of scope before `return x`), so it keeps a
+    // standalone declaration.  The zero-init now renders as the shorter
+    // `=0f` form; the branch stores must stay plain assignments.
+    assert!(
+        out.contains("var x=0f;") || out.contains("var x:f32;"),
+        "should keep a standalone declaration: {out}"
+    );
+    assert!(
+        !out.contains("var x=1") && !out.contains("var x=2"),
+        "must not defer declaration into a branch: {out}"
+    );
 }
 
 #[test]
@@ -314,4 +325,65 @@ fn global_splat_elides_const_type_annotation() {
         "const with Splat RHS should elide type annotation: {out}"
     );
     assert_valid_wgsl(&out);
+}
+
+// MARK: Zero-init var rendering (shorter of `:type` vs `=0i`)
+
+#[test]
+fn for_counter_and_scalar_use_literal_zero_init_end_to_end() {
+    // Full pipeline strips zero inits, so the for-counter reaches the
+    // bare-declaration path.  An un-aliased i32 must render the cheaper
+    // `= 0i` instead of `: i32`, and the update clause must use `++`.
+    let out = compact_with_passes(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        @compute @workgroup_size(1) fn main() {
+            var s = 0i;
+            for (var r = 0i; r < 4; r = r + 1) {
+                for (var c = 0i; c < 4; c = c + 1) { s = s + r * c; }
+            }
+            buf[0] = s;
+        }
+        "#,
+        Profile::Max,
+    );
+    assert!(
+        out.contains("= 0i"),
+        "i32 zero-init should use `= 0i`: {out}"
+    );
+    assert!(out.contains("++"), "counter update should use `++`: {out}");
+    assert!(!out.contains("+= 1"), "no `+= 1` should remain: {out}");
+    assert!(
+        !out.contains(": i32"),
+        "i32 zero-init must not regress to `: i32`: {out}"
+    );
+}
+
+#[test]
+fn deferred_zero_accumulator_uses_type_form_end_to_end() {
+    // A deferred var whose first store writes the zero value drops the
+    // store and relies on zero-init: `var acc = vec3f(0)` -> `var acc: vec3f`
+    // (the annotation is shorter than the explicit zero construct).
+    let out = compact_with_passes(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<f32>;
+        @compute @workgroup_size(1)
+        fn main(@builtin(local_invocation_index) n: u32) {
+            if n > 0u {
+                var acc = vec3(0.0, 0.0, 0.0);
+                for (var i = 0u; i < n; i = i + 1u) { acc = acc + vec3f(1.0); }
+                buf[0] = acc.x;
+            }
+        }
+        "#,
+        Profile::Max,
+    );
+    assert!(
+        out.contains(": vec3f"),
+        "deferred zero accumulator should use `: vec3f`: {out}"
+    );
+    assert!(
+        !out.contains("= vec3f("),
+        "explicit zero construct should be dropped: {out}"
+    );
 }

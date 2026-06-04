@@ -864,3 +864,331 @@ fn by_value_local_arg_call_bound_across_write_to_read_local() {
     );
     assert_valid_wgsl(&out);
 }
+
+// MARK: de Morgan equality fold (`!(a == b)` -> `a != b`)
+
+#[test]
+fn not_equal_folds_to_not_equal_operator() {
+    let out = compact_with_passes(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) n: u32) {
+            let a = i32(n);
+            let p = !(a == 2);
+            buf[0] = select(0, 1, p);
+        }
+        "#,
+        Profile::Max,
+    );
+    assert!(out.contains("!="), "!(a==b) should fold to a!=b: {out}");
+    assert!(
+        !out.contains("!("),
+        "the `!(` wrapper should be gone: {out}"
+    );
+}
+
+#[test]
+fn not_notequal_folds_to_equal_operator() {
+    let out = compact_with_passes(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) n: u32) {
+            let a = i32(n);
+            let p = !(a != 2);
+            buf[0] = select(0, 1, p);
+        }
+        "#,
+        Profile::Max,
+    );
+    assert!(out.contains("=="), "!(a!=b) should fold to a==b: {out}");
+    assert!(
+        !out.contains("!("),
+        "the `!(` wrapper should be gone: {out}"
+    );
+}
+
+#[test]
+fn negated_equality_folds_under_outer_comparison() {
+    // The folded `a != b` becomes an operand of an outer comparison.  WGSL
+    // forbids mixing `==`/`!=` without parentheses, so the emitter must
+    // parenthesise the folded Binary (an emit-time fold could not, having
+    // lost the comparison shape).  `compact_with_passes` re-validates the
+    // output, and the fold must still fire.
+    let out = compact_with_passes(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) g: vec3u) {
+            let a = i32(g.x); let b = i32(g.y); let d = i32(g.z);
+            let r = (!(a == b)) == (d > 0);
+            buf[0] = select(0, 1, r);
+        }
+        "#,
+        Profile::Max,
+    );
+    assert!(
+        out.contains("!="),
+        "inner equality should fold to !=: {out}"
+    );
+    assert!(!out.contains("!("), "no `!(` wrapper should survive: {out}");
+}
+
+#[test]
+fn negated_vector_equality_folds_componentwise() {
+    let out = compact_with_passes(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) g: vec3u) {
+            let va = vec2(i32(g.x), i32(g.y));
+            let vb = vec2(1, 2);
+            let r = !(va == vb);
+            buf[0] = select(0, 1, all(r));
+        }
+        "#,
+        Profile::Max,
+    );
+    assert!(
+        out.contains("!="),
+        "vector !(va==vb) should fold to va!=vb: {out}"
+    );
+}
+
+// MARK: short-circuit full collapse + idempotence (forwarding)
+
+#[test]
+fn short_circuit_guard_chain_fully_collapses_and_is_idempotent() {
+    // A 3-condition guard collapses to a single `if (a && b && c) { .. }`
+    // with the bool temp eliminated (no `var`/store, no `else { = false }`),
+    // and re-minifying the result does not grow it (a stable fixed point).
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) g: vec3u) {
+            let a = i32(g.x);
+            let b = i32(g.y);
+            let c = i32(g.z);
+            if (a < 10 && b < 20 && c < 30) { buf[0] = a + b + c; }
+        }
+    "#;
+    let out1 = compact_with_passes(src, Profile::Max);
+    assert!(
+        out1.contains("&&"),
+        "conditions should fold to `&&`: {out1}"
+    );
+    assert!(
+        !out1.contains("= false") && !out1.contains("=false"),
+        "the lowered `else {{ t = false }}` ladder must be gone: {out1}"
+    );
+    assert_eq!(
+        out1.matches("if").count(),
+        1,
+        "the chain should collapse to a single `if`: {out1}"
+    );
+    let out2 = compact_with_passes(&out1, Profile::Max);
+    assert!(
+        out2.len() <= out1.len(),
+        "re-minifying must not grow (idempotence): {} -> {} bytes\n  {out1}\n  {out2}",
+        out1.len(),
+        out2.len()
+    );
+}
+
+#[test]
+fn short_circuit_value_position_left_lowered_and_idempotent() {
+    // A value-position `&&` whose result feeds an EXPRESSION (`select`/`|`)
+    // is left lowered (folding it would create a non-idempotent `&&` store
+    // the forwarder cannot collapse), so re-minifying does not grow.
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) g: vec3u) {
+            let a = i32(g.x);
+            let b = i32(g.y);
+            let hit = a < 10 && b < 20;
+            buf[0] = select(0, 1, hit) | 2;
+        }
+    "#;
+    let out1 = compact_with_passes(src, Profile::Max);
+    let out2 = compact_with_passes(&out1, Profile::Max);
+    assert!(
+        out2.len() <= out1.len(),
+        "value-position && must be idempotent: {} -> {} bytes\n  {out1}\n  {out2}",
+        out1.len(),
+        out2.len()
+    );
+}
+
+// MARK: short-circuit forwarding correctness regressions
+
+#[test]
+fn forward_copy_chain_preserves_value_not_zero_init() {
+    // Regression: forwarding a chain where one local copies another
+    // (`var b = a;`) must not resolve redirects non-transitively and orphan
+    // the intermediate load (which would read the removed local's zero-init).
+    // The write must stay `g[k] + 1`, never a bare 0.
+    let out = compact_with_passes(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> g: array<i32>;
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {
+            let k = id.x;
+            var a = g[k] + 1;
+            var b = a;
+            g[k] = b;
+        }
+        "#,
+        Profile::Max,
+    );
+    assert!(
+        out.contains("++") || out.contains("+ 1") || out.contains("+1"),
+        "forwarded copy chain must preserve g[k]+1 (not zero-init 0): {out}"
+    );
+}
+
+#[test]
+fn short_circuit_value_used_in_if_keeps_body_reachable() {
+    // Regression: `var ok = a && b; if ok {..}` lowers to an
+    // inner && temp PLUS the `ok` copy; forwarding both must fold to
+    // `if (a && b) {..}`, never collapse to a never-assigned `var ok: bool;
+    // if ok {..}` (which reads false and makes the body dead).
+    let out = compact_with_passes(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> g: i32;
+        @compute @workgroup_size(1) fn main() {
+            var ok = g > 0 && g < 10;
+            if (ok) { g = 1; }
+        }
+        "#,
+        Profile::Max,
+    );
+    assert!(
+        out.contains("&&"),
+        "guard must keep its `&&` condition: {out}"
+    );
+    assert!(
+        !out.contains(": bool") && !out.contains(":bool"),
+        "no never-assigned bool temp should remain (dead-body bug): {out}"
+    );
+}
+
+#[test]
+fn mixed_and_or_logical_is_parenthesized() {
+    // Regression: WGSL gives `&&`/`||` no relative precedence, so a
+    // collapsed `a || (b && c)` guard must keep explicit parens (naga is
+    // permissive and would accept the bare form, so check the text).
+    let out = compact_with_passes(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> g: f32;
+        @fragment fn main(@location(0) p: vec4f) -> @location(0) f32 {
+            if (p.x > 2.0 || (p.y > 1.0 && p.z > 1.0)) { g = 7.0; }
+            return g;
+        }
+        "#,
+        Profile::Max,
+    );
+    assert!(
+        out.contains("||(") || out.contains("|| ("),
+        "`&&` inside `||` must be parenthesized: {out}"
+    );
+}
+
+#[test]
+fn bitwise_operand_of_logical_is_parenthesized() {
+    // Regression: WGSL's `&&`/`||` operands
+    // are `relational_expression`s, which cannot contain a bitwise
+    // expression, so a `bool`-typed `|`/`&` operand of `&&`/`||` must be
+    // parenthesized.  naga's frontend is permissive and round-trips the bare
+    // form, but Tint/Dawn reject "mixing '|' and '&&' requires parenthesis".
+    // The short-circuit re-sugar newly collapses such guards into a single
+    // logical `Binary` with a bitwise child, so the emitter must wrap it.
+    // The `fn` operands are bool atoms, so the only `)&&` / `)||` in the
+    // output is the bitwise wrap; the bare bug would emit `b&&C` / `d||E`.
+    let out = compact_with_passes(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> g: i32;
+        fn h(a: bool, b: bool, c: bool) -> bool { return (a | b) && c; }
+        fn k(a: bool, b: bool, c: bool) -> bool { return (a & b) || c; }
+        @compute @workgroup_size(1) fn main() {
+            if (h(g > 0, g > 1, g > 2)) { g = 1; }
+            if (k(g > 3, g > 4, g > 5)) { g = 2; }
+        }
+        "#,
+        Profile::Max,
+    );
+    // Whitespace-normalize so the check is independent of beautify mode:
+    // the wrapped bitwise produces `)&&` / `)||`; the bare bug emits a bare
+    // identifier (`b&&` / `d||`) instead.
+    let compact: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains(")&&"),
+        "`|` operand of `&&` must be parenthesized (no bare `b|c&&d`): {out}"
+    );
+    assert!(
+        compact.contains(")||"),
+        "`&` operand of `||` must be parenthesized (no bare `b&c||d`): {out}"
+    );
+}
+
+#[test]
+fn loop_invariant_not_forwarded_into_nested_loop_guard() {
+    // Regression: `forward_single_store_locals` must only forward a local
+    // whose store and load are in the SAME block.  A single-store local set
+    // in an outer block and read in an INNER loop's guard must NOT be
+    // forwarded - folding the invariant into the guard (`1 < 10` -> `true`)
+    // would let dead-branch strip the loop's only exit, leaving a bare
+    // `loop {}` that Tint rejects ("loop does not exit").  The guard `1 < n`
+    // (a comparison against the still-live variable) must survive.
+    let out = compact_with_passes(
+        r#"
+        @fragment fn main() -> @location(0) vec4f {
+            var r : i32 = 0;
+            var c : i32 = 0;
+            loop {
+                if (c < 1) {} else { break; }
+                if (r >= 0) { break; }
+                r = r + 1;
+                var n : i32 = 10;
+                var d : i32 = 0;
+                loop {
+                    let x = n;
+                    if (1 < x) {} else { break; }
+                    d = d + 1;
+                }
+                c = c + 1;
+            }
+            return vec4f(f32(r));
+        }
+        "#,
+        Profile::Max,
+    );
+    let compact: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("1<"),
+        "inner loop guard must survive (invariant not forwarded into it): {out}"
+    );
+}
+
+#[test]
+fn read_before_write_local_not_forwarded() {
+    // Regression: forward_single_store_locals must key a forward on the
+    // load's MATERIALISATION (its `Emit`), not on a later consuming
+    // statement.  In `let snap = t; t = E; return snap;` the `Load(t)` is
+    // emitted BEFORE the store, so `snap` holds t's zero-init value;
+    // forwarding it to `E` would silently miscompile the stale read.  The
+    // distinctive stored literal is dead (t is unread after `snap`) and must
+    // never reach the output - its presence would mean `snap` was forwarded.
+    let out = compact_with_passes(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> out: u32;
+        fn f() -> u32 {
+            var t: u32;
+            let snap = t;
+            t = 12345u;
+            return snap;
+        }
+        @compute @workgroup_size(1) fn main() { out = f(); }
+        "#,
+        Profile::Max,
+    );
+    assert!(
+        !out.contains("12345"),
+        "read-before-write `snap` must stay the zero-init value, not the \
+         forwarded store: {out}"
+    );
+}

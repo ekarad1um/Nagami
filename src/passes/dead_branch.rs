@@ -34,38 +34,450 @@ use std::collections::{HashMap, HashSet};
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
 
-/// `true` when `expr` is a "value-only declarative" expression: one
-/// that names a value in the function's permanent scope (Literal,
-/// Constant, Override, ZeroValue, FunctionArgument, GlobalVariable,
-/// LocalVariable) and carries no implicit `let` binding scoped to a
-/// statement.  Tightens `expression_needs_emit` for the short-circuit
-/// re-sugar invariant: `!expression_needs_emit` would also pass for
-/// `CallResult`/`AtomicResult`/etc., which `single_store_info` already
-/// excludes for orthogonal reasons (the originating Call would be a
-/// second statement in the branch), but mirroring the assertion to
-/// the documented declarative-only invariant survives future
-/// relaxations of `single_store_info` that might no longer guarantee
-/// the exclusion.
-fn is_value_only_declarative(expr: &naga::Expression) -> bool {
-    let result = matches!(
-        expr,
-        naga::Expression::Literal(_)
-            | naga::Expression::Constant(_)
-            | naga::Expression::Override(_)
-            | naga::Expression::ZeroValue(_)
-            | naga::Expression::FunctionArgument(_)
-            | naga::Expression::GlobalVariable(_)
-            | naga::Expression::LocalVariable(_)
+/// Like [`single_store_info`], but ALSO accepts a leading run of `Emit`
+/// statements before the single trailing `Store`.  Returns the store's
+/// `(pointer, value)` on match.
+///
+/// Used by the short-circuit re-sugar to recognise a branch that computes
+/// an intermediate value (`{ let _e = a < b; ...; d = _e; }`) before
+/// storing it.  Those leading `Emit`s are hoisted into the parent block by
+/// [`hoist_leading_emits`], so they evaluate UNCONDITIONALLY after the
+/// fold.  That is sound: `Emit` expressions are side-effect-free (every
+/// side-effecting / control-flow construct is a distinct `Statement` kind
+/// that this recogniser rejects via the `_ => None` arm), WGSL bounds-
+/// checks out-of-range indexing rather than trapping, the hoisted value is
+/// discarded by the `&&` / `||` whenever the guard fails, and lifting a
+/// computation OUT of a conditional can only reduce non-uniformity (it can
+/// never push a derivative / implicit-LOD sample into non-uniform control
+/// flow).  Yields `None` for any non-`Emit`/`Store` statement, a second
+/// store, zero stores, or any statement after the store.
+fn store_with_leading_emits(
+    block: &naga::Block,
+) -> Option<(
+    naga::Handle<naga::Expression>,
+    naga::Handle<naga::Expression>,
+)> {
+    let mut store = None;
+    for stmt in block.iter() {
+        match stmt {
+            naga::Statement::Emit(_) => {
+                if store.is_some() {
+                    return None; // an Emit after the store
+                }
+            }
+            naga::Statement::Store { pointer, value } => {
+                if store.is_some() {
+                    return None; // a second store
+                }
+                store = Some((*pointer, *value));
+            }
+            _ => return None, // a side-effecting or control-flow statement
+        }
+    }
+    store
+}
+
+/// `true` when `cond` is a constant `bool` literal.  The short-circuit
+/// re-sugar skips such conditions: `const_fold` runs before this pass, so
+/// a constant guard means the whole `if` is dead-branch-eliminable (the
+/// strictly better rewrite).  Re-sugaring it instead to `var d = false &&
+/// x;` would block that elimination and can leave a larger residue (e.g. a
+/// dead loop gated on a zero-init bool the loop-elimination cannot prove).
+fn is_const_bool(
+    cond: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+) -> bool {
+    matches!(
+        expressions[cond],
+        naga::Expression::Literal(naga::Literal::Bool(_))
+    )
+}
+
+/// Move the leading `Emit` statements of a re-sugared accept arm into
+/// `rebuilt` (the parent block), dropping its trailing `Store` - whose
+/// value has become the right operand of the `&&` / `||`.  The arm shape
+/// was already validated by [`store_with_leading_emits`].
+fn hoist_leading_emits(rebuilt: &mut naga::Block, accept: naga::Block) {
+    for (stmt, span) in accept.span_into_iter() {
+        if matches!(stmt, naga::Statement::Emit(_)) {
+            rebuilt.push(stmt, span);
+        }
+    }
+}
+
+// MARK: Single-store local forwarding (register promotion)
+
+/// Forward a local that is assigned exactly once and otherwise only read
+/// (`var t; ...; t = E; ...; use(t)`): redirect every `Load(t)` to the
+/// stored value `E` and drop the store, leaving `t` dead.
+///
+/// This collapses the per-join `&&`/`||` re-sugaring - `t1 = a && b;
+/// t2 = t1 && c; if t2 {..}` - all the way to `if (a && b && c) {..}`, and
+/// (crucially) makes that re-sugaring IDEMPOTENT: re-parsing `if (a && b
+/// && c)` re-lowers to fresh single-use temps that fold straight back to
+/// the same shape, a stable fixed point.  It is also a useful general
+/// optimisation (single-def/single-use locals vanish).
+///
+/// Soundness gates:
+///  * `t` has exactly one whole-variable store (value `E`) and every other
+///    reference is a `Load(t)` - no element access, pointer-arg, or second
+///    store.  Verified by an EXHAUSTIVE census (`total_refs == 1 + loads`)
+///    built from the canonical handle visitors, so any missed reference
+///    fails the equality and bails.
+///  * `t` has no initialiser.
+///  * the store and the materialising `Emit` of every load are top-level
+///    statements of the SAME block, store first - so each load observes the
+///    stored value, never a stale / pre-store (zero-init) one.
+///
+/// `E`'s evaluation position is unchanged (its `Emit` stays put; the store
+/// captured `E` immediately after that `Emit`), so the forwarded value
+/// equals what `t` held.  The generator's `must_bind_loads` still guards
+/// any load-versus-write hazard when it later inlines `E`.
+///
+/// This pass only redirects loads and removes the store; it leaves the
+/// now-dead local declaration and the orphaned `Load(t)` expression in the
+/// arena.  Pruning them is delegated to the downstream dead-local / dead-
+/// expression cleanup (e.g. [`super::load_dedup`]'s dead-init removal),
+/// which runs later in the fixpoint - so reordering or removing that pass
+/// would leave a stray `var t;` (a size regression only, never a
+/// miscompile).
+fn forward_single_store_locals(function: &mut naga::Function) -> bool {
+    let nlocals = function.local_variables.len();
+    if nlocals == 0 {
+        return false;
+    }
+
+    // === Exhaustive per-local reference census ===
+    let mut total_refs = vec![0u32; nlocals];
+    let mut whole_stores = vec![0u32; nlocals];
+    let mut store_value: Vec<Option<naga::Handle<naga::Expression>>> = vec![None; nlocals];
+    let mut load_count = vec![0usize; nlocals];
+    // `min_consumer[h]` = the lowest-indexed EXPRESSION that references `h`
+    // as an operand (`u32::MAX` if none).  The re-sugared `&&`/`||` Binary
+    // is appended at the END of the arena, so forwarding a `Load` to it can
+    // make an earlier expression reference a later handle - a forward
+    // reference naga rejects.  Forwarding is allowed only when the stored
+    // value precedes every EXPRESSION consumer; statement consumers impose
+    // no arena-order constraint, and their value-correctness rests on the
+    // store-before-load-`Emit` gate in `collect_forwards`, not on this guard.
+    let mut min_consumer = vec![u32::MAX; function.expressions.len()];
+    {
+        let exprs = &function.expressions;
+        let local_index = |h: naga::Handle<naga::Expression>| -> Option<usize> {
+            match exprs[h] {
+                naga::Expression::LocalVariable(l) => Some(l.index()),
+                _ => None,
+            }
+        };
+        for (hc, expr) in exprs.iter() {
+            if let naga::Expression::Load { pointer } = expr
+                && let Some(t) = local_index(*pointer)
+            {
+                load_count[t] += 1;
+            }
+            super::expr_util::visit_expression_children(expr, |child| {
+                if let Some(t) = local_index(child) {
+                    total_refs[t] += 1;
+                }
+                let slot = &mut min_consumer[child.index()];
+                *slot = (*slot).min(hc.index() as u32);
+            });
+        }
+        super::expr_util::visit_block_expression_handles(&function.body, false, &mut |h| {
+            if let Some(t) = local_index(h) {
+                total_refs[t] += 1;
+            }
+        });
+        count_whole_stores(&function.body, exprs, &mut whole_stores, &mut store_value);
+    }
+
+    let mut candidate = vec![false; nlocals];
+    for (lh, lvar) in function.local_variables.iter() {
+        let t = lh.index();
+        // Single store AND single load: forwarding inlines `E` at exactly
+        // one site, so it always shrinks (the `var` + store vanish) and
+        // never duplicates `E` - a multi-load forward could, growing output.
+        if whole_stores[t] == 1
+            && load_count[t] == 1
+            && total_refs[t] as usize == 2
+            && lvar.init.is_none()
+        {
+            candidate[t] = true;
+        }
+    }
+    if !candidate.iter().any(|&c| c) {
+        return false;
+    }
+
+    // === Locate the forwards that satisfy block-local dominance ===
+    let mut redirects: HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>> =
+        HashMap::new();
+    let mut remove_store = vec![false; nlocals];
+    let census = ForwardCensus {
+        candidate: &candidate,
+        load_count: &load_count,
+        store_value: &store_value,
+        min_consumer: &min_consumer,
+    };
+    collect_forwards(
+        &function.body,
+        &function.expressions,
+        &census,
+        &mut redirects,
+        &mut remove_store,
     );
-    // Invariant: this set is a subset of `!expression_needs_emit`.
-    // A variant added here that needs an Emit slot would silently
-    // break the short-circuit re-sugar.
-    debug_assert!(
-        !result || !super::expr_util::expression_needs_emit(expr),
-        "is_value_only_declarative classified {expr:?} as declarative but \
-         expression_needs_emit reports it requires an Emit slot",
-    );
-    result
+    if redirects.is_empty() {
+        return false;
+    }
+
+    // === Apply: redirect loads to the stored value, then drop the stores ===
+    for (_, expr) in function.expressions.iter_mut() {
+        let _ = super::expr_util::try_map_expression_handles_in_place(expr, &mut |h| {
+            Some(*redirects.get(&h).unwrap_or(&h))
+        });
+    }
+    remap_block_handles(&mut function.body, &redirects);
+    remove_forwarded_stores(&mut function.body, &function.expressions, &remove_store);
+    true
+}
+
+/// Count whole-variable `Store`s per local (recording the lone value) so
+/// [`forward_single_store_locals`] can spot single-def locals.
+fn count_whole_stores(
+    block: &naga::Block,
+    exprs: &naga::Arena<naga::Expression>,
+    whole_stores: &mut [u32],
+    store_value: &mut [Option<naga::Handle<naga::Expression>>],
+) {
+    for stmt in block.iter() {
+        match stmt {
+            naga::Statement::Store { pointer, value } => {
+                if let naga::Expression::LocalVariable(l) = exprs[*pointer] {
+                    whole_stores[l.index()] += 1;
+                    store_value[l.index()] = Some(*value);
+                }
+            }
+            naga::Statement::If { accept, reject, .. } => {
+                count_whole_stores(accept, exprs, whole_stores, store_value);
+                count_whole_stores(reject, exprs, whole_stores, store_value);
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases {
+                    count_whole_stores(&case.body, exprs, whole_stores, store_value);
+                }
+            }
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => {
+                count_whole_stores(body, exprs, whole_stores, store_value);
+                count_whole_stores(continuing, exprs, whole_stores, store_value);
+            }
+            naga::Statement::Block(inner) => {
+                count_whole_stores(inner, exprs, whole_stores, store_value);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Read-only census slices threaded through [`collect_forwards`].
+struct ForwardCensus<'a> {
+    candidate: &'a [bool],
+    load_count: &'a [usize],
+    store_value: &'a [Option<naga::Handle<naga::Expression>>],
+    min_consumer: &'a [u32],
+}
+
+/// `true` when `value` is a bare `Load` of a forwarding-candidate local -
+/// i.e. a copy `var t = c;`.  Forwarding such a `t` in the same pass as
+/// `c` would chain two redirects (`Load(t) -> Load(c) -> E_c`) that the
+/// non-transitive apply cannot follow, so the caller defers it.
+fn is_candidate_copy(
+    value: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+    candidate: &[bool],
+) -> bool {
+    matches!(
+        expressions[value],
+        naga::Expression::Load { pointer }
+            if matches!(
+                expressions[pointer],
+                naga::Expression::LocalVariable(c) if candidate[c.index()]
+            )
+    )
+}
+
+/// For each block, redirect a candidate local's loads to its stored value
+/// when the store and the materialising `Emit` of every load are top-level
+/// statements of THIS block with the store first, so each load observes the
+/// stored value and all of the local's loads are accounted for here.
+fn collect_forwards(
+    block: &naga::Block,
+    exprs: &naga::Arena<naga::Expression>,
+    census: &ForwardCensus<'_>,
+    redirects: &mut HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    remove_store: &mut [bool],
+) {
+    // Top-level candidate stores in this block, keyed by local, with index.
+    let mut store_idx: HashMap<usize, usize> = HashMap::new();
+    for (i, stmt) in block.iter().enumerate() {
+        if let naga::Statement::Store { pointer, .. } = stmt
+            && let naga::Expression::LocalVariable(l) = exprs[*pointer]
+            && census.candidate[l.index()]
+        {
+            store_idx.insert(l.index(), i);
+        }
+    }
+    // A candidate's `Load` is forwardable only when its MATERIALISATION - the
+    // `Emit` that defines it - is a top-level statement of THIS block at an
+    // index after the store.  Keying on the Emit position (not on a later
+    // statement that merely consumes the load) is load-bearing: a
+    // read-before-write `let snap = t; t = E; use(snap)` emits `Load(t)`
+    // BEFORE the store yet consumes it after, so forwarding to `E` would swap
+    // the pre-store / zero-init value `snap` actually holds - a silent
+    // miscompile.  Scanning only this block's own `Emit`s also keeps
+    // forwarding SAME-block: a load materialised in a nested loop / if belongs
+    // to that block and is matched (against an inner store) only when the
+    // recursion below reaches it, never forwarded out to an enclosing store
+    // (which could fold a loop-invariant into a guard and expose an infinite
+    // loop Tint rejects).
+    let mut found: HashMap<usize, HashSet<naga::Handle<naga::Expression>>> = HashMap::new();
+    for (i, stmt) in block.iter().enumerate() {
+        let naga::Statement::Emit(range) = stmt else {
+            continue;
+        };
+        for h in range.clone() {
+            if let naga::Expression::Load { pointer } = exprs[h]
+                && let naga::Expression::LocalVariable(l) = exprs[pointer]
+                && let Some(&si) = store_idx.get(&l.index())
+                && i > si
+            {
+                found.entry(l.index()).or_default().insert(h);
+            }
+        }
+    }
+    for (&t, _) in store_idx.iter() {
+        let Some(loads_here) = found.get(&t) else {
+            continue;
+        };
+        if loads_here.len() == census.load_count[t]
+            && census.load_count[t] > 0
+            && let Some(e) = census.store_value[t]
+            // Forward-reference guard: `e` must precede every expression that
+            // consumes each load, or the redirect makes an earlier expression
+            // reference a later handle (invalid IR).
+            && loads_here
+                .iter()
+                .all(|&lh| (e.index() as u32) < census.min_consumer[lh.index()])
+            // Copy-chain guard: if `e` is a bare `Load` of ANOTHER forwarded
+            // candidate (`var t = c;`), redirecting `Load(t) -> Load(c)` while
+            // `c` is also forwarded would resolve non-transitively - removing
+            // c's store orphans `Load(c)`, which then reads c's zero-init.
+            // Defer `t` to a later sweep, after `c` has been folded into `e`.
+            && !is_candidate_copy(e, exprs, census.candidate)
+        {
+            for &lh in loads_here {
+                redirects.insert(lh, e);
+            }
+            remove_store[t] = true;
+        }
+    }
+    // Recurse into nested blocks (each handled independently).
+    for stmt in block.iter() {
+        match stmt {
+            naga::Statement::If { accept, reject, .. } => {
+                collect_forwards(accept, exprs, census, redirects, remove_store);
+                collect_forwards(reject, exprs, census, redirects, remove_store);
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases {
+                    collect_forwards(&case.body, exprs, census, redirects, remove_store);
+                }
+            }
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => {
+                collect_forwards(body, exprs, census, redirects, remove_store);
+                collect_forwards(continuing, exprs, census, redirects, remove_store);
+            }
+            naga::Statement::Block(inner) => {
+                collect_forwards(inner, exprs, census, redirects, remove_store);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Apply the load-redirect map to every statement (recursively).
+fn remap_block_handles(
+    block: &mut naga::Block,
+    redirects: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+) {
+    for stmt in block.iter_mut() {
+        super::expr_util::remap_statement_handles(stmt, &mut |h| *redirects.get(&h).unwrap_or(&h));
+        match stmt {
+            naga::Statement::If { accept, reject, .. } => {
+                remap_block_handles(accept, redirects);
+                remap_block_handles(reject, redirects);
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases.iter_mut() {
+                    remap_block_handles(&mut case.body, redirects);
+                }
+            }
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => {
+                remap_block_handles(body, redirects);
+                remap_block_handles(continuing, redirects);
+            }
+            naga::Statement::Block(inner) => {
+                remap_block_handles(inner, redirects);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Drop the (now redundant) whole stores of forwarded locals.
+fn remove_forwarded_stores(
+    block: &mut naga::Block,
+    exprs: &naga::Arena<naga::Expression>,
+    remove_store: &[bool],
+) {
+    let original = std::mem::take(block);
+    let mut rebuilt = naga::Block::with_capacity(original.len());
+    for (mut stmt, span) in original.span_into_iter() {
+        match &mut stmt {
+            naga::Statement::If { accept, reject, .. } => {
+                remove_forwarded_stores(accept, exprs, remove_store);
+                remove_forwarded_stores(reject, exprs, remove_store);
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases.iter_mut() {
+                    remove_forwarded_stores(&mut case.body, exprs, remove_store);
+                }
+            }
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => {
+                remove_forwarded_stores(body, exprs, remove_store);
+                remove_forwarded_stores(continuing, exprs, remove_store);
+            }
+            naga::Statement::Block(inner) => {
+                remove_forwarded_stores(inner, exprs, remove_store);
+            }
+            _ => {}
+        }
+        if let naga::Statement::Store { pointer, .. } = &stmt
+            && let naga::Expression::LocalVariable(l) = exprs[*pointer]
+            && remove_store[l.index()]
+        {
+            continue; // drop the forwarded store
+        }
+        rebuilt.push(stmt, span);
+    }
+    *block = rebuilt;
 }
 
 use super::load_dedup::{collect_modified_locals, get_stored_local, is_zero_literal};
@@ -92,14 +504,24 @@ impl Pass for DeadBranchPass {
         for (_, function) in module.functions.iter_mut() {
             // Phase 0: short-circuit re-sugaring runs before the else
             // store phase destroys the lowered patterns.
-            changed += desugar_short_circuit(&mut function.body, &mut function.expressions);
+            let foldable = compute_resugar_foldable(function);
+            changed +=
+                desugar_short_circuit(&mut function.body, &mut function.expressions, &foldable);
+            changed += usize::from(forward_single_store_locals(function));
             changed += eliminate_redundant_else_stores_in_function(function, &const_lits);
             changed +=
                 eliminate_dead_branches(&mut function.body, &function.expressions, &const_lits);
         }
         for entry in module.entry_points.iter_mut() {
-            changed +=
-                desugar_short_circuit(&mut entry.function.body, &mut entry.function.expressions);
+            changed += {
+                let foldable = compute_resugar_foldable(&entry.function);
+                desugar_short_circuit(
+                    &mut entry.function.body,
+                    &mut entry.function.expressions,
+                    &foldable,
+                )
+            };
+            changed += usize::from(forward_single_store_locals(&mut entry.function));
             changed +=
                 eliminate_redundant_else_stores_in_function(&mut entry.function, &const_lits);
             changed += eliminate_dead_branches(
@@ -130,13 +552,70 @@ impl Pass for DeadBranchPass {
 // `Binary(LogicalAnd)` / `Binary(LogicalOr)` expressions so downstream
 // passes (and the generator) see the compact form.
 
+/// Per-local gate for the re-sugar: `true` when a local has exactly one
+/// load and that load has NO expression consumer (only statement consumers
+/// like an `if` condition or a `Store` value).  Folding a join into a
+/// `d = cond && val` store is kept ONLY for such locals, because they are
+/// the ones [`forward_single_store_locals`] can then forward into a
+/// condition without a forward reference.  Value-position results whose
+/// load feeds an expression (`B = false | d`, `select(.., d)`) are left
+/// lowered - exactly as before the re-sugar existed - so the output stays
+/// idempotent (re-minifying never flip-flops between the two shapes).
+fn compute_resugar_foldable(function: &naga::Function) -> Vec<bool> {
+    let nlocals = function.local_variables.len();
+    let exprs = &function.expressions;
+    // Pass 1: `has_expr_consumer[h]` = some EXPRESSION uses `h` as an operand.
+    // (Statement consumers - `if` conditions, `Store`/`Return` values - are
+    // NOT expression operands and so leave this `false`.)
+    let mut has_expr_consumer = vec![false; exprs.len()];
+    for (_, expr) in exprs.iter() {
+        super::expr_util::visit_expression_children(expr, |child| {
+            has_expr_consumer[child.index()] = true;
+        });
+    }
+    // Pass 2: a local is foldable when it has at least one load and NONE of
+    // its loads feed an expression - i.e. every load is a condition / value
+    // that [`forward_single_store_locals`] can later forward into place
+    // without a forward reference.
+    let mut load_count = vec![0usize; nlocals];
+    let mut load_expr_consumed = vec![false; nlocals];
+    for (hc, expr) in exprs.iter() {
+        if let naga::Expression::Load { pointer } = expr
+            && let naga::Expression::LocalVariable(l) = exprs[*pointer]
+        {
+            load_count[l.index()] += 1;
+            if has_expr_consumer[hc.index()] {
+                load_expr_consumed[l.index()] = true;
+            }
+        }
+    }
+    (0..nlocals)
+        .map(|t| load_count[t] >= 1 && !load_expr_consumed[t])
+        .collect()
+}
+
+/// `true` when the whole-variable store through `pointer` targets a local
+/// the re-sugar is allowed to fold (see [`compute_resugar_foldable`]).
+fn store_target_foldable(
+    pointer: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+    foldable: &[bool],
+) -> bool {
+    matches!(
+        expressions[pointer],
+        naga::Expression::LocalVariable(l) if foldable[l.index()]
+    )
+}
+
 /// Recursively fold short-circuit if/else store patterns into
 /// `Binary` logical-and / logical-or expressions.  Returns the number
 /// of replacements performed so the caller can aggregate a change
-/// count across phases.
+/// count across phases.  `foldable` gates which store targets may fold
+/// (see [`compute_resugar_foldable`]).
 fn desugar_short_circuit(
     block: &mut naga::Block,
     expressions: &mut naga::Arena<naga::Expression>,
+    foldable: &[bool],
 ) -> usize {
     let original = std::mem::take(block);
     let mut rebuilt = naga::Block::with_capacity(original.len());
@@ -149,22 +628,22 @@ fn desugar_short_circuit(
         // of silently bypassing recursion.
         match &mut statement {
             naga::Statement::Block(inner) => {
-                changed += desugar_short_circuit(inner, expressions);
+                changed += desugar_short_circuit(inner, expressions, foldable);
             }
             naga::Statement::If { accept, reject, .. } => {
-                changed += desugar_short_circuit(accept, expressions);
-                changed += desugar_short_circuit(reject, expressions);
+                changed += desugar_short_circuit(accept, expressions, foldable);
+                changed += desugar_short_circuit(reject, expressions, foldable);
             }
             naga::Statement::Switch { cases, .. } => {
                 for case in cases.iter_mut() {
-                    changed += desugar_short_circuit(&mut case.body, expressions);
+                    changed += desugar_short_circuit(&mut case.body, expressions, foldable);
                 }
             }
             naga::Statement::Loop {
                 body, continuing, ..
             } => {
-                changed += desugar_short_circuit(body, expressions);
-                changed += desugar_short_circuit(continuing, expressions);
+                changed += desugar_short_circuit(body, expressions, foldable);
+                changed += desugar_short_circuit(continuing, expressions, foldable);
             }
             naga::Statement::Emit(_)
             | naga::Statement::Store { .. }
@@ -194,32 +673,26 @@ fn desugar_short_circuit(
                 accept,
                 reject,
             } => {
-                // Pattern 1 (&&): `if (cond) { d = val; } else { d = false; }`
-                // -> `d = cond && val;`
+                // Pattern 1 (&&): `if cond { [emits...]; d = val; } else { d = false; }`
+                // -> hoist the leading emits, then `d = cond && val;`.
                 //
-                // Scope invariant: the rewritten Binary lives in the
-                // parent block, so both `val_a` and `condition` must
-                // already be in scope there.
-                //   * `condition`: a WGSL `if` evaluates its condition
-                //     before entering either branch, so its `Emit`
-                //     dominates the If and lives in the parent block.
-                //   * `val_a`: `single_store_info` rejects any branch
-                //     with an `Emit`, leaving `val_a` declarative
-                //     (Literal/Constant/Override/ZeroValue/
-                //     FunctionArgument/{Global,Local}Variable - all
-                //     "in scope everywhere").  The explicit
-                //     `is_value_only_declarative` guard mirrors that
-                //     invariant: a malformed IR where the producing
-                //     statement for a `CallResult`/`AtomicResult` was
-                //     removed but the result expression handle survived
-                //     would otherwise pass `single_store_info` (bare
-                //     Store) and the resugared Binary would reference
-                //     an out-of-scope handle.
-                if let (Some((ptr_a, val_a)), Some((ptr_r, val_r))) =
-                    (single_store_info(&accept), single_store_info(&reject))
-                    && same_local_pointer(ptr_a, ptr_r, expressions)
+                // Scope: the rewritten Binary lives in the parent block, so
+                // both operands must be in scope there.  `condition`'s Emit
+                // dominates the If (WGSL evaluates it before either branch).
+                // `val_a` and its intermediates are produced by the accept
+                // arm's leading `Emit`s, which [`hoist_leading_emits`] moves
+                // into the parent ahead of the Binary - see
+                // [`store_with_leading_emits`] for why evaluating them
+                // unconditionally is sound (side-effect-free, bounds-checked,
+                // discarded on guard failure, uniformity-monotonic).  The
+                // reject arm is a single declarative `d = false` store with
+                // nothing to preserve.
+                if !is_const_bool(condition, expressions)
+                    && let Some((ptr_r, val_r)) = single_store_info(&reject)
                     && is_bool_false(expressions, val_r)
-                    && is_value_only_declarative(&expressions[val_a])
+                    && let Some((ptr_a, val_a)) = store_with_leading_emits(&accept)
+                    && same_local_pointer(ptr_a, ptr_r, expressions)
+                    && store_target_foldable(ptr_a, expressions, foldable)
                 {
                     let binary = expressions.append(
                         naga::Expression::Binary {
@@ -229,14 +702,8 @@ fn desugar_short_circuit(
                         },
                         naga::Span::default(),
                     );
-                    // `single_store_info` requires both branches to
-                    // contain exactly one `Store` statement (no `Emit`s,
-                    // no nested control flow), so `accept`/`reject`
-                    // carry no expressions worth preserving here -
-                    // drop both blocks.  The new `Emit` + `Store` above
-                    // already represents the entire post-fold body.
-                    drop(accept);
                     drop(reject);
+                    hoist_leading_emits(&mut rebuilt, accept);
                     rebuilt.push(
                         naga::Statement::Emit(naga::Range::new_from_bounds(binary, binary)),
                         span,
@@ -252,20 +719,22 @@ fn desugar_short_circuit(
                     continue;
                 }
 
-                // Pattern 2 (||): `if (!cond) { d = val; } else { d = true; }`
-                // -> `d = !cond || val;` (rewritten as `inner_cond || val`).
+                // Pattern 2 (||): `if !cond { [emits...]; d = val; } else { d = true; }`
+                // -> hoist the leading emits, then `d = !cond || val;`
+                // (rewritten as `inner_cond || val`).
                 //
-                // Same scope and `is_value_only_declarative` invariants
-                // as pattern 1.  `inner_cond` (the operand of the
-                // LogicalNot) is in scope transitively: the LogicalNot's
-                // Emit dominates the If, and the LogicalNot can only
-                // reference operands whose Emit dominates IT.
+                // Same hoisting rationale and scope invariants as pattern 1.
+                // `inner_cond` (the operand of the LogicalNot condition) is
+                // in scope transitively: the LogicalNot's Emit dominates the
+                // If, and it can only reference operands whose Emit dominates
+                // IT.
                 if let Some(inner_cond) = unwrap_logical_not(condition, expressions)
-                    && let (Some((ptr_a, val_a)), Some((ptr_r, val_r))) =
-                        (single_store_info(&accept), single_store_info(&reject))
-                    && same_local_pointer(ptr_a, ptr_r, expressions)
+                    && !is_const_bool(inner_cond, expressions)
+                    && let Some((ptr_r, val_r)) = single_store_info(&reject)
                     && is_bool_true(expressions, val_r)
-                    && is_value_only_declarative(&expressions[val_a])
+                    && let Some((ptr_a, val_a)) = store_with_leading_emits(&accept)
+                    && same_local_pointer(ptr_a, ptr_r, expressions)
+                    && store_target_foldable(ptr_a, expressions, foldable)
                 {
                     let binary = expressions.append(
                         naga::Expression::Binary {
@@ -275,14 +744,8 @@ fn desugar_short_circuit(
                         },
                         naga::Span::default(),
                     );
-                    // `single_store_info` requires both branches to
-                    // contain exactly one `Store` statement (no `Emit`s,
-                    // no nested control flow), so `accept`/`reject`
-                    // carry no expressions worth preserving here -
-                    // drop both blocks.  The new `Emit` + `Store` above
-                    // already represents the entire post-fold body.
-                    drop(accept);
                     drop(reject);
+                    hoist_leading_emits(&mut rebuilt, accept);
                     rebuilt.push(
                         naga::Statement::Emit(naga::Range::new_from_bounds(binary, binary)),
                         span,
@@ -321,30 +784,24 @@ fn desugar_short_circuit(
 /// Return the pointer and value of a block whose sole statement is a
 /// single `Store`.  Yields `None` when the block contains any `Emit`,
 /// has zero stores, more than one store, or any other statement.
-/// The desugaring caller uses this to recognise the single-assign
-/// arm of the lowered short-circuit patterns AND to guarantee that
-/// no expensive intermediate computation is moved out of the branch.
+///
+/// The short-circuit re-sugar uses this to recognise the REJECT arm of a
+/// lowered pattern - the `d = false` (`&&`) / `d = true` (`||`) constant
+/// store that becomes the operator's short-circuit value.  Rejecting any
+/// `Emit` keeps that arm purely declarative: the constant `false`/`true`
+/// is a `Literal` needing no `Emit`, and there is nothing in the arm to
+/// hoist.  (The ACCEPT arm, by contrast, goes through
+/// [`store_with_leading_emits`], which deliberately permits and hoists
+/// leading `Emit`s - see [`hoist_leading_emits`] for why that is sound.)
 fn single_store_info(
     block: &naga::Block,
 ) -> Option<(
     naga::Handle<naga::Expression>,
     naga::Handle<naga::Expression>,
 )> {
-    // Reject branches that carry any `Emit` range.  An `Emit`
-    // represents intermediate-expression evaluation (e.g., a load, a
-    // binary op, an array index), and the short-circuit re-sugar
-    // would *hoist* every such `Emit` out of the branch in
-    // `hoist_emits`.  Once hoisted, the computation runs
-    // unconditionally - even when WGSL's `&&` / `||` would
-    // short-circuit at runtime.  For the conditional-load case
-    // (`if c { d = arr[i]; } else { d = false; }`) hoisting the
-    // `arr[i]` load makes it observable on every iteration, which is
-    // both wasteful and (for `i` out of bounds) potentially observable
-    // through implementation-defined out-of-range behaviour.  We
-    // therefore restrict the pattern to branches that store a
-    // declarative-only value (literal, FunctionArgument, LocalVariable
-    // ref, GlobalVariable ref, Constant, ZeroValue, ...) where no
-    // `Emit` is required inside the branch in the first place.
+    // Any `Emit` (a load, binary op, array index, ...) disqualifies the
+    // arm: a constant-storing reject arm never needs one, so its presence
+    // means this is not the declarative short-circuit value we expect.
     let mut result = None;
     for stmt in block.iter() {
         match stmt {
@@ -2816,15 +3273,14 @@ fn f(a: bool, b: bool) -> bool {
     }
 
     #[test]
-    fn short_circuit_preserves_branch_with_emit_in_value() {
-        // The accept branch stores a computed expression
-        // (`array[idx]` requires an `Emit` inside the branch to load
-        // the array entry).  Re-sugaring into `d = a && array[idx]`
-        // would hoist that load into the outer scope, defeating the
-        // short-circuit: when `a` is false the load now runs anyway,
-        // observable through implementation-defined out-of-bounds
-        // behaviour at runtime.  The guard in `single_store_info`
-        // forces the `If` to remain.
+    fn short_circuit_folds_branch_with_emit_in_value() {
+        // The accept branch stores a computed expression (`arr[idx]` needs
+        // an `Emit` to load the element).  The re-sugar HOISTS that leading
+        // emit and folds `if a { d = arr[idx]; } else { d = false; }` into
+        // `d = a && arr[idx]`.  Sound because the load is side-effect-free,
+        // WGSL bounds-checks the (possibly out-of-range) index rather than
+        // trapping, the value is discarded by the `&&` when `a` is false,
+        // and lifting it out of the branch only reduces non-uniformity.
         let src = r#"
 fn f(a: bool, idx: u32) -> bool {
     let arr = array<bool, 4>(true, false, true, false);
@@ -2834,20 +3290,30 @@ fn f(a: bool, idx: u32) -> bool {
 }
 @fragment fn fs() -> @location(0) vec4f { return vec4f(f32(f(true, 0u))); }
 "#;
-        let (_changed, module) = run_pass(src);
-        // The `f` function must still contain at least one `If`
-        // statement: the conditional `arr[idx]` evaluation cannot be
-        // hoisted safely, so the desugar pattern must not fire.
+        let (changed, module) = run_pass(src);
+        assert!(changed, "the emit-in-value branch should be re-sugared");
         let f_function = module
             .functions
             .iter()
             .find(|(_, func)| func.name.as_deref() == Some("f"))
             .map(|(_, func)| func)
             .expect("function `f` should survive the pass");
+        // The lowered short-circuit `If` is folded away ...
+        assert_eq!(
+            count_ifs(&f_function.body),
+            0,
+            "the lowered short-circuit If should fold into `&&`"
+        );
+        // ... into a synthesized `a && arr[idx]` LogicalAnd.
         assert!(
-            count_ifs(&f_function.body) >= 1,
-            "If with a non-trivial (Emit-required) store value must NOT be desugared \
-             into `&&` because hoisting the Emit would defeat short-circuit semantics"
+            f_function.expressions.iter().any(|(_, e)| matches!(
+                e,
+                naga::Expression::Binary {
+                    op: naga::BinaryOperator::LogicalAnd,
+                    ..
+                }
+            )),
+            "a LogicalAnd should be synthesized for `a && arr[idx]`"
         );
     }
 

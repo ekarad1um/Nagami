@@ -603,7 +603,7 @@ impl<'a> Generator<'a> {
                 }
 
                 let mut s = String::new();
-                s.push_str(&self.type_ref(*ty)?);
+                s.push_str(&self.vector_ctor_name(*ty, components, ctx)?);
                 s.push('(');
                 // Collapse vector Compose with all-identical scalar components
                 // into splat form: vec3f(x,x,x) -> vec3f(x).
@@ -1879,6 +1879,82 @@ impl<'a> Generator<'a> {
         })
     }
 
+    /// Emit the declaration tail of a zero-initialized `var`: either
+    /// `:<type>` (relying on WGSL's guarantee that an uninitialized local
+    /// is zero) or `=<zero-literal>`, whichever is the shorter source
+    /// form.  Callers emit `var <name>` first; this appends the chosen
+    /// tail with no trailing `;`.  Every zero-init `var` emit site routes
+    /// through here so the `:T`-vs-`=0i` choice never drifts between paths.
+    ///
+    /// A scalar's typed-suffix zero literal (`0i`/`0u`/`0f`/`0h`) is one
+    /// byte shorter than its `:i32`/`:u32`/`:f32`/`:f16` annotation, while
+    /// `:bool` beats `=false` and every composite (`:vec3f` vs `=vec3f(0)`)
+    /// favours the annotation.  A short type alias (`alias j=i32;` -> `:j`)
+    /// can undercut even `=0i`, so compare the rendered lengths instead of
+    /// assuming a winner.
+    pub(super) fn emit_zero_init_tail(
+        &mut self,
+        ty: naga::Handle<naga::Type>,
+    ) -> Result<(), Error> {
+        let type_str = self.type_ref(ty)?;
+        if let naga::TypeInner::Scalar(s) = self.module.types[ty].inner {
+            let zlit = scalar_zero(s.kind, s.width);
+            if zlit.len() < type_str.len() {
+                self.push_assign();
+                self.out.push_str(zlit);
+                return Ok(());
+            }
+        }
+        self.push_colon();
+        self.out.push_str(&type_str);
+        Ok(())
+    }
+
+    /// The constructor name for a vector `Compose`.  Normally the type's
+    /// rendered name (`vec2u`, `vec3f`, or a type alias), but the bare
+    /// `vecN` form when BOTH (a) it is strictly shorter than the
+    /// suffixed/aliased name, and (b) at least one component is a
+    /// non-literal whose concrete scalar type already equals the element
+    /// type - so WGSL infers the same element type from that component and
+    /// converts the others.
+    ///
+    /// Literals inside a constructor render in BARE (abstract) form, so a
+    /// `vec2u(4, 1)` cannot lose its `u` - dropping it would re-infer
+    /// `vec2i`.  Only a typed non-literal component (e.g. a `u32` field
+    /// access in `vec2u(p.k, 4)`) pins the element type; an abstract
+    /// component's scalar kind never matches the concrete element scalar,
+    /// so it is correctly not counted.
+    ///
+    /// Soundness rests on the pin component rendering in TYPED form.  A
+    /// non-literal `ZeroValue` or unnamed `Constant` would resolve to the
+    /// right scalar yet still emit a bare token, so it cannot be the sole
+    /// pinner - but it never is: `const_fold` runs first and folds away any
+    /// all-constant `Compose`, so a vector reaching the generator always has
+    /// a runtime (typed) component.  A future pass that leaves an unnamed
+    /// const / `ZeroValue` as a Compose's only non-literal component must
+    /// revisit this gate.
+    fn vector_ctor_name(
+        &self,
+        ty: naga::Handle<naga::Type>,
+        components: &[naga::Handle<naga::Expression>],
+        ctx: &FunctionCtx<'a, '_>,
+    ) -> Result<String, Error> {
+        let type_str = self.type_ref(ty)?;
+        if let naga::TypeInner::Vector { size, scalar } = self.module.types[ty].inner {
+            let bare = format!("vec{}", super::syntax::vector_size_num(size));
+            if bare.len() < type_str.len()
+                && components.iter().any(|&c| {
+                    !matches!(ctx.func.expressions[c], naga::Expression::Literal(_))
+                        && type_inner_scalar(ctx.info[c].ty.inner_with(&self.module.types))
+                            == Some(scalar)
+                })
+            {
+                return Ok(bare);
+            }
+        }
+        Ok(type_str)
+    }
+
     /// Emit an expression that is the base of a postfix operation in the
     /// global expression arena (`.member`, `[index]`, `.xyzw`).
     fn emit_global_postfix_base(
@@ -2499,12 +2575,10 @@ fn binary_op_str(op: naga::BinaryOperator) -> &'static str {
     }
 }
 
-/// Check whether a child expression must be wrapped in parentheses when
-/// appearing as an operand of `parent_op`.
-/// `true` when a binary child needs parentheses for the enclosing
-/// parent shape.  Accounts for operator precedence, associativity,
-/// and the handful of cases WGSL treats specially (for example
-/// `a - (b - c)`).
+/// `true` when a binary or unary child needs parentheses as an operand of
+/// `parent_op`, per operator precedence, associativity, and the WGSL grammar
+/// levels that forbid bare operands (bitwise, shift, comparison, and the
+/// no-relative-precedence `&&`/`||` mix).
 fn child_needs_parens(
     child: naga::Handle<naga::Expression>,
     arena: &naga::Arena<naga::Expression>,
@@ -2582,6 +2656,45 @@ fn child_needs_parens(
         return child_prec < PREC_SHIFT;
     }
 
+    // A `&&` / `||` parent's operands are each a `relational_expression`
+    // (WGSL https://www.w3.org/TR/WGSL/#syntax-expression): the grammar
+    // admits comparisons, shifts and arithmetic bare but NOT another
+    // logical or a bitwise expression.  naga's permissive frontend
+    // round-trips the bare forms, but Tint/Dawn (and browsers) reject them,
+    // so wrap exactly the children the grammar forbids:
+    if matches!(
+        parent_op,
+        naga::BinaryOperator::LogicalAnd | naga::BinaryOperator::LogicalOr
+    ) {
+        return match child_op {
+            // Mixing `&&` and `||` is illegal bare ("mixing '&&' and '||'
+            // requires parenthesis").  The grammar's own left-recursion
+            // (`a && b && c`) keeps a SAME-operator LEFT child bare; a
+            // same-operator RIGHT child is wrapped to preserve the IR's tree
+            // shape (associativity makes the value identical either way, but
+            // re-grouping a right-leaning chain would perturb idempotence).
+            Some(naga::BinaryOperator::LogicalAnd | naga::BinaryOperator::LogicalOr) => {
+                child_op != Some(parent_op) || is_right
+            }
+            // A bitwise expression (`|` / `^` / `&`) is not a
+            // `relational_expression`, so it can never be a bare `&&` / `||`
+            // operand (Tint rejects "mixing '|' and '&&' requires
+            // parenthesis").  `bool | bool` / `bool & bool` are legal and
+            // the short-circuit re-sugar now collapses `(a | b) && c` into a
+            // single logical Binary, so this child shape is reachable and
+            // MUST be wrapped.  (`bool ^ bool` is itself invalid WGSL, so
+            // `^` never reaches here, but listing it is harmless.)
+            Some(
+                naga::BinaryOperator::InclusiveOr
+                | naga::BinaryOperator::ExclusiveOr
+                | naga::BinaryOperator::And,
+            ) => true,
+            // Comparisons, shifts, arithmetic, unary and atoms are all valid
+            // `relational_expression` operands - keep them bare.
+            _ => false,
+        };
+    }
+
     // Left-associative: left child needs parens if strictly lower,
     // right child if lower-or-equal (to preserve tree structure).
     if is_right {
@@ -2591,11 +2704,9 @@ fn child_needs_parens(
     }
 }
 
-/// A Unary's operand needs parentheses only when it is a Binary
-/// expression (all Binary precedences are below Unary).
-/// `true` when a unary child needs parentheses.  Only operators that
-/// themselves lower to WGSL binary or postfix shapes qualify; atoms
-/// and calls never do.
+/// `true` only when the operand is an uncached Binary expression: every
+/// Binary precedence is below Unary, so it must be parenthesised; a cached
+/// operand (emitted as a name), atom, call, or nested unary never is.
 fn unary_child_needs_parens(
     child: naga::Handle<naga::Expression>,
     arena: &naga::Arena<naga::Expression>,
@@ -2604,11 +2715,9 @@ fn unary_child_needs_parens(
     !is_cached && matches!(arena[child], naga::Expression::Binary { .. })
 }
 
-/// Assemble a binary expression string from pre-computed operand strings,
-/// operator token, spacing, and parenthesisation flags.
-/// Assemble `left op right` with the correct parenthesisation and
-/// operator spacing for the current beautify mode.  All binary
-/// emission paths funnel through here.
+/// Assemble `left op right` from pre-computed operand strings with the
+/// correct parenthesisation and operator spacing for the current beautify
+/// mode.  All binary emission paths funnel through here.
 fn assemble_binary(
     ls: &str,
     rs: &str,
@@ -2815,12 +2924,21 @@ fn literal_bit_eq(a: &naga::Literal, b: &naga::Literal) -> bool {
     }
 }
 
-/// Return the logically-negated comparison operator, if `op` is a
-/// comparison.
-/// Map a comparison operator to the equivalent negated operator
-/// when negation is semantically safe (equality and inequality are
-/// safe for every scalar type; ordered comparisons are deferred to
-/// the caller, which checks for float operands).
+/// The scalar element of a scalar or vector type, or `None` for any
+/// other type.  Used by [`Generator::vector_ctor_name`] to test whether
+/// a component's concrete scalar pins a vector constructor's element type.
+fn type_inner_scalar(inner: &naga::TypeInner) -> Option<naga::Scalar> {
+    match inner {
+        naga::TypeInner::Scalar(s) => Some(*s),
+        naga::TypeInner::Vector { scalar, .. } => Some(*scalar),
+        _ => None,
+    }
+}
+
+/// Map a comparison operator to the equivalent negated operator when
+/// negation is semantically safe (equality and inequality are safe for
+/// every scalar type; ordered comparisons are deferred to the caller,
+/// which checks for float operands).
 fn flip_comparison(op: naga::BinaryOperator) -> Option<naga::BinaryOperator> {
     use naga::BinaryOperator as B;
     match op {

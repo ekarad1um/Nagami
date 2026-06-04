@@ -637,6 +637,39 @@ fn fold_local_expressions(
                         continue;
                     }
                 }
+
+                // de Morgan on equality: `!(a == b)` -> `a != b` and
+                // `!(a != b)` -> `a == b`, dropping the `!()` wrapper (3
+                // bytes).  Equality negation is EXACT for every type -
+                // scalars, vectors (component-wise `vecN<bool>`), floats
+                // including NaN (`!(x==y)` <-> `x!=y` always) - so no
+                // operand-type check is needed, unlike ordered relations.
+                // Doing it here (not at emit time) lets the normal `Binary`
+                // emit path compute parentheses correctly; a value-position
+                // emit-time fold would mis-parenthesise a nested comparison.
+                // Gate on the comparison being uniquely owned by this `!`
+                // so its operands are reused in place with no duplication;
+                // a shared comparison is left as `!name` by the emitter.
+                if op == naga::UnaryOperator::LogicalNot
+                    && let naga::Expression::Binary {
+                        op: cmp,
+                        left,
+                        right,
+                    } = arena[expr]
+                    && let Some(flipped) = flip_equality(cmp)
+                    && refcounts.get(expr.index()).copied() == Some(1)
+                {
+                    arena[handle] = naga::Expression::Binary {
+                        op: flipped,
+                        left,
+                        right,
+                    };
+                    simplify_count += 1;
+                    // The comparison node is now dead; drop its Emit so the
+                    // generator does not materialise it a second time.
+                    folded.insert(expr);
+                    continue;
+                }
             }
             // select(x, x, c) -> x.  Refcount escape does NOT apply:
             // accept == reject means the shared handle has refcount
@@ -657,6 +690,19 @@ fn fold_local_expressions(
     }
 
     (folded, simplify_count)
+}
+
+/// The negated form of an equality operator (`==` <-> `!=`), or `None`
+/// for any other operator.  Only equality is included because its
+/// negation is exact for every WGSL type including floats with NaN;
+/// ordered relations (`<`, `>=`, ...) would need the operand type to
+/// rule out the NaN-unsafe float case, which this pass does not resolve.
+fn flip_equality(op: naga::BinaryOperator) -> Option<naga::BinaryOperator> {
+    match op {
+        naga::BinaryOperator::Equal => Some(naga::BinaryOperator::NotEqual),
+        naga::BinaryOperator::NotEqual => Some(naga::BinaryOperator::Equal),
+        _ => None,
+    }
 }
 
 trait LiteralContext {
@@ -2773,6 +2819,107 @@ mod tests {
         assert_eq!(changed.len(), 2, "both nested operations should be folded");
         assert_f32_literal(&arena, add, 3.0);
         assert_f32_literal(&arena, mul, 9.0);
+    }
+
+    #[test]
+    fn de_morgan_negated_equality_folds_in_place() {
+        use naga::{BinaryOperator as B, UnaryOperator as U};
+        // `!(a == b)` -> `a != b` and `!(a != b)` -> `a == b`: the `!` node
+        // is rewritten into the flipped comparison reusing the operands in
+        // place, and the now-dead comparison's Emit is dropped (added to the
+        // folded set).  Operands are FunctionArguments so const-folding
+        // cannot pre-empt the rewrite by collapsing the comparison.
+        for (cmp_op, flipped) in [(B::Equal, B::NotEqual), (B::NotEqual, B::Equal)] {
+            let mut arena = naga::Arena::new();
+            let a = arena.append(naga::Expression::FunctionArgument(0), Default::default());
+            let b = arena.append(naga::Expression::FunctionArgument(1), Default::default());
+            let cmp = arena.append(
+                naga::Expression::Binary {
+                    op: cmp_op,
+                    left: a,
+                    right: b,
+                },
+                Default::default(),
+            );
+            let not = arena.append(
+                naga::Expression::Unary {
+                    op: U::LogicalNot,
+                    expr: cmp,
+                },
+                Default::default(),
+            );
+            // Comparison (handle index 2) is uniquely owned by the `!`.
+            let refcounts = vec![0u32, 0, 1, 0];
+            let (folded, _) = fold_local(
+                &mut arena,
+                &refcounts,
+                &HashMap::new(),
+                &naga::UniqueArena::new(),
+                &HashMap::new(),
+            );
+            assert!(
+                matches!(
+                    arena[not],
+                    naga::Expression::Binary { op, left, right }
+                        if op == flipped && left == a && right == b
+                ),
+                "`!({cmp_op:?})` should rewrite in place to `{flipped:?}`, got {:?}",
+                arena[not]
+            );
+            assert!(
+                folded.contains(&cmp),
+                "the dead comparison's Emit must be dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn de_morgan_shared_equality_is_not_folded() {
+        use naga::{BinaryOperator as B, UnaryOperator as U};
+        // A comparison referenced by more than the `!` (refcount > 1) is
+        // left alone: rewriting it in place would corrupt the other
+        // consumer, so the emitter keeps `!name`.
+        let mut arena = naga::Arena::new();
+        let a = arena.append(naga::Expression::FunctionArgument(0), Default::default());
+        let b = arena.append(naga::Expression::FunctionArgument(1), Default::default());
+        let cmp = arena.append(
+            naga::Expression::Binary {
+                op: B::Equal,
+                left: a,
+                right: b,
+            },
+            Default::default(),
+        );
+        let not = arena.append(
+            naga::Expression::Unary {
+                op: U::LogicalNot,
+                expr: cmp,
+            },
+            Default::default(),
+        );
+        // refcount 2 on the comparison -> shared, must NOT fold.
+        let refcounts = vec![0u32, 0, 2, 0];
+        let (folded, _) = fold_local(
+            &mut arena,
+            &refcounts,
+            &HashMap::new(),
+            &naga::UniqueArena::new(),
+            &HashMap::new(),
+        );
+        assert!(
+            matches!(
+                arena[not],
+                naga::Expression::Unary {
+                    op: U::LogicalNot,
+                    ..
+                }
+            ),
+            "a shared comparison must stay `!(==)`, not fold to `!=`"
+        );
+        assert!(
+            !folded.contains(&cmp),
+            "a shared comparison's Emit must NOT be dropped"
+        );
     }
 
     #[test]

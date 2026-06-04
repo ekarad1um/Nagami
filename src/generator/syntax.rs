@@ -344,7 +344,7 @@ fn hex_float_f64(v: f64, suffix: &str) -> Option<String> {
 /// the true maximum.  naga rounds it back and accepts it (so nagami's naga-based
 /// self-check passes), but tint/Dawn reject any literal whose *exact* magnitude
 /// exceeds the maximum - so the decimal form is a silent portability miscompile.
-/// `±f32::MAX` is the only offender: as the largest finite f32 its upper
+/// `+/-f32::MAX` is the only offender: as the largest finite f32 its upper
 /// neighbour is infinity, so its rounding interval reaches past MAX, whereas
 /// every smaller value's shortest decimal stays in an interval bounded below MAX.
 /// `f16::MAX` (65504) and `f64::MAX` have shortest decimals at or below their
@@ -1576,7 +1576,7 @@ mod tests {
             literal_to_wgsl_bare(naga::Literal::F32(-f32::MAX), &full()),
             "-0x1.fffffep127"
         );
-        // The guard is exactly `±f32::MAX`: the next value down keeps the
+        // The guard is exactly `+/-f32::MAX`: the next value down keeps the
         // ordinary shortest-form path (its decimal does not overshoot).
         let below_max = f32::from_bits(f32::MAX.to_bits() - 1);
         assert_ne!(

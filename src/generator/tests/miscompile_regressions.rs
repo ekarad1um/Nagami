@@ -185,9 +185,16 @@ fn subvector_compose_not_splat_elided() {
         @group(0)@binding(1) var<uniform> w: vec4f;\
         @fragment fn main() -> @location(0) vec4f { let a = v; return vec4<f32>(a, a) * w; }";
     let out = minify(src);
-    // The compose stays a full vec4 constructor; no bare `vec2 * vec4`.
+    // The compose stays a full TWO-component vec4 constructor (no splat-
+    // elision to a scalar `vec2 * vec4`).  The `f` element suffix may be
+    // dropped because the `vec2f` components already pin the f32 element
+    // type, so both `vec4f(A,A)` and the shorter `vec4(A,A)` are accepted -
+    // what matters is the two-component `(A,A)` shape, not a scalar splat.
     assert!(
-        out.contains("vec4f(A,A)*a") || out.contains("vec4f(A,A) * a"),
+        out.contains("vec4(A,A)*a")
+            || out.contains("vec4(A,A) * a")
+            || out.contains("vec4f(A,A)*a")
+            || out.contains("vec4f(A,A) * a"),
         "sub-vector compose was wrongly splat-elided: {out}"
     );
 }

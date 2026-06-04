@@ -771,6 +771,21 @@ impl<'a> Generator<'a> {
                     return Ok(());
                 }
 
+                // Drop a no-op self-store `p = p`: an UNCACHED `Load` of the
+                // same place reads `p`'s current value and writes it straight
+                // back, changing nothing.  naga re-lowers a folded
+                // `var d = a && b` into a temp-plus-copy that coalescing
+                // collapses to `d = d`; emitting it would accumulate one such
+                // line on every re-minify (a non-idempotence growth).  The
+                // `uncached` guard is essential - a `let t = p; ..p..; p = t`
+                // restores a stale value and is NOT a no-op.
+                if !ctx.expr_names.contains_key(value)
+                    && let naga::Expression::Load { pointer: loaded } = ctx.func.expressions[*value]
+                    && ptrs_structurally_equal(loaded, *pointer, &ctx.func.expressions)
+                {
+                    return Ok(());
+                }
+
                 // Check if this is the first store to a deferred local var.
                 let deferred_local =
                     if let naga::Expression::LocalVariable(lh) = ctx.func.expressions[*pointer] {
@@ -787,30 +802,45 @@ impl<'a> Generator<'a> {
                     ctx.deferred_vars[lh.index()] = false;
                     self.out.push_str("var ");
                     self.out.push_str(&ctx.local_names[&lh]);
-                    self.push_assign();
-                    // When the value is an uncached Literal, use the typed
-                    // suffix so WGSL infers the correct concrete type.
-                    if !ctx.expr_names.contains_key(value) {
-                        if let naga::Expression::Literal(lit) = ctx.func.expressions[*value] {
-                            self.out.push_str(&super::syntax::literal_to_wgsl(
-                                lit,
-                                &self.options.float_precision,
-                            ));
+                    // A deferred var's first store IS its declaration, so a
+                    // first store of the zero value is equivalent to relying
+                    // on WGSL's zero-init.  Drop the value and emit the
+                    // shorter `:type` / `=0i` tail (e.g. `var E=vec3f(0)` ->
+                    // `var E:vec3f`).
+                    if !ctx.expr_names.contains_key(value)
+                        && crate::passes::load_dedup::is_zero_init(&ctx.func.expressions, *value)
+                    {
+                        self.emit_zero_init_tail(ctx.func.local_variables[lh].ty)?;
+                    } else {
+                        self.push_assign();
+                        // When the value is an uncached Literal, use the typed
+                        // suffix so WGSL infers the correct concrete type.
+                        if !ctx.expr_names.contains_key(value) {
+                            if let naga::Expression::Literal(lit) = ctx.func.expressions[*value] {
+                                self.out.push_str(&super::syntax::literal_to_wgsl(
+                                    lit,
+                                    &self.options.float_precision,
+                                ));
+                            } else {
+                                self.out.push_str(&self.emit_expr(*value, ctx)?);
+                            }
                         } else {
                             self.out.push_str(&self.emit_expr(*value, ctx)?);
                         }
-                    } else {
-                        self.out.push_str(&self.emit_expr(*value, ctx)?);
                     }
                     self.out.push(';');
                 } else if let Some((cop, other)) = self.try_compound_assign(*pointer, *value, ctx) {
                     self.out.push_str(&self.emit_lvalue(*pointer, ctx)?);
-                    let sp = self.bin_op_sep();
-                    self.out.push_str(sp);
-                    self.out.push_str(cop);
-                    self.out.push_str(sp);
-                    self.out
-                        .push_str(&self.emit_compound_assign_rhs(cop, other, ctx)?);
+                    if let Some(inc) = self.try_increment(cop, other, *value, ctx) {
+                        self.out.push_str(inc);
+                    } else {
+                        let sp = self.bin_op_sep();
+                        self.out.push_str(sp);
+                        self.out.push_str(cop);
+                        self.out.push_str(sp);
+                        self.out
+                            .push_str(&self.emit_compound_assign_rhs(cop, other, ctx)?);
+                    }
                     self.out.push(';');
                 } else {
                     self.out.push_str(&self.emit_lvalue(*pointer, ctx)?);
@@ -1469,13 +1499,16 @@ impl<'a> Generator<'a> {
             }
         } else if let Some(lh) = decl_only_local {
             // For-loop counter with no explicit init (WGSL zero-initialises).
-            // Emit a bare `var name:type` declaration so the variable is in scope.
+            // Emit the shorter of `var name:type` / `var name=0i` so an
+            // un-aliased scalar counter keeps the one-byte-cheaper `=0i`
+            // form instead of regressing to `:i32`.
             self.out.push_str("var ");
             self.out.push_str(&ctx.local_names[&lh]);
             let ty = ctx.func.local_variables[lh].ty;
-            self.out.push(':');
-            self.out.push_str(&self.type_ref(ty)?);
-            // Declared in the for-init: see the note above.
+            self.emit_zero_init_tail(ty)?;
+            // The for-init clause emitted this counter's `var` declaration;
+            // clearing its deferred flag stops a later body Store from
+            // re-declaring it as a second `var`.
             deferred_for_init_local = Some(lh);
         }
         if let Some(lh) = deferred_for_init_local {
@@ -1685,12 +1718,16 @@ impl<'a> Generator<'a> {
                     self.emit_atomic_store(*pointer, *value, atomic_scalar, ctx)?;
                 } else if let Some((cop, other)) = self.try_compound_assign(*pointer, *value, ctx) {
                     self.out.push_str(&self.emit_lvalue(*pointer, ctx)?);
-                    let sp = self.bin_op_sep();
-                    self.out.push_str(sp);
-                    self.out.push_str(cop);
-                    self.out.push_str(sp);
-                    self.out
-                        .push_str(&self.emit_compound_assign_rhs(cop, other, ctx)?);
+                    if let Some(inc) = self.try_increment(cop, other, *value, ctx) {
+                        self.out.push_str(inc);
+                    } else {
+                        let sp = self.bin_op_sep();
+                        self.out.push_str(sp);
+                        self.out.push_str(cop);
+                        self.out.push_str(sp);
+                        self.out
+                            .push_str(&self.emit_compound_assign_rhs(cop, other, ctx)?);
+                    }
                 } else {
                     self.out.push_str(&self.emit_lvalue(*pointer, ctx)?);
                     self.push_assign();
@@ -1804,6 +1841,51 @@ impl<'a> Generator<'a> {
         // Non-commutative exactly when a matrix multiplies another matrix or a
         // vector (on either side); matrix*scalar and scalar*matrix stay safe.
         !((l_mat && (r_mat || r_vec)) || (r_mat && l_vec))
+    }
+
+    /// Recognise `lhs += 1` / `lhs -= 1` on a concrete 32-bit integer
+    /// scalar and return the WGSL increment / decrement statement token
+    /// (`++` / `--`), which is one byte shorter than the compound form.
+    /// WGSL permits `++`/`--` only on references to integer scalars, so
+    /// floats, vectors, bools, and 64-bit integers keep `+= 1` / `-= 1`.
+    /// `value` is the `Store`'s value expression (the `lhs <op> 1` binary)
+    /// whose resolved type is exactly the lvalue's store type.
+    fn try_increment(
+        &self,
+        cop: &str,
+        other: naga::Handle<naga::Expression>,
+        value: naga::Handle<naga::Expression>,
+        ctx: &FunctionCtx<'a, '_>,
+    ) -> Option<&'static str> {
+        let token = match cop {
+            "+=" => "++",
+            "-=" => "--",
+            _ => return None,
+        };
+        // The operand that `++`/`--` drops must be exactly the literal 1.
+        if ctx.expr_names.contains_key(&other) {
+            return None;
+        }
+        let is_one = matches!(
+            ctx.func.expressions[other],
+            naga::Expression::Literal(
+                naga::Literal::I32(1) | naga::Literal::U32(1) | naga::Literal::AbstractInt(1)
+            )
+        );
+        if !is_one {
+            return None;
+        }
+        // The store target must be a concrete integer scalar (i32/u32);
+        // anything else (float, vector, bool, 64-bit) is not a valid
+        // increment target in WGSL.
+        matches!(
+            ctx.info[value].ty.inner_with(&self.module.types),
+            naga::TypeInner::Scalar(naga::Scalar {
+                kind: naga::ScalarKind::Sint | naga::ScalarKind::Uint,
+                width: 4,
+            })
+        )
+        .then_some(token)
     }
 
     /// Emit the right-hand side of a compound assignment, applying splat

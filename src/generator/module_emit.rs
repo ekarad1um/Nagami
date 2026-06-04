@@ -1015,8 +1015,10 @@ impl<'a> Generator<'a> {
                     self.out.push_str(&self.emit_expr(init, &mut ctx)?);
                 }
             } else {
-                self.push_colon();
-                self.out.push_str(&self.type_ref(local.ty)?);
+                // No initializer: WGSL zero-initialises the local.  Pick the
+                // shorter of `:type` / `=0i` (a bare scalar counter keeps the
+                // cheaper `=0i` form; composites and `bool` keep `:type`).
+                self.emit_zero_init_tail(local.ty)?;
             }
             self.out.push(';');
             self.push_newline();

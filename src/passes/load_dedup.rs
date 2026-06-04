@@ -392,7 +392,7 @@ fn remove_dead_inits(function: &mut naga::Function) -> bool {
 /// `true` when `handle` evaluates to the all-zero value for its type.
 /// Recursively walks `Compose` and `Splat` so `vec3f(0.0, 0.0, 0.0)`
 /// and `vec3f(0.0)` are both recognised as zero.
-fn is_zero_init(
+pub(crate) fn is_zero_init(
     expressions: &naga::Arena<naga::Expression>,
     handle: naga::Handle<naga::Expression>,
 ) -> bool {

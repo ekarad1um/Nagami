@@ -865,3 +865,64 @@ fn global_compose_identical_collapses_to_splat() {
     );
     assert_valid_wgsl(&out);
 }
+
+// MARK: Vector constructor element-type inference (vec2u(x,4) -> vec2(x,4))
+
+#[test]
+fn vector_ctor_drops_suffix_when_a_component_pins_type() {
+    let out = compact(
+        r#"
+        @group(0) @binding(0) var<uniform> p: vec2u;
+        @group(0) @binding(1) var<storage, read_write> buf: array<u32>;
+        @compute @workgroup_size(1) fn main() {
+            let v = vec2(p.x, 4u);
+            buf[0] = v.x + v.y;
+        }
+        "#,
+    );
+    assert!(
+        out.contains("vec2(") && !out.contains("vec2u("),
+        "a u32 component pins the element type, so vec2u drops its suffix: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn vector_ctor_keeps_suffix_when_all_components_are_literals() {
+    let out = compact(
+        r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<u32>;
+        @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) n: u32) {
+            var v = vec2(4u, 1u);
+            v.x = v.x + n;
+            buf[0] = v.x + v.y;
+        }
+        "#,
+    );
+    // Both components are literals (bare/abstract inside the constructor);
+    // dropping `u` would re-infer vec2<i32>, so the suffix MUST stay.
+    assert!(
+        out.contains("vec2u("),
+        "all-literal vec2u must keep its suffix: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+#[test]
+fn vector_ctor_drops_suffix_for_subvector_component() {
+    let out = compact(
+        r#"
+        @group(0) @binding(0) var<uniform> a: vec2f;
+        @group(0) @binding(1) var<storage, read_write> buf: array<f32>;
+        @compute @workgroup_size(1) fn main() {
+            let v = vec4<f32>(a, a);
+            buf[0] = v.x + v.w;
+        }
+        "#,
+    );
+    assert!(
+        out.contains("vec4(") && !out.contains("vec4f("),
+        "a vec2f component pins f32, so vec4f drops its suffix: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
