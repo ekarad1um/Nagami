@@ -888,39 +888,31 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     let (final_source, final_bytes, changed, rolled_back, compacted_valid, duration_us) =
         match gen_result {
             Ok(emitted) => {
-                let after_bytes = emitted.source.len();
-                let changed = before_bytes != after_bytes
-                    || naga_output.as_deref() != Some(emitted.source.as_str());
-                // With a preamble active the emitted source is
-                // incomplete on its own; validate by re-prepending the
-                // preamble with directives properly hoisted.
-                let validation_result = if let Some(normalized_preamble) =
-                    normalized_preamble.as_deref()
-                {
-                    // Reuse the same normalised preamble computed
-                    // up-front so the re-prepended text exactly matches
-                    // what naga parsed; this avoids both redundant
-                    // work and any chance of drift if the preprocess
-                    // function ever became non-deterministic.
-                    let (emit_directives, emit_body) = split_directives(&emitted.source);
-                    let (pre_directives, pre_body) = split_directives(normalized_preamble);
-                    let combined =
-                        join_with_newline(&[emit_directives, pre_directives, pre_body, emit_body]);
-                    io::validate_wgsl_text(&combined)
-                } else {
-                    io::validate_wgsl_text(&emitted.source)
-                };
+                // WGSL requires every directive (`enable`/`requires`/
+                // `diagnostic`) to precede all declarations.  An active preamble
+                // is prepended ahead of this output, so the body must carry no
+                // leading directives - the preamble owns them.  Strip them and
+                // validate the order the consumer ships, [preamble, body], so a
+                // directive the preamble omits errors here, not on the GPU.  With
+                // no preamble the whole module is the output and its directives
+                // lead it.
+                let validation_result =
+                    if let Some(normalized_preamble) = normalized_preamble.as_deref() {
+                        // Validate against the normalised preamble naga actually
+                        // parsed, so the check matches the module.
+                        let emit_body = split_directives(&emitted.source).1;
+                        let (pre_directives, pre_body) = split_directives(normalized_preamble);
+                        let combined = join_with_newline(&[pre_directives, pre_body, emit_body]);
+                        io::validate_wgsl_text(&combined)
+                    } else {
+                        io::validate_wgsl_text(&emitted.source)
+                    };
                 let valid = match &validation_result {
                     Ok(()) => true,
-                    // Key the bypass on the validator's own message, not on the
-                    // emitted source text.  The custom generator never
-                    // synthesises `enable subgroups;` (it emits the builtins
-                    // bare), so an `emitted.source.contains("enable subgroups;")`
-                    // guard was unsatisfiable - it made this whole arm dead.
-                    // naga's text front-end accepts the bare subgroup builtins
-                    // today, so this still does not fire; it remains as forward
-                    // defence for a naga release that reports the subgroups
-                    // round-trip limitation through text re-validation.
+                    // Keyed on the validator's message (not the output text):
+                    // forward defence for a future naga that rejects its own valid
+                    // subgroup-builtin round-trip.  Inert on current naga, which
+                    // accepts the bare builtins.
                     Err(e) if is_known_text_validation_limitation(e) => {
                         if config.trace.enabled {
                             eprintln!(
@@ -932,8 +924,19 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                     Err(_) => false,
                 };
                 if valid {
+                    // Read the naga-baseline comparison before `emitted.source`
+                    // may be moved into `final_source`.
+                    let differs_from_baseline =
+                        naga_output.as_deref() != Some(emitted.source.as_str());
+                    let final_source = if has_preamble {
+                        split_directives(&emitted.source).1.to_owned()
+                    } else {
+                        emitted.source
+                    };
+                    let after_bytes = final_source.len();
+                    let changed = before_bytes != after_bytes || differs_from_baseline;
                     (
-                        emitted.source,
+                        final_source,
                         after_bytes,
                         changed,
                         false,
@@ -941,12 +944,10 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                         emitted.duration_us,
                     )
                 } else if has_preamble {
-                    // Naga-emitter fallback unsafe with a preamble -
-                    // its output carries the preamble's decls already,
-                    // and the caller will re-prepend them, duplicating.
-                    // Propagate the underlying validator message so
-                    // the user can diagnose; the original error was
-                    // dropped before this branch.
+                    // The naga fallback already embeds the preamble's declarations,
+                    // so the caller re-prepending the preamble would duplicate them
+                    // - unusable.  Propagate the validator message (the original
+                    // emit error was dropped earlier) so the user can diagnose.
                     let underlying = match validation_result {
                         Err(e) => e.to_string(),
                         Ok(()) => "(no underlying error)".to_string(),
@@ -2178,19 +2179,19 @@ mod tests {
 
     #[test]
     fn preamble_with_enable_f16_shader() {
-        // Regression for F1: a preamble that carries its OWN `enable f16;`
-        // directive, combined with a source that genuinely USES f16, minified
-        // in COMPACT mode (where the whole module is one physical line).  A
-        // line-based directive splitter misclassified that single line as one
-        // big directive and placed the preamble's `enable` after the emitted
-        // declarations -> "expected global declaration, but found a global
-        // directive" (a hard Error::Emit, since the naga fallback is unsafe
-        // with a preamble).  The `;`-aware splitter keeps every directive
-        // ahead of every declaration.
+        // A preamble that carries its OWN `enable f16;` directive, combined with
+        // a source that genuinely USES f16, minified in COMPACT mode (the whole
+        // module is one physical line).  Two contracts are verified:
         //
-        // (The old form of this test passed even on buggy code: its `enable
-        // f16;` was dropped as unused and its preamble carried no directive,
-        // so the mis-splice was never exercised.)
+        //   1. The output body is directive-FREE.  With a preamble active the
+        //      consumer prepends the preamble in front of this output, so a
+        //      directive left in the body would land AFTER the preamble's global
+        //      declarations - illegal WGSL ("directives must come before all
+        //      global declarations").  The preamble owns the directive.
+        //   2. The shipped artifact `[preamble, output]` is valid WGSL.  This is
+        //      what exercises the `;`-aware `split_directives`: a line-based
+        //      splitter would misclassify the compact one-line output as one big
+        //      directive and mis-order the splice.
         let preamble = "\
             enable f16;\n\
             @group(0) @binding(0) var<uniform> bias: f16;\
@@ -2210,10 +2211,52 @@ mod tests {
         // Default config => compact mode.
         let output = run(source, &config)
             .expect("enable f16; in preamble + f16 source must minify in compact mode");
+        // Contract 1: the preamble owns the directive; the body must not carry a
+        // copy (it would be mis-ordered after the preamble's globals).
         assert!(
-            output.source.contains("enable f16;"),
-            "the surviving f16 use must keep the enable directive: {}",
+            !output.source.contains("enable f16;"),
+            "output body must not carry the directive when the preamble supplies it: {}",
             output.source
+        );
+        // Contract 2: the artifact the consumer actually ships re-parses.
+        let shipped = format!("{preamble}\n{}", output.source);
+        io::validate_wgsl_text(&shipped)
+            .expect("the shipped [preamble, output] concatenation must be valid WGSL");
+    }
+
+    #[test]
+    fn preamble_missing_directive_errors_not_silent_ship() {
+        // A source that genuinely uses f16 but whose preamble does NOT supply
+        // `enable f16;`.  The directive cannot validly live in the output (it
+        // would land after the preamble's globals) nor be dropped (f16 then has
+        // no enabling directive anywhere), so there is no valid `[preamble,
+        // output]` to emit.  It must ERROR here, naming the missing extension, so
+        // the user adds the directive to the preamble.
+        let preamble = "\
+            @group(0) @binding(0) var<uniform> bias: f32;\
+        ";
+        // The f16 write to a storage buffer is observable, so DCE keeps it and
+        // the emitted module genuinely needs `enable f16;`.
+        let source = "\
+            @group(0) @binding(1) var<storage, read_write> sink: f16;\n\
+            @compute @workgroup_size(1) fn main() {\n\
+                sink = 1.0h;\n\
+            }\
+        ";
+        let config = Config {
+            preamble: Some(preamble.to_string()),
+            ..Default::default()
+        };
+        let msg = match run(source, &config) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!(
+                "f16 source with a preamble lacking `enable f16;` must error, \
+                 not silently ship invalid WGSL"
+            ),
+        };
+        assert!(
+            msg.contains("f16"),
+            "the error should name the missing f16 extension: {msg}"
         );
     }
 
