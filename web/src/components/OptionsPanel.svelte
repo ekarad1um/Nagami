@@ -94,7 +94,7 @@
         <!-- Beautify -->
         <label
           class="flex items-center justify-between gap-2 text-slate-400"
-          title="Format output with indentation and newlines for readability"
+          title="Format output with indentation and newlines for readability."
         >
           Beautify
           <input
@@ -136,7 +136,7 @@
         <!-- Preserve symbols -->
         <label
           class="flex items-center justify-between gap-2 text-slate-400"
-          title="Comma-separated names to exclude from renaming (e.g. main, uniforms)"
+          title="Comma-separated names to exclude from renaming (e.g. main, uniforms)."
         >
           Preserve
           <input
@@ -154,7 +154,7 @@
         <label
           for="preamble"
           class="text-xs text-slate-400 flex items-center gap-1 mb-1.5"
-          title="External WGSL declarations (uniforms, structs) prepended for parsing but excluded from output"
+          title="External WGSL declarations (uniforms, structs) prepended for parsing but excluded from output."
         >
           Preamble
           {#if options.preamble}

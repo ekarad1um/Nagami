@@ -6,28 +6,34 @@ Nagami lowers WGSL into [Naga IR](https://github.com/gfx-rs/wgpu/tree/trunk/naga
 
 **What it does that grep-and-replace can't:**
 
-- Dead code elimination - unused functions, variables, constants, parameters vanish
+- Dead code elimination - unused declarations and parameters vanish
 - Constant folding - `1.0 + 2.0` -> `3.0`, `x * 1` -> `x`
 - Function inlining - small helpers absorbed into callers
 - CSE - duplicate pure expressions share one evaluation
 - Load dedup & dead stores - redundant reads merge, `var x = a; x = b` -> `var x = b`
 - Variable coalescing - non-overlapping locals share one slot
+- Struct construction - `t.a = x; t.b = y; return t` -> `return T(x, y)`
+- Vector-constant hoisting - a vector literal repeated across functions -> one shared `const`
+- Literal extraction - a repeated scalar constant -> one shared `const`
 - For-loop reconstruction - `loop`/`break`/`continuing` -> `for`
-- Identifier mangling - `myLongVariableName` -> `a`
-- Type aliasing - `vec3f` used five times -> `alias T=vec3f;`
-- Splat elision - `vec3(x) * v` -> `x * v`
-- Swizzle coalescing - `vec3(v.x, v.y, v.z)` -> `v.xyz`
-- Literal extraction - repeated magic numbers -> shared `const`
-- Shortest literal form - `1048576f` -> `0x1p20f`
-- Float precision trimming - decimal places or significant figures, per type (lossy, opt-in)
-- Compound assignment - `x = x + 1` -> `x += 1`
-- Type elision - redundant type annotations on `var`/`const` stripped
 - Branch flipping - `if c {} else { x; }` -> `if !c { x; }`
-- Short-circuit re-sugaring - Naga's lowered `if/else` chains fold back into `&&`/`||`
+- Short-circuit re-sugaring - Naga's lowered `if`/`else` chains fold back into `&&`/`||`
 - Else block elision - `if c { return; } else { x; }` -> `if c { return; } x;`
 - Dead code after terminators - unreachable past `return`/`break`/`discard` stripped
 - Empty construct removal - vacuous `if` and degenerate `switch` vanish
+- Compound assignment - `x = x + 1` -> `x += 1`
+- Splat elision - `vec3(x) * v` -> `x * v`
+- Swizzle coalescing - `vec3(v.x, v.y, v.z)` -> `v.xyz`
+- Identity-swizzle elision - `v.xy` on a `vec2` -> `v`
+- Zero-value construction - `vec3f(0, 0, 0)` -> `vec3f()`
+- Sub-vector splatting - `vec4f(0, 0, 0, 2)` -> `vec4f(vec3f(), 2)`
+- Matrix flattening - `mat2x2f(vec2f(a, b), vec2f(c, d))` -> `mat2x2f(a, b, c, d)`
 - Precedence-aware parens - only necessary parentheses survive
+- Identifier mangling - `myLongVariableName` -> `a`
+- Type aliasing - `vec3f` used five times -> `alias T = vec3f;`
+- Type elision - redundant `var`/`const` type annotations stripped
+- Shortest literal form - `1048576f` -> `0x1p20f`
+- Float precision trimming - cap decimal places or significant figures, per type (lossy, opt-in)
 - Preamble support - external declarations excluded from output
 - Library modules - shader fragments without entry points preserved
 
@@ -56,7 +62,7 @@ nagami shader.wgsl --sig-figs 4 -o out.wgsl         # lossy: cap significant fig
 
 ## Profiles
 
-Three optimization profiles control which IR passes run. Generator-level optimizations (for-loop reconstruction, swizzle coalescing, splat elision, compound assignment, type elision, branch flipping, precedence-aware parens, shortest literal form, cost-aware let binding, type aliasing, literal extraction) are always applied regardless of profile.
+Three optimization profiles control which IR passes run. Generator-level optimizations (for-loop reconstruction, swizzle coalescing, identity-swizzle elision, splat elision, zero-value construction, matrix flattening, sub-vector splatting, array-type elision, compound assignment, type elision, branch flipping, precedence-aware parens, shortest literal form, cost-aware let binding, type aliasing, literal extraction) are always applied regardless of profile.
 
 | Optimization | `baseline` | `aggressive` | **`max`** |
 |---|:---:|:---:|:---:|
@@ -68,6 +74,8 @@ Three optimization profiles control which IR passes run. Generator-level optimiz
 | Function inlining | - | ✓ (24 nodes / 3 call sites) | ✓ (48 nodes / 6 call sites) |
 | Load dedup + dead stores | - | ✓ | ✓ |
 | Variable coalescing | - | ✓ | ✓ |
+| Struct-build coalescing | - | ✓ | ✓ |
+| Vector-constant hoisting | - | ✓ | ✓ |
 | Common subexpression elim | - | - | ✓ |
 | Identifier mangling | - | - | ✓ |
 
