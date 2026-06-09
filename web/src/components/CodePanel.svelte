@@ -422,7 +422,7 @@
   {#if readonly}
     <div
       data-searchable
-      class="highlight-panel code-panel code-text flex-1 w-full overflow-auto p-3 {wrap
+      class="highlight-panel code-panel code-text flex-1 w-full overflow-auto p-3 selection:bg-slate-600/40 {wrap
         ? 'wrap-on'
         : ''}"
     >
@@ -448,19 +448,8 @@
         >
           {lineNumbers}
         </div>
-        <!-- Stacked layers: highlight (behind) + textarea (on top) -->
+        <!-- Stacked layers: highlight (on top) + textarea (behind) -->
         <div class="editor-stack flex-1 min-w-0">
-          <div
-            data-searchable
-            class="highlight-input code-text p-3 pointer-events-none whitespace-pre"
-            aria-hidden="true"
-          >
-            {#if inputHighlightedHtml && inputHighlightedCode === value}
-              {@html inputHighlightedHtml}
-            {:else}
-              {value}
-            {/if}
-          </div>
           <textarea
             class="code-text p-3 bg-transparent text-transparent caret-slate-200 resize-none outline-none placeholder:text-slate-600 selection:bg-slate-600/40"
             {value}
@@ -472,6 +461,17 @@
             oninput={(e) => oninput?.((e.target as HTMLTextAreaElement).value)}
             onkeydown={handleKeydown}
           ></textarea>
+          <div
+            data-searchable
+            class="highlight-input code-text p-3 pointer-events-none whitespace-pre"
+            aria-hidden="true"
+          >
+            {#if inputHighlightedHtml && inputHighlightedCode === value}
+              {@html inputHighlightedHtml}
+            {:else}
+              {value}
+            {/if}
+          </div>
         </div>
       </div>
     </div>
