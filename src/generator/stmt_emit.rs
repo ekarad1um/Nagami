@@ -1087,28 +1087,13 @@ impl<'a> Generator<'a> {
             // grows a new ray-query function variant produces a compile
             // error here instead of silently bypassing emission.
             S::RayQuery { query, fun } => {
-                // INVARIANT: naga's function validator restricts the
-                // `query` field to `Expression::LocalVariable(_)` and
-                // rejects anything else with `InvalidRayQueryExpression`
-                // (verified against naga 29.0.3
-                // `src/valid/function.rs`).  That guarantees
-                // `emit_expr(query)` returns a bare local-variable
-                // identifier - no parens, no path accesses, no
-                // pre-existing pointer - so prepending `&` to form
-                // the WGSL `&q` address-of operand is always
-                // syntactically correct and semantically aligned with
-                // the spec for `rayQueryInitialize`/etc.
-                //
-                // If a future naga release relaxes this restriction
-                // (e.g. allows `Access`/`AccessIndex` chains rooted
-                // at a local, or function-argument pointers), this
-                // arm needs to branch on the Expression variant:
-                // pointer-typed function arguments must be emitted
-                // verbatim (no `&`); LocalVariable/Access/AccessIndex
-                // chains keep the current `&` prefix.  The debug
-                // assertion below trips loudly on a build that
-                // unexpectedly produces a different variant so the
-                // upgrade signal isn't silent.
+                // naga's validator restricts `query` to
+                // `Expression::LocalVariable` (else `InvalidRayQueryExpression`),
+                // so `emit_expr(query)` is a bare identifier and prepending `&`
+                // for the `&q` operand is always correct.  The debug_assert guards
+                // this: if naga ever relaxes it, branch on the variant here -
+                // pointer function-arguments emit verbatim (no `&`), local/Access
+                // chains keep the `&`.
                 debug_assert!(
                     matches!(
                         ctx.func.expressions[*query],
@@ -1164,23 +1149,20 @@ impl<'a> Generator<'a> {
                     }
                 }
             }
-            // Cooperative-matrix store.  Naga's own WGSL backend
-            // panics on this statement (verified against naga 29.0.3),
-            // so we cannot rely on the pipeline's naga-emitter fallback.
-            // The canonical WGSL surface for cooperative matrix ops
-            // is still evolving; until the spec stabilises and naga
-            // ships a backend, return a structured Emit error so the
-            // failure is visible (and so `--preamble`-active runs
-            // surface the missing support to the caller rather than
-            // attempting a fallback that would itself crash).
+            // Cooperative-matrix store.  nagami's generator can't render the
+            // `cooperative_matrix<...>` type, so it errors and the pipeline falls
+            // back to naga's WGSL backend - but naga emits the store while
+            // OMITTING `enable wgpu_cooperative_matrix;` (the coop type is held
+            // inline on the load/store, never interned in `module.types`, so
+            // naga's own enable-detection misses it), so the fallback fails
+            // re-validation and the store surfaces this error cleanly
+            // (empirically verified).  (`rename` reserves the `A`/`B`/`C` role
+            // names for when this path round-trips.)
             S::CooperativeStore { .. } => {
                 return Err(Error::Emit(format!(
-                    "cooperative-matrix store emission is not yet supported in '{}'; \
-                     the `cooperative_matrix<...>` type renderer is also missing \
-                     (see `generator::syntax::type_inner_name`) - both gaps must be \
-                     closed together when the WGSL cooperative-matrix extension \
-                     stabilises.  naga's own WGSL backend does not emit this \
-                     statement either, so the pipeline cannot fall back",
+                    "cooperative-matrix store is not supported by nagami's \
+                     generator in '{}', and naga's WGSL fallback cannot \
+                     round-trip it either",
                     ctx.display_name,
                 )));
             }

@@ -44,15 +44,15 @@ fn emit_wgsl_with_naga_safe(
 }
 
 /// `true` when `module` contains an override-sized array
-/// (`ArraySize::Pending`, e.g. `array<i32, O*2>`).  naga 29's own WGSL
-/// back-end hits an `unreachable!()` while emitting the override size
-/// expression, which under the release `panic = "abort"` strategy aborts the
-/// process instead of returning an error.  nagami's generator emits these
-/// types itself, so callers skip the naga baseline/fallback emit for such
-/// modules rather than invoke the panicking path.
+/// (`ArraySize::Pending`, e.g. `array<i32, O*2>`).  naga's WGSL back-end has no
+/// arm for the override size expression in `write_possibly_const_expression`
+/// (it hits `_ => unreachable!()`), so it ABORTS under the release
+/// `panic = "abort"` strategy rather than returning an error.  nagami's generator
+/// emits these types itself, so callers skip the naga baseline/fallback emit for
+/// such modules rather than invoke the panicking path.
 ///
-/// Crate-visible because the pipeline driver's trace / `validate_each_pass`
-/// text-emission path (`pipeline::emit_wgsl_with_info`) needs the same guard.
+/// Crate-visible because the pipeline's trace / validate-each-pass text-emission
+/// path needs the same guard.
 pub(crate) fn module_has_override_sized_array(module: &naga::Module) -> bool {
     module.types.iter().any(|(_, ty)| {
         matches!(
@@ -71,17 +71,15 @@ pub(crate) fn module_has_override_sized_array(module: &naga::Module) -> bool {
 /// `true` when any `override` or module-scope `var` initializer contains an
 /// expression naga's WGSL back-end cannot write.
 ///
-/// naga 29's `write_possibly_const_expression` (the writer for override and
-/// global-variable initializers) only handles `Literal`, `Constant`,
-/// `ZeroValue`, `Compose`, `Splat`, and `Override`; any other variant - e.g.
-/// the `Binary` in `override height = 2 * depth;` or the `gain * 10.` in
-/// `var<private> g: f32 = gain * 10.;` - falls through to `unreachable!()` and,
-/// under the release `panic = "abort"` strategy, aborts the process instead of
-/// returning an error.  (Fully-const initializers such as `2.0 * 3.0` are
-/// folded to a `Literal` by naga's front-end before they reach the writer, so
-/// only override-dependent initializers trip it.)  nagami's own generator emits
-/// these initializers correctly, so callers skip the naga baseline/fallback
-/// emit for such modules, exactly as for [`module_has_override_sized_array`].
+/// naga's `write_possibly_const_expression` (the writer for override and
+/// global-variable initializers) handles only `Literal`, `Constant`,
+/// `ZeroValue`, `Compose`, `Splat`, and `Override`; any other variant - e.g. the
+/// `Binary` in `override height = 2 * depth;` - falls through to
+/// `_ => unreachable!()` and ABORTS under `panic = "abort"`.  (Fully-const
+/// initializers such as `2.0 * 3.0` are folded to a `Literal` by naga's
+/// front-end before the writer, so only override-dependent initializers trip
+/// it.)  nagami emits these correctly, so callers skip the naga baseline/fallback
+/// for such modules, as for [`module_has_override_sized_array`].
 pub(crate) fn module_has_non_const_global_initializer(module: &naga::Module) -> bool {
     use naga::Expression as E;
 
@@ -124,69 +122,40 @@ pub(crate) fn module_has_non_const_global_initializer(module: &naga::Module) -> 
 }
 
 /// `true` when callers must skip the naga WGSL baseline/fallback emit because
-/// naga 29's back-end would abort (`panic = "abort"`) rather than error on this
+/// naga's back-end would abort (`panic = "abort"`) rather than error on this
 /// module.  Every site that emits via naga's WGSL backend gates on this so the
 /// abort-trigger set stays defined in one place.
 pub(crate) fn module_needs_naga_baseline_skip(module: &naga::Module) -> bool {
     module_has_override_sized_array(module) || module_has_non_const_global_initializer(module)
 }
 
-/// `true` when `line` is exactly one of the `wgpu_*` enable directives
-/// that naga rejects.  Matched against the trimmed line so surrounding
-/// whitespace is irrelevant.
-fn should_strip_enable_directive(line: &str) -> bool {
-    matches!(
-        line.trim(),
-        "enable wgpu_binding_array;"
-            | "enable wgpu_per_vertex;"
-            | "enable wgpu_ray_query;"
-            | "enable wgpu_ray_query_vertex_return;"
-    )
-}
-
-/// Normalise `source` so naga's front-end accepts it.  Three
-/// adjustments, in order: lone-CR endings rewritten to LF (so
-/// `str::lines` sees every break), `wgpu_*` enable directives naga
-/// rejects are stripped, and `enable f16;` is injected when the
-/// source uses the `f16` token without declaring it.  Output is
-/// re-derived from the IR, so callers of [`run`] never observe these
-/// rewrites.
+/// Normalise `source` so naga's front-end accepts it: rewrite lone-CR endings
+/// to LF (so the per-line scans see every break), then inject the `enable`
+/// directives naga 30 requires to parse a feature the text uses but does not
+/// declare (`enable f16;`, `enable wgpu_binding_array;`).  naga 30 implements
+/// every `wgpu_*` extension, so nothing is stripped.  Output is re-derived from
+/// the IR, so callers of [`run`] never observe these rewrites.
 fn preprocess_source_for_naga(source: &str) -> String {
-    // `str::lines` ignores lone `\r` (classic-Mac); the downstream
-    // per-line scans assume every break is visible, so normalise CR
-    // to LF first.
     let normalized = normalize_line_endings(source);
-    let source = normalized.as_str();
 
-    let mut had_changes = false;
-    let mut stripped = String::with_capacity(source.len());
-
-    for line in source.lines() {
-        if should_strip_enable_directive(line) {
-            had_changes = true;
-            continue;
-        }
-        stripped.push_str(line);
-        stripped.push('\n');
+    // Older toolchains made these directives optional, or the source targeted a
+    // different compiler.  Detection is whole-token on comment-stripped text so
+    // a longer identifier never triggers, and the has-directive guards avoid a
+    // duplicate.
+    let mut prefix = String::new();
+    if references_f16_token(&normalized) && !has_enable_f16_directive(&normalized) {
+        prefix.push_str("enable f16;\n");
     }
-
-    // Shaders often use f16 without an explicit `enable f16;`; inject it
-    // when absent so naga can parse them.  `references_f16_token` matches
-    // whole tokens on comment-stripped text (so `myf16var`/`mesh` never
-    // trigger), and `has_enable_f16_directive` tolerates arbitrary
-    // whitespace in an existing `enable   f16;` so it is not injected twice.
-    if references_f16_token(&stripped) && !has_enable_f16_directive(&stripped) {
-        let mut with_f16 = String::with_capacity(stripped.len() + 12);
-        with_f16.push_str("enable f16;\n");
-        with_f16.push_str(&stripped);
-        return with_f16;
+    if references_binding_array_token(&normalized)
+        && !has_enable_directive(&normalized, "wgpu_binding_array")
+    {
+        prefix.push_str("enable wgpu_binding_array;\n");
     }
-
-    if had_changes {
-        stripped
-    } else {
-        source.to_string()
+    if prefix.is_empty() {
+        return normalized;
     }
+    prefix.push_str(&normalized);
+    prefix
 }
 
 /// Rewrite lone `\r` to `\n`; leave `\r\n` intact (`str::lines`
@@ -379,25 +348,143 @@ fn references_f16_token(source: &str) -> bool {
 /// Tolerates arbitrary intra-line whitespace between `enable`, `f16`,
 /// and the terminating `;` so hand-formatted shaders are still detected.
 fn has_enable_f16_directive(source: &str) -> bool {
+    has_enable_directive(source, "f16")
+}
+
+/// `true` when `source` declares `enable <ext>;`, including as one entry of a
+/// comma-separated list (`enable f16, clip_distances;`) and regardless of how
+/// the directives are split across lines.  A false negative is not harmless:
+/// the preamble guard in [`run`] turns it into a hard error on valid input, so
+/// EVERY directive is scanned, not just the first on a line.
+fn has_enable_directive(source: &str, ext: &str) -> bool {
     let cleaned = strip_wgsl_comments(source);
-    for line in cleaned.lines() {
-        let t = line.trim();
-        let Some(rest) = t.strip_prefix("enable") else {
+    // Each `;`-terminated segment is one directive; a directive lists one or
+    // more comma-separated extensions.  Scanning all segments handles several
+    // directives on one line (`enable a; enable f16;`) - the callers include
+    // arbitrary user-authored preamble text.
+    for segment in cleaned.split(';') {
+        let Some(list) = segment.trim_start().strip_prefix("enable") else {
             continue;
         };
-        // `enable` must be followed by at least one space or tab to be
-        // lexically distinct from an identifier like `enablef16`.
-        if !rest.starts_with([' ', '\t']) {
+        // `enable` must be followed by whitespace to be the keyword, not an
+        // identifier prefix like `enablef16` / `enable_x`.
+        if !list.starts_with([' ', '\t']) {
             continue;
         }
-        let rest = rest.trim_start_matches([' ', '\t']);
-        let Some(rest) = rest.strip_prefix("f16") else {
-            continue;
-        };
-        let rest = rest.trim_start_matches([' ', '\t']);
-        if rest.starts_with(';') {
+        if list.split(',').any(|e| e.trim() == ext) {
             return true;
         }
+    }
+    false
+}
+
+/// Strip the dead `return;` naga's WGSL front-end appends after a diverging
+/// tail construct in a non-void function (and entry point).  naga never proves
+/// a `loop` non-falling-through, so it appends `Statement::Return { value:
+/// None }`, which naga 30's validator rejects as `InvalidReturnType`.  Removing
+/// it only where the preceding construct PROVABLY diverges
+/// ([`block_definitely_terminates`]) is semantics-preserving: the appended
+/// return is unreachable there.  The generator re-synthesises the return in its
+/// output on the same predicate, so the round-trip is unchanged.
+fn strip_front_end_appended_returns(module: &mut naga::Module) {
+    fn strip(func: &mut naga::Function) {
+        if func.result.is_none() {
+            return; // void function: a bare `return;` tail is legitimate
+        }
+        if func.body.len() < 2 {
+            return; // need a diverging construct BEFORE the appended return
+        }
+        if !matches!(
+            func.body.last(),
+            Some(naga::Statement::Return { value: None })
+        ) {
+            return;
+        }
+        let last_span = func
+            .body
+            .span_iter()
+            .last()
+            .map_or(naga::Span::UNDEFINED, |(_, s)| *s);
+        let len = func.body.len();
+        func.body.cull(len - 1..);
+        // Keep the strip only if what now sits at the tail provably diverges;
+        // otherwise restore the return (the function genuinely falls through,
+        // which stays invalid and takes the bailout below).
+        if !crate::passes::dead_branch::block_definitely_terminates(&func.body) {
+            func.body
+                .push(naga::Statement::Return { value: None }, last_span);
+        }
+    }
+    for (_, func) in module.functions.iter_mut() {
+        strip(func);
+    }
+    for ep in module.entry_points.iter_mut() {
+        strip(&mut ep.function);
+    }
+}
+
+/// naga-only `enable wgpu_*;` directives the generator emits so naga can PARSE
+/// the feature, but which tint/Dawn reject and the shipped tint-facing output
+/// must omit:
+///
+/// * `wgpu_binding_array` - tint supports binding arrays NATIVELY without an
+///   enable, so a stripped output is fully tint-valid.
+/// * `wgpu_int16` - tint has no `i16`/`u16`, so an output that actually uses
+///   16-bit integers is not tint-valid regardless; stripping only ever fixes
+///   the SPURIOUS case (a dead `frexp(f16)` whose i16 exponent lingers in the
+///   type arena) where the emitted body uses no 16-bit integer at all.
+const NAGA_ONLY_ENABLES: [&str; 2] = ["enable wgpu_binding_array;", "enable wgpu_int16;"];
+
+/// Remove the [`NAGA_ONLY_ENABLES`] directives (each with one immediately
+/// following newline, if any) from generator output.  Each is emitted at most
+/// once.
+fn strip_naga_only_enables(mut source: String) -> String {
+    for directive in NAGA_ONLY_ENABLES {
+        if let Some(pos) = source.find(directive) {
+            let after = &source[pos + directive.len()..];
+            let tail = after.strip_prefix('\n').unwrap_or(after).to_owned();
+            source.truncate(pos);
+            source.push_str(&tail);
+        }
+    }
+    source
+}
+
+/// The [`NAGA_ONLY_ENABLES`] present in generator output `emit_source`, as a
+/// directive prefix.  Prepended to the preamble self-check text: naga REQUIRES
+/// these to parse the feature, but the shipped body omits them and a user
+/// preamble legitimately lacks them, so without injecting them the naga check
+/// would reject a body that is nonetheless tint-valid.  Genuine tint-required
+/// enables (f16, ...) are deliberately NOT injected.
+fn naga_only_enable_prefix(emit_source: &str) -> String {
+    let mut prefix = String::new();
+    for directive in NAGA_ONLY_ENABLES {
+        if emit_source.contains(directive) {
+            prefix.push_str(directive);
+            prefix.push('\n');
+        }
+    }
+    prefix
+}
+
+/// `true` when `source` uses the `binding_array` type-generator as a whole
+/// token (so a longer identifier like `my_binding_array` never triggers).
+/// naga 30 requires `enable wgpu_binding_array;` to PARSE such a type, so the
+/// preprocessor injects the directive when it is used without one.
+fn references_binding_array_token(source: &str) -> bool {
+    let cleaned = strip_wgsl_comments(source);
+    let bytes = cleaned.as_bytes();
+    let needle = b"binding_array";
+    let mut i = 0;
+    while let Some(off) = cleaned[i..].find("binding_array") {
+        let start = i + off;
+        let end = start + needle.len();
+        let before_ok = start == 0 || !is_ident_char(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_ident_char(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        i = start + 1;
     }
     false
 }
@@ -601,16 +688,49 @@ pub struct Output {
 /// [`Error::Emit`] if naga's backend cannot render the final IR.
 pub fn run_module(module: &mut naga::Module, config: &Config) -> Result<Report, Error> {
     let info = io::validate_module(module)?;
-    let before_wgsl = emit_wgsl_with_naga_safe(module, &info)?;
+    let before_wgsl = emit_module_for_report(module, &info, config)?;
     let mut report = Report::new(before_wgsl.len());
 
     pipeline::run_ir_passes(module, config, &mut report)?;
 
     let info = io::validate_module(module)?;
-    let after_wgsl = emit_wgsl_with_naga_safe(module, &info)?;
+    let after_wgsl = emit_module_for_report(module, &info, config)?;
     report.output_bytes = after_wgsl.len();
 
     Ok(report)
+}
+
+/// Render `module` to WGSL text for [`run_module`]'s byte accounting.
+///
+/// Prefers naga's WGSL back-end, but that back-end ABORTS (release
+/// `panic = "abort"`) rather than errors on modules with an override-sized
+/// array or a non-const global initializer - see
+/// [`module_needs_naga_baseline_skip`].  For those, render via nagami's own
+/// generator (which handles them and is what nagami actually ships), so the
+/// public `run_module` entry point never crashes on validator-accepted input.
+fn emit_module_for_report(
+    module: &naga::Module,
+    info: &naga::valid::ModuleInfo,
+    config: &Config,
+) -> Result<String, Error> {
+    if module_needs_naga_baseline_skip(module) {
+        let emitted = generate(
+            module,
+            info,
+            GenerateOptions {
+                beautify: config.beautify,
+                indent: config.indent,
+                mangle: config.mangle(),
+                float_precision: config.float_precision,
+                preserve_symbols: config.preserve_symbols.iter().cloned().collect(),
+                type_alias: true,
+                ..Default::default()
+            },
+        )?;
+        Ok(emitted.source)
+    } else {
+        emit_wgsl_with_naga_safe(module, info)
+    }
 }
 
 /// Collect every top-level declaration name in `module`: types,
@@ -847,6 +967,43 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         .preserve_symbols
         .extend(preamble_names.iter().cloned());
 
+    // naga's WGSL front-end appends an implicit `return;` (value `None`) to a
+    // function body whose tail is a `loop` - it never proves a loop
+    // non-falling-through, even one whose body always returns - and naga 30's
+    // validator now rejects that as `InvalidReturnType` in a non-void function.
+    // Such input (a function ending in a diverging loop) is valid WGSL that
+    // tint/Dawn accept and that naga 29 also validated; strip the dead appended
+    // return so nagami can still minimise it.  The strip is gated on the SAME
+    // `block_definitely_terminates` predicate the generator uses to RE-synthesise
+    // the trailing return in its output, so input and output stay in lockstep.
+    strip_front_end_appended_returns(&mut module);
+
+    // Bail out on input naga's validator rejects.  naga's front-end PARSES some
+    // shaders it then rejects at validation - notably a const-expression
+    // division / modulo by zero (a WGSL shader-creation error naga 30 enforces
+    // that tint/Dawn accept leniently).  nagami cannot optimise such input, so
+    // return it verbatim (like the unsupported-extension bailout) rather than
+    // error and break a batch run.  Doing this BEFORE the passes also means the
+    // post-pass `validate_module` failure below provably indicates a pass bug
+    // (valid in, invalid out) and rightly stays a hard error.
+    if io::validate_module(&module).is_err() {
+        report.pass_reports.push(PassReport {
+            pass_name: "validation_bailout".to_string(),
+            before_bytes: Some(source.len()),
+            after_bytes: Some(source.len()),
+            changed: false,
+            duration_us: 0,
+            validation_ok: false,
+            text_validation_ok: None,
+            rolled_back: true,
+        });
+        report.output_bytes = source.len();
+        return Ok(Output {
+            source: source.to_string(),
+            report,
+        });
+    }
+
     pipeline::run_ir_passes(&mut module, &effective_config, &mut report)?;
 
     let info = io::validate_module(&module)?;
@@ -898,11 +1055,22 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                 // lead it.
                 let validation_result =
                     if let Some(normalized_preamble) = normalized_preamble.as_deref() {
-                        // Validate against the normalised preamble naga actually
-                        // parsed, so the check matches the module.
+                        // The generator's naga-ONLY enables (wgpu_binding_array /
+                        // wgpu_int16) must be present for naga to PARSE the feature,
+                        // but they are dropped from the shipped body and a user
+                        // preamble legitimately lacks them - inject them for THIS
+                        // naga check only.  Genuine tint-required enables (f16, ...)
+                        // are NOT injected, so a body needing one the preamble omits
+                        // still fails here (or hits the f16 guard below).
                         let emit_body = split_directives(&emitted.source).1;
                         let (pre_directives, pre_body) = split_directives(normalized_preamble);
-                        let combined = join_with_newline(&[pre_directives, pre_body, emit_body]);
+                        let naga_only = naga_only_enable_prefix(&emitted.source);
+                        let combined = join_with_newline(&[
+                            naga_only.as_str(),
+                            pre_directives,
+                            pre_body,
+                            emit_body,
+                        ]);
                         io::validate_wgsl_text(&combined)
                     } else {
                         io::validate_wgsl_text(&emitted.source)
@@ -929,10 +1097,36 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                     let differs_from_baseline =
                         naga_output.as_deref() != Some(emitted.source.as_str());
                     let final_source = if has_preamble {
+                        // A preamble owns all directives, so the body's leading
+                        // directives (including any `enable wgpu_binding_array;`)
+                        // are already dropped here.
                         split_directives(&emitted.source).1.to_owned()
                     } else {
-                        emitted.source
+                        // Strip the naga-only `enable wgpu_*;` directives the
+                        // generator emitted for the self-check: tint rejects
+                        // them, so the shipped, tint-facing output must not carry
+                        // them.
+                        strip_naga_only_enables(emitted.source)
                     };
+                    // With a preamble active the body's directives are stripped
+                    // (the preamble owns them).  If the stripped body still needs
+                    // `enable f16;` but the consumer's preamble does not declare
+                    // it, the shipped `[preamble, body]` document is invalid, and
+                    // WGSL forbids re-emitting the directive after the preamble's
+                    // declarations, so nagami cannot repair it.  The self-check
+                    // above validates against the f16-INJECTED normalised preamble
+                    // (see `preprocess_source_for_naga`) and masks this, so guard
+                    // explicitly and surface a diagnosable error.
+                    if has_preamble
+                        && references_f16_token(&final_source)
+                        && !has_enable_f16_directive(effective_preamble.unwrap_or(""))
+                    {
+                        return Err(Error::Emit(
+                            "shader body requires `enable f16;` but the preamble \
+                             does not declare it; add `enable f16;` to the preamble"
+                                .to_string(),
+                        ));
+                    }
                     let after_bytes = final_source.len();
                     let changed = before_bytes != after_bytes || differs_from_baseline;
                     (
@@ -1632,7 +1826,11 @@ mod tests {
     }
 
     #[test]
-    fn run_strips_wgpu_binding_array_enable_directive() {
+    fn run_strips_naga_only_binding_array_enable_from_output() {
+        // naga 30 requires `enable wgpu_binding_array;` to parse a binding_array,
+        // but tint/Dawn reject the naga-specific directive and support binding
+        // arrays natively, so the shipped tint-facing output must NOT carry it -
+        // yet the minified binding_array itself must survive.
         let src = r#"
             enable wgpu_binding_array;
             @group(0) @binding(0)
@@ -1646,7 +1844,13 @@ mod tests {
         let output = run(src, &Config::default()).expect("run should succeed");
         assert!(
             !output.source.contains("enable wgpu_binding_array;"),
-            "legacy enable directive should be removed in normalized input"
+            "naga-only enable directive must be stripped from tint-facing output: {}",
+            output.source
+        );
+        assert!(
+            output.source.contains("binding_array<"),
+            "the binding_array type itself must survive minification: {}",
+            output.source
         );
     }
 
@@ -1654,8 +1858,9 @@ mod tests {
     /// `run` returns the original input verbatim plus a synthetic
     /// `unsupported_extension_bailout` PassReport so downstream
     /// tooling can distinguish "ran the pipeline" from "bailed out".
-    /// `subgroups` is currently a parse-time error in naga 29
-    /// (matched by `UNSUPPORTED_EXTENSION_PATTERNS`); a future naga
+    /// `subgroups` remains a parse-time error in naga 30 (its
+    /// `enable subgroups;` is the sole `UnimplementedEnableExtension`,
+    /// matched here by `UNSUPPORTED_EXTENSION_PATTERNS`); a future naga
     /// release that lands subgroup support will need a different
     /// trigger here.
     #[test]
@@ -1954,12 +2159,19 @@ mod tests {
     }
 
     #[test]
-    fn preprocess_strips_wgpu_directive_with_cr_only_endings() {
+    fn preprocess_preserves_wgpu_directive_with_cr_only_endings() {
+        // naga 30 implements (and requires) `wgpu_binding_array`, so it is no
+        // longer stripped; the lone-CR line ending is still normalised to LF so
+        // the downstream per-line scans see the break.
         let src = "enable wgpu_binding_array;\r@fragment fn m() -> @location(0) vec4f { return vec4f(0); }";
         let out = preprocess_source_for_naga(src);
         assert!(
-            !out.contains("enable wgpu_binding_array;"),
-            "lone-CR-terminated wgpu_* directive must still be stripped: {out:?}"
+            out.contains("enable wgpu_binding_array;"),
+            "implemented wgpu_* directive must be preserved: {out:?}"
+        );
+        assert!(
+            !out.contains('\r'),
+            "lone CR must be normalised to LF: {out:?}"
         );
     }
 
@@ -1986,6 +2198,40 @@ mod tests {
     fn has_enable_f16_directive_rejects_non_directive() {
         assert!(!has_enable_f16_directive("var enable_f16: bool;"));
         assert!(!has_enable_f16_directive("fn enable() {} // f16"));
+    }
+
+    #[test]
+    fn has_enable_f16_directive_matches_comma_separated_list() {
+        // WGSL permits a comma-separated enable list; `f16` in any position must
+        // be recognised.  A false negative here is not harmless: the preamble
+        // guard in `run` turns it into a hard error on valid input.
+        assert!(has_enable_f16_directive("enable f16, clip_distances;\n"));
+        assert!(has_enable_f16_directive("enable clip_distances, f16;\n"));
+        assert!(has_enable_f16_directive(
+            "enable dual_source_blending , f16 ;"
+        ));
+        assert!(!has_enable_f16_directive(
+            "enable clip_distances, dual_source_blending;"
+        ));
+    }
+
+    #[test]
+    fn has_enable_f16_directive_matches_second_directive_on_same_line() {
+        // Several directives may share one physical line; f16 in any of them
+        // must be found (a false negative hard-errors the preamble guard).
+        assert!(has_enable_f16_directive(
+            "enable dual_source_blending; enable f16;"
+        ));
+        assert!(has_enable_f16_directive(
+            "enable clip_distances; enable f16, subgroups;"
+        ));
+        // Directives on separate lines (each ends in `;`, all before any decl).
+        assert!(has_enable_f16_directive(
+            "enable dual_source_blending;\nenable f16;\nstruct S { x: f32 }"
+        ));
+        assert!(!has_enable_f16_directive(
+            "enable dual_source_blending; enable clip_distances;"
+        ));
     }
 
     #[test]
@@ -2258,6 +2504,75 @@ mod tests {
             msg.contains("f16"),
             "the error should name the missing f16 extension: {msg}"
         );
+    }
+
+    #[test]
+    fn preamble_declares_f16_in_comma_separated_enable_list() {
+        // A preamble that declares f16 as one entry of a comma-separated enable
+        // list (valid WGSL) supplies the directive just as a lone `enable f16;`
+        // does, so an f16 body must minify - NOT trip the missing-directive
+        // guard.  Regression: the guard's single-extension-only detection used to
+        // hard-error this valid input.
+        let preamble = "\
+            enable f16, clip_distances;\n\
+            @group(0) @binding(0) var<uniform> bias: f16;\
+        ";
+        let source = "\
+            @group(0) @binding(1) var<storage, read_write> sink: f16;\n\
+            @compute @workgroup_size(1) fn main() {\n\
+                sink = 1.0h + bias;\n\
+            }\
+        ";
+        let config = Config {
+            preamble: Some(preamble.to_string()),
+            ..Default::default()
+        };
+        let output = run(source, &config)
+            .expect("f16 declared in a comma-separated enable list must minify, not error");
+        assert!(
+            !output.source.contains("enable f16;"),
+            "the preamble owns the directive; the body must not carry it: {}",
+            output.source
+        );
+        let shipped = format!("{preamble}\n{}", output.source);
+        io::validate_wgsl_text(&shipped)
+            .expect("the shipped [preamble, output] concatenation must be valid WGSL");
+    }
+
+    #[test]
+    fn binding_array_minifies_under_preamble_without_naga_only_enable() {
+        // naga needs `enable wgpu_binding_array;` to PARSE a binding_array, but
+        // tint supports them natively (no enable) so the shipped body omits it and
+        // the preamble need not declare it.  The preamble self-check injects that
+        // naga-only enable for its naga re-parse ONLY.  Regression: the self-check
+        // validated the enable-less body against naga and hard-errored, with no
+        // preamble spelling that both minified and shipped tint-valid output.
+        let preamble = "const SCALE: f32 = 2.0;";
+        let source = "\
+            @group(0) @binding(0) var tex: binding_array<texture_2d<f32>, 4>;\n\
+            @fragment fn m() -> @location(0) vec4f {\n\
+                return textureLoad(tex[0], vec2i(0), 0) * SCALE;\n\
+            }";
+        let config = Config {
+            preamble: Some(preamble.to_string()),
+            ..Default::default()
+        };
+        let output = run(source, &config)
+            .expect("binding_array + preamble must minify, not hard-error on the self-check");
+        assert!(
+            !output.source.contains("enable wgpu_binding_array;"),
+            "shipped body must not carry the naga-only enable: {}",
+            output.source
+        );
+        assert!(
+            output.source.contains("binding_array<"),
+            "the binding_array type must survive: {}",
+            output.source
+        );
+        // The shipped body is tint-valid without the enable; naga needs it, so
+        // prepend it to confirm [preamble, body] round-trips through naga.
+        let shipped = format!("enable wgpu_binding_array;\n{preamble}\n{}", output.source);
+        io::validate_wgsl_text(&shipped).expect("[preamble, body] must round-trip through naga");
     }
 
     // MARK: Splat elision tests

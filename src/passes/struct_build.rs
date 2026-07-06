@@ -51,15 +51,35 @@ fn expr_loads_local(
     g: naga::Handle<naga::LocalVariable>,
     arena: &naga::Arena<naga::Expression>,
 ) -> bool {
-    let mut found = false;
+    let mut visited = std::collections::HashSet::new();
+    expr_loads_local_memo(h, g, arena, &mut visited)
+}
+
+fn expr_loads_local_memo(
+    h: naga::Handle<naga::Expression>,
+    g: naga::Handle<naga::LocalVariable>,
+    arena: &naga::Arena<naga::Expression>,
+    visited: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+) -> bool {
+    // A shared sub-expression forms a diamond in the DAG; without a visited set
+    // each incoming edge re-walks it, making this exponential (2^depth) on wide
+    // shared trees (a ~1KB shader can then hang the pass).  A handle is inserted
+    // before it is explored and only ever memoises `false`: a handle whose
+    // subtree DOES contain `g` returns `true` on its first visit and the
+    // caller's `if !found` guard short-circuits every later edge, so it is never
+    // revisited to yield a wrong `false`.
+    if !visited.insert(h) {
+        return false;
+    }
     if let naga::Expression::Load { pointer } = arena[h]
         && get_stored_local(arena, pointer) == Some(g)
     {
         return true;
     }
+    let mut found = false;
     crate::passes::expr_util::visit_expression_children(&arena[h], |child| {
         if !found {
-            found = expr_loads_local(child, g, arena);
+            found = expr_loads_local_memo(child, g, arena, visited);
         }
     });
     found
@@ -365,13 +385,28 @@ fn expr_mentions_local(
     local: naga::Handle<naga::LocalVariable>,
     arena: &naga::Arena<naga::Expression>,
 ) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    expr_mentions_local_memo(h, local, arena, &mut visited)
+}
+
+fn expr_mentions_local_memo(
+    h: naga::Handle<naga::Expression>,
+    local: naga::Handle<naga::LocalVariable>,
+    arena: &naga::Arena<naga::Expression>,
+    visited: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+) -> bool {
+    // Memoised for the same reason as `expr_loads_local_memo`: without a visited
+    // set, shared sub-expressions make this exponential on the DAG.
+    if !visited.insert(h) {
+        return false;
+    }
     if matches!(arena[h], naga::Expression::LocalVariable(l) if l == local) {
         return true;
     }
     let mut found = false;
     crate::passes::expr_util::visit_expression_children(&arena[h], |child| {
         if !found {
-            found = expr_mentions_local(child, local, arena);
+            found = expr_mentions_local_memo(child, local, arena, visited);
         }
     });
     found

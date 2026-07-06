@@ -76,12 +76,12 @@ pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
                 Box::new(dead_branch::DeadBranchPass),
             ];
 
-            // CSE introduces `let` bindings for shared sub-expressions.
-            // Profitable only under [`Profile::Max`], where mangling
-            // shrinks the binding name down to a single character and
-            // amortises the added line.  Under Aggressive the longer
-            // identifier defeats the saving, so CSE stays off.
-            if config.profile == Profile::Max {
+            // CSE introduces `let` bindings for shared sub-expressions,
+            // profitable only when rename mangles the binding name down to one
+            // character.  Gate on the effective mangle setting (not just the
+            // profile), so a `Max` config with mangling explicitly disabled does
+            // not ship the long identifier and reverse the saving.
+            if config.profile == Profile::Max && config.mangle() {
                 passes.push(Box::new(cse::CSEPass));
             }
 
@@ -97,12 +97,20 @@ pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
                 Box::new(coalescing::CoalescingPass),
                 Box::new(dead_param::DeadParamPass),
                 Box::new(emit_merge::EmitMergePass),
-                // Hoist repeated all-literal vector constants into shared module
-                // consts BEFORE rename, so rename names them by frequency (this
-                // is what makes the optimization idempotent).
-                Box::new(const_hoist::ConstHoistPass),
-                rename,
             ]);
+
+            // Hoist repeated all-literal vector constants into shared module
+            // consts BEFORE rename, so rename names them by frequency (this is
+            // what makes the optimization idempotent).  Gated on mangling for the
+            // same reason as CSE: the pass prices its savings at a 2-char bound
+            // name, which only rename's mangling delivers.  Without mangling the
+            // `_hoist{N}` placeholder ships verbatim and the long identifier can
+            // defeat - even reverse - the saving.
+            if config.profile == Profile::Max && config.mangle() {
+                passes.push(Box::new(const_hoist::ConstHoistPass));
+            }
+
+            passes.push(rename);
 
             passes
         }

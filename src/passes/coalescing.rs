@@ -831,14 +831,16 @@ fn scan_block_usage(
             naga::Statement::Loop {
                 body, continuing, ..
             } => {
-                // Loop body's writes do NOT propagate to the parent
-                // scope's init state.  Even when reachable, an early
-                // `break` / `Return` inside the body bypasses later
-                // writes; without terminator-aware analysis we cannot
-                // claim post-loop coverage.  Restore entry-state
-                // after each recursion to keep the parent's view
-                // unchanged.
+                // Loop writes don't propagate to the parent (an early break/Return
+                // bypasses later writes, so post-loop coverage is unprovable):
+                // snapshot and restore `local_init` around the scans.  Scan
+                // body/continuing with EMPTY coverage - pre-loop coverage doesn't
+                // survive the back edge, so a loop-carried read of a
+                // partially-initialised aggregate would be wrongly judged covered,
+                // keeping the local coalesce-safe while a later aliased local
+                // clobbers the carried value.  Empty = sound meet over entry edges.
                 let entry_init = local_init.clone();
+                local_init.clear();
                 let _ = scan_block_usage(
                     body,
                     expressions,
@@ -848,7 +850,7 @@ fn scan_block_usage(
                     usage,
                     local_init,
                 );
-                *local_init = entry_init.clone();
+                local_init.clear();
                 let _ = scan_block_usage(
                     continuing,
                     expressions,

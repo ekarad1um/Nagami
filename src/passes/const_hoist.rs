@@ -44,6 +44,8 @@ fn lit_key(l: naga::Literal) -> LitKey {
         L::Bool(v) => (7, v as u64),
         L::AbstractInt(v) => (8, v as u64),
         L::AbstractFloat(v) => (9, v.to_bits()),
+        L::I16(v) => (10, v as u16 as u64),
+        L::U16(v) => (11, v as u64),
     }
 }
 
@@ -63,6 +65,10 @@ fn est_lit_len(l: naga::Literal) -> usize {
         L::F64(v) => v.to_string(),
         L::AbstractFloat(v) => v.to_string(),
         L::F16(v) => v.to_f32().to_string(),
+        // i16/u16 always emit via the constructor form `i16(N)` / `u16(N)`
+        // (there is no bare int16 literal in WGSL), so price that width.
+        L::I16(v) => format!("i16({v})"),
+        L::U16(v) => format!("u16({v})"),
     };
     s.len().max(1)
 }
@@ -172,7 +178,7 @@ impl Pass for ConstHoistPass {
         "const-hoist"
     }
 
-    fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
+    fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
         // Phase 1: collect every hoistable vector-literal Compose in every
         // function and entry-point body (global expressions are skipped).
         let mut candidates: Vec<Candidate> = Vec::new();
@@ -227,6 +233,46 @@ impl Pass for ConstHoistPass {
         let mut group_list: Vec<(GroupKey, Vec<usize>)> = groups.into_iter().collect();
         group_list.sort_by(|a, b| a.0.cmp(&b.0));
 
+        // Names the placeholder must avoid.  The load-bearing case is a
+        // preserve-listed (preamble) name: rename keeps such a name verbatim, and
+        // if it matches a preamble symbol the generator suppresses the hoisted
+        // declaration as preamble-owned, silently rebinding every use to the
+        // preamble's (different) value.  The raw `_hoist{constants.len()}` scheme
+        // can hit this because preamble consts count in `constants.len()`.  The
+        // remaining module-level names are belt-and-suspenders (rename mangles a
+        // non-preserved placeholder to a fresh unique name anyway).  Seed the
+        // avoid-set once and record each minted name so repeated hoists differ.
+        let mut reserved_names: std::collections::HashSet<String> =
+            ctx.config.preserve_symbols.iter().cloned().collect();
+        for (_, c) in module.constants.iter() {
+            if let Some(n) = c.name.as_deref() {
+                reserved_names.insert(n.to_string());
+            }
+        }
+        for (_, g) in module.global_variables.iter() {
+            if let Some(n) = g.name.as_deref() {
+                reserved_names.insert(n.to_string());
+            }
+        }
+        for (_, ov) in module.overrides.iter() {
+            if let Some(n) = ov.name.as_deref() {
+                reserved_names.insert(n.to_string());
+            }
+        }
+        for (_, f) in module.functions.iter() {
+            if let Some(n) = f.name.as_deref() {
+                reserved_names.insert(n.to_string());
+            }
+        }
+        for ep in module.entry_points.iter() {
+            reserved_names.insert(ep.name.clone());
+        }
+        for (_, ty) in module.types.iter() {
+            if let Some(n) = ty.name.as_deref() {
+                reserved_names.insert(n.to_string());
+            }
+        }
+
         const NAME_LEN: usize = 2;
         let mut changed = false;
         // Per-function set of handles converted Compose -> Constant, so their
@@ -279,9 +325,20 @@ impl Pass for ConstHoistPass {
                 },
                 naga::Span::UNDEFINED,
             );
+            // Mint a collision-free placeholder: start at the arena length and
+            // walk forward until the name is fresh in `reserved_names` (which
+            // also records it, keeping later hoists in this loop distinct).
+            let mut suffix = module.constants.len();
+            let hoist_name = loop {
+                let cand = format!("_hoist{}", suffix);
+                if reserved_names.insert(cand.clone()) {
+                    break cand;
+                }
+                suffix += 1;
+            };
             let const_handle = module.constants.append(
                 naga::Constant {
-                    name: Some(format!("_hoist{}", module.constants.len())),
+                    name: Some(hoist_name),
                     ty,
                     init,
                 },

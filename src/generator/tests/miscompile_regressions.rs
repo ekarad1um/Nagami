@@ -363,11 +363,10 @@ fn f16_multiply_by_zero_is_not_mis_signed() {
     );
 }
 
-/// An override-sized array (`array<i32, O*2>`) must round-trip without
-/// aborting the process.  naga 29's own WGSL back-end hits `unreachable!()`
-/// on the override size expression; under the release `panic = "abort"`
-/// strategy that crashes (SIGABRT).  nagami emits these types with its own
-/// generator, so `run` must detect the override-sized array and skip the
+/// An override-sized array (`array<i32, O*2>`) must round-trip without aborting.
+/// naga's WGSL back-end hits `unreachable!()` on the override size expression,
+/// SIGABRTing under the release `panic = "abort"`.  nagami emits these types with
+/// its own generator, so `run` must detect the override-sized array and skip the
 /// naga baseline/fallback emit rather than invoke it.
 #[test]
 fn override_sized_array_does_not_abort() {
@@ -682,11 +681,11 @@ fn normal_returning_fn_not_padded_with_zero_return() {
     );
 }
 
-/// naga 29's WGSL back-end hits `unreachable!()` (and, under release
-/// `panic = "abort"`, SIGABRTs) when writing a non-const override / global-var
-/// initializer such as `override h = 2 * d;`.  Because nagami eagerly emits
-/// that naga baseline before its own generator runs, the baseline must be
-/// skipped for such modules (the generator emits them correctly).
+/// naga's WGSL back-end hits `unreachable!()` (SIGABRTing under release
+/// `panic = "abort"`) when writing a non-const override / global-var initializer
+/// such as `override h = 2 * d;`.  nagami eagerly emits that naga baseline before
+/// its own generator runs, so the baseline must be skipped for such modules (the
+/// generator emits them correctly).
 #[test]
 fn override_binary_initializer_minifies_without_abort() {
     let out = minify(
@@ -1047,5 +1046,28 @@ fn interleaved_struct_builds_do_not_drop_live_statements() {
     assert!(
         !out.contains(".b=2") && !out.contains(".y=200"),
         "an interleaved struct build left orphan member stores: {out}"
+    );
+}
+
+/// Two single-use pure calls feeding one `if` condition must BOTH inline into
+/// the condition, not leave one `let`-bound.  An `Emit` merges sibling pending
+/// calls onto one carrier; consuming only the first (a prior bug) needlessly
+/// bound the second to a `let`.  Both survived the same clears, so both are
+/// safe to inline at the shared use site - a byte-minimality guard.
+#[test]
+fn sibling_pure_calls_in_if_condition_both_inline() {
+    // `f`/`g` are pure (write only locals) and loop-bearing, so neither is
+    // fully inlined - each survives as a `Call` whose single-use result feeds
+    // the `==`.  Their own bodies emit no `let`, so any `let` in the output can
+    // only be a needlessly-bound call result.
+    let src = "\
+        fn f(x:f32)->f32{ var s=0.0; for(var i=0;i<9;i=i+1){ s=s+x; } return s; }\
+        fn g(x:f32)->f32{ var s=1.0; for(var i=0;i<9;i=i+1){ s=s*x; } return s; }\
+        @fragment fn main(@location(0) v:f32,@location(1) w:f32)->@location(0) f32{\
+            if(f(v)==g(w)){ return 1.0; } return 0.0; }";
+    let out = minify(src);
+    assert!(
+        !out.contains("let "),
+        "both pure calls should inline into the `if` condition, none `let`-bound: {out}"
     );
 }

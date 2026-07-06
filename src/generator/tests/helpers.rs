@@ -122,7 +122,19 @@ pub fn compact_mangled_preserved(src: &str, preserve: &[&str]) -> String {
 /// at the offending test rather than this helper.
 #[track_caller]
 pub fn assert_valid_wgsl(out: &str) {
-    let module = naga::front::wgsl::parse_str(out).unwrap_or_else(|e| {
+    // naga requires `enable wgpu_binding_array;` to parse a `binding_array`, but
+    // nagami's shipped output omits that naga-only directive (tint rejects it
+    // and supports binding arrays natively; `run` strips it).  Inject it for the
+    // naga re-parse here, exactly as the real consumer's toolchain / the
+    // pipeline self-check does, so the helper still validates the body.
+    let injected;
+    let to_parse = if out.contains("binding_array") && !out.contains("enable wgpu_binding_array;") {
+        injected = format!("enable wgpu_binding_array;\n{out}");
+        injected.as_str()
+    } else {
+        out
+    };
+    let module = naga::front::wgsl::parse_str(to_parse).unwrap_or_else(|e| {
         panic!("re-parse failed for:\n{out}\nerror: {e:?}");
     });
     naga::valid::Validator::new(

@@ -515,14 +515,29 @@ fn count_calls(block: &naga::Block, calls: &mut HashMap<naga::Handle<naga::Funct
 ///   set and shift subsequent assignments one slot, producing a
 ///   two-sweep oscillation that keeps the pipeline from converging.
 ///
-/// Preserve-listed entries in every arena are always reserved
-/// regardless of `mangle` so the user-visible names survive.
+/// Every preserve-listed name is reserved unconditionally, including names
+/// absent from every arena - e.g. a preamble binding a prior pass pruned - so
+/// the user-visible names survive and are never re-minted for a body symbol.
 fn collect_reserved_names(
     module: &naga::Module,
     preserve: &HashSet<String>,
     mangle: bool,
 ) -> HashSet<String> {
     let mut reserved = HashSet::new();
+
+    // Reserve every preserve-listed name unconditionally, before the
+    // arena scans below.  `preserve` includes all preamble-declared symbols
+    // (they are added to `preserve_symbols` automatically), and a preamble
+    // declaration may have been pruned from the module arenas by an earlier
+    // pass (e.g. `CompactPass` dropping an unused preamble global).  The
+    // per-arena scans only see names that still exist, so a pruned preamble
+    // name would otherwise be re-minted for an unrelated body identifier;
+    // the generator then suppresses that same-named body declaration as
+    // preamble-owned and every reference silently rebinds to the host's
+    // preamble binding.  Reserving here is deterministic per config, so
+    // idempotence is unaffected, and it subsumes the preserve half of the scans
+    // below - which therefore only reserve their non-preserve cases.
+    reserved.extend(preserve.iter().cloned());
 
     if !mangle {
         for (_, c) in module.constants.iter() {
@@ -537,47 +552,22 @@ fn collect_reserved_names(
             }
         }
     } else {
-        // Even when mangling, preserve-listed constants and overrides
-        // retain their names and must be reserved.
-        for (_, c) in module.constants.iter() {
-            if let Some(name) = c.name.as_deref()
-                && preserve.contains(name)
-            {
-                reserved.insert(name.to_string());
-            }
-        }
+        // Every `@id`-less override keeps its name (the host's pipeline-constant
+        // key) and is not renamed, so no mangled identifier may collide with it.
+        // (Preserve-listed overrides are already covered by the seed above.)
         for (_, ov) in module.overrides.iter() {
-            // Reserve preserve-listed overrides AND every `@id`-less override:
-            // the latter keeps its name (the host's pipeline-constant key) and
-            // is not renamed, so no mangled identifier may collide with it.
             if let Some(name) = ov.name.as_deref()
-                && (preserve.contains(name) || ov.id.is_none())
+                && ov.id.is_none()
             {
                 reserved.insert(name.to_string());
             }
         }
     }
 
-    for (_, global) in module.global_variables.iter() {
-        if let Some(name) = global.name.as_deref()
-            && preserve.contains(name)
-        {
-            reserved.insert(name.to_string());
-        }
-    }
-
-    for (_, function) in module.functions.iter() {
-        if let Some(name) = function.name.as_deref()
-            && preserve.contains(name)
-        {
-            reserved.insert(name.to_string());
-        }
-        collect_preserved_function_names(function, preserve, &mut reserved);
-    }
-
+    // Entry-point names are host-referenced and never renamed, so reserve them
+    // unconditionally.
     for entry in module.entry_points.iter() {
         reserved.insert(entry.name.clone());
-        collect_preserved_function_names(&entry.function, preserve, &mut reserved);
     }
 
     // Always reserve every source struct type name and struct member
@@ -637,31 +627,6 @@ fn collect_reserved_names(
     }
 
     reserved
-}
-
-/// Reserve every preserve-listed argument and local inside `function`
-/// so the rename sweep cannot repurpose those names for unrelated
-/// declarations elsewhere in the module.
-fn collect_preserved_function_names(
-    function: &naga::Function,
-    preserve: &HashSet<String>,
-    reserved: &mut HashSet<String>,
-) {
-    for argument in function.arguments.iter() {
-        if let Some(name) = argument.name.as_deref()
-            && preserve.contains(name)
-        {
-            reserved.insert(name.to_string());
-        }
-    }
-
-    for (_, local) in function.local_variables.iter() {
-        if let Some(name) = local.name.as_deref()
-            && preserve.contains(name)
-        {
-            reserved.insert(name.to_string());
-        }
-    }
 }
 
 /// Thin wrapper over [`name_gen::next_name_insert`] so the pass body

@@ -1231,10 +1231,14 @@ fn splice_block(target: &mut naga::Block, source: naga::Block) {
 /// next statement).
 fn definitely_terminates(stmt: &naga::Statement) -> bool {
     match stmt {
-        naga::Statement::Return { .. }
-        | naga::Statement::Kill
-        | naga::Statement::Break
-        | naga::Statement::Continue => true,
+        // NOTE: `Kill` (discard) is deliberately NOT a terminator.  Under WGSL's
+        // demote-to-helper semantics execution CONTINUES past `discard`, and
+        // tint's control-flow analysis requires the statements after it to stay
+        // present - a trailing `return` in a non-void function, or a loop's
+        // `return`/`break` exit.  Treating `discard` as terminating strips that
+        // reachable code and yields output tint rejects ("missing return at end
+        // of function" / "loop does not exit").
+        naga::Statement::Return { .. } | naga::Statement::Break | naga::Statement::Continue => true,
         naga::Statement::Block(inner) => block_definitely_terminates(inner),
         naga::Statement::If { accept, reject, .. } => {
             block_definitely_terminates(accept) && block_definitely_terminates(reject)
@@ -1247,7 +1251,7 @@ fn definitely_terminates(stmt: &naga::Statement) -> bool {
         }
         // A switch terminates the outer block iff every non-
         // fall-through case exits *beyond* the switch
-        // (Return/Kill/Continue), a Default case exists, AND the
+        // (Return/Continue), a Default case exists, AND the
         // last case does NOT have `fall_through: true`.  A bare
         // Break exits the switch only (resumes after it), so it
         // does not qualify; see [`case_body_terminates_beyond_switch`].
@@ -1298,7 +1302,9 @@ pub(crate) fn block_definitely_terminates(block: &naga::Block) -> bool {
 /// switch to the loop's continuing block, so it IS a beyond-switch terminator.
 fn case_body_terminates_beyond_switch(block: &naga::Block) -> bool {
     block.last().is_some_and(|stmt| match stmt {
-        naga::Statement::Return { .. } | naga::Statement::Kill | naga::Statement::Continue => true,
+        // `Kill` (discard) is NOT a terminator - execution continues past it;
+        // see the note in `definitely_terminates`.
+        naga::Statement::Return { .. } | naga::Statement::Continue => true,
         // Break in a switch case exits the switch only.
         naga::Statement::Break => false,
         naga::Statement::Block(inner) => case_body_terminates_beyond_switch(inner),
@@ -1308,8 +1314,8 @@ fn case_body_terminates_beyond_switch(block: &naga::Block) -> bool {
         // A `loop` inside a switch case only falls through if it contains a
         // bare `break` (which exits the loop, not the switch).  When the loop
         // body definitely terminates *and* has no bare loop-control
-        // statements, the only way out is Return/Kill, both of which exit
-        // beyond the switch.  Matches the reasoning in `definitely_terminates`.
+        // statements, the only way out is Return, which exits beyond the
+        // switch.  Matches the reasoning in `definitely_terminates`.
         naga::Statement::Loop { body, .. } => {
             block_definitely_terminates(body) && !contains_bare_loop_control(body)
         }
@@ -1904,6 +1910,17 @@ fn eliminate_redundant_else_stores(
                     known_values,
                     fresh_loads,
                 );
+                // continuing is entered from every `continue` edge and body
+                // fall-through, not sequentially after the body's tail, so a fact
+                // the body set there (e.g. `known[d]=true` before a `break`) may
+                // not hold on those edges - inheriting it would delete a live
+                // continuing store as redundant.  Roll back to the post-wipe state
+                // (a sound meet over entry edges).  `fresh_loads` needs no reset:
+                // any Store clears its entry, so a surviving `fresh_loads[d]=h`
+                // means `d` is unwritten after `h`, which naga emits on every path
+                // into continuing, so `d==h` on all edges and its narrowing stays
+                // sound.
+                known_values.rollback_to(cp_loop);
                 changed += eliminate_redundant_else_stores(
                     continuing,
                     expressions,

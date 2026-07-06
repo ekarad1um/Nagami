@@ -415,6 +415,7 @@ pub(crate) fn is_zero_init(
 pub(crate) fn is_zero_literal(lit: &naga::Literal) -> bool {
     match lit {
         naga::Literal::Bool(false) => true,
+        naga::Literal::I16(0) | naga::Literal::U16(0) => true,
         naga::Literal::I32(0) | naga::Literal::U32(0) => true,
         naga::Literal::I64(0) | naga::Literal::U64(0) => true,
         naga::Literal::AbstractInt(0) => true,
@@ -1301,13 +1302,6 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         dead_store_ids.insert(store_id);
     }
 
-    // The collection phase is complete; release the immutable borrow
-    // on `function.body` so the mutation phase below can take its
-    // `&mut`.  Without this drop, `apply_to_block(&mut function.body,
-    // ...)` would conflict with `scope_idx`'s `PhantomData<&'body
-    // Block>` borrow.
-    drop(scope_idx);
-
     // Undo: only undo candidates whose Store is NOT fully dead.
     for h in undo_candidates {
         if let Some(&(ptr, val, _in_loop)) = seeded_by_store.get(&h)
@@ -1317,6 +1311,40 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         }
         replacements.remove(&h);
     }
+
+    // `dead_store_ids` was computed against the PRE-undo replacements.  The undo
+    // loop just removed replacements for non-dead complex forwards, so a Store
+    // counted dead can regain a load whose forwarding was undone and is now
+    // live.  Removing that Store while the load survives makes the load read the
+    // variable's zero-init (a silent miscompile).  Re-run the later-live-load
+    // guard against the post-undo replacements and drop any Store that is no
+    // longer dead.
+    dead_store_ids.retain(|&store_id| {
+        let (store_ptr, _) = store_id;
+        // On any lookup miss, conservatively KEEP the Store (drop it from the
+        // dead set, i.e. `retain` returns false) - matching the `continue` in the
+        // guard that populated the set.  Removing a Store we can no longer analyze
+        // is the unsafe direction (a surviving load would read the zero-init).
+        let Some(local) = get_stored_local(&function.expressions, store_ptr) else {
+            return false;
+        };
+        let Some(store_pos) = scope_idx.store_position(store_id) else {
+            return false;
+        };
+        let regained_live_load = all_loads.get(&local).is_some_and(|loads| {
+            loads.iter().any(|&load_h| {
+                scope_idx
+                    .handle_position(load_h)
+                    .is_some_and(|lp| lp > store_pos)
+                    && replacements.get(&load_h).is_none_or(|&r| r >= load_h)
+            })
+        });
+        !regained_live_load
+    });
+
+    // The collection/undo phases are complete; release the immutable borrow on
+    // `function.body` so `apply_to_block` below can take its `&mut`.
+    drop(scope_idx);
 
     // After undoing complex forwarding for non-dead variables, all
     // detected store-to-load opportunities may have been reverted.
@@ -1374,6 +1402,7 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         &dead_locals,
         &dead_store_ids,
         &function.expressions,
+        false,
     );
 
     // Remove named expressions that point to replaced handles.
@@ -2433,6 +2462,13 @@ fn apply_to_block(
     dead_locals: &HashSet<naga::Handle<naga::LocalVariable>>,
     dead_store_ids: &HashSet<StoreId>,
     expressions: &naga::Arena<naga::Expression>,
+    // `true` once recursion has entered a `Loop` body/continuing.  `dead_store_ids`
+    // keys a dead Store by `(pointer, value)` identity alone, and a loop-internal
+    // Store can share that identity with the out-of-loop Store the inlining path
+    // retired (e.g. `x = e` written both before and inside a loop).  Such in-loop
+    // Stores are never removal candidates, so one matching a dead id is a
+    // collision victim the back edge still reads: never remove it by identity.
+    in_loop: bool,
 ) {
     let original = std::mem::take(block);
     let mut rebuilt = naga::Block::with_capacity(original.len());
@@ -2481,9 +2517,10 @@ fn apply_to_block(
                 {
                     continue;
                 }
-                // Skip only the specific Store whose (pointer, value) was
-                // identified as dead (last-store inlining).
-                if dead_store_ids.contains(&(*pointer, *value)) {
+                // Remove a dead Store only outside loops; inside, its
+                // (pointer, value) identity can collide with a live loop-carried
+                // Store (see the `in_loop` param doc).
+                if !in_loop && dead_store_ids.contains(&(*pointer, *value)) {
                     continue;
                 }
             }
@@ -2494,6 +2531,7 @@ fn apply_to_block(
                     dead_locals,
                     dead_store_ids,
                     expressions,
+                    in_loop,
                 );
             }
             naga::Statement::If { accept, reject, .. } => {
@@ -2503,6 +2541,7 @@ fn apply_to_block(
                     dead_locals,
                     dead_store_ids,
                     expressions,
+                    in_loop,
                 );
                 apply_to_block(
                     reject,
@@ -2510,6 +2549,7 @@ fn apply_to_block(
                     dead_locals,
                     dead_store_ids,
                     expressions,
+                    in_loop,
                 );
             }
             naga::Statement::Switch { cases, .. } => {
@@ -2520,19 +2560,28 @@ fn apply_to_block(
                         dead_locals,
                         dead_store_ids,
                         expressions,
+                        in_loop,
                     );
                 }
             }
             naga::Statement::Loop {
                 body, continuing, ..
             } => {
-                apply_to_block(body, replacements, dead_locals, dead_store_ids, expressions);
+                apply_to_block(
+                    body,
+                    replacements,
+                    dead_locals,
+                    dead_store_ids,
+                    expressions,
+                    true,
+                );
                 apply_to_block(
                     continuing,
                     replacements,
                     dead_locals,
                     dead_store_ids,
                     expressions,
+                    true,
                 );
             }
             // Leaf statements - apply_to_block only specializes Emit
@@ -3146,8 +3195,7 @@ fn fs_main() -> @location(0) vec4f {
         // A cache entry for `mat_var` seeded before the CooperativeStore
         // must be invalidated by data.pointer's root, even though
         // `target` has CooperativeMatrix type and therefore cannot itself
-        // resolve to a LocalVariable per naga's validator
-        // (`naga/valid/function.rs:1660`).
+        // resolve to a LocalVariable per naga's validator.
 
         let mut module = naga::Module::default();
 

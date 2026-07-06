@@ -1308,6 +1308,8 @@ enum LiteralKey {
     F32(u32),
     F64(u64),
     F16(u16),
+    U16(u16),
+    I16(i16),
     U32(u32),
     I32(i32),
     U64(u64),
@@ -1322,6 +1324,8 @@ fn literal_key(lit: naga::Literal) -> LiteralKey {
         naga::Literal::F32(v) => LiteralKey::F32(v.to_bits()),
         naga::Literal::F64(v) => LiteralKey::F64(v.to_bits()),
         naga::Literal::F16(v) => LiteralKey::F16(v.to_bits()),
+        naga::Literal::U16(v) => LiteralKey::U16(v),
+        naga::Literal::I16(v) => LiteralKey::I16(v),
         naga::Literal::U32(v) => LiteralKey::U32(v),
         naga::Literal::I32(v) => LiteralKey::I32(v),
         naga::Literal::U64(v) => LiteralKey::U64(v),
@@ -7399,9 +7403,11 @@ fn main(@location(0) v: vec3<f32>) -> @location(0) vec4<f32> {
 
     #[test]
     fn e2e_vec_and_zero_stays_valid() {
+        // Integer-typed shader I/O must carry `@interpolate(flat)` (integers
+        // cannot be interpolated); naga 30 enforces this at validation.
         let source = r#"
 @fragment
-fn main(@location(0) v: vec4<u32>) -> @location(0) vec4<u32> {
+fn main(@location(0) @interpolate(flat) v: vec4<u32>) -> @location(0) @interpolate(flat) vec4<u32> {
     return v & vec4<u32>(0u);
 }
 "#;

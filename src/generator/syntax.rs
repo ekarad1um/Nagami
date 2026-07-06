@@ -356,6 +356,49 @@ fn f32_overshoot_safe_hex(v: f32, suffix: &str) -> Option<String> {
         .flatten()
 }
 
+/// `true` when a decimal / scientific f32 candidate `token` (carrying `suffix`,
+/// `"f"` or `""`) recovers `v` bit-for-bit through WGSL's concretization path:
+/// the lexer reads the literal as an AbstractFloat (f64), then converts to f32.
+///
+/// Rust's shortest-float formatting only guarantees a round-trip through the
+/// DIRECT `str -> f32` parse (which is naga's front-end path); tint/Dawn
+/// double-round through f64, and for a handful of bit patterns the two disagree
+/// by 1 ULP (e.g. `7.038531e-26` narrows to `0x15ae43fe` via f64 but the value
+/// is `0x15ae43fd`).  A token that fails this check would ship a different
+/// constant than intended, invisibly to the naga self-check (which parses direct
+/// to f32).
+fn f32_candidate_narrows_exactly(token: &str, suffix: &str, v: f32) -> bool {
+    let numeric = token.strip_suffix(suffix).unwrap_or(token);
+    numeric.parse::<f64>().map(|d| (d as f32).to_bits()) == Ok(v.to_bits())
+}
+
+/// Pick the shortest f32 token that recovers `v` through WGSL's f64
+/// concretization path.  `dec` (always present) and `sci` (optional) are the
+/// shortest decimal / scientific forms; `hex` (present for normals) is exact.
+/// A decimal / scientific candidate is adopted only when it narrows exactly;
+/// otherwise the exact hex form wins.  The final `dec` fallthrough is defensive:
+/// every finite f32 narrows exactly (normals via hex; every subnormal via its
+/// shortest decimal, verified exhaustively), so only a non-representable NaN
+/// could reach it - which valid WGSL const-eval never produces.
+fn f32_shortest_exact(
+    v: f32,
+    suffix: &str,
+    dec: String,
+    hex: Option<String>,
+    sci: Option<String>,
+) -> String {
+    let sci_safe = sci.filter(|s| f32_candidate_narrows_exactly(s, suffix, v));
+    if f32_candidate_narrows_exactly(&dec, suffix, v) {
+        pick_shortest(dec, [hex, sci_safe])
+    } else if let Some(h) = hex {
+        pick_shortest(h, [sci_safe])
+    } else if let Some(s) = sci_safe {
+        s
+    } else {
+        dec
+    }
+}
+
 /// Scientific-notation candidate for a finite `f32` value, appending
 /// `suffix` (for example `f` or empty).  Returns `None` only for zero,
 /// infinity, and NaN - for zero the decimal `"0"` form always wins and
@@ -445,7 +488,13 @@ pub(super) fn literal_to_wgsl(literal: naga::Literal, precision: &FloatPrecision
             let v = round_f32(v, precision.f32);
             f32_overshoot_safe_hex(v, "f").unwrap_or_else(|| {
                 let dec = compact_float_literal_token(format!("{v}f"));
-                pick_shortest(dec, [hex_float_f32(v, "f"), scientific_float_f32(v, "f")])
+                f32_shortest_exact(
+                    v,
+                    "f",
+                    dec,
+                    hex_float_f32(v, "f"),
+                    scientific_float_f32(v, "f"),
+                )
             })
         }
         naga::Literal::F64(v) => {
@@ -459,6 +508,10 @@ pub(super) fn literal_to_wgsl(literal: naga::Literal, precision: &FloatPrecision
             let dec = compact_float_literal_token(format!("{}lf", fmt_f64_debug(v)));
             pick_shortest(dec, [hex_float_f64(v, "lf"), scientific_float_f64(v, "lf")])
         }
+        // WGSL has no bare int16 literal; both `f16`-adjacent 16-bit integer
+        // types are written via their constructor, matching naga's WGSL backend.
+        naga::Literal::U16(v) => format!("u16({v})"),
+        naga::Literal::I16(v) => format!("i16({v})"),
         naga::Literal::U32(v) => shortest_uint_repr(v as u64, "u"),
         naga::Literal::I32(v) => {
             if v == i32::MIN {
@@ -540,7 +593,13 @@ pub(super) fn literal_to_wgsl_bare(literal: naga::Literal, precision: &FloatPrec
             let v = round_f32(v, precision.f32);
             f32_overshoot_safe_hex(v, "").unwrap_or_else(|| {
                 let dec = bare_float_decimal(format!("{v}"), v == 0.0 && v.is_sign_negative());
-                pick_shortest(dec, [hex_float_f32(v, ""), scientific_float_f32(v, "")])
+                f32_shortest_exact(
+                    v,
+                    "",
+                    dec,
+                    hex_float_f32(v, ""),
+                    scientific_float_f32(v, ""),
+                )
             })
         }
         naga::Literal::F64(v) => {
@@ -552,6 +611,11 @@ pub(super) fn literal_to_wgsl_bare(literal: naga::Literal, precision: &FloatPrec
             let dec = bare_float_decimal(format!("{v}"), v == 0.0 && v.is_sign_negative());
             pick_shortest(dec, [hex_float_f64(v, ""), scientific_float_f64(v, "")])
         }
+        // The constructor form is the only WGSL spelling for a 16-bit integer;
+        // it is unambiguous in a type-pinned position, so the bare path matches
+        // the typed one (mirrors naga's WGSL backend).
+        naga::Literal::U16(v) => format!("u16({v})"),
+        naga::Literal::I16(v) => format!("i16({v})"),
         naga::Literal::U32(v) => shortest_uint_repr(v as u64, ""),
         naga::Literal::I32(v) => {
             if v == i32::MIN {
@@ -1016,7 +1080,7 @@ pub(super) fn builtin_name(bi: naga::BuiltIn) -> Result<&'static str, Error> {
         naga::BuiltIn::ViewIndex => "view_index",
         naga::BuiltIn::BaseInstance => "base_instance",
         naga::BuiltIn::BaseVertex => "base_vertex",
-        naga::BuiltIn::ClipDistance => "clip_distances",
+        naga::BuiltIn::ClipDistances => "clip_distances",
         naga::BuiltIn::CullDistance => "cull_distance",
         naga::BuiltIn::InstanceIndex => "instance_index",
         naga::BuiltIn::PointSize => "point_size",

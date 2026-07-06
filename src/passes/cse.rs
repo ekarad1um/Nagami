@@ -68,16 +68,12 @@ enum CseKey {
     Swizzle {
         size: naga::VectorSize,
         vector: naga::Handle<naga::Expression>,
-        // Stored as `[u8; 4]` because `SwizzleComponent` lacks `Hash`
-        // and there are only four lanes.  The `as u8` cast at the
-        // construction site is safe because naga's `SwizzleComponent`
-        // is `#[repr(u8)]` with discriminants 0..=3 (X / Y / Z / W)
-        // - verified against `naga::ir::SwizzleComponent` in naga
-        // 29.0.x.  The cast is therefore an identity on the
-        // discriminant byte.  If a future naga release adds a fifth
-        // discriminant we still fit in `u8`; any mismatch would
-        // surface as a CSE-key miss (different pattern -> different
-        // key) rather than a wrong-result fold.
+        // Stored as `[u8; 4]` because `SwizzleComponent` lacks `Hash` and there
+        // are only four lanes.  The `as u8` cast is an identity on the
+        // discriminant byte: naga's `SwizzleComponent` is `#[repr(u8)]` with
+        // discriminants 0..=3 (X / Y / Z / W).  A future fifth discriminant still
+        // fits in `u8`; any mismatch surfaces as a CSE-key miss (different pattern
+        // -> different key), never a wrong fold.
         pattern: [u8; 4],
     },
     Unary {
@@ -440,7 +436,19 @@ fn collect_cse_replacements(
             }
 
             naga::Statement::Block(inner) => {
+                // The generator emits `Statement::Block` with braces (a real
+                // lexical scope), so a canonical registered inside `inner` is in
+                // scope only within those braces.  Redirecting a later
+                // expression OUTSIDE the block to such an in-block canonical
+                // emits a reference to an out-of-scope `let` - text-invalid WGSL
+                // that naga's flow-insensitive validator accepts but re-parse /
+                // tint reject.  Checkpoint and roll back so in-block canonicals
+                // do not leak, matching the If / Switch / Loop arms.  (When the
+                // generator instead unwraps a block inline this only forgoes a
+                // legitimate CSE - safe.)
+                let checkpoint = cse_map.checkpoint();
                 collect_cse_replacements(inner, expressions, cse_map, replacements);
+                cse_map.rollback_to(checkpoint);
             }
 
             // Leaf statements: CSE only collects from `Emit` ranges

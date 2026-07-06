@@ -953,6 +953,12 @@ impl<'a> Generator<'a> {
             alias_used.extend(global_names.iter().cloned());
             alias_used.extend(function_names.iter().cloned());
             alias_used.extend(module.entry_points.iter().map(|ep| ep.name.clone()));
+            // Preserve-listed / preamble-declared names may no longer appear in
+            // any module arena (a pruned preamble binding) yet still exist in the
+            // consumer's spliced document; reserve them so a minted alias name
+            // cannot shadow or redeclare one.  Mirrors the mangle-counter seed at
+            // the top of this function.
+            alias_used.extend(options.preserve_symbols.iter().cloned());
             let all_funcs = module
                 .functions
                 .iter()

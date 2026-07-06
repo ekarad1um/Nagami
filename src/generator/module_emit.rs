@@ -79,6 +79,7 @@ impl<'a> Generator<'a> {
         // Emit `enable` directives for features the module actually uses.
         // Mirrors naga's own `enable`-directive detection.
         let mut needs_f16 = false;
+        let mut needs_int16 = false;
         let mut needs_dual_source_blending = false;
         let mut needs_clip_distances = false;
         let mut needs_primitive_index = false;
@@ -86,6 +87,7 @@ impl<'a> Generator<'a> {
         let mut needs_mesh_shaders = self.module.uses_mesh_shaders();
         let mut needs_cooperative_matrix = false;
         let mut needs_ray_tracing = false;
+        let mut needs_binding_array = false;
 
         let check_binding = |binding: &naga::Binding,
                              needs_dual: &mut bool,
@@ -98,7 +100,7 @@ impl<'a> Generator<'a> {
                 naga::Binding::Location {
                     blend_src: Some(_), ..
                 } => *needs_dual = true,
-                naga::Binding::BuiltIn(naga::BuiltIn::ClipDistance) => *needs_clip = true,
+                naga::Binding::BuiltIn(naga::BuiltIn::ClipDistances) => *needs_clip = true,
                 naga::Binding::BuiltIn(naga::BuiltIn::PrimitiveIndex) => *needs_prim = true,
                 naga::Binding::BuiltIn(naga::BuiltIn::DrawIndex) => *needs_draw = true,
                 naga::Binding::Location {
@@ -131,6 +133,7 @@ impl<'a> Generator<'a> {
                 | naga::TypeInner::Vector { scalar: s, .. }
                 | naga::TypeInner::Matrix { scalar: s, .. } => {
                     needs_f16 |= s == naga::Scalar::F16;
+                    needs_int16 |= s == naga::Scalar::I16 || s == naga::Scalar::U16;
                 }
                 naga::TypeInner::Struct { ref members, .. } => {
                     for binding in members.iter().filter_map(|m| m.binding.as_ref()) {
@@ -150,6 +153,11 @@ impl<'a> Generator<'a> {
                 }
                 naga::TypeInner::AccelerationStructure { .. } => {
                     needs_ray_tracing = true;
+                }
+                // naga 30 requires `enable wgpu_binding_array;` for a
+                // `binding_array<...>` type; mirror its backend's detection.
+                naga::TypeInner::BindingArray { .. } => {
+                    needs_binding_array = true;
                 }
                 _ => {}
             }
@@ -178,6 +186,36 @@ impl<'a> Generator<'a> {
                 })
             };
             needs_f16 = scan(&self.module.global_expressions)
+                || self
+                    .module
+                    .functions
+                    .iter()
+                    .any(|(_, f)| scan(&f.expressions))
+                || self
+                    .module
+                    .entry_points
+                    .iter()
+                    .any(|ep| scan(&ep.function.expressions));
+        }
+
+        // Same edge case for `wgpu_int16`: a bare `i16`/`u16` literal (emitted
+        // as `i16(N)` / `u16(N)`) or a cast to a 16-bit integer may not register
+        // a standalone `TypeInner`, yet the emitted text still needs the enable.
+        if !needs_int16 {
+            let scan = |arena: &naga::Arena<naga::Expression>| {
+                arena.iter().any(|(_, e)| {
+                    matches!(
+                        e,
+                        naga::Expression::Literal(naga::Literal::I16(_) | naga::Literal::U16(_))
+                            | naga::Expression::As {
+                                kind: naga::ScalarKind::Sint | naga::ScalarKind::Uint,
+                                convert: Some(2),
+                                ..
+                            }
+                    )
+                })
+            };
+            needs_int16 = scan(&self.module.global_expressions)
                 || self
                     .module
                     .functions
@@ -248,11 +286,14 @@ impl<'a> Generator<'a> {
         // This avoids known naga subgroup-directive text-parse limitations
         // and prevents non-profitable growth for tiny subgroup-only shaders.
 
-        // Emit.
+        // Emit.  Ordering follows naga's own WGSL backend (f16, int16, ...,
+        // binding_array, ...) so the directive block matches the naga baseline.
         let any_enable = needs_f16
+            || needs_int16
             || needs_dual_source_blending
             || needs_clip_distances
             || needs_mesh_shaders
+            || needs_binding_array
             || needs_draw_index
             || needs_primitive_index
             || needs_cooperative_matrix
@@ -260,6 +301,10 @@ impl<'a> Generator<'a> {
         if any_enable {
             if needs_f16 {
                 self.out.push_str("enable f16;");
+                self.push_newline();
+            }
+            if needs_int16 {
+                self.out.push_str("enable wgpu_int16;");
                 self.push_newline();
             }
             if needs_dual_source_blending {
@@ -272,6 +317,14 @@ impl<'a> Generator<'a> {
             }
             if needs_mesh_shaders {
                 self.out.push_str("enable wgpu_mesh_shader;");
+                self.push_newline();
+            }
+            // naga 30 requires this to parse a `binding_array<...>`; the naga
+            // self-check and re-parse depend on it.  It is a naga-only directive
+            // tint rejects, so `run` strips it from the final tint-facing output
+            // (tint supports binding arrays natively without an enable).
+            if needs_binding_array {
+                self.out.push_str("enable wgpu_binding_array;");
                 self.push_newline();
             }
             if needs_draw_index {
@@ -594,13 +647,13 @@ impl<'a> Generator<'a> {
             // Emit per-function @diagnostic(...) attributes.
             self.emit_diagnostic_attrs(ep.function.diagnostic_filter_leaf);
 
-            let incoming_payload_name = self.module.global_variables.iter().find_map(|(h, g)| {
-                if matches!(g.space, naga::AddressSpace::IncomingRayPayload) {
-                    Some(self.global_names[h.index()].clone())
-                } else {
-                    None
-                }
-            });
+            // Use THIS entry point's recorded payload handle, not a scan for the
+            // first IncomingRayPayload global: a module with two hit/miss entry
+            // points using different payloads would otherwise bind every one to
+            // the first payload, silently wiring the wrong variable at runtime.
+            let incoming_payload_name = ep
+                .incoming_ray_payload
+                .map(|h| self.global_names[h.index()].clone());
 
             match ep.stage {
                 naga::ShaderStage::Vertex => self.out.push_str("@vertex "),
@@ -816,7 +869,21 @@ impl<'a> Generator<'a> {
                 struct_align.round_up(actual_start + natural_size) - actual_start
             };
 
-            let need_size = effective_size != default_effective;
+            // A runtime-sized array member (only ever the last member) must not
+            // carry an `@size` attribute: WGSL forbids sizing a runtime-sized
+            // array and tint rejects it.  The layouter's span rounding can
+            // otherwise make `effective_size` diverge from `default_effective`
+            // here (e.g. an `@align` on an earlier member rounds the struct
+            // span up), so suppress the attribute for such members - a runtime
+            // array's footprint is determined at binding time, never here.
+            let is_runtime_array = matches!(
+                self.module.types[member.ty].inner,
+                naga::TypeInner::Array {
+                    size: naga::ArraySize::Dynamic,
+                    ..
+                }
+            );
+            let need_size = !is_runtime_array && effective_size != default_effective;
             if need_size {
                 self.out.push_str(&format!("@size({}) ", effective_size));
             }
@@ -1686,7 +1753,17 @@ fn collect_block_local_refs(
 /// locals set is what lets a Store to a local invalidate only the pending
 /// calls that actually read that local (see the `Store` arm).
 struct PendingCall {
+    /// The `Call` result handle to mark inlineable once a non-`Emit` statement
+    /// finally consumes this pending entry.
     result: naga::Handle<naga::Expression>,
+    /// The outermost expression currently carrying the call.  Equal to
+    /// `result` until an `Emit` wraps the call in a larger expression (e.g.
+    /// `f() + 1`), after which consumption is matched against the wrapper.
+    /// Keeping the call pending through such wrappers - rather than moving it
+    /// straight to the inlineable set at the `Emit` - is what keeps the Store /
+    /// control-flow clearing rules guarding it, so a single-use carrier cannot
+    /// float the (pure) call past an intervening store to memory it reads.
+    carrier: naga::Handle<naga::Expression>,
     reads_locals: std::collections::HashSet<naga::Handle<naga::LocalVariable>>,
 }
 
@@ -1967,8 +2044,30 @@ fn find_inlineable_calls(
 
     for stmt in block.iter() {
         if let Some(h) = last_impure {
-            if matches!(stmt, naga::Statement::Emit(_)) {
-                // Still assembling the consuming expression; keep `h` pending.
+            let survives_emit = if let naga::Statement::Emit(range) = stmt {
+                // The impure call may skip an Emit ONLY when that Emit merely
+                // assembles the call's own consuming expression and reads no
+                // memory itself.  If the Emit materialises a `Load` (or any
+                // other memory access - e.g. `let x = W;` binding a global the
+                // call writes), inlining the call into a later consumer would
+                // hoist that read above the call's write - a silent miscompile.
+                // The call result itself counts as memory-free (it IS the
+                // write being relocated), so a range that is otherwise
+                // memory-free is safe to skip.
+                let mut found = false;
+                let mut memo = std::collections::HashMap::new();
+                range
+                    .clone()
+                    .all(|root| expr_is_memory_free(root, h, expressions, &mut found, &mut memo))
+            } else {
+                false
+            };
+            if survives_emit {
+                // Still assembling a memory-free consuming expression; keep `h`.
+            } else if matches!(stmt, naga::Statement::Emit(_)) {
+                // A memory-reading Emit: keep the impure call `let`-bound at its
+                // own statement rather than relocating past the read.
+                last_impure = None;
             } else {
                 last_impure = None;
                 if impure_call_inlines_safely(stmt, h, expressions) {
@@ -2018,6 +2117,7 @@ fn find_inlineable_calls(
                     }
                     pending.push(PendingCall {
                         result: *h,
+                        carrier: *h,
                         reads_locals,
                     });
                 } else {
@@ -2218,38 +2318,51 @@ fn expr_is_memory_free(
     memory_free
 }
 
-/// Visit every direct expression handle referenced by `stmt` (for Emit
-/// statements, this includes the direct children of every expression in the
-/// emit range).  Any handle found in `pending` is moved to `result`.
-/// Consume the pending call-result list into the `inlineable_calls`
-/// set when the next statement is a single consumer, otherwise drop
-/// the pending entries so they emit as explicit `let` bindings.
+/// Consume the pending call list against `stmt`.  A non-`Emit` statement is a
+/// real use site: every pending call whose carrier it references moves into
+/// `result` (the inlineable set).  An `Emit` is not a use site - it only wraps
+/// the call in a larger expression, so it advances each matching call's carrier
+/// to that wrapper, keeping the Store / control-flow guards active until a real
+/// consumer is reached.
 fn consume_pending_for_statement(
     stmt: &naga::Statement,
     expressions: &naga::Arena<naga::Expression>,
     pending: &mut Vec<PendingCall>,
     result: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
 ) {
+    // A NON-`Emit` statement is a real consumption site: relocate the pending
+    // call's result into the inlineable set (matched against its current
+    // carrier, which an earlier `Emit` may have advanced past the raw call).
+    // Drain EVERY pending call sharing the carrier, not just the first: sibling
+    // single-use pure calls (`if a()==b()`) are merged onto one wrapper carrier
+    // by the `Emit` arm, and all are safe to inline at this shared use site
+    // (each survived the same Store / control-flow clears).
     let check =
         |h: naga::Handle<naga::Expression>,
          pending: &mut Vec<PendingCall>,
          result: &mut std::collections::HashSet<naga::Handle<naga::Expression>>| {
-            if let Some(pos) = pending.iter().position(|p| p.result == h) {
+            while let Some(pos) = pending.iter().position(|p| p.carrier == h) {
                 result.insert(pending.swap_remove(pos).result);
             }
         };
 
     match stmt {
         naga::Statement::Emit(range) => {
+            // An `Emit` does not FIX the call's emission point - it only builds a
+            // larger expression around it that is itself emitted later.  Advance
+            // each pending call's carrier to the wrapping expression instead of
+            // moving it to the inlineable set, so the Store / control-flow
+            // clearing rules keep guarding it until a non-`Emit` statement
+            // consumes it.  Range order is topological (children precede
+            // parents), so the carrier bubbles up to the outermost expression.
             for h in range.clone() {
-                let mut uses: Vec<naga::Handle<naga::Expression>> = Vec::new();
-                visit_expr_children(&expressions[h], |child| uses.push(child));
-                for u in uses {
-                    check(u, pending, result);
-                    if pending.is_empty() {
-                        return;
+                visit_expr_children(&expressions[h], |child| {
+                    for p in pending.iter_mut() {
+                        if p.carrier == child {
+                            p.carrier = h;
+                        }
                     }
-                }
+                });
             }
         }
         naga::Statement::If { condition, .. } => check(*condition, pending, result),
@@ -3442,6 +3555,7 @@ fn find_for_loop_vars(
         &candidates,
         &mut result,
         must_bind_loads,
+        false,
     );
     result
 }
@@ -3712,6 +3826,7 @@ fn is_for_loop_candidate(
 /// locals are safe to absorb into each.  Complements
 /// [`compute_block_ownership`], which handles the liveness half of
 /// the decision.
+#[allow(clippy::too_many_arguments)]
 fn scan_block_for_loop_vars(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
@@ -3720,6 +3835,13 @@ fn scan_block_for_loop_vars(
     candidates: &[bool],
     result: &mut Vec<bool>,
     must_bind_loads: &std::collections::HashSet<naga::Handle<naga::Expression>>,
+    // `true` once the walk has descended through a `Loop`.  A counter absorbed
+    // into a for-init via its declaration/zero-init (not an explicit pre-loop
+    // re-init `Store`) is sound only at top level: nested in another loop that
+    // init would re-execute every outer iteration, whereas the source declared
+    // the counter once.  Legitimate nested `for`s re-init via a `Store` (the
+    // deferred-var path, which ignores this flag), so gating here is safe.
+    inside_loop: bool,
 ) {
     let local_len = result.len();
     if !candidates.iter().any(|&b| b) {
@@ -3756,7 +3878,7 @@ fn scan_block_for_loop_vars(
                         false
                     }
                 });
-                if has_update {
+                if has_update && !inside_loop {
                     result[i] = true;
                 }
             }
@@ -3805,6 +3927,7 @@ fn scan_block_for_loop_vars(
                     &a_cands,
                     result,
                     must_bind_loads,
+                    inside_loop,
                 );
                 scan_block_for_loop_vars(
                     reject,
@@ -3814,6 +3937,7 @@ fn scan_block_for_loop_vars(
                     &r_cands,
                     result,
                     must_bind_loads,
+                    inside_loop,
                 );
             }
             naga::Statement::Switch { cases, .. } => {
@@ -3843,6 +3967,7 @@ fn scan_block_for_loop_vars(
                         &cands,
                         result,
                         must_bind_loads,
+                        inside_loop,
                     );
                 }
             }
@@ -3858,6 +3983,7 @@ fn scan_block_for_loop_vars(
                     &cands,
                     result,
                     must_bind_loads,
+                    inside_loop,
                 );
             }
             naga::Statement::Loop {
@@ -3888,6 +4014,9 @@ fn scan_block_for_loop_vars(
                     &b_cands,
                     result,
                     must_bind_loads,
+                    // Descending through this Loop: any counter marked below is
+                    // nested and must not be absorbed via declaration/zero init.
+                    true,
                 );
             }
             _ => {}
