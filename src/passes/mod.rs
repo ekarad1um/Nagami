@@ -15,6 +15,7 @@ pub mod const_fold;
 pub mod const_hoist;
 pub mod cse;
 pub mod dead_branch;
+pub mod dead_local;
 pub mod dead_param;
 pub mod emit_merge;
 pub mod expr_util;
@@ -69,6 +70,13 @@ pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
 
             let mut passes: Vec<Box<dyn Pass>> = vec![
                 Box::new(compact::CompactPass) as Box<dyn Pass>,
+                // Right after compaction: with statement-unreachable
+                // expressions culled, "no LocalVariable expression" is
+                // exactly "dead local", and clearing them BEFORE the
+                // inliner lifts its locals-veto for bodies whose locals
+                // were all optimised away (a class that otherwise only
+                // dissolves on a re-minify round trip).
+                Box::new(dead_local::DeadLocalPass),
                 Box::new(const_fold::ConstFoldPass),
                 Box::new(dead_branch::DeadBranchPass),
                 inline_pass,

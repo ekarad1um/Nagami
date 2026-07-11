@@ -97,22 +97,133 @@ impl Pass for InliningPass {
         "function_inlining"
     }
 
-    fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
+    fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
+        // A call to a function with an empty body is a no-op statement: the
+        // callee cannot observe or affect anything, and argument expressions
+        // are pure evaluations that die with the call (compact culls them).
+        // The expression-template machinery below excludes ALL void
+        // functions, so without this, `fn e(){} ... e();` survives every
+        // pass and the empty callee is pinned alive by its own call sites.
+        // Calls to preserve-listed functions are kept: their declarations
+        // are an external contract and an intact call site is the cheapest
+        // proof the declaration stays live.
+        let mut changed = delete_calls_to_empty_functions(module, &ctx.config.preserve_symbols);
+
         let templates = collect_inline_templates(module, self.max_node_count, self.max_call_sites);
         if templates.is_empty() {
-            return Ok(false);
+            return Ok(changed);
         }
 
-        let mut changed = 0usize;
+        let mut inlined = 0usize;
         for (_, function) in module.functions.iter_mut() {
-            changed += inline_in_function(function, &templates);
+            inlined += inline_in_function(function, &templates);
         }
         for entry in module.entry_points.iter_mut() {
-            changed += inline_in_function(&mut entry.function, &templates);
+            inlined += inline_in_function(&mut entry.function, &templates);
         }
+        changed |= inlined > 0;
 
-        Ok(changed > 0)
+        Ok(changed)
     }
+}
+
+/// Remove every `Call` to a function whose body is empty (or a lone bare
+/// `return;`).  Such calls have no observable effect; deleting them lets the
+/// next compaction drop the callee itself.  Returns whether anything changed.
+fn delete_calls_to_empty_functions(module: &mut naga::Module, preserve: &[String]) -> bool {
+    let empty: std::collections::HashSet<naga::Handle<naga::Function>> = module
+        .functions
+        .iter()
+        .filter(|(_, f)| {
+            let body_is_empty = matches!(
+                f.body.iter().collect::<Vec<_>>().as_slice(),
+                [] | [naga::Statement::Return { value: None }]
+            );
+            body_is_empty
+                && f.result.is_none()
+                && !f
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| preserve.iter().any(|p| p == n))
+        })
+        .map(|(h, _)| h)
+        .collect();
+    if empty.is_empty() {
+        return false;
+    }
+
+    let mut changed = false;
+    for (_, function) in module.functions.iter_mut() {
+        changed |= drop_empty_calls_in_block(&mut function.body, &empty);
+    }
+    for entry in module.entry_points.iter_mut() {
+        changed |= drop_empty_calls_in_block(&mut entry.function.body, &empty);
+    }
+    changed
+}
+
+/// Recursively drop `Call`s to `empty` functions from `block`.  Compound
+/// statements are recursed explicitly (house rule: no `_ =>` on statement
+/// recursion, so a future block-bearing naga variant breaks the build here).
+fn drop_empty_calls_in_block(
+    block: &mut naga::Block,
+    empty: &std::collections::HashSet<naga::Handle<naga::Function>>,
+) -> bool {
+    let original = std::mem::take(block);
+    let mut rebuilt = naga::Block::with_capacity(original.len());
+    let mut changed = false;
+    for (mut stmt, span) in original.span_into_iter() {
+        match &mut stmt {
+            naga::Statement::Call {
+                function,
+                result: None,
+                ..
+            } if empty.contains(function) => {
+                changed = true;
+                continue;
+            }
+            naga::Statement::Block(inner) => {
+                changed |= drop_empty_calls_in_block(inner, empty);
+            }
+            naga::Statement::If { accept, reject, .. } => {
+                changed |= drop_empty_calls_in_block(accept, empty);
+                changed |= drop_empty_calls_in_block(reject, empty);
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases.iter_mut() {
+                    changed |= drop_empty_calls_in_block(&mut case.body, empty);
+                }
+            }
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => {
+                changed |= drop_empty_calls_in_block(body, empty);
+                changed |= drop_empty_calls_in_block(continuing, empty);
+            }
+            naga::Statement::Emit(_)
+            | naga::Statement::Call { .. }
+            | naga::Statement::Store { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
+            | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
+        }
+        rebuilt.push(stmt, span);
+    }
+    *block = rebuilt;
+    changed
 }
 
 // MARK: Template collection
@@ -173,6 +284,27 @@ fn collect_inline_templates(
         if call_sites > 1 {
             let expansion = node_count * (call_sites - 1);
             if expansion > MAX_MULTI_SITE_EXPANSION {
+                continue;
+            }
+            // Node counts undercount TEXT: a `Math` node renders its full
+            // builtin name (`faceForward(` is 12 characters counted as one
+            // node), so duplicating a Math-bearing body across sites grows
+            // bytes even inside the node budget - the corpus faceForward /
+            // reflect class regressed ~+10 B per extra site this way.
+            // Image accessors share the long-spelling problem.  Keeping the
+            // helper is the better equilibrium; single-site inlining is
+            // unaffected.
+            let has_char_heavy_node = function.expressions.iter().any(|(h, e)| {
+                visited[h.index()]
+                    && matches!(
+                        e,
+                        naga::Expression::Math { .. }
+                            | naga::Expression::ImageSample { .. }
+                            | naga::Expression::ImageLoad { .. }
+                            | naga::Expression::ImageQuery { .. }
+                    )
+            });
+            if has_char_heavy_node {
                 continue;
             }
         }

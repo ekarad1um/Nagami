@@ -422,6 +422,41 @@ fn void_fn_non_tail_return_survives_elision() {
     );
 }
 
+/// Multi-site inlining of a `Math`-bearing body grows bytes: the node
+/// budget counts `faceForward(...)` as one node but it renders 12+
+/// characters, so duplicating it at every call site costs more than the
+/// declaration saves (the corpus faceForward/reflect +10 B-per-site class).
+/// The helper must stay a function.
+#[test]
+fn multi_site_math_helper_is_not_duplicated() {
+    let src = "fn h(x: vec2f) -> vec2f { return faceForward(x, x, x); }\
+        @group(0)@binding(0) var<storage,read_write> o: vec2f;\
+        @compute @workgroup_size(1) fn main() { o = h(o) + h(o.yx) + h(o * 2.0); }";
+    let out = minify(src);
+    assert_eq!(
+        out.matches("faceForward").count(),
+        1,
+        "the Math body must render once, in the kept helper: {out}"
+    );
+}
+
+/// A call to an empty void function is a no-op statement; the inliner's
+/// expression-template machinery excludes void functions entirely, so
+/// without the dedicated empty-callee deletion `fn e(){} ... e();` would be
+/// pinned alive forever by its own call sites.
+#[test]
+fn calls_to_empty_functions_dissolve() {
+    let src = "fn e() {}\
+        fn f() {}\
+        @group(0)@binding(0) var<storage,read_write> o: u32;\
+        @compute @workgroup_size(1) fn main() { e(); f(); f(); o = 1u; }";
+    let out = minify(src);
+    assert!(
+        !out.contains("fn e") && !out.contains("fn f") && !out.contains("();"),
+        "empty functions and their call sites must dissolve: {out}"
+    );
+}
+
 /// Constructor suffix elision via literal pins: a float-form literal pins
 /// f32 and an int literal pins i32, so `vec4f`/`vec3i` shrink to the bare
 /// inferring form; u32 (whose abstract default is i32) must keep its suffix.
@@ -1147,10 +1182,14 @@ fn write_only_local_is_eliminated() {
 }
 
 /// Critical soundness: a local whose pointer ESCAPES to a callee must keep
-/// its stores - the callee can read the value through the pointer.
+/// its stores - the callee can read the value through the pointer.  The sink
+/// needs a real body: a call to an EMPTY callee is deleted outright (nothing
+/// can read through the pointer), which would leave this test exercising
+/// nothing.
 #[test]
 fn escaped_local_stores_are_not_removed() {
-    let src = "fn sink(p:ptr<function,f32>){}\
+    let src = "@group(0)@binding(1) var<storage,read_write> g:f32;\
+        fn sink(p:ptr<function,f32>){ g = *p; }\
         @group(0)@binding(0) var<storage,read_write> o:f32;\
         @compute @workgroup_size(1) fn main(){var d=1.0;d=2.0;sink(&d);o=5.0;}";
     let out = minify(src);
