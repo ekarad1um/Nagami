@@ -28,7 +28,7 @@ use crate::pipeline::{Pass, PassContext};
 
 use super::expr_util::{
     flatten_replacement_chains, nested_blocks, nested_blocks_mut, remap_statement_handles,
-    try_map_expression_handles_in_place,
+    try_map_expression_handles_in_place, visit_expression_children,
 };
 use super::scoped_map::ScopedMap;
 
@@ -1388,6 +1388,67 @@ fn is_simple_for_forwarding(expr: &naga::Expression) -> bool {
     )
 }
 
+/// Ceiling on the effective (post-forwarding) expression-tree depth a
+/// store-seeded cache entry may have.  Store-forwarding a value that
+/// itself absorbed the previous store's tree grows the IR without bound on
+/// flat reassignment chains (`a = a*2.0+1.0;` x9000 -> an 18k-deep tree),
+/// which overflows every RECURSIVE consumer downstream: `render_depth`'s
+/// own measurement, naga's writer, and wasm's ~1 MB caller stack that the
+/// CLI's big-stack worker does not cover - and the deep tree ships in the
+/// OUTPUT, so every re-minification pays it again.  128 is far above any
+/// human-written statement's depth and far below the shallowest consumer
+/// stack budget.
+const SUBSTITUTION_DEPTH_CAP: u32 = 128;
+
+/// Approximate effective depth of `value`'s expression tree, reading
+/// through recorded load `replacements` (a forwarded `Load` counts as its
+/// replacement's tree, an un-forwarded one as its POINTER chain - subscript
+/// expressions are real rendered tree content and can absorb a previous
+/// iteration's forwarded tree, e.g. `x = a[x & 3] + 1;` chains).
+/// Level-order walk, saturating at `cap + 1`; the shared visited set and
+/// node budget keep it O(cap) per call, at worst UNDER-counting a diamond
+/// whose deep path re-enters a shared node - acceptable slack against
+/// consumers with thousands of frames of headroom.
+fn effective_forwarded_depth(
+    value: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    cap: u32,
+) -> u32 {
+    let mut frontier = vec![value];
+    let mut next = Vec::new();
+    let mut seen = HashSet::new();
+    let mut budget = 8192usize;
+    let mut depth = 0u32;
+    while !frontier.is_empty() {
+        depth += 1;
+        if depth > cap {
+            return depth;
+        }
+        for handle in frontier.drain(..) {
+            if !seen.insert(handle) {
+                continue;
+            }
+            budget -= 1;
+            if budget == 0 {
+                return cap + 1;
+            }
+            match &expressions[handle] {
+                naga::Expression::Load { pointer } => {
+                    if let Some(&replacement) = replacements.get(&handle) {
+                        next.push(replacement);
+                    } else {
+                        next.push(*pointer);
+                    }
+                }
+                expr => visit_expression_children(expr, |child| next.push(child)),
+            }
+        }
+        std::mem::swap(&mut frontier, &mut next);
+    }
+    depth
+}
+
 /// Populate `escaped` (locals whose pointer is passed to a callee) and
 /// `partially_stored` (locals receiving field- or index-level writes)
 /// in a single statement-tree walk.  Locals in either set are
@@ -1654,13 +1715,27 @@ fn collect_redundant_loads<'body>(
                     // The undo phase in dedup_loads_in_function will later
                     // revert forwarding for non-dead variables when the
                     // forwarded expression is complex (would inflate output).
+                    //
+                    // Depth gate: an effectively-deep value stays UNSEEDED
+                    // (the invalidation above already removed the stale
+                    // entry, so later loads simply keep the variable read) -
+                    // otherwise flat reassignment chains grow the tree
+                    // without bound; see `SUBSTITUTION_DEPTH_CAP`.
                     if let Some(key) = get_pointer_key(expressions, *pointer) {
                         let mut resolved = *value;
                         while let Some(&next) = replacements.get(&resolved) {
                             resolved = next;
                         }
-                        cache.insert(key.clone(), resolved);
-                        store_source.insert(key, (*pointer, *value, in_loop));
+                        if effective_forwarded_depth(
+                            resolved,
+                            expressions,
+                            replacements,
+                            SUBSTITUTION_DEPTH_CAP,
+                        ) <= SUBSTITUTION_DEPTH_CAP
+                        {
+                            cache.insert(key.clone(), resolved);
+                            store_source.insert(key, (*pointer, *value, in_loop));
+                        }
                     }
                 }
             }
@@ -1881,16 +1956,26 @@ fn collect_redundant_loads<'body>(
                 };
 
                 // Meet-over-branches is only sound for switches that
-                // execute *exactly one* case on every path.  That
-                // requires (a) a `Default` case so the switch is total,
-                // and (b) no `fall_through` between cases (otherwise a
+                // execute *exactly one* case on every path AND whose only
+                // route to post-switch code is falling off a case's end.
+                // That requires (a) a `Default` case so the switch is
+                // total, (b) no `fall_through` between cases (otherwise a
                 // case's "final state" includes later cases' writes and
-                // the pre-meet snapshot is meaningless).
+                // the pre-meet snapshot is meaningless), and (c) no bare
+                // `break` in any case: a switch-binding break reaches
+                // post-switch code carrying the PRE-break state - e.g. the
+                // SPIR-V-structurizer phi idiom
+                // `switch(0u){default:{ if(c){x=1; break;} x=2; }}` exits
+                // with x=1 on the break path, which the fall-end meet
+                // (x=2) never sees; forwarding it deletes live stores.
                 let has_default = cases
                     .iter()
                     .any(|c| matches!(c.value, naga::SwitchValue::Default));
                 let any_fallthrough = cases.iter().any(|c| c.fall_through);
-                let meet_applicable = has_default && !any_fallthrough;
+                let any_switch_break = cases
+                    .iter()
+                    .any(|c| crate::passes::dead_branch::contains_bare_break(&c.body));
+                let meet_applicable = has_default && !any_fallthrough && !any_switch_break;
 
                 let mut total_modified: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
                 let mut meet: Option<HashMap<PointerKey, naga::Handle<naga::Expression>>> = None;
@@ -1954,15 +2039,12 @@ fn collect_redundant_loads<'body>(
                 }
 
                 if let Some(m) = meet {
-                    // Same early-exit soundness reasoning as the `If`
-                    // arm above: with `has_default && !any_fallthrough`
-                    // the switch executes exactly one case, so the
-                    // meet can only introduce forwarding that is
-                    // consistent across all cases.  Entries surviving
-                    // in a case that terminates early (Return / Break
-                    // out of an enclosing loop / etc.) are sound
-                    // because the meet entry is only read on paths
-                    // that fall through the switch.
+                    // With bare breaks excluded by `meet_applicable`, the
+                    // only early exits left in a case are Return / Kill
+                    // (leave the function) and Continue (jumps to an
+                    // enclosing loop's continuing block) - none reach
+                    // post-switch code, so every path that DOES reach it
+                    // fell off a case end and agrees with the meet.
                     for (k, v) in m {
                         cache.insert(k, v);
                     }

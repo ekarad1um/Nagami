@@ -1,7 +1,7 @@
 //! Mutated-load binding analysis: which emitted loads must become
 //! `let` bindings because a write to their place intervenes before a use.
 
-use super::ref_counts::visit_expr_children;
+use crate::passes::expr_util::visit_expression_children;
 
 /// The memory location a pointer refers to, resolved to a root variable
 /// plus one level of refinement off that root.  Two places that share a
@@ -380,7 +380,7 @@ fn flag_used_loads(
         // each statement walk starts a fresh `visited`.
         return;
     }
-    visit_expr_children(&expressions[root], |child| {
+    visit_expression_children(&expressions[root], |child| {
         flag_used_loads(child, expressions, pending, must_bind, visited);
     });
 }

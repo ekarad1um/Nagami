@@ -63,22 +63,11 @@ fn bump(counts: &mut [usize], h: naga::Handle<naga::Expression>) {
     counts[h.index()] += 1;
 }
 
-/// Generator-local alias for the shared exhaustive child walker in
-/// [`crate::passes::expr_util::visit_expression_children`].  Kept as a
-/// thin indirection so the generator's call sites don't take a direct
-/// dependency on the passes layer.
-pub(in crate::generator) fn visit_expr_children(
-    expr: &naga::Expression,
-    f: impl FnMut(naga::Handle<naga::Expression>),
-) {
-    crate::passes::expr_util::visit_expression_children(expr, f);
-}
-
 /// Shortcut helper that bumps `counts` for every child handle of
 /// `expr`.  Used by [`compute_expression_ref_counts`] in the
 /// arena-traversal loop.
 fn count_expr_children(expr: &naga::Expression, counts: &mut [usize]) {
-    visit_expr_children(expr, |h| bump(counts, h));
+    crate::passes::expr_util::visit_expression_children(expr, |h| bump(counts, h));
 }
 
 /// Walk `block` and increment `counts[h]` for every expression

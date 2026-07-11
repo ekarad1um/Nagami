@@ -228,6 +228,19 @@ fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// `true` when a WGSL line break starts at byte `i`: LF / VT / FF / CR plus
+/// NEL (U+0085), LS (U+2028), and PS (U+2029) in their UTF-8 forms.
+fn wgsl_line_break_at(bytes: &[u8], i: usize) -> bool {
+    match bytes[i] {
+        0x0A..=0x0D => true,
+        0xC2 => bytes.get(i + 1) == Some(&0x85),
+        0xE2 => {
+            bytes.get(i + 1) == Some(&0x80) && matches!(bytes.get(i + 2), Some(&0xA8) | Some(&0xA9))
+        }
+        _ => false,
+    }
+}
+
 /// Replace WGSL line and block comments with spaces while preserving
 /// byte offsets and line breaks, so subsequent lexical scans see only
 /// real code but any positional diagnostics stay accurate.
@@ -236,9 +249,12 @@ fn strip_wgsl_comments(source: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        // Line comment
+        // Line comment.  WGSL ends it at ANY line-break code point
+        // (https://www.w3.org/TR/WGSL/#line-break), not just `\n`: stopping
+        // early would blank a live statement that follows e.g. a lone `\r`
+        // on the same `str::lines` line - the bailout paths ship this text.
         if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            while i < bytes.len() && bytes[i] != b'\n' {
+            while i < bytes.len() && !wgsl_line_break_at(bytes, i) {
                 out.push(b' ');
                 i += 1;
             }
@@ -493,9 +509,11 @@ fn strip_naga_only_enables(mut source: String) -> String {
 /// otherwise ship fully un-minified text.
 ///
 /// Grammar-agnostic and token-safe by construction, so it needs no parser:
-/// * a space survives between two identifier-ish chars (Unicode-aware -
-///   WGSL identifiers are XID, approximated by `char::is_alphanumeric` plus
-///   `_`), covering `enable f16`, `else if`, `let x`;
+/// * a space survives between two identifier-ish chars (WGSL identifiers are
+///   XID; approximated by ASCII alphanumeric, `_`, and EVERY non-ASCII char -
+///   XID's exotic members like U+2118 fail `is_alphanumeric`, and the
+///   over-approximation only ever keeps a redundant space), covering
+///   `enable f16`, `else if`, `let x`;
 /// * a space survives where maximal munch would fuse two tokens of valid
 ///   WGSL into one: `- -x` (`--` is reserved), `+ +` (likewise), `& &x` /
 ///   `| |` (would form `&&`/`||`), and `x / *p` (would open a `/*` comment);
@@ -509,7 +527,7 @@ fn strip_naga_only_enables(mut source: String) -> String {
 /// UTF-8 sequence).
 fn compact_wgsl_text(source: &str) -> String {
     let stripped = strip_wgsl_comments(source);
-    let ident_ish = |c: char| c.is_alphanumeric() || c == '_';
+    let ident_ish = |c: char| c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii();
     let mut out = String::with_capacity(stripped.len());
     let mut prev_char: Option<char> = None;
     for chunk in stripped.split_ascii_whitespace() {
@@ -525,6 +543,26 @@ fn compact_wgsl_text(source: &str) -> String {
         prev_char = chunk.chars().next_back();
     }
     out
+}
+
+/// Bailout paths ship the input body only lexically compacted, so any leading
+/// directives stay inside it; with a preamble active the consumer's
+/// [preamble, body] concatenation would place them after the preamble's
+/// declarations - invalid WGSL for every consumer, shipped with exit 0.  The
+/// generator path strips body directives (the preamble owns them); a bailout
+/// has no parser to do that, so it hard-errors instead (mirroring the f16
+/// preamble guard).  A directive-free body concatenates cleanly and still
+/// ships.
+fn preamble_bailout_guard(effective_preamble: Option<&str>, source: &str) -> Result<(), Error> {
+    if effective_preamble.is_some() && !split_directives(source).0.trim().is_empty() {
+        return Err(Error::Emit(
+            "input cannot be minified (naga bailout) and carries leading directives; \
+             the shipped [preamble, body] order would misplace them - move the \
+             directives into the preamble or minify without --preamble"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Finish the naga-emitter fallback text for shipping: lexically compact it
@@ -987,19 +1025,40 @@ struct EmitOutcome {
     duration_us: u64,
 }
 
+/// The last rung of the fallback ladder: both the generator output AND the
+/// naga-emitter fallback fail text re-validation, i.e. the optimized IR has
+/// no valid WGSL spelling at all (a pass-manufactured literal pair whose
+/// runtime value is const-eval-rejected, e.g. `5f/0f` -> inf).  Ship the
+/// INPUT lexically compacted, mirroring the parse/validation bailouts, so a
+/// batch run gets un-optimized-but-correct output instead of a hard error.
+fn untextable_ir_bailout(source: &str, before_bytes: usize) -> EmitOutcome {
+    let compacted = compact_wgsl_text(source);
+    let bytes = compacted.len();
+    EmitOutcome {
+        source: compacted,
+        bytes,
+        changed: bytes != before_bytes,
+        rolled_back: true,
+        validation_ok: false,
+        duration_us: 0,
+    }
+}
+
 /// Settle the generator's emission attempt against the fallback ladder.
 ///
 /// Falls back to naga's output if the generator errored or produced
-/// invalid WGSL.  With a preamble active (`normalized_preamble` /
-/// `effective_preamble` are `Some` together), `naga_output` still
-/// contains the preamble's declarations and is unusable as a fallback
-/// (the consumer will re-prepend the preamble, producing duplicate
-/// definitions), so the error must propagate instead.
+/// invalid WGSL; if THAT text also fails re-validation, degrades once more
+/// to [`untextable_ir_bailout`].  With a preamble active
+/// (`normalized_preamble` / `effective_preamble` are `Some` together),
+/// `naga_output` still contains the preamble's declarations and is unusable
+/// as a fallback (the consumer will re-prepend the preamble, producing
+/// duplicate definitions), so the error must propagate instead.
 fn resolve_generator_output(
     gen_result: Result<generator::Emission, Error>,
     naga_output: Option<String>,
     normalized_preamble: Option<&str>,
     effective_preamble: Option<&str>,
+    source: &str,
     before_bytes: usize,
     trace_enabled: bool,
 ) -> Result<EmitOutcome, Error> {
@@ -1118,14 +1177,19 @@ fn resolve_generator_output(
                 // not guaranteed: naga's own wgsl-out can emit tokens its
                 // frontend then rejects (e.g. an `f32(<f64 literal>)` cast,
                 // or an f16 literal whose `enable f16;` directive it drops).
-                // Re-validate before trusting it so a doubly-invalid case
-                // surfaces as a diagnosable error instead of silently
-                // shipping invalid WGSL (matching the preamble posture above).
+                // Re-validate before trusting it.  A doubly-invalid case is
+                // an IR no emitter can round-trip through WGSL text (e.g. a
+                // pass-manufactured `5f/0f` whose runtime value is inf -
+                // inexpressible as a const-expression for ANY consumer), not
+                // necessarily a pass bug: degrade to the compacted-input
+                // bailout, loudly, instead of failing a batch run on valid
+                // input.
                 if let Err(ve) = io::validate_wgsl_text(&naga_output) {
-                    return Err(Error::Emit(format!(
-                        "generator output failed validation and the naga-emitter \
-                             fallback is also invalid: {ve}"
-                    )));
+                    eprintln!(
+                        "warning: minified IR cannot round-trip WGSL text ({ve}); \
+                         shipping the input lexically compacted"
+                    );
+                    return Ok(untextable_ir_bailout(source, before_bytes));
                 }
                 let fallback = finalize_naga_fallback_text(naga_output);
                 let final_bytes = fallback.len();
@@ -1160,13 +1224,14 @@ fn resolve_generator_output(
                 if trace_enabled {
                     eprintln!("warning: generator emit failed ({e}); falling back to naga emitter");
                 }
-                // Re-validate the naga fallback (see above) so a doubly-invalid
-                // case errors instead of shipping invalid WGSL.
+                // Re-validate the naga fallback; doubly-invalid degrades to the
+                // compacted-input bailout (see the un-textable-IR note above).
                 if let Err(ve) = io::validate_wgsl_text(&naga_output) {
-                    return Err(Error::Emit(format!(
-                        "generator emit failed ({e}) and the naga-emitter \
-                             fallback is also invalid: {ve}"
-                    )));
+                    eprintln!(
+                        "warning: generator emit failed ({e}); minified IR cannot \
+                         round-trip WGSL text ({ve}); shipping the input lexically compacted"
+                    );
+                    return Ok(untextable_ir_bailout(source, before_bytes));
                 }
                 let fallback = finalize_naga_fallback_text(naga_output);
                 let final_bytes = fallback.len();
@@ -1265,6 +1330,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
             // no changes"; `validation_ok = true` is "no failure
             // observed" (no IR ever built), set true so CI gates
             // asserting `all validation_ok` don't fail spuriously.
+            preamble_bailout_guard(effective_preamble, source)?;
             let compacted = compact_wgsl_text(source);
             let mut report = Report::new(source.len());
             report.output_bytes = compacted.len();
@@ -1318,6 +1384,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         // Same lexical compaction as the unsupported-extension bailout:
         // rejected-but-parseable input (e.g. const division by zero) still
         // deserves comment/whitespace removal on its way through.
+        preamble_bailout_guard(effective_preamble, source)?;
         let compacted = compact_wgsl_text(source);
         report.pass_reports.push(PassReport {
             pass_name: "validation_bailout".to_string(),
@@ -1381,6 +1448,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         naga_output,
         normalized_preamble.as_deref(),
         effective_preamble,
+        source,
         before_bytes,
         config.trace.enabled,
     )?;

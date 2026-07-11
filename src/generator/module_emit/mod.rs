@@ -22,7 +22,6 @@ mod ref_counts;
 
 pub(super) use defer_vars::find_deferrable_vars;
 pub(super) use local_resolve::local_var_in_stmts;
-pub(super) use ref_counts::visit_expr_children;
 
 use call_inline::{compute_pure_functions, find_inlineable_calls};
 use defer_vars::find_for_loop_vars;
@@ -1093,6 +1092,7 @@ impl<'a> Generator<'a> {
             inlineable_calls,
             must_bind_loads,
             render_depth_memo: vec![0; func.expressions.len()],
+            stashed_call_depth: HashMap::new(),
             display_name: displayed_name.to_string(),
         };
 

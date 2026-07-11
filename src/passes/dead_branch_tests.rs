@@ -91,6 +91,70 @@ fn main() {
     );
 }
 
+/// The dead-tail drop after a definite terminator (step 3) needs the same
+/// result-producer guard as the collapse sites: dropping an unreachable
+/// `Call { result: Some }` orphans its result expression - invalid IR - and
+/// one such poisoned function used to roll the whole pass back every sweep,
+/// freezing every fold in the module.  `run_pass` validates the post-pass
+/// module and panics on invalid IR, so this test fails if the guard is
+/// removed; the `if true` fold in `main` proves the pass still LANDS on the
+/// rest of the module.
+#[test]
+fn dead_tail_with_result_producer_stays_valid_and_folds_elsewhere() {
+    let src = r#"
+fn helper() -> i32 { return 7; }
+fn poisoned() -> i32 {
+    return 1;
+    let x = helper();
+    return x;
+}
+@compute @workgroup_size(1)
+fn main() {
+    var v: i32 = 0;
+    if true { v = 42; } else { v = 7; }
+    v = v + poisoned();
+    _ = v;
+}
+"#;
+    let (changed, module) = run_pass(src);
+    assert!(changed, "folds elsewhere must land, not roll back");
+    let main = module
+        .entry_points
+        .iter()
+        .find(|e| e.name == "main")
+        .expect("main entry point");
+    assert_eq!(
+        count_ifs(&main.function.body),
+        0,
+        "if true must fold despite the poisoned dead tail in another function"
+    );
+}
+
+/// A switch whose every arm is empty or a lone bare `break` does nothing -
+/// those breaks only exit the switch itself and expressions carry no side
+/// effects, so the whole statement (selector included) must be deleted.
+/// The splice paths can never remove this shape: their bare-break guard
+/// (correctly) refuses to splice a body whose `break` would mis-target.
+#[test]
+fn deletes_switch_whose_arms_are_empty_or_bare_break() {
+    let src = r#"
+@group(0) @binding(0) var<storage, read_write> s: array<u32>;
+@compute @workgroup_size(1)
+fn main() {
+    let x = s[0];
+    switch (x) {
+        case 0u: { break; }
+        default: { break; }
+    }
+    s[1] = 9u;
+}
+"#;
+    let (changed, module) = run_pass(src);
+    assert!(changed, "deletion must be reported");
+    let body = &module.entry_points[0].function.body;
+    assert_eq!(count_switches(body), 0, "trivial switch must be deleted");
+}
+
 #[test]
 fn eliminates_if_true_accept_branch() {
     let src = r#"
@@ -791,6 +855,50 @@ fn f(a: bool, b: bool) -> bool {
             count_ifs(&func.body),
             0,
             "if should be desugared to d = a || b"
+        );
+    }
+}
+
+/// `||` whose LEFT operand is an equality: const_fold's De Morgan folds
+/// the lowering's `!(x==y)` condition into `x!=y` before this pass ever
+/// sees it, so the un-flip path must recover the negation and build
+/// `d = (x==y) || b` - the left-operand op assertion pins the POLARITY
+/// (synthesizing the same op instead of the flipped one would be a silent
+/// miscompile this test must catch).
+#[test]
+fn short_circuit_or_with_equality_left_operand_desugars() {
+    let src = r#"
+fn f(x: u32, y: u32, b: bool) -> bool {
+    var d: bool;
+    if x != y { d = b; } else { d = true; }
+    return d;
+}
+@fragment fn fs() -> @location(0) vec4f { return vec4f(f32(f(1u, 2u, true))); }
+"#;
+    let (changed, module) = run_pass(src);
+    assert!(changed);
+    for (_, func) in module.functions.iter() {
+        assert_eq!(
+            count_ifs(&func.body),
+            0,
+            "equality-left || must desugar to d = (x==y) || b"
+        );
+        let or_left_op = func.expressions.iter().find_map(|(_, e)| match e {
+            naga::Expression::Binary {
+                op: naga::BinaryOperator::LogicalOr,
+                left,
+                ..
+            } => Some(match func.expressions[*left] {
+                naga::Expression::Binary { op, .. } => Some(op),
+                _ => None,
+            }),
+            _ => None,
+        });
+        assert_eq!(
+            or_left_op,
+            Some(Some(naga::BinaryOperator::Equal)),
+            "the || left operand must be the UN-FLIPPED comparison (source \
+             had x != y, so the recovered negation is x == y)"
         );
     }
 }

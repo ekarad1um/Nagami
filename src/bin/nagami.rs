@@ -100,7 +100,7 @@ struct Args {
     #[arg(
         long,
         requires = "trace",
-        help = "Re-validate emitted WGSL text after every pass and roll back on failure."
+        help = "Re-validate emitted WGSL text after every pass and escalate any failure to a hard error (instead of the default silent per-pass rollback)."
     )]
     validate_each_pass: bool,
 
@@ -187,6 +187,34 @@ fn precision_from_cli(
 }
 
 fn main() -> ExitCode {
+    // Forward-substitution can build expression trees whose depth scales
+    // with the input's STATEMENT count (flat `a = a*2+1;` chains), and
+    // several IR walks recurse once per depth level - the 8 MiB default
+    // main stack overflows (SIGABRT under `panic = "abort"`) near ~9k
+    // chained reassignments.  A worker with a large reserved stack (pages
+    // commit lazily) moves that cliff ~30x beyond any real shader; the
+    // per-pass substitution-depth cap that would bound it outright is
+    // tracked in docs/PLAN.md.
+    const WORKER_STACK_BYTES: usize = 256 * 1024 * 1024;
+    match std::thread::Builder::new()
+        .name("nagami".into())
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(cli_main)
+    {
+        Ok(worker) => match worker.join() {
+            Ok(code) => code,
+            // Unreachable under `panic = "abort"` (a worker panic aborts the
+            // process), but a defined exit beats an unwrap if the panic
+            // strategy ever changes.
+            Err(_) => ExitCode::from(2),
+        },
+        // Stack reservation failed: degrade to the default stack rather
+        // than refuse to run at all.
+        Err(_) => cli_main(),
+    }
+}
+
+fn cli_main() -> ExitCode {
     match run_cli() {
         Ok(should_fail_check) => {
             if should_fail_check {

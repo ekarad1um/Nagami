@@ -341,6 +341,103 @@ fn e2e_preserve_symbols_multiple_categories() {
     io::validate_wgsl_text(&output.source).expect("output must be valid WGSL");
 }
 
+/// A flat reassignment chain must not become one unboundedly-deep
+/// expression tree: store-to-load forwarding is depth-capped
+/// (`SUBSTITUTION_DEPTH_CAP`), because the deep tree overflows recursive
+/// consumers (render_depth's measurement, naga's writer, wasm's ~1 MB
+/// stack that the CLI's big-stack worker does not cover) and ships in the
+/// output, re-charging every re-minification.
+#[test]
+fn e2e_flat_reassignment_chain_stays_depth_bounded() {
+    let mut src = String::from(
+        "@group(0) @binding(0) var<storage, read_write> s: f32;\n\
+         @compute @workgroup_size(1)\n\
+         fn main() {\n    var a: f32 = 1.0;\n",
+    );
+    for _ in 0..600 {
+        src.push_str("    a = a * 2.0 + 1.0;\n");
+    }
+    src.push_str("    s = a;\n}\n");
+    let output = run(&src, &Config::default()).unwrap();
+    let (mut depth, mut max_depth) = (0i32, 0i32);
+    for ch in output.source.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                max_depth = max_depth.max(depth);
+            }
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    assert!(
+        max_depth <= 200,
+        "output nesting must stay near the substitution cap, got {max_depth}"
+    );
+    io::validate_wgsl_text(&output.source).expect("output must be valid WGSL");
+}
+
+/// naga materialises a dynamically-indexed function-scope `const` array as
+/// a full `Compose` at the use site; once load_dedup forwards the index
+/// variable's literal, const_fold must pick the element so the composite
+/// dies - round one used to ship the whole array inline
+/// (`array<u32,2310>(...)[0]`, the corpus large_array 4749-vs-100-byte
+/// idempotence gap).
+#[test]
+fn e2e_const_array_with_forwarded_index_folds_to_element() {
+    let src = r#"
+            @group(0) @binding(0) var<storage, read_write> s: array<u32>;
+            @compute @workgroup_size(1)
+            fn main() {
+                const kArray = array(10u, 20u, 30u, 40u);
+                var q = 2u;
+                s[0] = kArray[q];
+            }
+        "#;
+    let output = run(src, &Config::default()).unwrap();
+    assert!(
+        output.source.contains("=30"),
+        "the picked element must be stored directly: {}",
+        output.source
+    );
+    assert!(
+        !output.source.contains("40"),
+        "the composite (its unpicked elements) must be gone: {}",
+        output.source
+    );
+}
+
+/// A preserved function must keep BOTH its definition and its call sites.
+/// Template inlining used to bake the body into callers, after which
+/// `naga::compact` culled the now call-less declaration - for a `--preamble`
+/// input that body is only a STUB, so the consumer's real definition was
+/// silently bypassed.
+#[test]
+fn e2e_preserve_symbols_function_keeps_definition_and_call_site() {
+    let src = r#"
+            fn palette(t: f32) -> f32 {
+                return t * 2.0 + 1.0;
+            }
+            @fragment
+            fn fs_main() -> @location(0) vec4f {
+                let v = palette(0.25);
+                return vec4f(v);
+            }
+        "#;
+    let config = Config {
+        profile: config::Profile::Max,
+        preserve_symbols: vec!["palette".to_string()],
+        ..Default::default()
+    };
+    let output = run(src, &config).unwrap();
+    assert!(
+        output.source.matches("palette(").count() >= 2,
+        "preserved function must survive as declaration + intact call: {}",
+        output.source
+    );
+    io::validate_wgsl_text(&output.source).expect("output must be valid WGSL");
+}
+
 // MARK: Struct name collision regression tests
 
 #[test]
@@ -708,6 +805,60 @@ fn compact_wgsl_text_is_token_safe_and_idempotent() {
     assert!(!compacted.contains("--") && !compacted.contains("/*"));
     // Idempotent: a second pass is byte-identical.
     assert_eq!(compact_wgsl_text(&compacted), compacted);
+}
+
+#[test]
+fn line_comments_end_at_every_wgsl_line_break() {
+    // WGSL ends a `//` comment at any of LF/VT/FF/CR/NEL/LS/PS; ending only
+    // at `\n` swallowed the statement after a lone `\r` INTO the comment on
+    // the bailout paths (silent statement loss with exit 0).
+    for brk in [
+        '\u{000B}', '\u{000C}', '\r', '\u{0085}', '\u{2028}', '\u{2029}',
+    ] {
+        let src = format!("// note{brk}live();\n");
+        let stripped = strip_wgsl_comments(&src);
+        assert!(
+            stripped.contains("live();"),
+            "statement after {brk:?}-terminated comment was blanked: {stripped:?}"
+        );
+    }
+}
+
+#[test]
+fn compact_keeps_space_before_non_ascii_identifier() {
+    // U+2118 is XID_Start but fails `is_alphanumeric`; fusing the keyword
+    // and identifier into one token shipped tint-invalid text on the
+    // bailout paths.
+    let compacted = compact_wgsl_text("let \u{2118} = subgroupAdd(1.0);");
+    assert!(
+        compacted.starts_with("let \u{2118}"),
+        "non-ASCII identifier fused with the keyword: {compacted}"
+    );
+}
+
+#[test]
+fn preamble_plus_bailout_with_directives_hard_errors() {
+    // The unsupported-extension bailout ships the body verbatim-compacted,
+    // keeping its leading `enable subgroups;`; the consumer's
+    // [preamble, body] order would misplace it, so preamble mode must
+    // refuse loudly instead of shipping a poisoned document with exit 0.
+    let body = "enable subgroups;\n@compute @workgroup_size(64)\n\
+        fn m(@builtin(subgroup_invocation_id) sid: u32) { _ = subgroupAdd(f32(sid)); }";
+    let config = Config {
+        preamble: Some("@group(0) @binding(9) var<uniform> pre_u: f32;".to_string()),
+        ..Config::default()
+    };
+    let err = match run(body, &config) {
+        Err(e) => e,
+        Ok(out) => panic!(
+            "directive-carrying bailout must not ship, got: {}",
+            out.source
+        ),
+    };
+    assert!(
+        err.to_string().contains("preamble"),
+        "error should name the preamble conflict: {err}"
+    );
 }
 
 #[test]

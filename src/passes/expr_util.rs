@@ -1,28 +1,11 @@
 //! Centralised classifiers and walkers for [`naga::Expression`] and
-//! [`naga::Statement`] shapes.  Every helper uses an exhaustive
-//! `match` with no `_` arm so a future naga variant trips the build
-//! here, forcing a deliberate classification decision at the single
-//! point of truth rather than letting passes drift on private
-//! deny-lists.
-//!
-//! Consumers:
-//! * `inlining` - template clone gate (`is_disallowed_inline_expression`)
-//!   and statement-handle remapper (`try_map_expression_handles_in_place`).
-//! * `dead_branch` - `expression_needs_emit` for the short-circuit
-//!   re-sugar invariant (`val_a` must be declarative).
-//! * `load_dedup` - `needs_pre_emit` for the scope-leak filter; reuses
-//!   the emit-range rebuilder.
-//! * `cse` - `flatten_replacement_chains`,
-//!   `try_map_expression_handles_in_place`, and the post-CSE
-//!   statement walker.
-//! * `const_fold` - `rebuild_emit_ranges_after_removal`, plus a local
-//!   `is_pure_to_clone` that is a *tightened derivative* of
-//!   `is_disallowed_inline_expression` (additionally rejects Load and
-//!   image / derivative reads because const_fold CLONES expression
-//!   content into sibling arena slots rather than referencing it).
-//!
-//! `coalescing` deliberately keeps its own hand-rolled exhaustive
-//! statement walker and does NOT consume this module.
+//! [`naga::Statement`] shapes, shared by the passes and the generator.
+//! Every helper uses an exhaustive `match` with no `_` arm so a future
+//! naga variant trips the build here, forcing a deliberate
+//! classification decision at the single point of truth rather than
+//! letting consumers drift on private deny-lists.  (One deliberate
+//! holdout: `coalescing` keeps its own hand-rolled exhaustive statement
+//! walker.)
 
 // MARK: Expression classifiers
 

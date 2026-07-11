@@ -1612,3 +1612,221 @@ fn sibling_pure_calls_in_if_condition_both_inline() {
         "both pure calls should inline into the `if` condition, none `let`-bound: {out}"
     );
 }
+
+/// A void-fn tail `if f() { return; }` drains to an empty shell via
+/// tail-return elision; the shell's condition is the STASHED single-use
+/// call's only emission site, so skipping it as vacuous deleted the call -
+/// and its storage write - from the output (silent miscompile).  The kept
+/// `if a(){}` shell converges to a bare call on re-minify.
+#[test]
+fn vacuous_tail_if_keeps_stashed_impure_call() {
+    let src = "@group(0)@binding(0) var<storage,read_write> out:array<u32,4>;\
+        fn f()->bool{ out[0]=out[0]+1u; return out[0]>10u; }\
+        @compute @workgroup_size(1) fn main(){ out[1]=7u; if f(){ return; } }";
+    let out = minify(src);
+    assert!(
+        out.contains("if a(){}"),
+        "the drained tail must keep its shell - its condition is the call's only emission site: {out}"
+    );
+}
+
+/// Switch-selector variant of the vacuous-tail hazard: every case body drains
+/// to empty, and the selector holds the stashed call.
+#[test]
+fn vacuous_tail_switch_keeps_stashed_selector_call() {
+    let src = "@group(0)@binding(0) var<storage,read_write> out:array<u32,4>;\
+        fn g()->u32{ out[0]=out[0]+1u; return out[0]; }\
+        @compute @workgroup_size(1) fn main(){ out[1]=7u;\
+            switch g() { case 0u: { return; } default: { return; } } }";
+    let out = minify(src);
+    assert!(
+        out.contains("switch a(){"),
+        "the drained switch must keep its shell around the stashed selector call: {out}"
+    );
+}
+
+/// A single-use pure call in a loop BODY whose only consumer sits in the
+/// `continuing` block must stay `let`-bound in the body: marking it
+/// inlineable relocated its text past the continuing block's stores, so the
+/// argument re-read post-increment values (acc summed f(2..4) not f(1..3)).
+#[test]
+fn body_call_consumed_in_continuing_stays_bound() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: vec2f;\
+        fn f(p: f32) -> f32 { var t: f32 = p * 2.0; if (p > 1000.0) { t = 0.0; } return t; }\
+        @compute @workgroup_size(1) fn main() {\
+            var x: f32 = 1.0; var acc: f32 = 0.0; var i: i32 = 0;\
+            loop { let c = f(x);\
+                continuing { x = x + 1.0; acc = acc + c; i = i + 1; break if i >= 3; } }\
+            o.x = acc; }\
+        @compute @workgroup_size(1) fn main2() { o.y = f(4.0); }";
+    let out = minify(src);
+    assert!(
+        out.contains("let A=c(a);continuing"),
+        "the body call must bind before the continuing block that consumes it: {out}"
+    );
+    assert!(
+        !out.contains("+=c(a)"),
+        "the call text must not relocate into the continuing block: {out}"
+    );
+}
+
+/// `break if` variant: the loop's break condition evaluates AFTER the
+/// continuing block, so a body call consumed there re-read post-increment
+/// arguments (loop ran 2 iterations instead of 3).
+#[test]
+fn body_call_consumed_in_break_if_stays_bound() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: vec2f;\
+        fn f(p: f32) -> f32 { var t: f32 = p * 2.0; if (p > 1000.0) { t = 0.0; } return t; }\
+        @compute @workgroup_size(1) fn main() {\
+            var x: f32 = 1.0;\
+            loop { o.x = o.x + 1.0; let c = f(x);\
+                continuing { x = x + 1.0; break if c > 4.0; } } }\
+        @compute @workgroup_size(1) fn main2() { o.y = f(4.0); }";
+    let out = minify(src);
+    assert!(
+        out.contains("let a=b(B);"),
+        "the body call feeding `break if` must stay bound in the body: {out}"
+    );
+    assert!(
+        out.contains("break if a>4"),
+        "`break if` must read the pre-increment binding: {out}"
+    );
+}
+
+/// A pure call consumed as another pure call's ARGUMENT bakes the inner text
+/// inside the outer's stash, so the outer must inherit the inner's
+/// argument-local reads: without the union, `f(g(y))` floated past `y = ...`
+/// and re-read the post-store value (and the initial `y` was never passed).
+#[test]
+fn composed_call_inherits_inner_argument_reads() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: vec2f;\
+        fn g(p: f32) -> f32 { var t: f32 = p * 2.0; if (p > 1000.0) { t = 0.0; } return t; }\
+        fn f(q: f32) -> f32 { var t: f32 = q + 10.0; if (q > 1000.0) { t = 0.0; } return t; }\
+        @compute @workgroup_size(1) fn main() {\
+            var y: f32 = o.y; var acc: f32 = 0.0; var i: i32 = 0;\
+            loop { let a = g(y); let c = f(a); y = f32(i) * 5.0; acc = acc + c; i = i + 1;\
+                if (i >= 3) { break; } }\
+            o.x = acc; }\
+        @compute @workgroup_size(1) fn main2() { o.y = g(3.0) + f(4.0); }";
+    let out = minify(src);
+    assert!(
+        out.contains("let a=E(D(b));b="),
+        "the composed call must bind BEFORE the store to the inner argument's local: {out}"
+    );
+    assert!(
+        !out.contains("+=E(D(b))"),
+        "the composed call text must not relocate past the store to `b`: {out}"
+    );
+}
+
+/// Inlining literal args manufactures literal pairs whose checked folds used
+/// to decline (`MIN / -1`, `MIN % -1`, sign-overflowing `<<`); the declined
+/// text then failed naga's re-parse const-eval in BOTH the generator output
+/// and the fallback - exit 2 on valid input.  WGSL defines the runtime
+/// values (e1, 0, and the bit-pattern shift), so the folds must produce them.
+#[test]
+fn manufactured_min_div_rem_shl_fold_to_defined_values() {
+    let src = "@group(0)@binding(0) var<storage,read_write> out:array<i32,4>;\
+        fn f(x:i32)->i32{ return x / -1; }\
+        fn g(x:i32)->i32{ return x % -1; }\
+        fn h(x:i32)->i32{ return x << 1u; }\
+        @compute @workgroup_size(1) fn main(){\
+            out[0]=f(-2147483648); out[1]=g(-2147483648); out[2]=h(1073741824); }";
+    let out = minify(src);
+    assert!(
+        out.contains("i32(-2147483648)"),
+        "MIN / -1 and 1073741824 << 1u must fold to the defined value MIN: {out}"
+    );
+    assert!(
+        out.contains("A[1]=0;"),
+        "MIN % -1 must fold to the defined value 0: {out}"
+    );
+}
+
+/// A pass-manufactured float division by literal zero has NO valid WGSL
+/// spelling (its runtime value is inf, const-eval-rejected by every
+/// consumer); the generator output and the naga fallback both fail
+/// re-validation.  That must degrade to the compacted-input bailout, not a
+/// hard error that kills a batch run on valid input.
+#[test]
+fn untextable_float_div_zero_ships_compacted_input() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: f32;\n\
+        @compute @workgroup_size(1)\n\
+        fn main() {\n  var a: f32 = 5.0;\n  var b: f32 = 0.0;\n  out = a / b;\n}";
+    let result = crate::run(src, &crate::config::Config::default())
+        .expect("un-textable IR must bail out, not error");
+    assert!(
+        result.source.contains("out=a/b;"),
+        "bailout must ship the input compacted, division intact: {}",
+        result.source
+    );
+}
+
+/// A chain of single-use pure calls stashes each call's text inside the
+/// next (`A(A(A(...)))`) with no `let` to break it; `render_depth` priced
+/// the stash as a leaf, so the cap never fired and 127+ links shipped text
+/// past tint's parser recursion limit while naga's self-check accepted it.
+/// The recorded stash depth must force a binding past the budget.
+#[test]
+fn deep_pure_call_chain_binds_past_depth_budget() {
+    let mut src = String::from(
+        "@group(0)@binding(0) var<storage,read_write> o: f32;\
+         fn f(x: f32) -> f32 { return x * 0.5 + 0.25; }\
+         @compute @workgroup_size(1) fn main(){ var a: f32 = 1.0; let b0 = f(a);",
+    );
+    for i in 1..150 {
+        src.push_str(&format!("let b{i} = f(b{});", i - 1));
+    }
+    src.push_str("o = b149; }");
+    let out = minify(&src);
+    let mut cur = 0i32;
+    let mut max_depth = 0i32;
+    for c in out.chars() {
+        match c {
+            '(' => {
+                cur += 1;
+                max_depth = max_depth.max(cur);
+            }
+            ')' => cur -= 1,
+            _ => {}
+        }
+    }
+    assert!(
+        max_depth <= 80,
+        "stashed-call chain must bind past the depth budget, got paren depth {max_depth}: {}",
+        &out[..out.len().min(400)]
+    );
+}
+
+/// load_dedup's switch meet took each case's fall-off-the-end cache state,
+/// but a bare `break` in a case reaches post-switch code carrying the
+/// PRE-break value (the SPIR-V-structurizer phi idiom); forwarding the
+/// fall-end value made the local dead and deleted its stores - a silent
+/// value miscompile shipped on a real corpus file (graphicsfuzz
+/// one-sized-array).  The meet must not apply when any case breaks.
+#[test]
+fn switch_meet_keeps_stores_when_case_breaks() {
+    let src = "@group(0)@binding(0) var<storage,read_write> out: array<f32>;\
+        @group(0)@binding(1) var<uniform> u: vec4u;\
+        @compute @workgroup_size(1) fn main() {\
+            let s = i32(u.x); let c = u.y == 1u; let v = f32(u.z);\
+            var x: f32 = 3.0;\
+            switch (s) {\
+                case 0 { if (c) { break; } x = v; }\
+                default { x = v; }\
+            }\
+            out[0] = x; }";
+    let out = minify(src);
+    assert!(
+        out.contains("var a=3f;"),
+        "the init must survive - the break path reads it: {out}"
+    );
+    assert!(
+        out.contains("a=b;}default{a=b;}"),
+        "case stores must survive - only the fall-through paths write v: {out}"
+    );
+    assert!(
+        out.contains("B[0]=a;"),
+        "the post-switch read must consult the local, not a forwarded value: {out}"
+    );
+}

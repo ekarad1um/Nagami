@@ -84,10 +84,13 @@ impl InliningPass {
 
 /// Snapshot of an inlinable function: the expression arena alongside
 /// the handle that delivers the return value.  Cloned into each
-/// caller's arena when the call is replaced.
+/// caller's arena when the call is replaced.  `argument_types` carries the
+/// callee's declared parameter types so the pre-clone OOB gate can size an
+/// `Access` base type-derivedly, independent of the caller argument's
+/// expression shape.
 #[derive(Clone)]
 struct InlineTemplate {
-    argument_count: usize,
+    argument_types: Vec<naga::Handle<naga::Type>>,
     return_expr: naga::Handle<naga::Expression>,
     expressions: naga::Arena<naga::Expression>,
 }
@@ -109,17 +112,22 @@ impl Pass for InliningPass {
         // proof the declaration stays live.
         let mut changed = delete_calls_to_empty_functions(module, &ctx.config.preserve_symbols);
 
-        let templates = collect_inline_templates(module, self.max_node_count, self.max_call_sites);
+        let templates = collect_inline_templates(
+            module,
+            self.max_node_count,
+            self.max_call_sites,
+            &ctx.config.preserve_symbols,
+        );
         if templates.is_empty() {
             return Ok(changed);
         }
 
         let mut inlined = 0usize;
         for (_, function) in module.functions.iter_mut() {
-            inlined += inline_in_function(function, &templates);
+            inlined += inline_in_function(function, &templates, &module.types);
         }
         for entry in module.entry_points.iter_mut() {
-            inlined += inline_in_function(&mut entry.function, &templates);
+            inlined += inline_in_function(&mut entry.function, &templates, &module.types);
         }
         changed |= inlined > 0;
 
@@ -205,11 +213,26 @@ fn collect_inline_templates(
     module: &naga::Module,
     max_node_count: usize,
     max_call_sites: usize,
+    preserve: &[String],
 ) -> HashMap<naga::Handle<naga::Function>, InlineTemplate> {
     let call_counts = collect_call_counts(module);
     let mut templates = HashMap::new();
 
     for (function_handle, function) in module.functions.iter() {
+        // Preserved functions are an external contract, never templates: a
+        // `--preamble` input carries only a STUB body whose real definition
+        // arrives when the consumer concatenates the preamble, so baking the
+        // stub's expression tree into callers silently bypasses that
+        // definition.  Plain `--preserve-symbol` declarations also survive
+        // only through intact call sites (`naga::compact` culls call-less
+        // functions whenever entry points exist).
+        if function
+            .name
+            .as_deref()
+            .is_some_and(|n| preserve.iter().any(|p| p == n))
+        {
+            continue;
+        }
         let call_sites = call_counts.get(&function_handle).copied().unwrap_or(0);
         if call_sites == 0 || call_sites > max_call_sites {
             continue;
@@ -276,7 +299,7 @@ fn collect_inline_templates(
         templates.insert(
             function_handle,
             InlineTemplate {
-                argument_count: function.arguments.len(),
+                argument_types: function.arguments.iter().map(|a| a.ty).collect(),
                 return_expr,
                 expressions: function.expressions.clone(),
             },
@@ -391,11 +414,13 @@ fn analyze_inline_expression(
 fn inline_in_function(
     function: &mut naga::Function,
     templates: &HashMap<naga::Handle<naga::Function>, InlineTemplate>,
+    types: &naga::UniqueArena<naga::Type>,
 ) -> usize {
     let (changed, _) = inline_in_block(
         &mut function.body,
         &mut function.expressions,
         templates,
+        types,
         &HashMap::new(),
     );
 
@@ -419,6 +444,7 @@ fn inline_in_block(
     block: &mut naga::Block,
     expressions: &mut naga::Arena<naga::Expression>,
     templates: &HashMap<naga::Handle<naga::Function>, InlineTemplate>,
+    types: &naga::UniqueArena<naga::Type>,
     inherited_replacements: &HashMap<
         naga::Handle<naga::Expression>,
         naga::Handle<naga::Expression>,
@@ -443,7 +469,7 @@ fn inline_in_block(
                 result: Some(result_handle),
             } => {
                 if let Some(template) = templates.get(&function)
-                    && template.argument_count == arguments.len()
+                    && template.argument_types.len() == arguments.len()
                 {
                     let old_len = expressions.len();
                     // Memo backed by `Vec<Option<Handle>>` indexed by
@@ -462,6 +488,7 @@ fn inline_in_block(
                         template,
                         &arguments,
                         expressions,
+                        types,
                         &mut memo,
                     ) {
                         push_emit_ranges_for_new_expressions(
@@ -497,7 +524,7 @@ fn inline_in_block(
                 // produced - otherwise a body-inlined call leaves them
                 // referencing an orphaned `CallResult`.
                 let (cb, body_replacements) =
-                    inline_in_block(&mut body, expressions, templates, &replacements);
+                    inline_in_block(&mut body, expressions, templates, types, &replacements);
                 changed += cb;
                 // `break_if` may reference a `CallResult` defined in the
                 // `continuing` block itself (naga allows it), so resolve it
@@ -505,8 +532,13 @@ fn inline_in_block(
                 // seeded from `body_replacements`, hence a superset.  Using
                 // only `body_replacements` would leave a continuing-inlined
                 // call's result orphaned in `break_if` -> invalid IR -> rollback.
-                let (cc, continuing_replacements) =
-                    inline_in_block(&mut continuing, expressions, templates, &body_replacements);
+                let (cc, continuing_replacements) = inline_in_block(
+                    &mut continuing,
+                    expressions,
+                    templates,
+                    types,
+                    &body_replacements,
+                );
                 changed += cc;
                 if let Some(handle) = break_if {
                     break_if = Some(resolve_replacement(handle, &continuing_replacements));
@@ -526,7 +558,8 @@ fn inline_in_block(
             // their interior expressions.
             mut other => {
                 for nested in nested_blocks_mut(&mut other) {
-                    changed += inline_in_block(nested, expressions, templates, &replacements).0;
+                    changed +=
+                        inline_in_block(nested, expressions, templates, types, &replacements).0;
                 }
                 rebuilt.push(other, span);
             }
@@ -596,6 +629,7 @@ fn clone_inline_expression(
     template: &InlineTemplate,
     arguments: &[naga::Handle<naga::Expression>],
     caller_expressions: &mut naga::Arena<naga::Expression>,
+    types: &naga::UniqueArena<naga::Type>,
     memo: &mut [Option<naga::Handle<naga::Expression>>],
 ) -> Option<naga::Handle<naga::Expression>> {
     if let Some(mapped) = memo[handle.index()] {
@@ -610,16 +644,138 @@ fn clone_inline_expression(
     let mapped = match expr {
         naga::Expression::FunctionArgument(index) => arguments.get(*index as usize).copied()?,
         _ => {
+            // Substitution can MANUFACTURE a statically out-of-bounds index
+            // the template never had: the template's `v[i]` is a runtime
+            // access, but a call site like `f(vec4(...), 6)` maps `i` to a
+            // literal, and naga's validator rejects a known-OOB constant
+            // index into a fixed-size composite - and a NEGATIVE constant
+            // index regardless of base type - either of which used to roll
+            // the whole pass back.  Checked BEFORE cloning children so the
+            // decline strands nothing: the index resolves through the
+            // argument list, the base length through the callee's declared
+            // parameter type (covering every caller argument shape) or a
+            // structural template composite.
+            if let naga::Expression::Access { base, index } = expr
+                && let Some(i) =
+                    substituted_index_value(*index, template, arguments, caller_expressions)
+                && (i < 0
+                    || substituted_base_len(*base, template, types)
+                        .is_some_and(|len| i as u64 >= len))
+            {
+                return None;
+            }
             let mut cloned = expr.clone();
             try_map_expression_handles_in_place(&mut cloned, &mut |child| {
-                clone_inline_expression(child, template, arguments, caller_expressions, memo)
+                clone_inline_expression(child, template, arguments, caller_expressions, types, memo)
             })?;
+            // Backstop for composed shapes the pre-clone gate cannot size
+            // (base or index produced by nested template expressions).
+            // Declining here strands the already-cloned children -
+            // unreferenced and individually valid; compact culls them.
+            if let naga::Expression::Access { base, index } = cloned
+                && let Some(i) = const_index_value(index, caller_expressions)
+                && (i < 0
+                    || static_composite_len(base, caller_expressions, types)
+                        .is_some_and(|len| i as u64 >= len))
+            {
+                return None;
+            }
             caller_expressions.append(cloned, Default::default())
         }
     };
 
     memo[handle.index()] = Some(mapped);
     Some(mapped)
+}
+
+/// Statically-known element count of `ty`: vector size, matrix column
+/// count, or fixed array length.  `None` = not indexable with a static
+/// bound (the OOB gates then stay out of the way).
+fn type_element_count(
+    ty: naga::Handle<naga::Type>,
+    types: &naga::UniqueArena<naga::Type>,
+) -> Option<u64> {
+    match &types[ty].inner {
+        naga::TypeInner::Vector { size, .. } => Some(*size as u64),
+        naga::TypeInner::Matrix { columns, .. } => Some(*columns as u64),
+        naga::TypeInner::Array {
+            size: naga::ArraySize::Constant(n),
+            ..
+        } => Some(n.get() as u64),
+        _ => None,
+    }
+}
+
+/// Statically-known element count of the composite VALUE produced by
+/// `handle`, derived structurally (no typifier): `Compose`/`ZeroValue`
+/// carry their type, `Splat`/`Swizzle` carry their size directly.
+fn static_composite_len(
+    handle: naga::Handle<naga::Expression>,
+    arena: &naga::Arena<naga::Expression>,
+    types: &naga::UniqueArena<naga::Type>,
+) -> Option<u64> {
+    match &arena[handle] {
+        naga::Expression::Compose { ty, .. } | naga::Expression::ZeroValue(ty) => {
+            type_element_count(*ty, types)
+        }
+        naga::Expression::Splat { size, .. } => Some(*size as u64),
+        naga::Expression::Swizzle { size, .. } => Some(*size as u64),
+        _ => None,
+    }
+}
+
+/// Post-substitution constant value of a template `Access` index, resolved
+/// WITHOUT cloning: a template-arena literal directly, or the caller
+/// argument a `FunctionArgument` maps to.  (`Expression::Constant` indices
+/// stay unresolvable here - no module access - and fall to the rollback.)
+fn substituted_index_value(
+    index: naga::Handle<naga::Expression>,
+    template: &InlineTemplate,
+    arguments: &[naga::Handle<naga::Expression>],
+    caller_expressions: &naga::Arena<naga::Expression>,
+) -> Option<i64> {
+    match &template.expressions[index] {
+        naga::Expression::FunctionArgument(k) => {
+            const_index_value(*arguments.get(*k as usize)?, caller_expressions)
+        }
+        naga::Expression::Literal(_) => const_index_value(index, &template.expressions),
+        _ => None,
+    }
+}
+
+/// Static element count of a template `Access` base: the callee's declared
+/// parameter type when the base is an argument (independent of the caller
+/// argument's expression shape), else a structural template composite.
+fn substituted_base_len(
+    base: naga::Handle<naga::Expression>,
+    template: &InlineTemplate,
+    types: &naga::UniqueArena<naga::Type>,
+) -> Option<u64> {
+    match &template.expressions[base] {
+        naga::Expression::FunctionArgument(m) => {
+            type_element_count(*template.argument_types.get(*m as usize)?, types)
+        }
+        _ => static_composite_len(base, &template.expressions, types),
+    }
+}
+
+/// The compile-time value of an integer-literal index expression, or
+/// `None` when the index is not a literal (a genuine runtime access).
+fn const_index_value(
+    handle: naga::Handle<naga::Expression>,
+    arena: &naga::Arena<naga::Expression>,
+) -> Option<i64> {
+    match arena[handle] {
+        naga::Expression::Literal(naga::Literal::I32(v)) => Some(v as i64),
+        naga::Expression::Literal(naga::Literal::U32(v)) => Some(v as i64),
+        naga::Expression::Literal(naga::Literal::I64(v)) => Some(v),
+        // Saturate: a u64 index beyond i64::MAX is OOB for any composite.
+        naga::Expression::Literal(naga::Literal::U64(v)) => {
+            Some(i64::try_from(v).unwrap_or(i64::MAX))
+        }
+        naga::Expression::Literal(naga::Literal::AbstractInt(v)) => Some(v),
+        _ => None,
+    }
 }
 
 /// Remap every expression handle referenced by `statement` through
@@ -989,6 +1145,74 @@ fn fs_main() -> @location(0) vec4f {
         assert_eq!(
             after_calls, 0,
             "helper call should be removed from entry point"
+        );
+    }
+
+    /// Substituting a call-site literal into a template's runtime `v[i]`
+    /// manufactures a statically out-of-bounds constant index that naga's
+    /// validator rejects - the clone must decline (call kept) instead of
+    /// poisoning the pass into a module-wide rollback.  `run_pass`
+    /// validates the post-pass module, so this test fails if the gate is
+    /// removed.  The in-bounds call proves the gate is value-sensitive,
+    /// not a blanket refusal.
+    #[test]
+    fn declines_call_site_whose_literal_index_is_out_of_bounds() {
+        let source = r#"
+fn pick(v: vec4<f32>, i: i32) -> f32 {
+    return v[i];
+}
+
+@compute @workgroup_size(1)
+fn main() {
+    let bad = pick(vec4<f32>(2.0, 3.0, 4.0, 5.0), 6);
+    let good = pick(vec4<f32>(2.0, 3.0, 4.0, 5.0), 2);
+    _ = bad + good;
+}
+"#;
+        let (changed, after) = run_pass(source);
+        assert!(changed, "the in-bounds call site must still inline");
+        let pick = find_function_handle_by_name(&after, "pick");
+        assert_eq!(
+            count_calls_to_function(&after.entry_points[0].function.body, pick),
+            1,
+            "exactly the OOB call site must survive as a call"
+        );
+    }
+
+    /// The pre-clone gate must also size the base from the callee's
+    /// DECLARED parameter type (the caller forwards its own argument, so no
+    /// structural composite exists in the caller arena) and must reject a
+    /// negative index outright - naga flags negative constant indices
+    /// regardless of base-length knowledge.  `run_pass` validates, so this
+    /// test fails with the gate removed.
+    #[test]
+    fn declines_forwarded_argument_base_and_negative_index() {
+        let source = r#"
+fn pick(v: vec4<f32>, i: i32) -> f32 {
+    return v[i];
+}
+
+fn outer(v: vec4<f32>) -> f32 {
+    return pick(v, 6);
+}
+
+@compute @workgroup_size(1)
+fn main() {
+    var w = vec4<f32>(1.0, 2.0, 3.0, 4.0);
+    let neg = pick(w, -1);
+    _ = outer(vec4<f32>(0.5, 0.5, 0.5, 0.5)) + neg;
+}
+"#;
+        let (_, after) = run_pass(source);
+        let pick = find_function_handle_by_name(&after, "pick");
+        let mut surviving_calls = 0;
+        for (_, func) in after.functions.iter() {
+            surviving_calls += count_calls_to_function(&func.body, pick);
+        }
+        surviving_calls += count_calls_to_function(&after.entry_points[0].function.body, pick);
+        assert_eq!(
+            surviving_calls, 2,
+            "both statically-invalid call sites must survive as calls"
         );
     }
 

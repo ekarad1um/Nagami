@@ -199,6 +199,13 @@ pub(super) struct FunctionCtx<'a, 'm> {
     /// taken can only make an ancestor's stored depth an overestimate -
     /// the safe direction (at worst an extra `let`).
     pub(super) render_depth_memo: Vec<u16>,
+    /// True rendered depth of each STASHED single-use call text (see
+    /// `emit_call_result`), keyed by `CallResult` handle.  A `CallResult`
+    /// has no expression children - its arguments hang off the `Call`
+    /// statement - so without this record a chain of stashed calls prices
+    /// as nested leaves and escapes the depth cap entirely (tint's parser
+    /// recursion limit then rejects text naga's self-check accepts).
+    pub(super) stashed_call_depth: std::collections::HashMap<naga::Handle<naga::Expression>, u16>,
     /// Display name for the current function, used to decorate
     /// diagnostic messages.
     pub(super) display_name: String,

@@ -180,8 +180,11 @@ fn fold_global_expressions(
     let mut literal_cache = build_literal_cache(&module.global_expressions);
 
     // Shared cycle-tracker reused across every global handle (see the
-    // identical optimisation in `fold_local_expressions`).
+    // identical optimisation in `fold_local_expressions`).  The memo
+    // survives the in-loop rewrites because they only ever replace an
+    // expression with a same-value Literal / Compose (see `ConstValueMemo`).
     let mut visiting = HashSet::new();
+    let mut memo: ConstValueMemo = vec![None; module.global_expressions.len()];
     for handle in handles {
         visiting.clear();
         // Try composite-aware resolution first (covers vectors, swizzle, etc.).
@@ -191,7 +194,7 @@ fn fold_global_expressions(
                 types: &module.types,
                 const_inits: &const_inits,
             };
-            resolve_const_value(handle, &ctx, &mut visiting)
+            resolve_const_value(handle, &ctx, &mut visiting, &mut memo)
         };
 
         if let Some(ConstValue::Scalar(literal)) = value {
@@ -430,8 +433,12 @@ fn fold_local_expressions(
     // tracker only needs to be empty at the start of each
     // `resolve_const_value` call, not freshly allocated - `clear()`
     // keeps the bucket capacity around and avoids N allocations on
-    // large function arenas.
+    // large function arenas.  The memo persists across handles AND the
+    // in-loop rewrites (same-value Literal / Compose only; see
+    // `ConstValueMemo`) - without it every handle re-descends its whole
+    // operand chain, quadratic on the deep chains load_dedup builds.
     let mut visiting = HashSet::new();
+    let mut memo: ConstValueMemo = vec![None; arena.len()];
     for handle in handles.iter().copied() {
         visiting.clear();
         let value = {
@@ -440,7 +447,7 @@ fn fold_local_expressions(
                 types,
                 const_literals,
             };
-            resolve_const_value(handle, &ctx, &mut visiting)
+            resolve_const_value(handle, &ctx, &mut visiting, &mut memo)
         };
 
         match value {
@@ -744,16 +751,35 @@ impl ConstValue {
     }
 }
 
+/// Per-arena memo for [`resolve_const_value`], indexed by expression-handle
+/// index.  Outer `None` = not yet computed; inner value = the full resolution
+/// result (including "not a constant").  Without it the per-handle folding
+/// loops re-descend every operand chain from scratch, which is O(N^2) on the
+/// deep chains our own passes build and dominated corpus-wide pass time.
+///
+/// Safety of caching across the in-loop rewrites: the folding loops only ever
+/// replace an expression with a `Literal` / `Compose` of the value it already
+/// resolved to, so a stored entry never goes stale.  Cached results are
+/// entry-point-independent even on cyclic (corrupt) IR: a cycle-guard hit
+/// returns `None` BEFORE the memo store, and no resolver arm converts a child
+/// failure into `Some`, so a wrong `Some` can never be cached - at worst a
+/// cycle-dependent member caches the `None` it deterministically resolves to.
+type ConstValueMemo = Vec<Option<Option<ConstValue>>>;
+
 /// Composite-resolution context.  Extends [`LiteralContext`] with
 /// access to the type arena because `Compose` / `Splat` rewrites need
 /// to discover the component type and vector size.
 trait ConstFoldContext {
     fn arena(&self) -> &naga::Arena<naga::Expression>;
     fn types(&self) -> &naga::UniqueArena<naga::Type>;
+    /// `memo` is threaded through so an implementation that resolves the
+    /// constant's init by descending the SAME arena (the global context)
+    /// keeps memoization; implementations backed by a prebuilt map ignore it.
     fn resolve_constant_value(
         &self,
         handle: naga::Handle<naga::Constant>,
         visiting: &mut HashSet<Handle<naga::Expression>>,
+        memo: &mut ConstValueMemo,
     ) -> Option<ConstValue>;
 }
 
@@ -774,9 +800,10 @@ impl ConstFoldContext for GlobalConstFoldContext<'_> {
         &self,
         handle: naga::Handle<naga::Constant>,
         visiting: &mut HashSet<Handle<naga::Expression>>,
+        memo: &mut ConstValueMemo,
     ) -> Option<ConstValue> {
         let init = *self.const_inits.get(&handle)?;
-        resolve_const_value(init, self, visiting)
+        resolve_const_value(init, self, visiting, memo)
     }
 }
 
@@ -797,6 +824,7 @@ impl ConstFoldContext for LocalConstFoldContext<'_> {
         &self,
         handle: naga::Handle<naga::Constant>,
         _visiting: &mut HashSet<Handle<naga::Expression>>,
+        _memo: &mut ConstValueMemo,
     ) -> Option<ConstValue> {
         self.const_literals
             .get(&handle)
@@ -868,30 +896,55 @@ fn cast_width8_to(src: naga::Literal, target: naga::Scalar) -> Option<naga::Lite
 }
 
 /// Resolve `handle` to a fully-constant [`ConstValue`], threading
-/// `visiting` to short-circuit cyclic expression graphs.  This is the
-/// composite-aware generalisation of [`resolve_literal`]; it handles
-/// `Compose`, `Splat`, `ZeroValue`, `Swizzle`, `AccessIndex`, and
-/// component-wise `Binary` / `Unary` on vectors.
+/// `visiting` to short-circuit cyclic expression graphs and `memo` to
+/// resolve every handle at most once per arena walk (see
+/// [`ConstValueMemo`]).  This is the composite-aware generalisation of
+/// [`resolve_literal`]; it handles `Compose`, `Splat`, `ZeroValue`,
+/// `Swizzle`, `AccessIndex`, and component-wise `Binary` / `Unary` on
+/// vectors.
 fn resolve_const_value<C: ConstFoldContext>(
     handle: Handle<naga::Expression>,
     ctx: &C,
     visiting: &mut HashSet<Handle<naga::Expression>>,
+    memo: &mut ConstValueMemo,
 ) -> Option<ConstValue> {
+    if let Some(Some(cached)) = memo.get(handle.index()) {
+        return cached.clone();
+    }
     if !visiting.insert(handle) {
         return None;
     }
+    let out = resolve_const_value_uncached(handle, ctx, visiting, memo);
+    visiting.remove(&handle);
+    // Store failures too: the corpus-dominant cost is re-walking long
+    // RUNTIME (non-const) chains that fail resolution at every ancestor, so
+    // a success-only memo would leave the quadratic blow-up in place.
+    if let Some(slot) = memo.get_mut(handle.index()) {
+        *slot = Some(out.clone());
+    }
+    out
+}
 
+/// Arm-by-arm resolver behind [`resolve_const_value`]'s cycle guard and
+/// memo.  `?` failure exits are safe here only because the wrapper owns
+/// the `visiting.remove` and memo store on every return path.
+fn resolve_const_value_uncached<C: ConstFoldContext>(
+    handle: Handle<naga::Expression>,
+    ctx: &C,
+    visiting: &mut HashSet<Handle<naga::Expression>>,
+    memo: &mut ConstValueMemo,
+) -> Option<ConstValue> {
     let expr = &ctx.arena()[handle];
-    let out = match expr {
+    match expr {
         // Scalar leaves
         naga::Expression::Literal(lit) => Some(ConstValue::Scalar(*lit)),
-        naga::Expression::Constant(ch) => ctx.resolve_constant_value(*ch, visiting),
+        naga::Expression::Constant(ch) => ctx.resolve_constant_value(*ch, visiting, memo),
 
         // Composite constructors
         naga::Expression::ZeroValue(ty) => resolve_zero_value(*ty, ctx),
 
         naga::Expression::Splat { size, value } => {
-            let inner = resolve_const_value(*value, ctx, visiting)?;
+            let inner = resolve_const_value(*value, ctx, visiting, memo)?;
             let lit = inner.as_scalar()?;
             Some(ConstValue::Vector {
                 scalar: lit.scalar(),
@@ -901,19 +954,31 @@ fn resolve_const_value<C: ConstFoldContext>(
         }
 
         naga::Expression::Compose { ty, components } => {
-            resolve_compose(*ty, components, ctx, visiting)
+            resolve_compose(*ty, components, ctx, visiting, memo)
         }
 
         // Indexing / swizzle
         naga::Expression::AccessIndex { base, index } => {
-            let base_val = resolve_const_value(*base, ctx, visiting)?;
-            match base_val {
-                ConstValue::Vector { ref components, .. } => components
-                    .get(*index as usize)
-                    .copied()
-                    .map(ConstValue::Scalar),
-                _ => None,
-            }
+            resolve_composite_element(*base, *index as usize, ctx, visiting, memo)
+        }
+
+        // A dynamic `Access` whose index folds to a constant is a static
+        // pick in disguise.  Our own passes manufacture the shape: naga
+        // materialises a dynamically-indexed function-scope `const` array
+        // as a full `Compose` at the use site, and load_dedup then forwards
+        // the index variable's stored literal.  Without this fold the
+        // emitter ships the whole composite inline
+        // (`array<u32,2310>(...)[0]`), which only the NEXT minification
+        // round collapses via naga's front-end const-eval; folding here
+        // makes round one match round two.  A pointer-typed `base` can
+        // never fold: it is structurally a variable / pointer chain, not a
+        // `Compose`/`ZeroValue`, and those never resolve to a value.
+        naga::Expression::Access { base, index } => {
+            let idx = match resolve_const_value(*index, ctx, visiting, memo)? {
+                ConstValue::Scalar(l) => literal_index(l)?,
+                ConstValue::Vector { .. } => return None,
+            };
+            resolve_composite_element(*base, idx, ctx, visiting, memo)
         }
 
         naga::Expression::Swizzle {
@@ -921,7 +986,7 @@ fn resolve_const_value<C: ConstFoldContext>(
             vector,
             pattern,
         } => {
-            let vec_val = resolve_const_value(*vector, ctx, visiting)?;
+            let vec_val = resolve_const_value(*vector, ctx, visiting, memo)?;
             match vec_val {
                 ConstValue::Vector {
                     ref components,
@@ -946,13 +1011,13 @@ fn resolve_const_value<C: ConstFoldContext>(
 
         // Scalar ops (delegate to existing evaluators)
         naga::Expression::Unary { op, expr } => {
-            let inner = resolve_const_value(*expr, ctx, visiting)?;
+            let inner = resolve_const_value(*expr, ctx, visiting, memo)?;
             eval_const_unary(*op, inner)
         }
 
         naga::Expression::Binary { op, left, right } => {
-            let l = resolve_const_value(*left, ctx, visiting)?;
-            let r = resolve_const_value(*right, ctx, visiting)?;
+            let l = resolve_const_value(*left, ctx, visiting, memo)?;
+            let r = resolve_const_value(*right, ctx, visiting, memo)?;
             eval_const_binary(*op, l, r)
         }
 
@@ -963,13 +1028,13 @@ fn resolve_const_value<C: ConstFoldContext>(
             arg2,
             arg3: _,
         } => {
-            let a = resolve_const_value(*arg, ctx, visiting)?;
+            let a = resolve_const_value(*arg, ctx, visiting, memo)?;
             let b = match arg1 {
-                Some(h) => Some(resolve_const_value(*h, ctx, visiting)?),
+                Some(h) => Some(resolve_const_value(*h, ctx, visiting, memo)?),
                 None => None,
             };
             let c = match arg2 {
-                Some(h) => Some(resolve_const_value(*h, ctx, visiting)?),
+                Some(h) => Some(resolve_const_value(*h, ctx, visiting, memo)?),
                 None => None,
             };
             eval_const_math(*fun, a, b, c)
@@ -980,13 +1045,13 @@ fn resolve_const_value<C: ConstFoldContext>(
             accept,
             reject,
         } => {
-            let cond = resolve_const_value(*condition, ctx, visiting)?;
+            let cond = resolve_const_value(*condition, ctx, visiting, memo)?;
             match cond {
                 ConstValue::Scalar(naga::Literal::Bool(true)) => {
-                    resolve_const_value(*accept, ctx, visiting)
+                    resolve_const_value(*accept, ctx, visiting, memo)
                 }
                 ConstValue::Scalar(naga::Literal::Bool(false)) => {
-                    resolve_const_value(*reject, ctx, visiting)
+                    resolve_const_value(*reject, ctx, visiting, memo)
                 }
                 _ => None,
             }
@@ -1012,7 +1077,7 @@ fn resolve_const_value<C: ConstFoldContext>(
         } => {
             let width = (*convert)?;
             let target = naga::Scalar { kind: *kind, width };
-            match resolve_const_value(*operand, ctx, visiting)? {
+            match resolve_const_value(*operand, ctx, visiting, memo)? {
                 ConstValue::Scalar(
                     lit @ (naga::Literal::F64(_) | naga::Literal::U64(_) | naga::Literal::I64(_)),
                 ) => cast_width8_to(lit, target).map(ConstValue::Scalar),
@@ -1021,10 +1086,90 @@ fn resolve_const_value<C: ConstFoldContext>(
         }
 
         _ => None,
-    };
+    }
+}
 
-    visiting.remove(&handle);
-    out
+/// The non-negative compile-time value of an integer index literal, or
+/// `None` for negative / non-integer literals (the fold then declines and
+/// the expression ships as written).
+fn literal_index(lit: naga::Literal) -> Option<usize> {
+    use naga::Literal as L;
+    match lit {
+        L::I32(v) => usize::try_from(v).ok(),
+        L::U32(v) => Some(v as usize),
+        L::I64(v) => usize::try_from(v).ok(),
+        L::U64(v) => usize::try_from(v).ok(),
+        L::AbstractInt(v) => usize::try_from(v).ok(),
+        _ => None,
+    }
+}
+
+/// Resolve element `idx` of the composite VALUE produced by `base`.
+///
+/// Array / matrix bases are read STRUCTURALLY (a syntactic `Compose` /
+/// `ZeroValue` node, one component handle per element) so [`ConstValue`]
+/// never has to model whole-array shapes; everything else falls through to
+/// full base resolution, which covers vectors (whose `Compose` components
+/// flatten and so cannot be picked positionally) and vector-valued chains
+/// like `arr[1][2]` (the inner `Access` resolves to a `Vector` first).
+/// Nested array-of-array picks decline (the middle layer has no
+/// `ConstValue` form).
+fn resolve_composite_element<C: ConstFoldContext>(
+    base: Handle<naga::Expression>,
+    idx: usize,
+    ctx: &C,
+    visiting: &mut HashSet<Handle<naga::Expression>>,
+    memo: &mut ConstValueMemo,
+) -> Option<ConstValue> {
+    match &ctx.arena()[base] {
+        naga::Expression::Compose { ty, components } => match &ctx.types()[*ty].inner {
+            naga::TypeInner::Array { .. } | naga::TypeInner::Matrix { .. } => {
+                resolve_const_value(*components.get(idx)?, ctx, visiting, memo)
+            }
+            _ => resolve_vector_component(base, idx, ctx, visiting, memo),
+        },
+        naga::Expression::ZeroValue(ty) => match &ctx.types()[*ty].inner {
+            naga::TypeInner::Array {
+                base: elem,
+                size: naga::ArraySize::Constant(n),
+                ..
+            } => (idx < n.get() as usize)
+                .then(|| resolve_zero_value(*elem, ctx))
+                .flatten(),
+            naga::TypeInner::Matrix {
+                columns,
+                rows,
+                scalar,
+            } => {
+                let zero = naga::Literal::zero(*scalar)?;
+                (idx < *columns as usize).then(|| ConstValue::Vector {
+                    components: vec![zero; *rows as usize],
+                    size: *rows,
+                    scalar: *scalar,
+                })
+            }
+            _ => resolve_vector_component(base, idx, ctx, visiting, memo),
+        },
+        _ => resolve_vector_component(base, idx, ctx, visiting, memo),
+    }
+}
+
+/// Component `idx` of `base` once `base` fully resolves to a
+/// [`ConstValue::Vector`]; the vector-base arm of
+/// [`resolve_composite_element`].
+fn resolve_vector_component<C: ConstFoldContext>(
+    base: Handle<naga::Expression>,
+    idx: usize,
+    ctx: &C,
+    visiting: &mut HashSet<Handle<naga::Expression>>,
+    memo: &mut ConstValueMemo,
+) -> Option<ConstValue> {
+    match resolve_const_value(base, ctx, visiting, memo)? {
+        ConstValue::Vector { components, .. } => {
+            components.get(idx).copied().map(ConstValue::Scalar)
+        }
+        ConstValue::Scalar(_) => None,
+    }
 }
 
 /// Materialise `ZeroValue(ty)` as a [`ConstValue`] when the type is a
@@ -1061,6 +1206,7 @@ fn resolve_compose<C: ConstFoldContext>(
     components: &[Handle<naga::Expression>],
     ctx: &C,
     visiting: &mut HashSet<Handle<naga::Expression>>,
+    memo: &mut ConstValueMemo,
 ) -> Option<ConstValue> {
     let inner = &ctx.types()[ty].inner;
     match inner {
@@ -1071,7 +1217,7 @@ fn resolve_compose<C: ConstFoldContext>(
             // that flatten to N scalar components.
             let mut out = Vec::with_capacity(expected);
             for &c in components {
-                let val = resolve_const_value(c, ctx, visiting)?;
+                let val = resolve_const_value(c, ctx, visiting, memo)?;
                 match val {
                     ConstValue::Scalar(l) => {
                         if l.scalar() != target_scalar {
@@ -1489,29 +1635,55 @@ fn eval_binary(
         (B::Subtract, L::F32(a), L::F32(b)) if (a - b).is_finite() => Some(L::F32(a - b)),
         (B::Multiply, L::F32(a), L::F32(b)) if (a * b).is_finite() => Some(L::F32(a * b)),
         (B::Divide, L::F32(a), L::F32(b)) if b != 0.0 && (a / b).is_finite() => Some(L::F32(a / b)),
-        (B::Modulo, L::F32(a), L::F32(b)) if b != 0.0 && (a % b).is_finite() => Some(L::F32(a % b)),
+        // Float `%`: WGSL specifies `a - b*trunc(a/b)` in operand precision.
+        // Rust's `%` is exact fmod, which stays inside WGSL's 2.5-ULP
+        // division tolerance only while `trunc(a/b)` is exactly
+        // representable, i.e. `|a/b|` below the type's integer-precision
+        // limit (2^24 for f32, 2^53 for f64) - beyond it the divergence is
+        // unbounded (the truncated quotient itself rounds), so decline.
+        // Within the limit a rounded quotient can still cross an integer
+        // boundary the exact one does not; that residue is the same
+        // conformant-implementation-choice class as the float-divide fold
+        // above, not a correctness gap.
+        (B::Modulo, L::F32(a), L::F32(b))
+            if b != 0.0 && (a % b).is_finite() && (a / b).abs() < 16_777_216.0 =>
+        {
+            Some(L::F32(a % b))
+        }
 
         (B::Add, L::F64(a), L::F64(b)) if (a + b).is_finite() => Some(L::F64(a + b)),
         (B::Subtract, L::F64(a), L::F64(b)) if (a - b).is_finite() => Some(L::F64(a - b)),
         (B::Multiply, L::F64(a), L::F64(b)) if (a * b).is_finite() => Some(L::F64(a * b)),
         (B::Divide, L::F64(a), L::F64(b)) if b != 0.0 && (a / b).is_finite() => Some(L::F64(a / b)),
-        (B::Modulo, L::F64(a), L::F64(b)) if b != 0.0 && (a % b).is_finite() => Some(L::F64(a % b)),
+        (B::Modulo, L::F64(a), L::F64(b))
+            if b != 0.0 && (a % b).is_finite() && (a / b).abs() < 9_007_199_254_740_992.0 =>
+        {
+            Some(L::F64(a % b))
+        }
 
-        // Signed integer arithmetic uses checked_* so that overflow (which is a
-        // shader-creation/execution error in WGSL) is declined rather than
-        // silently wrapped.  Folding `i32::MAX + 1` to `-2147483648` would
-        // turn an error-producing program into a defined-value program.
+        // Signed add/sub/mul use checked_* so overflow is declined rather than
+        // wrapped: the surviving expression still ships (both validators accept
+        // e.g. `2147483647i+1i` in runtime position via the naga fallback), and
+        // a const-context original never reaches the passes (naga's front-end
+        // const-evaluates and rejects it at ingest).
         (B::Add, L::I32(a), L::I32(b)) => a.checked_add(b).map(L::I32),
         (B::Subtract, L::I32(a), L::I32(b)) => a.checked_sub(b).map(L::I32),
         (B::Multiply, L::I32(a), L::I32(b)) => a.checked_mul(b).map(L::I32),
-        (B::Divide, L::I32(a), L::I32(b)) if b != 0 => a.checked_div(b).map(L::I32),
-        (B::Modulo, L::I32(a), L::I32(b)) if b != 0 => a.checked_rem(b).map(L::I32),
+        // Div/rem MUST fold their sole checked-failure case (MIN / -1): the
+        // literal pair only arises from nagami's own transforms substituting
+        // literals into runtime expressions (e.g. inlining `f(-2147483648)`
+        // into `x / -1`), where WGSL DEFINES the results - e1 for `/`, 0 for
+        // `%` (https://www.w3.org/TR/WGSL/#arithmetic-expr).  Declined, the
+        // pair round-trips into naga's text const-eval which rejects it, and
+        // the whole emission dies (no fallback can express it either).
+        (B::Divide, L::I32(a), L::I32(b)) if b != 0 => Some(L::I32(a.checked_div(b).unwrap_or(a))),
+        (B::Modulo, L::I32(a), L::I32(b)) if b != 0 => Some(L::I32(a.checked_rem(b).unwrap_or(0))),
 
         (B::Add, L::I64(a), L::I64(b)) => a.checked_add(b).map(L::I64),
         (B::Subtract, L::I64(a), L::I64(b)) => a.checked_sub(b).map(L::I64),
         (B::Multiply, L::I64(a), L::I64(b)) => a.checked_mul(b).map(L::I64),
-        (B::Divide, L::I64(a), L::I64(b)) if b != 0 => a.checked_div(b).map(L::I64),
-        (B::Modulo, L::I64(a), L::I64(b)) if b != 0 => a.checked_rem(b).map(L::I64),
+        (B::Divide, L::I64(a), L::I64(b)) if b != 0 => Some(L::I64(a.checked_div(b).unwrap_or(a))),
+        (B::Modulo, L::I64(a), L::I64(b)) if b != 0 => Some(L::I64(a.checked_rem(b).unwrap_or(0))),
 
         (B::Add, L::U32(a), L::U32(b)) => Some(L::U32(a.wrapping_add(b))),
         (B::Subtract, L::U32(a), L::U32(b)) => Some(L::U32(a.wrapping_sub(b))),
@@ -1620,29 +1792,23 @@ fn eval_binary(
         (B::And, L::I32(a), L::I32(b)) => Some(L::I32(a & b)),
         (B::ExclusiveOr, L::I32(a), L::I32(b)) => Some(L::I32(a ^ b)),
         (B::InclusiveOr, L::I32(a), L::I32(b)) => Some(L::I32(a | b)),
-        // WGSL (https://www.w3.org/TR/WGSL/#logical-expr):
-        // `e1 << e2` with signed `e1` is a shader-creation error
-        // when shifted-out bits differ from the resulting sign bit, i.e.
-        // when the shift would not round-trip through i32.  Check via i64
-        // and decline the fold on overflow so a malformed program stays a
-        // compile-time error instead of being silently rewritten.
-        (B::ShiftLeft, L::I32(a), L::U32(b)) if b < 32 => {
-            let wide = (a as i64).wrapping_shl(b);
-            let narrowed = wide as i32;
-            (narrowed as i64 == wide).then_some(L::I32(narrowed))
-        }
+        // Signed `e1 << e2` discarding sign-changing bits is a shader-creation
+        // error only in CONST contexts, which naga's front-end already
+        // rejected at ingest; a literal pair here sits in a runtime
+        // expression manufactured by nagami's own transforms, where WGSL
+        // defines the shift as the plain bit-pattern result
+        // (https://www.w3.org/TR/WGSL/#bit-expr).  Fold that value: declined,
+        // the pair fails naga's text const-eval on re-parse and the whole
+        // emission dies.
+        (B::ShiftLeft, L::I32(a), L::U32(b)) if b < 32 => Some(L::I32(a.wrapping_shl(b))),
         (B::ShiftRight, L::I32(a), L::U32(b)) if b < 32 => Some(L::I32(a.wrapping_shr(b))),
 
         (B::And, L::I64(a), L::I64(b)) => Some(L::I64(a & b)),
         (B::ExclusiveOr, L::I64(a), L::I64(b)) => Some(L::I64(a ^ b)),
         (B::InclusiveOr, L::I64(a), L::I64(b)) => Some(L::I64(a | b)),
-        // Shift amount is `u32` (see the U64 note above); decline the fold on
-        // i64 overflow via the i128 round-trip, mirroring the i32 path.
-        (B::ShiftLeft, L::I64(a), L::U32(b)) if b < 64 => {
-            let wide = (a as i128).wrapping_shl(b);
-            let narrowed = wide as i64;
-            (narrowed as i128 == wide).then_some(L::I64(narrowed))
-        }
+        // Shift amount is `u32` (see the U64 note above); bit-pattern fold
+        // mirrors the i32 path's runtime-context rationale.
+        (B::ShiftLeft, L::I64(a), L::U32(b)) if b < 64 => Some(L::I64(a.wrapping_shl(b))),
         (B::ShiftRight, L::I64(a), L::U32(b)) if b < 64 => Some(L::I64(a.wrapping_shr(b))),
 
         (B::And, L::AbstractInt(a), L::AbstractInt(b)) => Some(L::AbstractInt(a & b)),

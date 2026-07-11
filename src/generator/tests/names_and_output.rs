@@ -1182,3 +1182,92 @@ fn less_than_comparison_in_vec_bool_constructor() {
     let out = compact(src);
     assert_valid_wgsl(&out);
 }
+
+/// A bare `<` comparison as a NON-FINAL call / `select` argument pairs with
+/// a later argument's top-level `>` in WGSL's template-list scanner
+/// (`f(a<b,c>d)` scans as the template `a<b,c>` applied to `d`); the
+/// emitter must parenthesise it.  Before the guard, the self-check caught
+/// the broken text and shipped the INPUT verbatim - total minification
+/// loss - which the newline assertion detects (real minified output is one
+/// line).
+#[test]
+fn less_than_call_and_select_arguments_get_template_guard_parens() {
+    let src = r#"
+            var<private> a: u32; var<private> b: u32;
+            var<private> c: u32; var<private> d: u32;
+            var<private> r: u32; var<private> rb: bool;
+            fn f(p: bool, q: bool) -> u32 {
+                if p { return 1u; }
+                if q { return 2u; }
+                return 0u;
+            }
+            @compute @workgroup_size(1)
+            fn main() {
+                r = f((a < b), c > d) + f((a < b), c > d);
+                rb = select((a < b), c > d, a == c);
+            }
+        "#;
+    let out = compact(src);
+    assert_valid_wgsl(&out);
+    assert!(
+        !out.contains('\n'),
+        "multi-line output means the whole-file fallback fired: {out}"
+    );
+    assert!(
+        out.contains("((") && out.contains("select(("),
+        "both `<` arguments must be parenthesised: {out}"
+    );
+}
+
+/// `!` over a comparison must NOT flip in VALUE contexts: parenthesization
+/// and the template-list guards classify children by ARENA variant, so a
+/// `Unary` that rendered as a bare comparison would ship atom-tight into a
+/// comparison parent (`a<b==c` - tint rejects, naga's self-check accepts,
+/// the miscompile class EE-B-1 closed).  The flip is condition-only
+/// (if/break_if).
+#[test]
+fn value_context_negated_comparison_keeps_unary_shape() {
+    let src = r#"
+            var<private> i: i32; var<private> j: i32;
+            var<private> c: bool; var<private> r1: bool; var<private> r2: bool;
+            @compute @workgroup_size(1)
+            fn main() {
+                r1 = !(i < j);
+                r2 = (!(i >= j)) == c;
+            }
+        "#;
+    let out = compact(src);
+    assert_valid_wgsl(&out);
+    // A regressed flip renders r2's negation as a bare comparison,
+    // dropping its `!(`.
+    assert!(
+        out.matches("!(").count() >= 2,
+        "value-context negations must keep the prefix form: {out}"
+    );
+}
+
+/// A root-level `>>` right operand under a bare `<` parent closes the
+/// template candidate the `<` opened (`a<b>>c` scans as `a<b>` plus `>c`);
+/// precedence alone leaves the tighter-binding shift bare, so the emitter
+/// needs the dedicated wrap.
+#[test]
+fn shift_right_under_less_gets_template_guard_parens() {
+    let src = r#"
+            var<private> a: u32; var<private> b: u32;
+            var<private> c: u32; var<private> rc: bool;
+            @compute @workgroup_size(1)
+            fn main() {
+                rc = a < (b >> c);
+            }
+        "#;
+    let out = compact(src);
+    assert_valid_wgsl(&out);
+    assert!(
+        !out.contains('\n'),
+        "multi-line output means the whole-file fallback fired: {out}"
+    );
+    assert!(
+        out.contains("<("),
+        "the shift right-operand must be parenthesised: {out}"
+    );
+}

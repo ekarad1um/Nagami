@@ -718,23 +718,27 @@ fn i32_mul_overflow_not_folded() {
 }
 
 #[test]
-fn i32_divide_min_by_neg1_not_folded() {
+fn i32_divide_min_by_neg1_folds_to_defined_value() {
+    // WGSL defines runtime `e1 / -1` at MIN as e1; declined, the literal
+    // pair (only manufactured by nagami's own transforms) fails naga's text
+    // const-eval on re-parse and the emission dies with no fallback.
     let r = eval_binary(
         naga::BinaryOperator::Divide,
         naga::Literal::I32(i32::MIN),
         naga::Literal::I32(-1),
     );
-    assert_eq!(r, None, "i32::MIN / -1 overflows and should not be folded");
+    assert_eq!(r, Some(naga::Literal::I32(i32::MIN)));
 }
 
 #[test]
-fn i32_modulo_min_by_neg1_not_folded() {
+fn i32_modulo_min_by_neg1_folds_to_defined_value() {
+    // WGSL defines runtime `MIN % -1` as 0 (see the divide twin above).
     let r = eval_binary(
         naga::BinaryOperator::Modulo,
         naga::Literal::I32(i32::MIN),
         naga::Literal::I32(-1),
     );
-    assert_eq!(r, None, "i32::MIN %% -1 overflows and should not be folded");
+    assert_eq!(r, Some(naga::Literal::I32(0)));
 }
 
 #[test]
@@ -748,13 +752,25 @@ fn i64_add_overflow_not_folded() {
 }
 
 #[test]
-fn i64_divide_min_by_neg1_not_folded() {
+fn i64_divide_min_by_neg1_folds_to_defined_value() {
+    // Mirrors the i32 rule: WGSL defines `MIN / -1` as MIN.
     let r = eval_binary(
         naga::BinaryOperator::Divide,
         naga::Literal::I64(i64::MIN),
         naga::Literal::I64(-1),
     );
-    assert_eq!(r, None, "i64::MIN / -1 overflows and should not be folded");
+    assert_eq!(r, Some(naga::Literal::I64(i64::MIN)));
+}
+
+#[test]
+fn i64_modulo_min_by_neg1_folds_to_defined_value() {
+    // Mirrors the i32 rule: WGSL defines `MIN % -1` as 0.
+    let r = eval_binary(
+        naga::BinaryOperator::Modulo,
+        naga::Literal::I64(i64::MIN),
+        naga::Literal::I64(-1),
+    );
+    assert_eq!(r, Some(naga::Literal::I64(0)));
 }
 
 #[test]
@@ -870,15 +886,17 @@ fn shift_left_i64_in_range_folds() {
 }
 
 #[test]
-fn shift_left_i64_overflow_not_folded() {
-    // `1i64 << 63` flips the sign bit and does not round-trip through i64,
-    // so it must NOT fold (stays a compile-time error in WGSL).
+fn shift_left_i64_overflow_folds_bit_pattern() {
+    // `1i64 << 63` flips the sign bit; a concrete literal pair here sits in
+    // a runtime expression (const contexts died at naga's front-end), where
+    // WGSL defines the plain bit-pattern shift.  Declining instead poisons
+    // emission: the pair fails naga's text const-eval on re-parse.
     let result = eval_binary(
         naga::BinaryOperator::ShiftLeft,
         naga::Literal::I64(1),
         naga::Literal::U32(63),
     );
-    assert_eq!(result, None, "i64 sign-bit overflow must not be folded");
+    assert_eq!(result, Some(naga::Literal::I64(i64::MIN)));
 }
 
 #[test]
@@ -924,22 +942,21 @@ fn shift_abstract_int_in_range_folds() {
     assert_eq!(result, Some(naga::Literal::AbstractInt(1024)));
 }
 
-// Regression: WGSL (https://www.w3.org/TR/WGSL/#logical-expr):
-// declares `e1 << e2` for signed `e1` to be a shader-creation
-// error when shifted-out bits differ from the resulting sign
-// bit (i.e., the operation would overflow the signed range).
-// Folding `1_i32 << 31` to `i32::MIN` would turn an invalid program
-// into a defined-value one; the fold must decline instead.
+// WGSL's sign-changing `<<` shader-creation error applies to CONST
+// contexts, which naga's front-end already rejected at ingest; concrete
+// literal pairs reaching the fold are runtime expressions manufactured by
+// nagami's own transforms, where the spec defines the bit-pattern result.
+// Folding it keeps the emission textable (a declined pair fails naga's
+// re-parse const-eval and kills the whole emission).
 #[test]
-fn shift_left_i32_sign_bit_overflow_not_folded() {
+fn shift_left_i32_sign_bit_overflow_folds_bit_pattern() {
     assert_eq!(
         eval_binary(
             naga::BinaryOperator::ShiftLeft,
             naga::Literal::I32(1),
             naga::Literal::U32(31),
         ),
-        None,
-        "1_i32 << 31 must not fold: shifted-out 0 differs from resulting sign bit 1"
+        Some(naga::Literal::I32(i32::MIN)),
     );
     assert_eq!(
         eval_binary(
@@ -947,8 +964,7 @@ fn shift_left_i32_sign_bit_overflow_not_folded() {
             naga::Literal::I32(2),
             naga::Literal::U32(30),
         ),
-        None,
-        "2_i32 << 30 must not fold for the same reason"
+        Some(naga::Literal::I32(i32::MIN)),
     );
 }
 
@@ -976,20 +992,17 @@ fn shift_left_i32_in_range_still_folds() {
 }
 
 #[test]
-fn shift_left_i64_sign_bit_overflow_not_folded() {
+fn shift_left_i64_sign_bit_overflow_folds_bit_pattern() {
     // RHS must be `U32` to reach the `(ShiftLeft, I64, U32)` arm: a WGSL
-    // shift amount is always `u32`, and that arm is where the i128
-    // round-trip overflow check declines `1_i64 << 63`.  (A `U64` RHS would
-    // match no arm and return `None` for the wrong reason - vacuously
-    // passing this test.)
+    // shift amount is always `u32`.  (A `U64` RHS would match no arm and
+    // return `None` for the wrong reason - vacuously passing this test.)
     assert_eq!(
         eval_binary(
             naga::BinaryOperator::ShiftLeft,
-            naga::Literal::I64(1),
-            naga::Literal::U32(63),
+            naga::Literal::I64(2),
+            naga::Literal::U32(62),
         ),
-        None,
-        "1_i64 << 63 must not fold (sign-bit overflow)"
+        Some(naga::Literal::I64(i64::MIN)),
     );
 }
 
@@ -5219,5 +5232,135 @@ fn build_constant_literal_cache_skips_abstract_literals() {
         !cache.contains_key(&abstract_int),
         "abstract literal must be filtered out of the cache; caching one \
              would silently roll the whole pass back every sweep",
+    );
+}
+
+/// `Access` whose index folds to a constant, into a syntactic array
+/// `Compose`, must fold to the picked element.  naga materialises a
+/// dynamically-indexed function-scope `const` array as a full composite at
+/// the use site and load_dedup forwards the index variable's stored
+/// literal, so without this fold the emitter ships the entire array inline
+/// (`array<u32,2310>(...)[0]`) and only the NEXT minification round
+/// collapses it - the signature idempotence gap.
+#[test]
+fn access_with_const_index_into_array_compose_folds_to_element() {
+    let mut types = naga::UniqueArena::new();
+    let u32_ty = types.insert(
+        naga::Type {
+            name: None,
+            inner: naga::TypeInner::Scalar(naga::Scalar::U32),
+        },
+        naga::Span::UNDEFINED,
+    );
+    let arr_ty = types.insert(
+        naga::Type {
+            name: None,
+            inner: naga::TypeInner::Array {
+                base: u32_ty,
+                size: naga::ArraySize::Constant(std::num::NonZeroU32::new(3).unwrap()),
+                stride: 4,
+            },
+        },
+        naga::Span::UNDEFINED,
+    );
+
+    let mut arena = naga::Arena::new();
+    let c0 = arena.append(
+        naga::Expression::Literal(naga::Literal::U32(10)),
+        naga::Span::UNDEFINED,
+    );
+    let c1 = arena.append(
+        naga::Expression::Literal(naga::Literal::U32(20)),
+        naga::Span::UNDEFINED,
+    );
+    let c2 = arena.append(
+        naga::Expression::Literal(naga::Literal::U32(30)),
+        naga::Span::UNDEFINED,
+    );
+    let compose = arena.append(
+        naga::Expression::Compose {
+            ty: arr_ty,
+            components: vec![c0, c1, c2],
+        },
+        naga::Span::UNDEFINED,
+    );
+    let idx = arena.append(
+        naga::Expression::Literal(naga::Literal::I32(1)),
+        naga::Span::UNDEFINED,
+    );
+    let access = arena.append(
+        naga::Expression::Access {
+            base: compose,
+            index: idx,
+        },
+        naga::Span::UNDEFINED,
+    );
+    let oob_idx = arena.append(
+        naga::Expression::Literal(naga::Literal::I32(7)),
+        naga::Span::UNDEFINED,
+    );
+    let oob = arena.append(
+        naga::Expression::Access {
+            base: compose,
+            index: oob_idx,
+        },
+        naga::Span::UNDEFINED,
+    );
+
+    let refcounts = vec![1u32; arena.len()];
+    let (folded, _) = fold_local(
+        &mut arena,
+        &refcounts,
+        &HashMap::new(),
+        &types,
+        &HashMap::new(),
+    );
+
+    assert!(
+        matches!(
+            arena[access],
+            naga::Expression::Literal(naga::Literal::U32(20))
+        ),
+        "in-bounds pick must fold to the element literal, got {:?}",
+        arena[access]
+    );
+    assert!(
+        folded.contains(&access),
+        "folded pick leaves its Emit range"
+    );
+    assert!(
+        matches!(arena[oob], naga::Expression::Access { .. }),
+        "out-of-bounds pick must decline, got {:?}",
+        arena[oob]
+    );
+}
+
+/// Float `%` folds only while `trunc(a/b)` is exactly representable in the
+/// operand type: WGSL lowers `a % b` to `a - b*trunc(a/b)` in that
+/// precision, so beyond the 2^24 (f32) / 2^53 (f64) quotient limit the
+/// runtime value diverges from Rust's exact fmod and the fold must
+/// decline.
+#[test]
+fn float_modulo_beyond_trunc_precision_declines() {
+    use naga::BinaryOperator as B;
+    use naga::Literal as L;
+    // Control: small quotient folds exactly.
+    assert_eq!(
+        eval_binary(B::Modulo, L::F32(7.5), L::F32(2.0)),
+        Some(L::F32(1.5))
+    );
+    // Quotient 2^25 >= 2^24: trunc(a/b) is not exactly representable.
+    assert_eq!(
+        eval_binary(B::Modulo, L::F32(67_108_864.0), L::F32(2.0)),
+        None
+    );
+    // f64 mirror: quotient 2^54 >= 2^53 declines, small folds.
+    assert_eq!(
+        eval_binary(B::Modulo, L::F64(7.5), L::F64(2.0)),
+        Some(L::F64(1.5))
+    );
+    assert_eq!(
+        eval_binary(B::Modulo, L::F64(36_028_797_018_963_968.0), L::F64(2.0)),
+        None
     );
 }

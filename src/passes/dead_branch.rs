@@ -630,13 +630,54 @@ fn desugar_short_circuit(
                 // in scope transitively: the LogicalNot's Emit dominates the
                 // If, and it can only reference operands whose Emit dominates
                 // IT.
-                if let Some(inner_cond) = unwrap_logical_not(condition, expressions)
-                    && !is_const_bool(inner_cond, expressions)
-                    && let Some((ptr_r, val_r)) = single_store_info(&reject)
+                //
+                // The negation is recovered two ways: a literal `LogicalNot`
+                // unwraps to its operand, and an equality-family comparison
+                // un-flips into a FRESH expression (const_fold's De Morgan
+                // rewrites the lowering's `!(x==y)` to `x!=y` before this
+                // phase runs, so equality-left `||` only exists in flipped
+                // form here).  Un-flipping `==`/`!=` is NaN-safe in both
+                // directions, unlike the ordered quartet; the synthesized
+                // handle references only `condition`'s own operands (their
+                // Emits dominate the If) and is covered by extending the
+                // Emit below.  Structural guards run FIRST so a failed
+                // match appends nothing.
+                if let Some((ptr_r, val_r)) = single_store_info(&reject)
                     && is_bool_true(expressions, val_r)
                     && let Some((ptr_a, val_a)) = store_with_leading_emits(&accept)
                     && same_local_pointer(ptr_a, ptr_r, expressions)
                     && store_target_foldable(ptr_a, expressions, foldable)
+                    && let Some((inner_cond, synthesized)) =
+                        match unwrap_logical_not(condition, expressions) {
+                            Some(inner) if !is_const_bool(inner, expressions) => {
+                                Some((inner, false))
+                            }
+                            Some(_) => None,
+                            None => {
+                                let unflipped = match &expressions[condition] {
+                                    naga::Expression::Binary {
+                                        op: naga::BinaryOperator::Equal,
+                                        left,
+                                        right,
+                                    } => Some((naga::BinaryOperator::NotEqual, *left, *right)),
+                                    naga::Expression::Binary {
+                                        op: naga::BinaryOperator::NotEqual,
+                                        left,
+                                        right,
+                                    } => Some((naga::BinaryOperator::Equal, *left, *right)),
+                                    _ => None,
+                                };
+                                unflipped.map(|(op, left, right)| {
+                                    (
+                                        expressions.append(
+                                            naga::Expression::Binary { op, left, right },
+                                            naga::Span::default(),
+                                        ),
+                                        true,
+                                    )
+                                })
+                            }
+                        }
                 {
                     let binary = expressions.append(
                         naga::Expression::Binary {
@@ -648,8 +689,12 @@ fn desugar_short_circuit(
                     );
                     drop(reject);
                     hoist_leading_emits(&mut rebuilt, accept);
+                    // A synthesized comparison sits immediately before
+                    // `binary` in the arena; start the Emit there so both
+                    // fresh expressions are covered.
+                    let emit_from = if synthesized { inner_cond } else { binary };
                     rebuilt.push(
-                        naga::Statement::Emit(naga::Range::new_from_bounds(binary, binary)),
+                        naga::Statement::Emit(naga::Range::new_from_bounds(emit_from, binary)),
                         span,
                     );
                     rebuilt.push(
@@ -786,19 +831,35 @@ fn unwrap_logical_not(
 /// rolls the whole pass back every sweep.  Variant-only and conservative - a
 /// result-less `Call` also trips it, at the cost of one kept-but-dead branch.
 fn block_has_result_producer(block: &naga::Block) -> bool {
+    block.iter().any(statement_has_result_producer)
+}
+
+/// `true` for a case body that cannot affect anything outside its switch:
+/// empty, or exactly one bare `Break` (which targets the switch itself).
+/// Anything else - including an `Emit` - keeps the arm non-trivial.
+fn case_body_is_switch_local_noop(body: &naga::Block) -> bool {
+    let mut statements = body.iter();
+    matches!(
+        (statements.next(), statements.next()),
+        (None, _) | (Some(naga::Statement::Break), None)
+    )
+}
+
+/// Statement-level worker behind [`block_has_result_producer`]; also used
+/// directly by the dead-tail drop, which inspects an iterator remainder
+/// rather than a block.
+fn statement_has_result_producer(stmt: &naga::Statement) -> bool {
     use naga::Statement as S;
-    block.iter().any(|stmt| {
-        matches!(
-            stmt,
-            S::Call { .. }
-                | S::Atomic { .. }
-                | S::WorkGroupUniformLoad { .. }
-                | S::RayQuery { .. }
-                | S::SubgroupBallot { .. }
-                | S::SubgroupGather { .. }
-                | S::SubgroupCollectiveOperation { .. }
-        ) || nested_blocks(stmt).any(block_has_result_producer)
-    })
+    matches!(
+        stmt,
+        S::Call { .. }
+            | S::Atomic { .. }
+            | S::WorkGroupUniformLoad { .. }
+            | S::RayQuery { .. }
+            | S::SubgroupBallot { .. }
+            | S::SubgroupGather { .. }
+            | S::SubgroupCollectiveOperation { .. }
+    ) || nested_blocks(stmt).any(block_has_result_producer)
 }
 
 /// Recursively walk `block`, folding branches whose condition is a
@@ -823,12 +884,9 @@ fn eliminate_dead_branches(
     let original = std::mem::take(block);
     let mut rebuilt = naga::Block::with_capacity(original.len());
     let mut changed = 0usize;
-    let total = original.len();
-    let mut processed = 0usize;
 
-    for (mut statement, span) in original.span_into_iter() {
-        processed += 1;
-
+    let mut statements = original.span_into_iter();
+    while let Some((mut statement, span)) = statements.next() {
         // Step 1: recurse into nested blocks first.  Leaf statements
         // are enumerated explicitly so a future naga release adding
         // a new block-bearing variant breaks the build instead of
@@ -1017,6 +1075,22 @@ fn eliminate_dead_branches(
 
             // Switch with constant integer selector
             naga::Statement::Switch { selector, cases } => {
+                // A switch whose every arm does nothing (empty body or a lone
+                // bare `break`, which merely exits the switch) is a no-op
+                // regardless of the selector - expressions cannot carry side
+                // effects in naga (calls/atomics are statements and would
+                // make the arm non-trivial), so dropping the selector's
+                // evaluation is safe too.  Checked before the
+                // constant-selector dispatch: that path's bare-break guard
+                // would otherwise KEEP the `case: {break;}` shape forever
+                // (splicing a bare break would mis-target).
+                if cases
+                    .iter()
+                    .all(|c| case_body_is_switch_local_noop(&c.body))
+                {
+                    changed += 1;
+                    continue;
+                }
                 if let Some(value) = resolve_switch_value(selector, expressions, const_lits) {
                     // A constant-selector collapse splices the matched case and
                     // DROPS the others (or all, on no-match).  Dropping a case
@@ -1090,12 +1164,8 @@ fn eliminate_dead_branches(
                         let body = cases.into_iter().next_back().unwrap().body;
                         splice_block(&mut rebuilt, body);
                         changed += 1;
-                    }
-                    // After recursion, if every case body is empty the
-                    // entire Switch is a no-op and can be discarded.
-                    else if cases.iter().all(|c| c.body.is_empty()) {
-                        changed += 1;
                     } else {
+                        // All-noop switches were already discarded above.
                         rebuilt.push(naga::Statement::Switch { selector, cases }, span);
                     }
                 }
@@ -1193,10 +1263,25 @@ fn eliminate_dead_branches(
         }
 
         // Step 3: if the last statement in `rebuilt` definitely terminates,
-        // all remaining statements in the original block are dead.
+        // all remaining statements in the original block are dead.  The drop
+        // is gated the same way as the collapse sites above: an unreachable
+        // result-producer statement must stay (its orphaned result
+        // expression fails validation and rolls the whole pass back every
+        // sweep), and the guard keeps the WHOLE tail because selectively
+        // dropping neighbours could strip an `Emit` covering the kept
+        // statement's operands.
         if rebuilt.last().is_some_and(definitely_terminates) {
-            let dead = total - processed;
-            changed += dead;
+            let tail: Vec<_> = statements.by_ref().collect();
+            if tail
+                .iter()
+                .any(|(stmt, _)| statement_has_result_producer(stmt))
+            {
+                for (stmt, sp) in tail {
+                    rebuilt.push(stmt, sp);
+                }
+            } else {
+                changed += tail.len();
+            }
             break;
         }
     }
@@ -1512,9 +1597,11 @@ fn contains_bare_continue(block: &naga::Block) -> bool {
 /// Returns `true` if `block` contains a bare `Break` targeting the
 /// immediately enclosing `Switch` or `Loop`.
 ///
-/// Used to guard switch-case splicing: after removing the switch wrapper a
-/// bare `Break` would mis-target the next enclosing construct.
-fn contains_bare_break(block: &naga::Block) -> bool {
+/// Used to guard switch-case splicing (after removing the switch wrapper a
+/// bare `Break` would mis-target the next enclosing construct) and
+/// load_dedup's switch meet (a case-level `Break` reaches post-switch code
+/// carrying the PRE-break cache state the fall-off-the-end meet never sees).
+pub(crate) fn contains_bare_break(block: &naga::Block) -> bool {
     for stmt in block.iter() {
         match stmt {
             naga::Statement::Break => return true,

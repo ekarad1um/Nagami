@@ -37,12 +37,42 @@ pub fn parse_wgsl_with_path(source: &str, path: &str) -> Result<naga::Module, Er
 /// caller is responsible for matching backend capabilities to the
 /// shader's actual feature use.
 pub fn validate_module(module: &naga::Module) -> Result<naga::valid::ModuleInfo, Error> {
-    naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    )
-    .validate(module)
-    .map_err(|e| Error::Validation(e.to_string()))
+    fn fresh_validator() -> naga::valid::Validator {
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+    }
+    thread_local! {
+        /// One `Validator` per thread: the pipeline validates after every
+        /// pass, and reuse keeps container capacity across calls
+        /// (`validate` resets per-module state itself).
+        static VALIDATOR: std::cell::RefCell<naga::valid::Validator> =
+            std::cell::RefCell::new(fresh_validator());
+    }
+    VALIDATOR.with(|validator| {
+        let result = validator.borrow_mut().validate(module);
+        match result {
+            Ok(info) => Ok(info),
+            // naga 30's internal `reset` misses the ray-pipeline pins
+            // (`trace_rays_*`): a payload-type HANDLE pinned by a previously
+            // validated module can false-reject a valid one (handles shift
+            // across compact_dce and across playground keystrokes).  A
+            // failure is therefore re-checked on a fresh validator, which
+            // then replaces the cached one so ray-heavy sessions do not
+            // re-pay the double validation.  A stale pin only ever ADDS a
+            // mismatch constraint, so false ACCEPTS are impossible and a
+            // fresh-validator reject is genuine.
+            Err(_) => {
+                let mut fresh = fresh_validator();
+                let info = fresh
+                    .validate(module)
+                    .map_err(|e| Error::Validation(e.to_string()))?;
+                *validator.borrow_mut() = fresh;
+                Ok(info)
+            }
+        }
+    })
 }
 
 /// Validate a naga module and render failures against `source`.

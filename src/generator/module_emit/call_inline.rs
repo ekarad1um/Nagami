@@ -1,7 +1,7 @@
 //! Call purity and single-use call-inlining analysis.
 
 use super::local_resolve::resolve_local_var;
-use super::ref_counts::visit_expr_children;
+use crate::passes::expr_util::visit_expression_children;
 
 /// A single-use `Call` result that may still be inlined into a later use
 /// site, paired with the set of function-locals its arguments load.  The
@@ -35,9 +35,16 @@ struct PendingCall {
 /// Missing the pointer case lets a single-use `let c = g(&d); d = ...;` call
 /// be inlined past the store, so the callee derefs the post-store value -
 /// a silent reorder miscompilation.
+///
+/// `call_reads` carries the recorded argument-locals of every pending pure
+/// call seen so far, keyed by its `CallResult` handle: a `CallResult` operand
+/// is a leaf here, but if THIS call is later relocated its stashed text bakes
+/// the inner call's text inside it, re-evaluating the inner arguments too -
+/// so the inner call's locals are part of this cone's read set.
 fn collect_loaded_locals(
     expr: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
+    call_reads: &CallReads,
     out: &mut std::collections::HashSet<naga::Handle<naga::LocalVariable>>,
     visited: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
 ) {
@@ -47,6 +54,9 @@ fn collect_loaded_locals(
     // harmless - only the traversal cost is saved.
     if !visited.insert(expr) {
         return;
+    }
+    if let Some(inner) = call_reads.get(&expr) {
+        out.extend(inner.iter().copied());
     }
     match &expressions[expr] {
         naga::Expression::Load { pointer } => {
@@ -66,10 +76,21 @@ fn collect_loaded_locals(
         }
         _ => {}
     }
-    visit_expr_children(&expressions[expr], |child| {
-        collect_loaded_locals(child, expressions, out, visited)
+    visit_expression_children(&expressions[expr], |child| {
+        collect_loaded_locals(child, expressions, call_reads, out, visited)
     });
 }
+
+/// Argument-locals of every pending pure call recorded so far, keyed by the
+/// call's `CallResult` expression.  Entries are never removed: an entry for a
+/// call that ends up `let`-bound is simply never consulted through a stashed
+/// cone (the binding name is evaluated once, at the call site), and an
+/// over-approximated read set only RETAINS a pending call longer - the safe
+/// direction.
+type CallReads = std::collections::HashMap<
+    naga::Handle<naga::Expression>,
+    std::collections::HashSet<naga::Handle<naga::LocalVariable>>,
+>;
 
 /// The root a pointer expression resolves to, for the write-effect analysis.
 enum PointerRoot {
@@ -285,6 +306,26 @@ pub(super) fn find_inlineable_calls(
     expressions: &naga::Arena<naga::Expression>,
     pure_functions: &[bool],
 ) -> std::collections::HashSet<naga::Handle<naga::Expression>> {
+    // The call-reads memo spans the whole function: an inner call's arguments
+    // are recorded where the call statement lives, but its stashed text is
+    // re-evaluated wherever an OUTER pending call that consumed it ends up.
+    let mut call_reads = CallReads::new();
+    find_inlineable_calls_in_block(
+        block,
+        ref_counts,
+        expressions,
+        pure_functions,
+        &mut call_reads,
+    )
+}
+
+fn find_inlineable_calls_in_block(
+    block: &naga::Block,
+    ref_counts: &[usize],
+    expressions: &naga::Arena<naga::Expression>,
+    pure_functions: &[bool],
+    call_reads: &mut CallReads,
+) -> std::collections::HashSet<naga::Handle<naga::Expression>> {
     let mut result = std::collections::HashSet::new();
     let mut pending: Vec<PendingCall> = Vec::new();
     // The result of an IMPURE call from an earlier statement, still eligible to
@@ -368,8 +409,15 @@ pub(super) fn find_inlineable_calls(
                     let mut reads_locals = std::collections::HashSet::new();
                     let mut visited = std::collections::HashSet::new();
                     for &arg in arguments {
-                        collect_loaded_locals(arg, expressions, &mut reads_locals, &mut visited);
+                        collect_loaded_locals(
+                            arg,
+                            expressions,
+                            call_reads,
+                            &mut reads_locals,
+                            &mut visited,
+                        );
                     }
+                    call_reads.insert(*h, reads_locals.clone());
                     pending.push(PendingCall {
                         result: *h,
                         carrier: *h,
@@ -411,18 +459,25 @@ pub(super) fn find_inlineable_calls(
             _ => {
                 pending.clear();
                 for nested in crate::passes::expr_util::nested_blocks(stmt) {
-                    result.extend(find_inlineable_calls(
+                    result.extend(find_inlineable_calls_in_block(
                         nested,
                         ref_counts,
                         expressions,
                         pure_functions,
+                        call_reads,
                     ));
                 }
             }
         }
     }
 
-    result.extend(pending.into_iter().map(|p| p.result));
+    // A call still pending at the end of the block has its single consumer
+    // OUTSIDE it - only a loop body's continuing/`break if` (or a `Block`'s
+    // parent) can legally dominate such a use.  Marking it inlineable would
+    // relocate the call text past statements this walk never saw (the
+    // continuing block's stores, the per-iteration increment feeding
+    // `break if`), re-evaluating its arguments after them - a silent
+    // miscompile.  Leftovers stay `let`-bound at their own statement.
     result
 }
 
@@ -519,7 +574,7 @@ fn expr_is_memory_free(
         | E::Compose { .. }
         | E::Derivative { .. } => {
             let mut ok = true;
-            visit_expr_children(&expressions[root], |child| {
+            visit_expression_children(&expressions[root], |child| {
                 if !expr_is_memory_free(child, call_result, expressions, found, memo) {
                     ok = false;
                 }
@@ -570,7 +625,7 @@ fn consume_pending_for_statement(
             // consumes it.  Range order is topological (children precede
             // parents), so the carrier bubbles up to the outermost expression.
             for h in range.clone() {
-                visit_expr_children(&expressions[h], |child| {
+                visit_expression_children(&expressions[h], |child| {
                     for p in pending.iter_mut() {
                         if p.carrier == child {
                             p.carrier = h;

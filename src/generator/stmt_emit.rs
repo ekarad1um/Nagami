@@ -651,6 +651,10 @@ impl<'a> Generator<'a> {
         // entirely (`if c { return; }` -> `if c {}`); conditions/selectors
         // are pure expressions in WGSL, so the empty shell is dead bytes -
         // skip it, which is also what a re-minify's dead_branch would do.
+        // EXCEPT when the condition/selector cone holds a stashed single-use
+        // call: its text's ONLY emission site is this consumer, so skipping
+        // the shell deletes the call (and its side effects) from the output.
+        // The kept `if f(){}` shell converges to a bare `f();` on re-minify.
         let vacuous = match &rewritten_tail {
             Some(naga::Statement::If { accept, reject, .. }) => {
                 accept.is_empty() && reject.is_empty()
@@ -658,7 +662,7 @@ impl<'a> Generator<'a> {
             Some(naga::Statement::Switch { cases, .. }) => cases.iter().all(|c| c.body.is_empty()),
             Some(naga::Statement::Block(inner)) => inner.is_empty(),
             Some(_) | None => false,
-        };
+        } && !tail_cone_has_stashed_call(&rewritten_tail, ctx);
         if let Some(rewritten) = &rewritten_tail
             && !vacuous
         {
@@ -666,7 +670,34 @@ impl<'a> Generator<'a> {
         }
         self.emit_stmts(&stmts, ctx)
     }
+}
 
+/// Whether the drained tail's condition/selector cone references a call whose
+/// text is stashed for inline emission (see `emit_call_result`): the shell is
+/// then that call's only route into the output and must not be skipped.
+fn tail_cone_has_stashed_call(tail: &Option<naga::Statement>, ctx: &FunctionCtx<'_, '_>) -> bool {
+    let root = match tail {
+        Some(naga::Statement::If { condition, .. }) => *condition,
+        Some(naga::Statement::Switch { selector, .. }) => *selector,
+        _ => return false,
+    };
+    let mut stack = vec![root];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(h) = stack.pop() {
+        if !seen.insert(h) {
+            continue;
+        }
+        if ctx.inlineable_calls.contains(&h) {
+            return true;
+        }
+        crate::passes::expr_util::visit_expression_children(&ctx.func.expressions[h], |child| {
+            stack.push(child)
+        });
+    }
+    false
+}
+
+impl<'a> Generator<'a> {
     /// Emit a slice of statement references while attempting to
     /// reconstruct a `for` loop from the `Loop` / `Store` init pattern
     /// whenever possible.  Invoked from
@@ -868,6 +899,20 @@ impl<'a> Generator<'a> {
                 result,
             } => {
                 let call = self.emit_call(*function, arguments, ctx)?;
+                // A stashed call's text hides its nesting from `render_depth`
+                // (a `CallResult` has no expression children - the arguments
+                // hang off the STATEMENT), so record the true rendered depth
+                // here for the stash gate and for `render_depth` to read
+                // through the cache; chains accumulate through it.
+                if let Some(h) = *result
+                    && ctx.inlineable_calls.contains(&h)
+                {
+                    let mut depth = 0u16;
+                    for &arg in arguments {
+                        depth = depth.max(self.render_depth(arg, ctx));
+                    }
+                    ctx.stashed_call_depth.insert(h, depth.saturating_add(4));
+                }
                 self.emit_call_result(&call, *result, ctx);
             }
             S::Atomic {
@@ -1489,6 +1534,12 @@ impl<'a> Generator<'a> {
         h: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> u16 {
+        // Stashed call text is cached in `expr_names` like a binding but
+        // renders at its recorded FULL depth, not as a leaf - checked first
+        // so a chain of stashed calls cannot hide from the cap.
+        if let Some(&stashed) = ctx.stashed_call_depth.get(&h) {
+            return stashed;
+        }
         if ctx.expr_names.contains_key(&h) {
             return 4;
         }
@@ -1860,20 +1911,26 @@ impl<'a> Generator<'a> {
         for s in &body_stmts[..guard_idx] {
             if let naga::Statement::Emit(range) = s {
                 for h in range.clone() {
-                    super::module_emit::visit_expr_children(&ctx.func.expressions[h], |child| {
-                        ctx.ref_counts[child.index()] =
-                            ctx.ref_counts[child.index()].saturating_sub(1);
-                    });
+                    crate::passes::expr_util::visit_expression_children(
+                        &ctx.func.expressions[h],
+                        |child| {
+                            ctx.ref_counts[child.index()] =
+                                ctx.ref_counts[child.index()].saturating_sub(1);
+                        },
+                    );
                 }
             }
         }
         for stmt in continuing.iter() {
             if let naga::Statement::Emit(range) = stmt {
                 for h in range.clone() {
-                    super::module_emit::visit_expr_children(&ctx.func.expressions[h], |child| {
-                        ctx.ref_counts[child.index()] =
-                            ctx.ref_counts[child.index()].saturating_sub(1);
-                    });
+                    crate::passes::expr_util::visit_expression_children(
+                        &ctx.func.expressions[h],
+                        |child| {
+                            ctx.ref_counts[child.index()] =
+                                ctx.ref_counts[child.index()].saturating_sub(1);
+                        },
+                    );
                 }
             }
         }
@@ -2215,9 +2272,21 @@ impl<'a> Generator<'a> {
                 return;
             }
             if ctx.inlineable_calls.contains(&handle) {
-                // Single-use in a safe zone: store call text for inline emission
-                ctx.expr_names.insert(handle, call.to_string());
-                return;
+                // Single-use in a safe zone: store call text for inline
+                // emission - but only within the depth budget.  Past it the
+                // text must not keep nesting at its consumer (tint's parser
+                // recursion limit rejects what naga's re-parse still accepts,
+                // so the self-check cannot catch this); binding resets the
+                // chain, since the binding renders as a leaf identifier.
+                if ctx
+                    .stashed_call_depth
+                    .get(&handle)
+                    .is_none_or(|d| *d <= MAX_RENDER_DEPTH)
+                {
+                    ctx.expr_names.insert(handle, call.to_string());
+                    return;
+                }
+                ctx.stashed_call_depth.remove(&handle);
             }
             let name = ctx.next_expr_name();
             self.out.push_str("let ");
