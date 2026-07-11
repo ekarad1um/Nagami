@@ -384,6 +384,66 @@ fn override_sized_array_does_not_abort() {
     );
 }
 
+/// A void function's tail if/switch arms need no closing `return;` - falling
+/// off the arm ends the function - and naga's `ensure_block_returns`
+/// re-synthesises them on every re-parse, so leaving them makes the text
+/// gain an `else{return;}` per arm per round trip (a former grow class).
+#[test]
+fn void_fn_tail_switch_case_returns_are_elided() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: u32;\
+        @compute @workgroup_size(1) fn main() {\
+            switch o { case 0u: { o = 1u; return; } default: { o = 2u; return; } }\
+        }";
+    let out = minify(src);
+    assert!(
+        !out.contains("return"),
+        "tail-position case returns are redundant in a void fn: {out}"
+    );
+    assert!(
+        out.contains("switch"),
+        "the switch itself must survive: {out}"
+    );
+}
+
+/// The elision must not touch a return that still skips code: here the arm
+/// `return;` jumps over the trailing store, so it is load-bearing.
+#[test]
+fn void_fn_non_tail_return_survives_elision() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: u32;\
+        @compute @workgroup_size(1) fn main() {\
+            if o > 3u { o = 1u; return; } else { o = 2u; return; }\
+        }";
+    let out = minify(src);
+    // Else-elision hoists the reject arm behind the if, making the accept's
+    // return load-bearing (it must skip the hoisted store).
+    assert!(
+        out.contains("return;}"),
+        "the branch-skipping return must survive: {out}"
+    );
+}
+
+/// Constructor suffix elision via literal pins: a float-form literal pins
+/// f32 and an int literal pins i32, so `vec4f`/`vec3i` shrink to the bare
+/// inferring form; u32 (whose abstract default is i32) must keep its suffix.
+#[test]
+fn ctor_suffix_drops_only_under_a_literal_pin() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: vec4f;\
+        @group(0)@binding(1) var<storage,read_write> u: vec2u;\
+        @compute @workgroup_size(1) fn main() {\
+            o = vec4f(0.5, o.x, o.y, o.z);\
+            u = vec2u(4u, u.x);\
+        }";
+    let out = minify(src);
+    assert!(
+        out.contains("vec4(.5,"),
+        "the float-form `.5` pins f32, so the suffix must drop: {out}"
+    );
+    assert!(
+        !out.contains("vec2u(4") || out.contains("vec2("),
+        "a u32 component (concrete, non-literal) may pin; bare `4` alone must not: {out}"
+    );
+}
+
 /// naga's compactor roots `special_types`, so a dead `__frexp_result_f16`
 /// (and its f16 member scalar) survives every DCE; the directive scan must
 /// not credit those dead types with an `enable f16;` the emitted text never
@@ -979,8 +1039,14 @@ fn pure_call_lets_inline_in_a_single_pass() {
 /// all-scalar form `mat2x2f(a,b,c,d)` rather than per-column `vec2f(...)`.
 #[test]
 fn matrix_scalar_columns_flatten() {
-    let src = "@fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{\
-        let m=mat2x2f(cos(p.x),sin(p.x),-sin(p.x),cos(p.x));return vec4f(m[0],m[1]);}";
+    // Normally-formatted source: a hand-pre-minified input here can end up
+    // SHORTER than the emit (CSE let-binds cos/sin at their break-even
+    // point), which trips the ship-input-when-not-smaller guard and hides
+    // the flattening this test observes.
+    let src = "@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {\
+        let m = mat2x2f(cos(p.x), sin(p.x), -sin(p.x), cos(p.x));\
+        return vec4f(m[0], m[1]);\
+    }";
     let out = minify(src);
     assert!(
         out.contains("mat2x2f(a,B,-B,a)"),

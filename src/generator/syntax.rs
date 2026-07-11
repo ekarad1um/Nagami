@@ -1015,13 +1015,21 @@ pub(super) fn storage_access(access: naga::StorageAccess) -> &'static str {
 /// parameter (`@location`, `@builtin`, `@interpolate`, `@invariant`,
 /// `@blend_src`, `@per_primitive`), omitting defaults to keep the output
 /// compact.
-pub(super) fn binding_attrs(binding: &naga::Binding) -> Result<String, Error> {
-    Ok(match binding {
+/// Render a binding's attribute list, gap-terminated for the identifier that
+/// follows (member/param name or return type).  In `compact` mode the
+/// attributes join directly - `@` always ends the previous token, so
+/// `@invariant@builtin(position)` lexes identically - and the trailing gap
+/// survives only after a bare-word attribute (`@per_primitive`), where
+/// joining with the following identifier would fuse tokens; a `)` joins
+/// safely.
+pub(super) fn binding_attrs(binding: &naga::Binding, compact: bool) -> Result<String, Error> {
+    let sep = if compact { "" } else { " " };
+    let mut out = match binding {
         naga::Binding::BuiltIn(bi) => {
             if let naga::BuiltIn::Position { invariant: true } = bi {
-                format!("@invariant @builtin({}) ", builtin_name(*bi)?)
+                format!("@invariant{sep}@builtin({})", builtin_name(*bi)?)
             } else {
-                format!("@builtin({}) ", builtin_name(*bi)?)
+                format!("@builtin({})", builtin_name(*bi)?)
             }
         }
         naga::Binding::Location {
@@ -1031,12 +1039,13 @@ pub(super) fn binding_attrs(binding: &naga::Binding) -> Result<String, Error> {
             blend_src,
             per_primitive,
         } => {
-            let mut out = format!("@location({location}) ");
+            let mut out = format!("@location({location})");
             if let Some(bs) = blend_src {
-                out.push_str(&format!("@blend_src({bs}) "));
+                out.push_str(&format!("{sep}@blend_src({bs})"));
             }
             if *per_primitive {
-                out.push_str("@per_primitive ");
+                out.push_str(sep);
+                out.push_str("@per_primitive");
             }
             // Elide @interpolate(perspective,center) - it is the WGSL
             // default for float location bindings.  naga always stores
@@ -1045,6 +1054,7 @@ pub(super) fn binding_attrs(binding: &naga::Binding) -> Result<String, Error> {
                 interpolation.is_some_and(|i| i != naga::Interpolation::Perspective);
             let non_default_sampling = sampling.is_some_and(|s| s != naga::Sampling::Center);
             if non_default_interp || non_default_sampling {
+                out.push_str(sep);
                 out.push_str("@interpolate(");
                 out.push_str(interpolation_name(
                     interpolation.unwrap_or(naga::Interpolation::Perspective),
@@ -1053,11 +1063,15 @@ pub(super) fn binding_attrs(binding: &naga::Binding) -> Result<String, Error> {
                     out.push(',');
                     out.push_str(sampling_name(*s));
                 }
-                out.push_str(") ");
+                out.push(')');
             }
             out
         }
-    })
+    };
+    if !compact || !out.ends_with(')') {
+        out.push(' ');
+    }
+    Ok(out)
 }
 
 /// Map [`naga::Interpolation`] to its WGSL keyword.

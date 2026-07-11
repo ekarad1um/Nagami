@@ -52,6 +52,48 @@ fn literal_needs_typed_form_outside_constructor(literal: naga::Literal) -> bool 
     )
 }
 
+/// `true` when `literal`, rendered in the BARE form constructor components
+/// use, re-infers exactly `scalar` as a `vecN(...)` component - i.e. it can
+/// pin the elided constructor's element type.
+///
+/// WGSL's abstract defaults decide: an integer-form token is `AbstractInt`
+/// (defaults i32), a float-form token `AbstractFloat` (defaults f32).  So an
+/// i32 element is pinned by ANY integer literal, and an f32 element by a
+/// literal whose bare rendering keeps a float shape (`.5`, `1e3`, `0x1p2` -
+/// but NOT a whole number, which renders as a bare int and would re-infer
+/// i32).  u32/f16/f64/16-bit elements are never literal-pinned: their
+/// abstract default is a different type.  Mixed abstract components stay
+/// compatible - the constructor's common type keeps the pinned default
+/// (`vec4(.5,1,1,1)` is AbstractFloat throughout -> f32).
+///
+/// The float-form test inspects the same rendering the emitter ships
+/// (per-type precision rounding included), so the decision cannot drift
+/// from the emitted token.
+fn literal_bare_form_pins_scalar(
+    literal: naga::Literal,
+    scalar: naga::Scalar,
+    precision: &crate::config::FloatPrecision,
+) -> bool {
+    match scalar {
+        naga::Scalar::I32 => matches!(
+            literal,
+            naga::Literal::I32(_) | naga::Literal::AbstractInt(_)
+        ),
+        naga::Scalar::F32 => {
+            if !matches!(
+                literal,
+                naga::Literal::F32(_) | naga::Literal::AbstractFloat(_)
+            ) {
+                return false;
+            }
+            let bare = literal_to_wgsl_bare(literal, precision);
+            // Integer-shaped text (`1`, `-2`) re-parses as AbstractInt.
+            !bare.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+        }
+        _ => false,
+    }
+}
+
 /// Convert a constant **width-8** literal (`F64` / `U64` / `I64`) to `target`
 /// (one of f32 / i32 / u32 / bool), matching naga's value-conversion
 /// semantics, or `None` for any other source/target (or a non-finite f32).
@@ -2092,21 +2134,25 @@ impl<'a> Generator<'a> {
     /// type - so WGSL infers the same element type from that component and
     /// converts the others.
     ///
-    /// Literals inside a constructor render in BARE (abstract) form, so a
-    /// `vec2u(4, 1)` cannot lose its `u` - dropping it would re-infer
-    /// `vec2i`.  Only a typed non-literal component (e.g. a `u32` field
-    /// access in `vec2u(p.k, 4)`) pins the element type; an abstract
-    /// component's scalar kind never matches the concrete element scalar,
-    /// so it is correctly not counted.
+    /// Literals inside a constructor render in BARE (abstract) form, so most
+    /// cannot pin: `vec2u(4, 1)` cannot lose its `u` - dropping it would
+    /// re-infer `vec2i`.  Two literal shapes DO pin, though (see
+    /// [`literal_bare_form_pins_scalar`]): a float-form token pins f32 and
+    /// any integer literal pins i32, because WGSL's abstract defaults land
+    /// exactly there and mixing with other abstract components can only
+    /// stay abstract-compatible (`vec4f(.5, 1, 1, 1)` -> `vec4(.5,1,1,1)`
+    /// still infers f32).  Otherwise only a typed non-literal component
+    /// (e.g. a `u32` field access in `vec2u(p.k, 4)`) pins the element
+    /// type.
     ///
-    /// Soundness rests on the pin component rendering in TYPED form.  A
-    /// non-literal `ZeroValue` or unnamed `Constant` would resolve to the
-    /// right scalar yet still emit a bare token, so it cannot be the sole
-    /// pinner - but it never is: `const_fold` runs first and folds away any
-    /// all-constant `Compose`, so a vector reaching the generator always has
-    /// a runtime (typed) component.  A future pass that leaves an unnamed
-    /// const / `ZeroValue` as a Compose's only non-literal component must
-    /// revisit this gate.
+    /// Soundness of the non-literal arm rests on the pin component
+    /// rendering in TYPED form.  A non-literal `ZeroValue` or unnamed
+    /// `Constant` would resolve to the right scalar yet still emit a bare
+    /// token, so it cannot be the sole pinner - but it never is:
+    /// `const_fold` runs first and folds away any all-constant `Compose`,
+    /// so a vector reaching the generator always has a runtime (typed)
+    /// component.  A future pass that leaves an unnamed const / `ZeroValue`
+    /// as a Compose's only non-literal component must revisit this gate.
     fn vector_ctor_name(
         &self,
         ty: naga::Handle<naga::Type>,
@@ -2117,10 +2163,14 @@ impl<'a> Generator<'a> {
         if let naga::TypeInner::Vector { size, scalar } = self.module.types[ty].inner {
             let bare = format!("vec{}", super::syntax::vector_size_num(size));
             if bare.len() < type_str.len()
-                && components.iter().any(|&c| {
-                    !matches!(ctx.func.expressions[c], naga::Expression::Literal(_))
-                        && type_inner_scalar(ctx.info[c].ty.inner_with(&self.module.types))
+                && components.iter().any(|&c| match &ctx.func.expressions[c] {
+                    naga::Expression::Literal(lit) => {
+                        literal_bare_form_pins_scalar(*lit, scalar, &self.options.float_precision)
+                    }
+                    _ => {
+                        type_inner_scalar(ctx.info[c].ty.inner_with(&self.module.types))
                             == Some(scalar)
+                    }
                 })
             {
                 return Ok(bare);
@@ -3373,10 +3423,29 @@ pub(super) fn is_arithmetic_op(op: naga::BinaryOperator) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConcretizedAbstract, concretize_abstract_literal_via_inner,
+        ConcretizedAbstract, concretize_abstract_literal_via_inner, literal_bare_form_pins_scalar,
         literal_needs_typed_form_outside_constructor,
     };
     use naga::Literal as L;
+
+    #[test]
+    fn literal_pin_rules_follow_abstract_defaults() {
+        let precision = crate::config::FloatPrecision::default();
+        let pins = |lit, scalar| literal_bare_form_pins_scalar(lit, scalar, &precision);
+        // Float-form f32 tokens pin f32; whole numbers render bare-int and
+        // re-infer i32, so they must not.
+        assert!(pins(L::F32(1.5), naga::Scalar::F32));
+        assert!(pins(L::F32(1e-6), naga::Scalar::F32));
+        assert!(!pins(L::F32(1.0), naga::Scalar::F32));
+        assert!(!pins(L::AbstractFloat(2.0), naga::Scalar::F32));
+        // Any integer literal pins i32 (AbstractInt's default).
+        assert!(pins(L::I32(7), naga::Scalar::I32));
+        assert!(pins(L::AbstractInt(-3), naga::Scalar::I32));
+        // Scalars whose abstract default differs never literal-pin.
+        assert!(!pins(L::U32(4), naga::Scalar::U32));
+        assert!(!pins(L::F16(half::f16::from_f32(0.5)), naga::Scalar::F16));
+        assert!(!pins(L::F64(0.5), naga::Scalar::F64));
+    }
 
     fn scalar_inner(kind: naga::ScalarKind, width: u8) -> naga::TypeInner {
         naga::TypeInner::Scalar(naga::Scalar { kind, width })

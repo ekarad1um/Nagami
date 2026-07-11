@@ -11,6 +11,89 @@ use crate::error::Error;
 
 use super::core::{FunctionCtx, Generator};
 
+/// Rewrite a function-tail statement so its arms no longer END in a void
+/// `return;`, returning `None` when nothing would change.  Falling off an
+/// if-arm, a (non-fall-through) switch case, or a nested block in tail
+/// position already ends the void function, so the return is pure bytes -
+/// and naga's `ensure_block_returns` re-synthesises them into arm tails on
+/// every re-parse, so leaving them makes the text grow one `else{return;}`
+/// per round trip.
+///
+/// Only `Return { value: None }` is touched, and a valued return cannot sit
+/// in a void function's IR, so this needs no void-ness gate.  Loops are
+/// deliberately NOT rewritten: a return inside a loop exits the loop, which
+/// falling off the body does not.  Fall-through cases flow into the next
+/// case, so their tail is not the function tail.
+fn elide_tail_void_returns(stmt: &naga::Statement) -> Option<naga::Statement> {
+    // Tail-rewrite one block: drop a trailing `return;`, else recurse into a
+    // trailing compound statement.  `None` = unchanged.
+    fn rewrite_block(block: &naga::Block) -> Option<naga::Block> {
+        let len = block.len();
+        let last = block.iter().last()?;
+        let replacement: Option<Option<naga::Statement>> = match last {
+            naga::Statement::Return { value: None } => Some(None),
+            other => elide_tail_void_returns(other).map(Some),
+        };
+        let replacement = replacement?;
+        let mut rebuilt = naga::Block::with_capacity(len);
+        for stmt in block.iter().take(len - 1) {
+            rebuilt.push(stmt.clone(), naga::Span::UNDEFINED);
+        }
+        if let Some(stmt) = replacement {
+            rebuilt.push(stmt, naga::Span::UNDEFINED);
+        }
+        Some(rebuilt)
+    }
+
+    match stmt {
+        naga::Statement::If {
+            condition,
+            accept,
+            reject,
+        } => {
+            let new_accept = rewrite_block(accept);
+            let new_reject = rewrite_block(reject);
+            if new_accept.is_none() && new_reject.is_none() {
+                return None;
+            }
+            Some(naga::Statement::If {
+                condition: *condition,
+                accept: new_accept.unwrap_or_else(|| accept.clone()),
+                reject: new_reject.unwrap_or_else(|| reject.clone()),
+            })
+        }
+        naga::Statement::Switch { selector, cases } => {
+            let rewrites: Vec<Option<naga::Block>> = cases
+                .iter()
+                .map(|c| {
+                    if c.fall_through {
+                        None
+                    } else {
+                        rewrite_block(&c.body)
+                    }
+                })
+                .collect();
+            if rewrites.iter().all(Option::is_none) {
+                return None;
+            }
+            Some(naga::Statement::Switch {
+                selector: *selector,
+                cases: cases
+                    .iter()
+                    .zip(rewrites)
+                    .map(|(c, rw)| naga::SwitchCase {
+                        value: c.value,
+                        body: rw.unwrap_or_else(|| c.body.clone()),
+                        fall_through: c.fall_through,
+                    })
+                    .collect(),
+            })
+        }
+        naga::Statement::Block(inner) => rewrite_block(inner).map(naga::Statement::Block),
+        _ => None,
+    }
+}
+
 /// Cap on the rendered nesting depth of any single emitted expression.
 ///
 /// tint's WGSL parser enforces a hard limit of 512 nested expressions and
@@ -486,13 +569,40 @@ impl<'a> Generator<'a> {
         elide_trailing_void_return: bool,
     ) -> Result<(), Error> {
         let mut stmts: Vec<_> = block.iter().collect();
-        // Optionally drop trailing `return;` (void return) that WGSL does not require.
-        if elide_trailing_void_return
-            && let Some(naga::Statement::Return { value: None }) = stmts.last()
-        {
-            stmts.pop();
+        let mut rewritten_tail: Option<naga::Statement> = None;
+        if elide_trailing_void_return {
+            // Drop a trailing `return;` (void return) that WGSL does not require.
+            if let Some(naga::Statement::Return { value: None }) = stmts.last() {
+                stmts.pop();
+            }
+            // The (new) tail statement may still END in void returns inside
+            // its arms - naga's `ensure_block_returns` pushes `return;` into
+            // tail if/switch arms on every re-parse, so without this the
+            // text gains an `else{return;}` per arm per round trip.  Falling
+            // off an arm in function-tail position IS the void return, so
+            // rewrite the arms' tails and emit the rewritten clone.
+            if let Some(last) = stmts.last()
+                && let Some(rewritten) = elide_tail_void_returns(last)
+            {
+                stmts.pop();
+                rewritten_tail = Some(rewritten);
+            }
         }
-        self.emit_stmts(&stmts, ctx)
+        self.emit_stmts(&stmts, ctx)?;
+        if let Some(rewritten) = &rewritten_tail {
+            // Mirror `emit_stmts`' per-statement framing (indent, then drop
+            // the speculative indent if the statement emitted nothing).
+            let before = self.out.len();
+            self.push_indent();
+            let after_indent = self.out.len();
+            self.generate_statement(rewritten, ctx)?;
+            if self.out.len() > after_indent {
+                self.push_newline();
+            } else {
+                self.out.truncate(before);
+            }
+        }
+        Ok(())
     }
 
     /// Emit a slice of statement references while attempting to

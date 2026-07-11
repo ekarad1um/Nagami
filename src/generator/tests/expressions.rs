@@ -746,8 +746,8 @@ fn compose_identical_f32_collapses_to_splat() {
     "#;
     let out = compact(src);
     assert!(
-        out.contains("vec3f(1.2)"),
-        "identical-component Compose should collapse to splat: {out}"
+        out.contains("vec3(1.2)"),
+        "identical-component Compose should collapse to splat (float-form literal pins f32, so the ctor suffix drops): {out}"
     );
     assert_valid_wgsl(&out);
 }
@@ -761,8 +761,8 @@ fn compose_identical_vec4_collapses_to_splat() {
     "#;
     let out = compact(src);
     assert!(
-        out.contains("vec4f(.5)"),
-        "vec4f with identical components should collapse: {out}"
+        out.contains("vec4(.5)"),
+        "vec4f with identical components should collapse (and drop its pinned suffix): {out}"
     );
     assert_valid_wgsl(&out);
 }
@@ -793,8 +793,8 @@ fn compose_identical_integer_collapses_to_splat() {
     "#;
     let out = compact(src);
     assert!(
-        out.contains("vec3i(7)"),
-        "vec3i with identical components should collapse: {out}"
+        out.contains("vec3(7)"),
+        "vec3i with identical components should collapse (int literal pins i32, so the ctor suffix drops): {out}"
     );
     assert_valid_wgsl(&out);
 }
@@ -860,8 +860,8 @@ fn global_compose_identical_collapses_to_splat() {
     "#;
     let out = compact(src);
     assert!(
-        out.contains("vec3f(2.5)"),
-        "global Compose with identical literals should collapse: {out}"
+        out.contains("vec3(2.5)"),
+        "global Compose with identical literals should collapse (float-form literal pins f32): {out}"
     );
     assert_valid_wgsl(&out);
 }

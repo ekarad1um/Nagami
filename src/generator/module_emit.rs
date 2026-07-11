@@ -552,7 +552,8 @@ impl<'a> Generator<'a> {
             if let Some(id) = ov.id {
                 self.out.push_str("@id(");
                 self.out.push_str(&id.to_string());
-                self.out.push_str(") ");
+                self.out
+                    .push_str(if self.options.beautify { ") " } else { ")" });
             }
             self.out.push_str("override ");
             self.out.push_str(&self.override_names[h.index()]);
@@ -711,7 +712,11 @@ impl<'a> Generator<'a> {
                 naga::ShaderStage::Vertex => self.out.push_str("@vertex "),
                 naga::ShaderStage::Fragment => self.out.push_str("@fragment "),
                 naga::ShaderStage::Compute => {
-                    self.out.push_str("@compute @workgroup_size(");
+                    self.out.push_str(if self.options.beautify {
+                        "@compute @workgroup_size("
+                    } else {
+                        "@compute@workgroup_size("
+                    });
 
                     let overrides = ep.workgroup_size_overrides.as_ref();
 
@@ -745,31 +750,50 @@ impl<'a> Generator<'a> {
                             }
                         }
                     }
-                    self.out.push_str(") ");
+                    self.out
+                        .push_str(if self.options.beautify { ") " } else { ")" });
                 }
                 naga::ShaderStage::RayGeneration => self.out.push_str("@ray_generation "),
                 naga::ShaderStage::AnyHit => {
-                    self.out.push_str("@any_hit ");
                     if let Some(name) = &incoming_payload_name {
-                        self.out.push_str("@incoming_payload(");
+                        self.out.push_str(if self.options.beautify {
+                            "@any_hit @incoming_payload("
+                        } else {
+                            "@any_hit@incoming_payload("
+                        });
                         self.out.push_str(name);
-                        self.out.push_str(") ");
+                        self.out
+                            .push_str(if self.options.beautify { ") " } else { ")" });
+                    } else {
+                        self.out.push_str("@any_hit ");
                     }
                 }
                 naga::ShaderStage::ClosestHit => {
-                    self.out.push_str("@closest_hit ");
                     if let Some(name) = &incoming_payload_name {
-                        self.out.push_str("@incoming_payload(");
+                        self.out.push_str(if self.options.beautify {
+                            "@closest_hit @incoming_payload("
+                        } else {
+                            "@closest_hit@incoming_payload("
+                        });
                         self.out.push_str(name);
-                        self.out.push_str(") ");
+                        self.out
+                            .push_str(if self.options.beautify { ") " } else { ")" });
+                    } else {
+                        self.out.push_str("@closest_hit ");
                     }
                 }
                 naga::ShaderStage::Miss => {
-                    self.out.push_str("@miss ");
                     if let Some(name) = &incoming_payload_name {
-                        self.out.push_str("@incoming_payload(");
+                        self.out.push_str(if self.options.beautify {
+                            "@miss @incoming_payload("
+                        } else {
+                            "@miss@incoming_payload("
+                        });
                         self.out.push_str(name);
-                        self.out.push_str(") ");
+                        self.out
+                            .push_str(if self.options.beautify { ") " } else { ")" });
+                    } else {
+                        self.out.push_str("@miss ");
                     }
                 }
                 _ => {
@@ -873,7 +897,10 @@ impl<'a> Generator<'a> {
                     .map(|ao| ao.round_up(default_offset) == member.offset)
                     .unwrap_or(false);
                 if works {
-                    self.out.push_str(&format!("@align({a}) "));
+                    self.out.push_str(&format!("@align({a})"));
+                    if self.options.beautify {
+                        self.out.push(' ');
+                    }
                 } else {
                     // The gap from `default_offset` to `member.offset`
                     // is not a power-of-two alignment expressible on
@@ -937,7 +964,10 @@ impl<'a> Generator<'a> {
             );
             let need_size = !is_runtime_array && effective_size != default_effective;
             if need_size {
-                self.out.push_str(&format!("@size({}) ", effective_size));
+                self.out.push_str(&format!("@size({})", effective_size));
+                if self.options.beautify {
+                    self.out.push(' ');
+                }
             }
 
             // Update the default-offset cursor.  If we emitted @size
@@ -951,7 +981,8 @@ impl<'a> Generator<'a> {
                 };
 
             if let Some(binding) = &member.binding {
-                self.out.push_str(&binding_attrs(binding)?);
+                self.out
+                    .push_str(&binding_attrs(binding, !self.options.beautify)?);
             }
             if let Some(mangled) = self.member_names.get(&(ty_handle, idx as u32)) {
                 self.out.push_str(mangled);
@@ -962,7 +993,11 @@ impl<'a> Generator<'a> {
             }
             self.push_colon();
             self.out.push_str(&self.type_ref(member.ty)?);
-            self.out.push(',');
+            // The last member's comma is optional; beautify keeps the
+            // conventional trailing comma, compact drops it.
+            if idx + 1 < member_count || self.options.beautify {
+                self.out.push(',');
+            }
             self.push_newline();
         }
         self.close_brace();
@@ -998,7 +1033,8 @@ impl<'a> Generator<'a> {
             self.out.push(',');
             self.out
                 .push_str(&triggering_rule_name(&filter.triggering_rule));
-            self.out.push_str(") ");
+            self.out
+                .push_str(if self.options.beautify { ") " } else { ")" });
         }
     }
 
@@ -1077,7 +1113,8 @@ impl<'a> Generator<'a> {
                 self.push_separator();
             }
             if let Some(binding) = &arg.binding {
-                self.out.push_str(&binding_attrs(binding)?);
+                self.out
+                    .push_str(&binding_attrs(binding, !self.options.beautify)?);
             }
             self.out.push_str(&ctx.argument_names[i]);
             self.push_colon();
@@ -1088,7 +1125,8 @@ impl<'a> Generator<'a> {
         if let Some(result) = &func.result {
             self.push_arrow();
             if let Some(binding) = &result.binding {
-                self.out.push_str(&binding_attrs(binding)?);
+                self.out
+                    .push_str(&binding_attrs(binding, !self.options.beautify)?);
             }
             self.out.push_str(&self.type_ref(result.ty)?);
         }

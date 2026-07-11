@@ -475,6 +475,63 @@ fn strip_naga_only_enables(mut source: String) -> String {
     source
 }
 
+/// Lexically compact WGSL text that never goes through the generator: strip
+/// comments, then collapse every whitespace run, keeping a single space only
+/// where joining would merge tokens.  Used on the bailout paths (input naga
+/// cannot parse or validate) and on the naga-emitter fallback, which
+/// otherwise ship fully un-minified text.
+///
+/// Grammar-agnostic and token-safe by construction, so it needs no parser:
+/// * a space survives between two identifier-ish chars (Unicode-aware -
+///   WGSL identifiers are XID, approximated by `char::is_alphanumeric`),
+///   covering `enable f16`, `else if`, `let x`;
+/// * a space survives where maximal munch would fuse two tokens of valid
+///   WGSL into one: `- -x` (`--` is reserved), `+ +` (likewise), `& &x` /
+///   `| |` (would form `&&`/`||`), and `x / *p` (would open a `/*` comment);
+///   `> >` joins deliberately - WGSL's template-list disambiguation reads
+///   nested `>>` correctly;
+/// * everything else joins.
+///
+/// Idempotent: re-running splits at exactly the kept spaces and re-keeps
+/// them.  Whole non-whitespace chunks are copied verbatim, so multi-byte
+/// characters pass through untouched (ASCII whitespace never splits a
+/// UTF-8 sequence).
+fn compact_wgsl_text(source: &str) -> String {
+    let stripped = strip_wgsl_comments(source);
+    let ident_ish = |c: char| c.is_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(stripped.len());
+    let mut prev_char: Option<char> = None;
+    for chunk in stripped.split_ascii_whitespace() {
+        if let (Some(prev), Some(next)) = (prev_char, chunk.chars().next()) {
+            let keep = (ident_ish(prev) && ident_ish(next))
+                || (prev == next && matches!(prev, '-' | '+' | '&' | '|'))
+                || (prev == '/' && matches!(next, '*' | '/'));
+            if keep {
+                out.push(' ');
+            }
+        }
+        out.push_str(chunk);
+        prev_char = chunk.chars().next_back();
+    }
+    out
+}
+
+/// Finish the naga-emitter fallback text for shipping: lexically compact it
+/// (naga's writer pretty-prints), then drop the naga-only enables exactly
+/// like the generator path - the shipped, tint-facing output must not carry
+/// them.  Compaction is verified by a naga re-parse; on failure (a compactor
+/// bug) the pretty-but-valid text ships instead.  The caller has already
+/// validated `naga_output` itself.
+fn finalize_naga_fallback_text(naga_output: String) -> String {
+    let compacted = compact_wgsl_text(&naga_output);
+    let text = if io::validate_wgsl_text(&compacted).is_ok() {
+        compacted
+    } else {
+        naga_output
+    };
+    strip_naga_only_enables(text)
+}
+
 /// The [`NAGA_ONLY_ENABLES`] present in generator output `emit_source`, as a
 /// directive prefix.  Prepended to the preamble self-check text: naga REQUIRES
 /// these to parse the feature, but the shipped body omits them and a user
@@ -956,27 +1013,31 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         Ok(m) => m,
         Err(e) if is_unsupported_extension_parse_error(&e) => {
             // Shader uses an extension naga can't parse (e.g.
-            // `wgpu_ray_query`).  Return the original source so the
-            // caller can still ship something runnable on backends
+            // `subgroups`).  Ship the source lexically compacted -
+            // comments and whitespace need no parser to remove, and
+            // this path otherwise ships fully un-minified text - so
+            // the caller still gets something runnable on backends
             // that DO understand the extension.  The synthetic
             // `unsupported_extension_bailout` PassReport lets
             // downstream tooling distinguish bailout from "ran with
             // no changes"; `validation_ok = true` is "no failure
             // observed" (no IR ever built), set true so CI gates
             // asserting `all validation_ok` don't fail spuriously.
+            let compacted = compact_wgsl_text(source);
             let mut report = Report::new(source.len());
+            report.output_bytes = compacted.len();
             report.pass_reports.push(PassReport {
                 pass_name: "unsupported_extension_bailout".to_string(),
                 before_bytes: Some(source.len()),
-                after_bytes: Some(source.len()),
-                changed: false,
+                after_bytes: Some(compacted.len()),
+                changed: compacted != source,
                 duration_us: 0,
                 validation_ok: true,
                 text_validation_ok: None,
                 rolled_back: false,
             });
             return Ok(Output {
-                source: source.to_string(),
+                source: compacted,
                 report,
             });
         }
@@ -1012,19 +1073,23 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     // post-pass `validate_module` failure below provably indicates a pass bug
     // (valid in, invalid out) and rightly stays a hard error.
     if io::validate_module(&module).is_err() {
+        // Same lexical compaction as the unsupported-extension bailout:
+        // rejected-but-parseable input (e.g. const division by zero) still
+        // deserves comment/whitespace removal on its way through.
+        let compacted = compact_wgsl_text(source);
         report.pass_reports.push(PassReport {
             pass_name: "validation_bailout".to_string(),
             before_bytes: Some(source.len()),
-            after_bytes: Some(source.len()),
-            changed: false,
+            after_bytes: Some(compacted.len()),
+            changed: compacted != source,
             duration_us: 0,
             validation_ok: false,
             text_validation_ok: None,
             rolled_back: true,
         });
-        report.output_bytes = source.len();
+        report.output_bytes = compacted.len();
         return Ok(Output {
-            source: source.to_string(),
+            source: compacted,
             report,
         });
     }
@@ -1197,10 +1262,12 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                              fallback is also invalid: {ve}"
                         )));
                     }
+                    let fallback = finalize_naga_fallback_text(naga_output);
+                    let final_bytes = fallback.len();
                     (
-                        naga_output,
-                        before_bytes,
-                        false,
+                        fallback,
+                        final_bytes,
+                        final_bytes != before_bytes,
                         true,
                         false,
                         emitted.duration_us,
@@ -1236,12 +1303,36 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                              fallback is also invalid: {ve}"
                         )));
                     }
-                    (naga_output, before_bytes, false, true, false, 0)
+                    let fallback = finalize_naga_fallback_text(naga_output);
+                    let final_bytes = fallback.len();
+                    (
+                        fallback,
+                        final_bytes,
+                        final_bytes != before_bytes,
+                        true,
+                        false,
+                        0,
+                    )
                 }
                 // No naga fallback available (override-sized array): the
                 // generator's own error is the only diagnosis.
                 None => return Err(e),
             },
+        };
+
+    // Never ship output larger than the input.  Rare shapes can grow (an
+    // already-minimal file whose emission spends more on scaffolding than it
+    // saves, or a loop-exit-preservation keep).  Two exemptions: beautify
+    // mode grows output on purpose, and with a preamble the input body may
+    // carry leading directives that the shipped [preamble, body] order
+    // forbids, so the original text is not a valid substitute.  The input is
+    // shipped VERBATIM, not compacted - it never went through the emit
+    // self-checks.
+    let (final_source, final_bytes, changed) =
+        if !config.beautify && !has_preamble && final_bytes > source.len() {
+            (source.to_string(), source.len(), false)
+        } else {
+            (final_source, final_bytes, changed)
         };
 
     report.pass_reports.push(PassReport {
@@ -1925,14 +2016,15 @@ mod tests {
     /// trigger here.
     #[test]
     fn unsupported_extension_bailout_includes_synthetic_pass_report() {
-        let src = "enable subgroups;\n\
+        let src = "enable subgroups; // naga cannot parse this extension\n\
                    @compute @workgroup_size(1) fn m() {}";
-        let output = run(src, &Config::default()).expect("bailout returns Ok with original source");
-        // The bailout path returns the ORIGINAL source verbatim
-        // (no pipeline run, no preprocessing pass).
+        let output = run(src, &Config::default()).expect("bailout returns Ok");
+        // The bailout path never reaches the pipeline, but it still ships the
+        // source lexically compacted (comments stripped, whitespace collapsed,
+        // token-fusing joins kept apart).
         assert_eq!(
-            output.source, src,
-            "bailout must return the original source unchanged"
+            output.source, "enable subgroups;@compute@workgroup_size(1)fn m(){}",
+            "bailout must ship the lexically compacted source"
         );
         let bailout = output
             .report
@@ -1944,10 +2036,58 @@ mod tests {
             "synthetic bailout pass report must be present so callers can detect the short-circuit"
         );
         let b = bailout.unwrap();
-        assert!(!b.changed);
+        assert!(b.changed, "compaction shrank the text, so changed=true");
         assert!(!b.rolled_back);
         assert_eq!(b.before_bytes, Some(src.len()));
-        assert_eq!(b.after_bytes, Some(src.len()));
+        assert_eq!(b.after_bytes, Some(output.source.len()));
+    }
+
+    #[test]
+    fn compact_wgsl_text_is_token_safe_and_idempotent() {
+        // Comments become whitespace; runs collapse; ident-ident keeps one
+        // space; token-fusing pairs keep one space; the rest joins.
+        let src = "enable f16;  // trailing comment\n\
+                   /* block */ fn  m ( a : f32 , p : ptr<function, f32> ) {\n\
+                     let b = a - -a;\n\
+                     let c = b / *p;\n\
+                   }";
+        let compacted = compact_wgsl_text(src);
+        assert_eq!(
+            compacted,
+            "enable f16;fn m(a:f32,p:ptr<function,f32>){let b=a- -a;let c=b/ *p;}"
+        );
+        // `- -` must not fuse into the reserved `--`, nor `/ *` into `/*`.
+        assert!(!compacted.contains("--") && !compacted.contains("/*"));
+        // Idempotent: a second pass is byte-identical.
+        assert_eq!(compact_wgsl_text(&compacted), compacted);
+    }
+
+    #[test]
+    fn output_never_exceeds_input_without_beautify() {
+        // Hand-pre-minified input where the emit's CSE scaffolding costs more
+        // than it saves: the guard must ship the input verbatim.
+        let src = "@fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{\
+            let m=mat2x2f(cos(p.x),sin(p.x),-sin(p.x),cos(p.x));return vec4f(m[0],m[1]);}";
+        let output = run(src, &Config::default()).expect("run succeeds");
+        assert!(
+            output.source.len() <= src.len(),
+            "output must never exceed the input: {} > {}",
+            output.source.len(),
+            src.len()
+        );
+        // Beautify mode is exempt - it grows output on purpose.
+        let pretty = run(
+            src,
+            &Config {
+                beautify: true,
+                ..Default::default()
+            },
+        )
+        .expect("beautify run succeeds");
+        assert!(
+            pretty.source.len() > src.len(),
+            "beautify must not be clamped by the size guard"
+        );
     }
 
     #[test]
