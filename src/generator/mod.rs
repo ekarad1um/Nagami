@@ -13,13 +13,16 @@
 //! * `syntax` - grammar constants (operator precedence, symbol sets).
 //! * `core` - the `Generator` type, output buffer, and the options
 //!   that flow in from [`crate::run`].
+//! * `cost` - byte-cost pricing conventions shared by the size
+//!   heuristics.
 //! * `literal_extract` - per-run extraction of repeated literals
 //!   into named `const` declarations.
-//! * `expr_emit` / `stmt_emit` / `module_emit` - one file per IR
+//! * `expr_emit` / `stmt_emit` / `module_emit` - one module per IR
 //!   scope (expression, statement, module), each driving the
 //!   generator buffer.
 
 mod core;
+mod cost;
 mod expr_emit;
 mod literal_extract;
 mod module_emit;

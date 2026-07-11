@@ -19,6 +19,23 @@ use wasm_bindgen::prelude::*;
 
 use crate::config::{Config, FloatPrecision, PrecisionMode, Profile};
 
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn console_error(msg: &str);
+}
+
+/// Route Rust panic info to `console.error` at module instantiation:
+/// under `panic = "abort"` the hook still runs first, so browsers get
+/// the panic text and file:line instead of an opaque
+/// `RuntimeError: unreachable executed`.  Hand-rolled because the
+/// `console_error_panic_hook` crate adds only a JS stack trace of
+/// mangled wasm frame indices.
+#[wasm_bindgen(start)]
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| console_error(&info.to_string())));
+}
+
 // MARK: JS value extraction
 
 /// Read `obj[key]`, collapsing `undefined` and `null` to `None` so

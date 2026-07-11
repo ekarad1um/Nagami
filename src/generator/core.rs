@@ -997,10 +997,7 @@ impl<'a> Generator<'a> {
             let mut alias_counter = 0usize;
             let mut decls: Vec<(String, String)> = Vec::new();
 
-            // Fixed overhead per alias declaration:
-            //   compact:  "alias <name>=<type>;"   -> 6 + 1 + 1 = 8 fixed chars
-            //   beautify: "alias <name> = <type>;\n" -> 6 + 3 + 2 = 11 fixed chars
-            let fixed_overhead: usize = if options.beautify { 11 } else { 8 };
+            let fixed_overhead = super::cost::decl_boilerplate(options.beautify);
 
             // `UniqueArena<Type>` deduplicates by the full `Type`
             // (name included), so the same `TypeInner` can appear under

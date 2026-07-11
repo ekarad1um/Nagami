@@ -870,6 +870,10 @@ fn rebuild_block_expressions(
             clone_expression_handle(h, old_expressions, new_expressions, handle_map)
         });
 
+        // The early Loop path above must have consumed every Loop: reaching
+        // the generic remap with one would clone `break_if` BEFORE its owning
+        // block is rebuilt, appending an un-emitted duplicate (invalid IR).
+        debug_assert!(!matches!(statement, naga::Statement::Loop { .. }));
         for nested in nested_blocks_mut(&mut statement) {
             rebuild_block_expressions(nested, old_expressions, new_expressions, handle_map);
         }

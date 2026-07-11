@@ -558,11 +558,7 @@ impl<'a> Generator<'a> {
         //    is the use count, `L` the per-use emitted length, `N` the
         //    bound name length (estimated as 1 for the initial filter),
         //    and `D` the declaration text length.  The boilerplate term
-        //    differs by output style:
-        //      compact:  `const N=D;`     = 6 + 1 + 1 = 8 fixed chars
-        //      beautify: `const N = D;\n` = 6 + 3 + 2 = 11 fixed chars
-        //    Mis-pricing in beautify mode wrongly accepts borderline
-        //    extractions that net-cost two bytes per use.
+        //    is the shared per-declaration constant in `super::cost`.
         //
         //    Per-use length `L`: a needs-typed literal (F16/F64/I64/U64 - the
         //    only kinds where `decl_text` carries a suffix `expr_text` lacks)
@@ -572,7 +568,7 @@ impl<'a> Generator<'a> {
         //    bare form and we stay conservative (`expr_text`) so we never
         //    over-extract into a net-larger output.  For every other kind
         //    `decl_text == expr_text`, so this is a no-op.
-        let boilerplate: isize = if self.options.beautify { 11 } else { 8 };
+        let boilerplate = super::cost::decl_boilerplate(self.options.beautify) as isize;
         let mut candidates: Vec<(isize, LiteralExtractKey, usize, bool)> = literal_counts
             .into_iter()
             .filter_map(|(key, (count, has_bare))| {

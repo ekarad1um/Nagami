@@ -52,6 +52,8 @@ fn lit_key(l: naga::Literal) -> LitKey {
 /// Rough minified length of a literal's bare token - good enough to keep the
 /// cost model conservative (it only ever slightly OVER-estimates the float
 /// forms, which biases toward fewer hoists, never toward growing the output).
+/// Pass-local by design: it prices un-rendered IR, unlike the rendered-text
+/// pricing sites inventoried in `crate::generator::cost`.
 fn est_lit_len(l: naga::Literal) -> usize {
     use naga::Literal as L;
     let s = match l {
@@ -157,6 +159,8 @@ fn collect_emitted(block: &naga::Block, out: &mut Vec<naga::Handle<naga::Express
     }
 }
 
+/// Pass entry point; the algorithm and its scope limits are the
+/// module-level docs.
 pub struct ConstHoistPass;
 
 impl Pass for ConstHoistPass {

@@ -1,10 +1,41 @@
 //! IR-level optimization passes assembled by [`build_ir_passes`].
 //!
-//! Pass ordering is load-bearing: const folding exposes dead branches,
-//! which in turn unlock further folding and enable inlining; CSE and
-//! load dedup run after inlining so they see the fully-materialised
-//! call bodies.  Adjust the order only with the interaction matrix
-//! in mind.  Individual pass modules document their own invariants.
+//! # Interaction matrix
+//!
+//! The driver sweeps the sequence to a fixed point, so a missed
+//! opportunity usually costs one extra sweep, not the optimization.
+//! The exceptions - ordering constraints that are load-bearing within a
+//! sweep or across the rename boundary - are exactly these:
+//!
+//! * `compact` -> `dead_local`: only after statement-unreachable
+//!   expressions are culled is "no `LocalVariable` expression" exactly
+//!   "dead local".
+//! * `dead_local` -> `inlining`: clearing dead locals lifts the
+//!   inliner's no-locals veto.
+//! * `const_fold` <-> `dead_branch`: folds expose constant branches,
+//!   pruned branches shrink bodies toward the inlinable
+//!   `[Emit*, Return]` shape; the pair therefore repeats after
+//!   `inlining` and after `load_dedup` (forwarded values surface fresh
+//!   constants).
+//! * `inlining` -> `cse` / `load_dedup`: both must see the
+//!   fully-materialised call bodies, or they dedup/forward across a
+//!   boundary the inliner is about to erase.
+//! * `struct_build` -> `coalescing` / `rename`: member-wise struct
+//!   builds collapse to one constructor store first.
+//! * `dead_param` late: a parameter's uses must dissolve before its
+//!   removal is visible, and it rewrites caller arity.
+//! * `emit_merge` late: re-merged `Emit` ranges restore the generator's
+//!   single-use inlining that pass-level range-splitting fragmented.
+//! * `cse` / `const_hoist` only under `Max` with mangling on: both
+//!   price their savings at a 1-2 character bound name that only
+//!   rename's mangling delivers.
+//! * `const_hoist` -> `rename`: the hoisted constant must exist before
+//!   frequency-based naming, or re-minified output names it differently
+//!   (idempotence).
+//! * `rename` last: its output is the stable identifier surface
+//!   everything downstream reads.
+//!
+//! Individual pass modules document their own invariants.
 
 use crate::config::{Config, Profile};
 use crate::pipeline::Pass;
@@ -25,12 +56,8 @@ pub mod rename;
 pub mod scoped_map;
 pub mod struct_build;
 
-/// Build the pass pipeline for `config.profile`.
-///
-/// Each profile bundles a fixed sequence of boxed [`Pass`] trait
-/// objects; the pipeline driver sweeps them to a fixed point.  The
-/// `rename` pass is shared across profiles because its output is the
-/// stable identifier surface everything downstream reads from.
+/// Build the pass pipeline for `config.profile`; ordering rationale
+/// lives in the module-level interaction matrix.
 pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
     let rename = Box::new(rename::RenamePass::new(
         config.preserve_symbols.clone(),
@@ -39,10 +66,8 @@ pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
 
     match config.profile {
         Profile::Baseline => {
-            // Minimal chain: compact (DCE) -> const-fold -> dead-branch
-            // -> dead-param -> emit merge -> rename.  No inlining, CSE,
-            // or load dedup; intended as a quick sanity pipeline that
-            // keeps the IR recognisable for debugging.
+            // Quick sanity pipeline that keeps the IR recognisable for
+            // debugging: no inlining, CSE, or load dedup.
             vec![
                 Box::new(compact::CompactPass) as Box<dyn Pass>,
                 Box::new(const_fold::ConstFoldPass),
@@ -70,12 +95,6 @@ pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
 
             let mut passes: Vec<Box<dyn Pass>> = vec![
                 Box::new(compact::CompactPass) as Box<dyn Pass>,
-                // Right after compaction: with statement-unreachable
-                // expressions culled, "no LocalVariable expression" is
-                // exactly "dead local", and clearing them BEFORE the
-                // inliner lifts its locals-veto for bodies whose locals
-                // were all optimised away (a class that otherwise only
-                // dissolves on a re-minify round trip).
                 Box::new(dead_local::DeadLocalPass),
                 Box::new(const_fold::ConstFoldPass),
                 Box::new(dead_branch::DeadBranchPass),
@@ -84,11 +103,6 @@ pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
                 Box::new(dead_branch::DeadBranchPass),
             ];
 
-            // CSE introduces `let` bindings for shared sub-expressions,
-            // profitable only when rename mangles the binding name down to one
-            // character.  Gate on the effective mangle setting (not just the
-            // profile), so a `Max` config with mangling explicitly disabled does
-            // not ship the long identifier and reverse the saving.
             if config.profile == Profile::Max && config.mangle() {
                 passes.push(Box::new(cse::CSEPass));
             }
@@ -97,23 +111,12 @@ pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
                 Box::new(load_dedup::LoadDedupPass) as Box<dyn Pass>,
                 Box::new(const_fold::ConstFoldPass),
                 Box::new(dead_branch::DeadBranchPass),
-                // Collapse field-wise struct builds (`var X; X.a=..; X.b=..;`)
-                // into one whole-struct `Store(X, T(..))` before the final
-                // coalescing + rename, so a fully-built struct local emits as a
-                // single `T(..)` constructor rather than a run of member stores.
                 Box::new(struct_build::StructBuildPass),
                 Box::new(coalescing::CoalescingPass),
                 Box::new(dead_param::DeadParamPass),
                 Box::new(emit_merge::EmitMergePass),
             ]);
 
-            // Hoist repeated all-literal vector constants into shared module
-            // consts BEFORE rename, so rename names them by frequency (this is
-            // what makes the optimization idempotent).  Gated on mangling for the
-            // same reason as CSE: the pass prices its savings at a 2-char bound
-            // name, which only rename's mangling delivers.  Without mangling the
-            // `_hoist{N}` placeholder ships verbatim and the long identifier can
-            // defeat - even reverse - the saving.
             if config.profile == Profile::Max && config.mangle() {
                 passes.push(Box::new(const_hoist::ConstHoistPass));
             }

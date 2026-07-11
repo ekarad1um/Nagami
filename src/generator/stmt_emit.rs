@@ -756,56 +756,7 @@ impl<'a> Generator<'a> {
     ) -> Result<(), Error> {
         use naga::Statement as S;
         match stmt {
-            S::Emit(range) => {
-                let mut emitted_any = false;
-                for h in range.clone() {
-                    // A `Load` whose place is written between this `Emit` and a
-                    // use MUST be bound; inlining it would read the post-write
-                    // value (silent miscompile).  `is_uniformity_pinned` shares
-                    // this force-bind for its own reason (see its doc).  Both
-                    // override the bare-local/global short-name skip in
-                    // `should_bind_expression` and the `min_binding_refs`
-                    // threshold below.
-                    let force_bind =
-                        ctx.must_bind_loads.contains(&h) || self.is_uniformity_pinned(h, ctx);
-                    // Both parsers bound nesting (see [`MAX_RENDER_DEPTH`]), so
-                    // single-use inlining must not flatten without bound: once
-                    // inlining `h` would render past the cap, bind it regardless
-                    // of the byte-cost threshold.  Restricted to
-                    // `should_bind_expression` shapes (never pointers /
-                    // statement-result names) and live values; depth passes
-                    // through unbindable nodes to their first bindable ancestor.
-                    let depth_capped = !force_bind
-                        && ctx.ref_counts[h.index()] > 0
-                        && self.should_bind_expression(h, ctx)
-                        && self.render_depth(h, ctx) > MAX_RENDER_DEPTH;
-                    if !force_bind && !depth_capped && !self.should_bind_expression(h, ctx) {
-                        continue;
-                    }
-                    // Skip binding when the expression has too few references
-                    // to justify the `let X=...;` overhead.  For trivially short
-                    // expressions (e.g. `-x`, `v.y`, `a*b`) the threshold is
-                    // higher because inlining them at each use site is cheaper.
-                    let refs = ctx.ref_counts[h.index()];
-                    if !force_bind && !depth_capped && refs < self.min_binding_refs(h, ctx) {
-                        continue;
-                    }
-                    // For subsequent bindings, start a new indented line.
-                    if emitted_any {
-                        self.push_newline();
-                        self.push_indent();
-                    }
-                    emitted_any = true;
-                    let name = ctx.next_expr_name();
-                    let value = self.emit_expr_uncached(h, ctx)?;
-                    self.out.push_str("let ");
-                    self.out.push_str(&name);
-                    self.push_assign();
-                    self.out.push_str(&value);
-                    self.out.push(';');
-                    ctx.expr_names.insert(h, name);
-                }
-            }
+            S::Emit(range) => self.generate_emit_stmt(range, ctx)?,
             S::Block(block) => {
                 self.out.push('{');
                 self.push_newline();
@@ -841,74 +792,7 @@ impl<'a> Generator<'a> {
                     }
                 }
             }
-            S::Switch { selector, cases } => {
-                self.out.push_str("switch ");
-                // Switch case labels carry an explicit type suffix
-                // (`0u` for `SwitchValue::U32`, bare `0` for `I32`);
-                // the selector must match.  If the selector is itself
-                // a `Literal::U32(0)` (rare but legal naga IR), the
-                // generic `emit_expr` path goes through the bare-
-                // literal gate and emits `0`, producing `switch 0 {
-                // case 0u: ... }` which naga rejects on selector /
-                // case-value type mismatch.  Force the typed form
-                // when the selector is an uncached literal to keep
-                // emit consistent with the case labels.
-                if !ctx.expr_names.contains_key(selector)
-                    && let naga::Expression::Literal(lit) = ctx.func.expressions[*selector]
-                {
-                    self.out.push_str(&super::syntax::literal_to_wgsl(
-                        lit,
-                        &self.options.float_precision,
-                    ));
-                } else {
-                    self.out.push_str(&self.emit_expr(*selector, ctx)?);
-                }
-                self.open_brace();
-                let mut new_case = true;
-                for case in cases {
-                    if case.fall_through && !case.body.is_empty() {
-                        return Err(Error::Emit(format!(
-                            "fall-through switch case with non-empty body \
-                             in function '{}' is not representable in WGSL",
-                            ctx.display_name,
-                        )));
-                    }
-                    if new_case {
-                        self.push_indent();
-                    }
-                    match case.value {
-                        naga::SwitchValue::I32(v) => {
-                            if new_case {
-                                self.out.push_str("case ");
-                            }
-                            self.out.push_str(&v.to_string());
-                        }
-                        naga::SwitchValue::U32(v) => {
-                            if new_case {
-                                self.out.push_str("case ");
-                            }
-                            self.out.push_str(&v.to_string());
-                            self.out.push('u');
-                        }
-                        naga::SwitchValue::Default => {
-                            if new_case && case.fall_through {
-                                self.out.push_str("case ");
-                            }
-                            self.out.push_str("default");
-                        }
-                    }
-                    new_case = !case.fall_through;
-                    if case.fall_through {
-                        self.out.push_str(self.comma_sep());
-                    } else {
-                        self.open_brace();
-                        self.generate_block(&case.body, ctx)?;
-                        self.close_brace();
-                        self.push_newline();
-                    }
-                }
-                self.close_brace();
-            }
+            S::Switch { selector, cases } => self.generate_switch_stmt(selector, cases, ctx)?,
             S::Loop {
                 body,
                 continuing,
@@ -958,91 +842,7 @@ impl<'a> Generator<'a> {
                 // Only emit barriers for the scopes explicitly requested.
                 self.emit_barrier_calls(*flags);
             }
-            S::Store { pointer, value } => {
-                if let Some(atomic_scalar) = self.atomic_scalar_for_expr(*pointer, ctx) {
-                    self.emit_atomic_store(*pointer, *value, atomic_scalar, ctx)?;
-                    self.out.push(';');
-                    return Ok(());
-                }
-
-                // Drop a no-op self-store `p = p`: an UNCACHED `Load` of the
-                // same place reads `p`'s current value and writes it straight
-                // back, changing nothing.  naga re-lowers a folded
-                // `var d = a && b` into a temp-plus-copy that coalescing
-                // collapses to `d = d`; emitting it would accumulate one such
-                // line on every re-minify (a non-idempotence growth).  The
-                // `uncached` guard is essential - a `let t = p; ..p..; p = t`
-                // restores a stale value and is NOT a no-op.
-                if !ctx.expr_names.contains_key(value)
-                    && let naga::Expression::Load { pointer: loaded } = ctx.func.expressions[*value]
-                    && ptrs_structurally_equal(loaded, *pointer, &ctx.func.expressions)
-                {
-                    return Ok(());
-                }
-
-                // Check if this is the first store to a deferred local var.
-                let deferred_local =
-                    if let naga::Expression::LocalVariable(lh) = ctx.func.expressions[*pointer] {
-                        if ctx.deferred_vars[lh.index()] {
-                            Some(lh)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                if let Some(lh) = deferred_local {
-                    ctx.deferred_vars[lh.index()] = false;
-                    self.out.push_str("var ");
-                    self.out.push_str(&ctx.local_names[&lh]);
-                    // A deferred var's first store IS its declaration, so a
-                    // first store of the zero value is equivalent to relying
-                    // on WGSL's zero-init.  Drop the value and emit the
-                    // shorter `:type` / `=0i` tail (e.g. `var E=vec3f(0)` ->
-                    // `var E:vec3f`).
-                    if !ctx.expr_names.contains_key(value)
-                        && crate::passes::load_dedup::is_zero_init(&ctx.func.expressions, *value)
-                    {
-                        self.emit_zero_init_tail(ctx.func.local_variables[lh].ty)?;
-                    } else {
-                        self.push_assign();
-                        // When the value is an uncached Literal, use the typed
-                        // suffix so WGSL infers the correct concrete type.
-                        if !ctx.expr_names.contains_key(value) {
-                            if let naga::Expression::Literal(lit) = ctx.func.expressions[*value] {
-                                self.out.push_str(&super::syntax::literal_to_wgsl(
-                                    lit,
-                                    &self.options.float_precision,
-                                ));
-                            } else {
-                                self.out.push_str(&self.emit_expr(*value, ctx)?);
-                            }
-                        } else {
-                            self.out.push_str(&self.emit_expr(*value, ctx)?);
-                        }
-                    }
-                    self.out.push(';');
-                } else if let Some((cop, other)) = self.try_compound_assign(*pointer, *value, ctx) {
-                    self.out.push_str(&self.emit_lvalue(*pointer, ctx)?);
-                    if let Some(inc) = self.try_increment(cop, other, *value, ctx) {
-                        self.out.push_str(inc);
-                    } else {
-                        let sp = self.bin_op_sep();
-                        self.out.push_str(sp);
-                        self.out.push_str(cop);
-                        self.out.push_str(sp);
-                        self.out
-                            .push_str(&self.emit_compound_assign_rhs(cop, other, ctx)?);
-                    }
-                    self.out.push(';');
-                } else {
-                    self.out.push_str(&self.emit_lvalue(*pointer, ctx)?);
-                    self.push_assign();
-                    self.out.push_str(&self.emit_expr(*value, ctx)?);
-                    self.out.push(';');
-                }
-            }
+            S::Store { pointer, value } => self.generate_store_stmt(pointer, value, ctx)?,
             S::ImageStore {
                 image,
                 coordinate,
@@ -1075,52 +875,7 @@ impl<'a> Generator<'a> {
                 fun,
                 value,
                 result,
-            } => {
-                let atomic_scalar = self.atomic_scalar_for_expr(*pointer, ctx);
-                let sep = self.comma_sep();
-                let fn_name = match *fun {
-                    naga::AtomicFunction::Add => "atomicAdd",
-                    naga::AtomicFunction::Subtract => "atomicSub",
-                    naga::AtomicFunction::And => "atomicAnd",
-                    naga::AtomicFunction::ExclusiveOr => "atomicXor",
-                    naga::AtomicFunction::InclusiveOr => "atomicOr",
-                    naga::AtomicFunction::Min => "atomicMin",
-                    naga::AtomicFunction::Max => "atomicMax",
-                    naga::AtomicFunction::Exchange { compare: None } => "atomicExchange",
-                    naga::AtomicFunction::Exchange {
-                        compare: Some(compare),
-                    } => {
-                        let mut call = String::from("atomicCompareExchangeWeak(&");
-                        call.push_str(&self.emit_expr(*pointer, ctx)?);
-                        call.push_str(sep);
-                        if let Some(scalar) = atomic_scalar {
-                            call.push_str(&self.emit_expr_for_atomic(compare, scalar, ctx)?);
-                        } else {
-                            call.push_str(&self.emit_expr(compare, ctx)?);
-                        }
-                        call.push_str(sep);
-                        if let Some(scalar) = atomic_scalar {
-                            call.push_str(&self.emit_expr_for_atomic(*value, scalar, ctx)?);
-                        } else {
-                            call.push_str(&self.emit_expr(*value, ctx)?);
-                        }
-                        call.push(')');
-                        self.emit_call_result(&call, *result, ctx);
-                        return Ok(());
-                    }
-                };
-                let mut call = String::from(fn_name);
-                call.push_str("(&");
-                call.push_str(&self.emit_expr(*pointer, ctx)?);
-                call.push_str(sep);
-                if let Some(scalar) = atomic_scalar {
-                    call.push_str(&self.emit_expr_for_atomic(*value, scalar, ctx)?);
-                } else {
-                    call.push_str(&self.emit_expr(*value, ctx)?);
-                }
-                call.push(')');
-                self.emit_call_result(&call, *result, ctx);
-            }
+            } => self.generate_atomic_stmt(pointer, fun, value, result, ctx)?,
             S::ImageAtomic {
                 image,
                 coordinate,
@@ -1128,64 +883,7 @@ impl<'a> Generator<'a> {
                 fun,
                 value,
             } => {
-                let image_atomic_scalar = self.image_atomic_scalar_for_expr(*image, ctx);
-                let fn_name = match *fun {
-                    naga::AtomicFunction::Add => "textureAtomicAdd",
-                    naga::AtomicFunction::Subtract => "textureAtomicSub",
-                    naga::AtomicFunction::And => "textureAtomicAnd",
-                    naga::AtomicFunction::ExclusiveOr => "textureAtomicXor",
-                    naga::AtomicFunction::InclusiveOr => "textureAtomicOr",
-                    naga::AtomicFunction::Min => "textureAtomicMin",
-                    naga::AtomicFunction::Max => "textureAtomicMax",
-                    naga::AtomicFunction::Exchange { compare: None } => "textureAtomicExchange",
-                    naga::AtomicFunction::Exchange {
-                        compare: Some(compare),
-                    } => {
-                        let sep = self.comma_sep();
-                        let mut call = String::from("textureAtomicCompareExchangeWeak(");
-                        call.push_str(&self.emit_expr(*image, ctx)?);
-                        call.push_str(sep);
-                        call.push_str(&self.emit_expr(*coordinate, ctx)?);
-                        if let Some(index) = array_index {
-                            call.push_str(sep);
-                            call.push_str(&self.emit_expr(*index, ctx)?);
-                        }
-                        call.push_str(sep);
-                        if let Some(scalar) = image_atomic_scalar {
-                            call.push_str(&self.emit_expr_for_atomic(compare, scalar, ctx)?);
-                        } else {
-                            call.push_str(&self.emit_expr(compare, ctx)?);
-                        }
-                        call.push_str(sep);
-                        if let Some(scalar) = image_atomic_scalar {
-                            call.push_str(&self.emit_expr_for_atomic(*value, scalar, ctx)?);
-                        } else {
-                            call.push_str(&self.emit_expr(*value, ctx)?);
-                        }
-                        call.push(')');
-                        self.out.push_str(&call);
-                        self.out.push(';');
-                        return Ok(());
-                    }
-                };
-                let sep = self.comma_sep();
-                self.out.push_str(fn_name);
-                self.out.push('(');
-                self.out.push_str(&self.emit_expr(*image, ctx)?);
-                self.out.push_str(sep);
-                self.out.push_str(&self.emit_expr(*coordinate, ctx)?);
-                if let Some(index) = array_index {
-                    self.out.push_str(sep);
-                    self.out.push_str(&self.emit_expr(*index, ctx)?);
-                }
-                self.out.push_str(sep);
-                if let Some(scalar) = image_atomic_scalar {
-                    self.out
-                        .push_str(&self.emit_expr_for_atomic(*value, scalar, ctx)?);
-                } else {
-                    self.out.push_str(&self.emit_expr(*value, ctx)?);
-                }
-                self.out.push_str(");");
+                self.generate_image_atomic_stmt(image, coordinate, array_index, fun, value, ctx)?
             }
             S::WorkGroupUniformLoad { pointer, result } => {
                 let name = ctx.next_expr_name();
@@ -1280,77 +978,7 @@ impl<'a> Generator<'a> {
             // arms are listed explicitly so a future naga release that
             // grows a new ray-query function variant produces a compile
             // error here instead of silently bypassing emission.
-            S::RayQuery { query, fun } => {
-                // naga's validator restricts `query` to
-                // `Expression::LocalVariable` (else `InvalidRayQueryExpression`),
-                // so `emit_expr(query)` is a bare identifier and prepending `&`
-                // for the `&q` operand is always correct.  The debug_assert guards
-                // this: if naga ever relaxes it, branch on the variant here -
-                // pointer function-arguments emit verbatim (no `&`), local/Access
-                // chains keep the `&`.
-                debug_assert!(
-                    matches!(
-                        ctx.func.expressions[*query],
-                        naga::Expression::LocalVariable(_)
-                    ),
-                    "Statement::RayQuery.query must be a LocalVariable per \
-                     naga's validator; got {:?}",
-                    ctx.func.expressions[*query]
-                );
-                let query_text = self.emit_expr(*query, ctx)?;
-                match fun {
-                    naga::RayQueryFunction::Initialize {
-                        acceleration_structure,
-                        descriptor,
-                    } => {
-                        let sep = self.comma_sep();
-                        self.out.push_str("rayQueryInitialize(&");
-                        self.out.push_str(&query_text);
-                        self.out.push_str(sep);
-                        self.out
-                            .push_str(&self.emit_expr(*acceleration_structure, ctx)?);
-                        self.out.push_str(sep);
-                        self.out.push_str(&self.emit_expr(*descriptor, ctx)?);
-                        self.out.push_str(");");
-                    }
-                    naga::RayQueryFunction::Proceed { result } => {
-                        let name = ctx.next_expr_name();
-                        self.out.push_str("let ");
-                        self.out.push_str(&name);
-                        self.push_assign();
-                        self.out.push_str("rayQueryProceed(&");
-                        self.out.push_str(&query_text);
-                        self.out.push_str(");");
-                        ctx.expr_names.insert(*result, name);
-                    }
-                    naga::RayQueryFunction::GenerateIntersection { hit_t } => {
-                        let sep = self.comma_sep();
-                        self.out.push_str("rayQueryGenerateIntersection(&");
-                        self.out.push_str(&query_text);
-                        self.out.push_str(sep);
-                        // naga's lowerer does not propagate an expected type
-                        // into this builtin's argument, so a bare literal
-                        // (`10`) concretizes to i32 and fails validation
-                        // ("Hit distance must be an f32"); pin the hint.
-                        self.out.push_str(&self.emit_expr_with_scalar_hint(
-                            *hit_t,
-                            Some(naga::Scalar::F32),
-                            ctx,
-                        )?);
-                        self.out.push_str(");");
-                    }
-                    naga::RayQueryFunction::ConfirmIntersection => {
-                        self.out.push_str("rayQueryConfirmIntersection(&");
-                        self.out.push_str(&query_text);
-                        self.out.push_str(");");
-                    }
-                    naga::RayQueryFunction::Terminate => {
-                        self.out.push_str("rayQueryTerminate(&");
-                        self.out.push_str(&query_text);
-                        self.out.push_str(");");
-                    }
-                }
-            }
+            S::RayQuery { query, fun } => self.generate_ray_query_stmt(query, fun, ctx)?,
             // Cooperative-matrix store.  nagami's generator can't render the
             // `cooperative_matrix<...>` type, so it errors and the pipeline falls
             // back to naga's WGSL backend - but naga emits the store while
@@ -1367,6 +995,431 @@ impl<'a> Generator<'a> {
                      round-trip it either",
                     ctx.display_name,
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    fn generate_emit_stmt(
+        &mut self,
+        range: &naga::Range<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        let mut emitted_any = false;
+        for h in range.clone() {
+            // A `Load` whose place is written between this `Emit` and a
+            // use MUST be bound; inlining it would read the post-write
+            // value (silent miscompile).  `is_uniformity_pinned` shares
+            // this force-bind for its own reason (see its doc).  Both
+            // override the bare-local/global short-name skip in
+            // `should_bind_expression` and the `min_binding_refs`
+            // threshold below.
+            let force_bind = ctx.must_bind_loads.contains(&h) || self.is_uniformity_pinned(h, ctx);
+            // Both parsers bound nesting (see [`MAX_RENDER_DEPTH`]), so
+            // single-use inlining must not flatten without bound: once
+            // inlining `h` would render past the cap, bind it regardless
+            // of the byte-cost threshold.  Restricted to
+            // `should_bind_expression` shapes (never pointers /
+            // statement-result names) and live values; depth passes
+            // through unbindable nodes to their first bindable ancestor.
+            let depth_capped = !force_bind
+                && ctx.ref_counts[h.index()] > 0
+                && self.should_bind_expression(h, ctx)
+                && self.render_depth(h, ctx) > MAX_RENDER_DEPTH;
+            if !force_bind && !depth_capped && !self.should_bind_expression(h, ctx) {
+                continue;
+            }
+            // Skip binding when the expression has too few references
+            // to justify the `let X=...;` overhead.  For trivially short
+            // expressions (e.g. `-x`, `v.y`, `a*b`) the threshold is
+            // higher because inlining them at each use site is cheaper.
+            let refs = ctx.ref_counts[h.index()];
+            if !force_bind && !depth_capped && refs < self.min_binding_refs(h, ctx) {
+                continue;
+            }
+            // For subsequent bindings, start a new indented line.
+            if emitted_any {
+                self.push_newline();
+                self.push_indent();
+            }
+            emitted_any = true;
+            let name = ctx.next_expr_name();
+            let value = self.emit_expr_uncached(h, ctx)?;
+            self.out.push_str("let ");
+            self.out.push_str(&name);
+            self.push_assign();
+            self.out.push_str(&value);
+            self.out.push(';');
+            ctx.expr_names.insert(h, name);
+        }
+        Ok(())
+    }
+
+    fn generate_switch_stmt(
+        &mut self,
+        selector: &naga::Handle<naga::Expression>,
+        cases: &[naga::SwitchCase],
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        self.out.push_str("switch ");
+        // Switch case labels carry an explicit type suffix
+        // (`0u` for `SwitchValue::U32`, bare `0` for `I32`);
+        // the selector must match.  If the selector is itself
+        // a `Literal::U32(0)` (rare but legal naga IR), the
+        // generic `emit_expr` path goes through the bare-
+        // literal gate and emits `0`, producing `switch 0 {
+        // case 0u: ... }` which naga rejects on selector /
+        // case-value type mismatch.  Force the typed form
+        // when the selector is an uncached literal to keep
+        // emit consistent with the case labels.
+        if !ctx.expr_names.contains_key(selector)
+            && let naga::Expression::Literal(lit) = ctx.func.expressions[*selector]
+        {
+            self.out.push_str(&super::syntax::literal_to_wgsl(
+                lit,
+                &self.options.float_precision,
+            ));
+        } else {
+            self.out.push_str(&self.emit_expr(*selector, ctx)?);
+        }
+        self.open_brace();
+        let mut new_case = true;
+        for case in cases {
+            if case.fall_through && !case.body.is_empty() {
+                return Err(Error::Emit(format!(
+                    "fall-through switch case with non-empty body \
+                             in function '{}' is not representable in WGSL",
+                    ctx.display_name,
+                )));
+            }
+            if new_case {
+                self.push_indent();
+            }
+            match case.value {
+                naga::SwitchValue::I32(v) => {
+                    if new_case {
+                        self.out.push_str("case ");
+                    }
+                    self.out.push_str(&v.to_string());
+                }
+                naga::SwitchValue::U32(v) => {
+                    if new_case {
+                        self.out.push_str("case ");
+                    }
+                    self.out.push_str(&v.to_string());
+                    self.out.push('u');
+                }
+                naga::SwitchValue::Default => {
+                    if new_case && case.fall_through {
+                        self.out.push_str("case ");
+                    }
+                    self.out.push_str("default");
+                }
+            }
+            new_case = !case.fall_through;
+            if case.fall_through {
+                self.out.push_str(self.comma_sep());
+            } else {
+                self.open_brace();
+                self.generate_block(&case.body, ctx)?;
+                self.close_brace();
+                self.push_newline();
+            }
+        }
+        self.close_brace();
+        Ok(())
+    }
+
+    fn generate_store_stmt(
+        &mut self,
+        pointer: &naga::Handle<naga::Expression>,
+        value: &naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        if let Some(atomic_scalar) = self.atomic_scalar_for_expr(*pointer, ctx) {
+            self.emit_atomic_store(*pointer, *value, atomic_scalar, ctx)?;
+            self.out.push(';');
+            return Ok(());
+        }
+
+        // Drop a no-op self-store `p = p`: an UNCACHED `Load` of the
+        // same place reads `p`'s current value and writes it straight
+        // back, changing nothing.  naga re-lowers a folded
+        // `var d = a && b` into a temp-plus-copy that coalescing
+        // collapses to `d = d`; emitting it would accumulate one such
+        // line on every re-minify (a non-idempotence growth).  The
+        // `uncached` guard is essential - a `let t = p; ..p..; p = t`
+        // restores a stale value and is NOT a no-op.
+        if !ctx.expr_names.contains_key(value)
+            && let naga::Expression::Load { pointer: loaded } = ctx.func.expressions[*value]
+            && ptrs_structurally_equal(loaded, *pointer, &ctx.func.expressions)
+        {
+            return Ok(());
+        }
+
+        // Check if this is the first store to a deferred local var.
+        let deferred_local =
+            if let naga::Expression::LocalVariable(lh) = ctx.func.expressions[*pointer] {
+                if ctx.deferred_vars[lh.index()] {
+                    Some(lh)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        if let Some(lh) = deferred_local {
+            ctx.deferred_vars[lh.index()] = false;
+            self.out.push_str("var ");
+            self.out.push_str(&ctx.local_names[&lh]);
+            // A deferred var's first store IS its declaration, so a
+            // first store of the zero value is equivalent to relying
+            // on WGSL's zero-init.  Drop the value and emit the
+            // shorter `:type` / `=0i` tail (e.g. `var E=vec3f(0)` ->
+            // `var E:vec3f`).
+            if !ctx.expr_names.contains_key(value)
+                && crate::passes::load_dedup::is_zero_init(&ctx.func.expressions, *value)
+            {
+                self.emit_zero_init_tail(ctx.func.local_variables[lh].ty)?;
+            } else {
+                self.push_assign();
+                // When the value is an uncached Literal, use the typed
+                // suffix so WGSL infers the correct concrete type.
+                if !ctx.expr_names.contains_key(value) {
+                    if let naga::Expression::Literal(lit) = ctx.func.expressions[*value] {
+                        self.out.push_str(&super::syntax::literal_to_wgsl(
+                            lit,
+                            &self.options.float_precision,
+                        ));
+                    } else {
+                        self.out.push_str(&self.emit_expr(*value, ctx)?);
+                    }
+                } else {
+                    self.out.push_str(&self.emit_expr(*value, ctx)?);
+                }
+            }
+            self.out.push(';');
+        } else if let Some((cop, other)) = self.try_compound_assign(*pointer, *value, ctx) {
+            self.out.push_str(&self.emit_lvalue(*pointer, ctx)?);
+            if let Some(inc) = self.try_increment(cop, other, *value, ctx) {
+                self.out.push_str(inc);
+            } else {
+                let sp = self.bin_op_sep();
+                self.out.push_str(sp);
+                self.out.push_str(cop);
+                self.out.push_str(sp);
+                self.out
+                    .push_str(&self.emit_compound_assign_rhs(cop, other, ctx)?);
+            }
+            self.out.push(';');
+        } else {
+            self.out.push_str(&self.emit_lvalue(*pointer, ctx)?);
+            self.push_assign();
+            self.out.push_str(&self.emit_expr(*value, ctx)?);
+            self.out.push(';');
+        }
+        Ok(())
+    }
+
+    fn generate_atomic_stmt(
+        &mut self,
+        pointer: &naga::Handle<naga::Expression>,
+        fun: &naga::AtomicFunction,
+        value: &naga::Handle<naga::Expression>,
+        result: &Option<naga::Handle<naga::Expression>>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        let atomic_scalar = self.atomic_scalar_for_expr(*pointer, ctx);
+        let sep = self.comma_sep();
+        let fn_name = match *fun {
+            naga::AtomicFunction::Add => "atomicAdd",
+            naga::AtomicFunction::Subtract => "atomicSub",
+            naga::AtomicFunction::And => "atomicAnd",
+            naga::AtomicFunction::ExclusiveOr => "atomicXor",
+            naga::AtomicFunction::InclusiveOr => "atomicOr",
+            naga::AtomicFunction::Min => "atomicMin",
+            naga::AtomicFunction::Max => "atomicMax",
+            naga::AtomicFunction::Exchange { compare: None } => "atomicExchange",
+            naga::AtomicFunction::Exchange {
+                compare: Some(compare),
+            } => {
+                let mut call = String::from("atomicCompareExchangeWeak(&");
+                call.push_str(&self.emit_expr(*pointer, ctx)?);
+                call.push_str(sep);
+                if let Some(scalar) = atomic_scalar {
+                    call.push_str(&self.emit_expr_for_atomic(compare, scalar, ctx)?);
+                } else {
+                    call.push_str(&self.emit_expr(compare, ctx)?);
+                }
+                call.push_str(sep);
+                if let Some(scalar) = atomic_scalar {
+                    call.push_str(&self.emit_expr_for_atomic(*value, scalar, ctx)?);
+                } else {
+                    call.push_str(&self.emit_expr(*value, ctx)?);
+                }
+                call.push(')');
+                self.emit_call_result(&call, *result, ctx);
+                return Ok(());
+            }
+        };
+        let mut call = String::from(fn_name);
+        call.push_str("(&");
+        call.push_str(&self.emit_expr(*pointer, ctx)?);
+        call.push_str(sep);
+        if let Some(scalar) = atomic_scalar {
+            call.push_str(&self.emit_expr_for_atomic(*value, scalar, ctx)?);
+        } else {
+            call.push_str(&self.emit_expr(*value, ctx)?);
+        }
+        call.push(')');
+        self.emit_call_result(&call, *result, ctx);
+        Ok(())
+    }
+
+    fn generate_image_atomic_stmt(
+        &mut self,
+        image: &naga::Handle<naga::Expression>,
+        coordinate: &naga::Handle<naga::Expression>,
+        array_index: &Option<naga::Handle<naga::Expression>>,
+        fun: &naga::AtomicFunction,
+        value: &naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        let image_atomic_scalar = self.image_atomic_scalar_for_expr(*image, ctx);
+        let fn_name = match *fun {
+            naga::AtomicFunction::Add => "textureAtomicAdd",
+            naga::AtomicFunction::Subtract => "textureAtomicSub",
+            naga::AtomicFunction::And => "textureAtomicAnd",
+            naga::AtomicFunction::ExclusiveOr => "textureAtomicXor",
+            naga::AtomicFunction::InclusiveOr => "textureAtomicOr",
+            naga::AtomicFunction::Min => "textureAtomicMin",
+            naga::AtomicFunction::Max => "textureAtomicMax",
+            naga::AtomicFunction::Exchange { compare: None } => "textureAtomicExchange",
+            naga::AtomicFunction::Exchange {
+                compare: Some(compare),
+            } => {
+                let sep = self.comma_sep();
+                let mut call = String::from("textureAtomicCompareExchangeWeak(");
+                call.push_str(&self.emit_expr(*image, ctx)?);
+                call.push_str(sep);
+                call.push_str(&self.emit_expr(*coordinate, ctx)?);
+                if let Some(index) = array_index {
+                    call.push_str(sep);
+                    call.push_str(&self.emit_expr(*index, ctx)?);
+                }
+                call.push_str(sep);
+                if let Some(scalar) = image_atomic_scalar {
+                    call.push_str(&self.emit_expr_for_atomic(compare, scalar, ctx)?);
+                } else {
+                    call.push_str(&self.emit_expr(compare, ctx)?);
+                }
+                call.push_str(sep);
+                if let Some(scalar) = image_atomic_scalar {
+                    call.push_str(&self.emit_expr_for_atomic(*value, scalar, ctx)?);
+                } else {
+                    call.push_str(&self.emit_expr(*value, ctx)?);
+                }
+                call.push(')');
+                self.out.push_str(&call);
+                self.out.push(';');
+                return Ok(());
+            }
+        };
+        let sep = self.comma_sep();
+        self.out.push_str(fn_name);
+        self.out.push('(');
+        self.out.push_str(&self.emit_expr(*image, ctx)?);
+        self.out.push_str(sep);
+        self.out.push_str(&self.emit_expr(*coordinate, ctx)?);
+        if let Some(index) = array_index {
+            self.out.push_str(sep);
+            self.out.push_str(&self.emit_expr(*index, ctx)?);
+        }
+        self.out.push_str(sep);
+        if let Some(scalar) = image_atomic_scalar {
+            self.out
+                .push_str(&self.emit_expr_for_atomic(*value, scalar, ctx)?);
+        } else {
+            self.out.push_str(&self.emit_expr(*value, ctx)?);
+        }
+        self.out.push_str(");");
+        Ok(())
+    }
+
+    fn generate_ray_query_stmt(
+        &mut self,
+        query: &naga::Handle<naga::Expression>,
+        fun: &naga::RayQueryFunction,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        // naga's validator restricts `query` to
+        // `Expression::LocalVariable` (else `InvalidRayQueryExpression`),
+        // so `emit_expr(query)` is a bare identifier and prepending `&`
+        // for the `&q` operand is always correct.  The debug_assert guards
+        // this: if naga ever relaxes it, branch on the variant here -
+        // pointer function-arguments emit verbatim (no `&`), local/Access
+        // chains keep the `&`.
+        debug_assert!(
+            matches!(
+                ctx.func.expressions[*query],
+                naga::Expression::LocalVariable(_)
+            ),
+            "Statement::RayQuery.query must be a LocalVariable per \
+                     naga's validator; got {:?}",
+            ctx.func.expressions[*query]
+        );
+        let query_text = self.emit_expr(*query, ctx)?;
+        match fun {
+            naga::RayQueryFunction::Initialize {
+                acceleration_structure,
+                descriptor,
+            } => {
+                let sep = self.comma_sep();
+                self.out.push_str("rayQueryInitialize(&");
+                self.out.push_str(&query_text);
+                self.out.push_str(sep);
+                self.out
+                    .push_str(&self.emit_expr(*acceleration_structure, ctx)?);
+                self.out.push_str(sep);
+                self.out.push_str(&self.emit_expr(*descriptor, ctx)?);
+                self.out.push_str(");");
+            }
+            naga::RayQueryFunction::Proceed { result } => {
+                let name = ctx.next_expr_name();
+                self.out.push_str("let ");
+                self.out.push_str(&name);
+                self.push_assign();
+                self.out.push_str("rayQueryProceed(&");
+                self.out.push_str(&query_text);
+                self.out.push_str(");");
+                ctx.expr_names.insert(*result, name);
+            }
+            naga::RayQueryFunction::GenerateIntersection { hit_t } => {
+                let sep = self.comma_sep();
+                self.out.push_str("rayQueryGenerateIntersection(&");
+                self.out.push_str(&query_text);
+                self.out.push_str(sep);
+                // naga's lowerer does not propagate an expected type
+                // into this builtin's argument, so a bare literal
+                // (`10`) concretizes to i32 and fails validation
+                // ("Hit distance must be an f32"); pin the hint.
+                self.out.push_str(&self.emit_expr_with_scalar_hint(
+                    *hit_t,
+                    Some(naga::Scalar::F32),
+                    ctx,
+                )?);
+                self.out.push_str(");");
+            }
+            naga::RayQueryFunction::ConfirmIntersection => {
+                self.out.push_str("rayQueryConfirmIntersection(&");
+                self.out.push_str(&query_text);
+                self.out.push_str(");");
+            }
+            naga::RayQueryFunction::Terminate => {
+                self.out.push_str("rayQueryTerminate(&");
+                self.out.push_str(&query_text);
+                self.out.push_str(");");
             }
         }
         Ok(())

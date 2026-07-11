@@ -41,6 +41,8 @@ use crate::error::Error;
 use crate::passes::load_dedup::get_stored_local;
 use crate::pipeline::{Pass, PassContext};
 
+/// Pass entry point; the algorithm and its safety gates are the
+/// module-level docs.
 pub struct StructBuildPass;
 
 /// `true` when the expression subtree rooted at `h` reads the local `g`

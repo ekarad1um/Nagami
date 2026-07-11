@@ -25,6 +25,10 @@ default = ["cli"]
 cli = ["dep:clap"]
 wasm = ["dep:wasm-bindgen", "dep:js-sys"]
 
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
 [dependencies]
 naga = { version = "30.0.0", default-features = false, features = ["wgsl-in", "wgsl-out"] }
 clap = { version = "4.6", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"], optional = true }

@@ -964,8 +964,11 @@ pub fn visit_statement_expression_handles<F>(
 /// Iterator over the blocks nested directly inside one statement, in
 /// syntactic order.  Construct via [`nested_blocks`].
 pub enum NestedBlocks<'a> {
+    /// Block-free statement: yields nothing.
     None,
+    /// Up to two fixed blocks (`Block` yields one; `If` / `Loop` two).
     Pair(Option<&'a naga::Block>, Option<&'a naga::Block>),
+    /// One body per switch case, in declaration order.
     Cases(std::slice::Iter<'a, naga::SwitchCase>),
 }
 
@@ -983,8 +986,11 @@ impl<'a> Iterator for NestedBlocks<'a> {
 
 /// Mutable twin of [`NestedBlocks`].  Construct via [`nested_blocks_mut`].
 pub enum NestedBlocksMut<'a> {
+    /// Block-free statement: yields nothing.
     None,
+    /// Up to two fixed blocks (`Block` yields one; `If` / `Loop` two).
     Pair(Option<&'a mut naga::Block>, Option<&'a mut naga::Block>),
+    /// One body per switch case, in declaration order.
     Cases(std::slice::IterMut<'a, naga::SwitchCase>),
 }
 
