@@ -5,6 +5,7 @@
 //! one `Emit` over the union range restores the inliner's ability to
 //! fold the expressions back into their consumers.
 
+use super::expr_util::nested_blocks_mut;
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
 
@@ -66,48 +67,8 @@ fn merge_emits_in_block(block: &mut naga::Block) -> bool {
             prev_emit_last = Some(last);
         } else {
             prev_emit_last = None;
-            match stmt {
-                naga::Statement::Block(inner) => {
-                    nested_changed |= merge_emits_in_block(inner);
-                }
-                naga::Statement::If { accept, reject, .. } => {
-                    nested_changed |= merge_emits_in_block(accept);
-                    nested_changed |= merge_emits_in_block(reject);
-                }
-                naga::Statement::Switch { cases, .. } => {
-                    for case in cases.iter_mut() {
-                        nested_changed |= merge_emits_in_block(&mut case.body);
-                    }
-                }
-                naga::Statement::Loop {
-                    body, continuing, ..
-                } => {
-                    nested_changed |= merge_emits_in_block(body);
-                    nested_changed |= merge_emits_in_block(continuing);
-                }
-                // Leaf statements (Emit is already handled by the
-                // outer `if let`).  Listed exhaustively so a new
-                // block-bearing variant trips the build instead of
-                // silently bypassing recursion.
-                naga::Statement::Emit(_)
-                | naga::Statement::Store { .. }
-                | naga::Statement::Break
-                | naga::Statement::Continue
-                | naga::Statement::Return { .. }
-                | naga::Statement::Kill
-                | naga::Statement::ControlBarrier(_)
-                | naga::Statement::MemoryBarrier(_)
-                | naga::Statement::ImageStore { .. }
-                | naga::Statement::ImageAtomic { .. }
-                | naga::Statement::Call { .. }
-                | naga::Statement::Atomic { .. }
-                | naga::Statement::RayQuery { .. }
-                | naga::Statement::RayPipelineFunction(_)
-                | naga::Statement::WorkGroupUniformLoad { .. }
-                | naga::Statement::SubgroupBallot { .. }
-                | naga::Statement::SubgroupGather { .. }
-                | naga::Statement::SubgroupCollectiveOperation { .. }
-                | naga::Statement::CooperativeStore { .. } => {}
+            for nested in nested_blocks_mut(stmt) {
+                nested_changed |= merge_emits_in_block(nested);
             }
         }
     }

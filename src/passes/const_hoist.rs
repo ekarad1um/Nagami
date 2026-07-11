@@ -148,25 +148,11 @@ fn full_literal_vector(
 /// and lets the caller scan only those handles rather than the whole arena.
 fn collect_emitted(block: &naga::Block, out: &mut Vec<naga::Handle<naga::Expression>>) {
     for stmt in block.iter() {
-        match stmt {
-            naga::Statement::Emit(range) => out.extend(range.clone()),
-            naga::Statement::Block(b) => collect_emitted(b, out),
-            naga::Statement::If { accept, reject, .. } => {
-                collect_emitted(accept, out);
-                collect_emitted(reject, out);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    collect_emitted(&case.body, out);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                collect_emitted(body, out);
-                collect_emitted(continuing, out);
-            }
-            _ => {}
+        if let naga::Statement::Emit(range) = stmt {
+            out.extend(range.clone());
+        }
+        for nested in super::expr_util::nested_blocks(stmt) {
+            collect_emitted(nested, out);
         }
     }
 }

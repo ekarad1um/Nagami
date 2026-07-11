@@ -147,70 +147,30 @@ fn remove_call_args_in_block(
     removals: &HashMap<naga::Handle<naga::Function>, Vec<usize>>,
 ) -> Result<(), Error> {
     for stmt in block.iter_mut() {
-        match stmt {
-            naga::Statement::Call {
-                function,
-                arguments,
-                ..
-            } => {
-                if let Some(indices) = removals.get(function) {
-                    for &idx in indices.iter().rev() {
-                        // Surface caller/callee arity drift as a
-                        // structured error attributed to dead_param,
-                        // not as a downstream validation crash under
-                        // some sibling pass's name.
-                        if idx >= arguments.len() {
-                            return Err(Error::Validation(format!(
-                                "dead_param: removal index {idx} out of bounds for call \
-                                 site with {} arguments - caller/callee out of sync",
-                                arguments.len()
-                            )));
-                        }
-                        arguments.remove(idx);
-                    }
+        if let naga::Statement::Call {
+            function,
+            arguments,
+            ..
+        } = stmt
+            && let Some(indices) = removals.get(function)
+        {
+            for &idx in indices.iter().rev() {
+                // Surface caller/callee arity drift as a
+                // structured error attributed to dead_param,
+                // not as a downstream validation crash under
+                // some sibling pass's name.
+                if idx >= arguments.len() {
+                    return Err(Error::Validation(format!(
+                        "dead_param: removal index {idx} out of bounds for call \
+                         site with {} arguments - caller/callee out of sync",
+                        arguments.len()
+                    )));
                 }
+                arguments.remove(idx);
             }
-            naga::Statement::If { accept, reject, .. } => {
-                remove_call_args_in_block(accept, removals)?;
-                remove_call_args_in_block(reject, removals)?;
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases.iter_mut() {
-                    remove_call_args_in_block(&mut case.body, removals)?;
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                remove_call_args_in_block(body, removals)?;
-                remove_call_args_in_block(continuing, removals)?;
-            }
-            naga::Statement::Block(inner) => {
-                remove_call_args_in_block(inner, removals)?;
-            }
-            // Leaf statements - no Call to surgery, no nested blocks.
-            // Enumerated explicitly so a future naga release adding
-            // a new block-bearing variant breaks the build here
-            // instead of silently leaving a Call's argument list
-            // out of sync with the renumbered callee signature.
-            naga::Statement::Emit(_)
-            | naga::Statement::Store { .. }
-            | naga::Statement::Break
-            | naga::Statement::Continue
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
+        }
+        for nested in super::expr_util::nested_blocks_mut(stmt) {
+            remove_call_args_in_block(nested, removals)?;
         }
     }
     Ok(())

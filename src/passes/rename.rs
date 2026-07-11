@@ -24,7 +24,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::Error;
 use crate::name_gen;
-use crate::passes::expr_util::{visit_block_expression_handles, visit_expression_children};
+use crate::passes::expr_util::{
+    nested_blocks, visit_block_expression_handles, visit_expression_children,
+};
 use crate::pipeline::{Pass, PassContext};
 
 /// Rename pass state.  `preserve` lists names that must survive
@@ -447,29 +449,13 @@ fn function_ref_counts(function: &naga::Function) -> Vec<usize> {
 /// liveness signal `function_ref_counts` filters on.
 fn mark_emit_live(block: &naga::Block, live: &mut [bool]) {
     for stmt in block.iter() {
-        match stmt {
-            naga::Statement::Emit(range) => {
-                for h in range.clone() {
-                    live[h.index()] = true;
-                }
+        if let naga::Statement::Emit(range) = stmt {
+            for h in range.clone() {
+                live[h.index()] = true;
             }
-            naga::Statement::Block(inner) => mark_emit_live(inner, live),
-            naga::Statement::If { accept, reject, .. } => {
-                mark_emit_live(accept, live);
-                mark_emit_live(reject, live);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    mark_emit_live(&case.body, live);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                mark_emit_live(body, live);
-                mark_emit_live(continuing, live);
-            }
-            _ => {}
+        }
+        for nested in nested_blocks(stmt) {
+            mark_emit_live(nested, live);
         }
     }
 }
@@ -478,27 +464,11 @@ fn mark_emit_live(block: &naga::Block, live: &mut [bool]) {
 /// flow) so a frequently-called function earns a shorter name.
 fn count_calls(block: &naga::Block, calls: &mut HashMap<naga::Handle<naga::Function>, usize>) {
     for stmt in block.iter() {
-        match stmt {
-            naga::Statement::Call { function, .. } => {
-                *calls.entry(*function).or_insert(0) += 1;
-            }
-            naga::Statement::Block(inner) => count_calls(inner, calls),
-            naga::Statement::If { accept, reject, .. } => {
-                count_calls(accept, calls);
-                count_calls(reject, calls);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    count_calls(&case.body, calls);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                count_calls(body, calls);
-                count_calls(continuing, calls);
-            }
-            _ => {}
+        if let naga::Statement::Call { function, .. } = stmt {
+            *calls.entry(*function).or_insert(0) += 1;
+        }
+        for nested in nested_blocks(stmt) {
+            count_calls(nested, calls);
         }
     }
 }

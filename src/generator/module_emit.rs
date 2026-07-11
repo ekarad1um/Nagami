@@ -1297,29 +1297,13 @@ pub(super) fn compute_expression_ref_counts(func: &naga::Function) -> FunctionEx
 /// expression ref counting.
 pub(super) fn collect_emitted_handles(block: &naga::Block, live: &mut Vec<bool>) {
     for stmt in block {
-        match stmt {
-            naga::Statement::Emit(range) => {
-                for h in range.clone() {
-                    live[h.index()] = true;
-                }
+        if let naga::Statement::Emit(range) = stmt {
+            for h in range.clone() {
+                live[h.index()] = true;
             }
-            naga::Statement::Block(inner) => collect_emitted_handles(inner, live),
-            naga::Statement::If { accept, reject, .. } => {
-                collect_emitted_handles(accept, live);
-                collect_emitted_handles(reject, live);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    collect_emitted_handles(&case.body, live);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                collect_emitted_handles(body, live);
-                collect_emitted_handles(continuing, live);
-            }
-            _ => {}
+        }
+        for nested in crate::passes::expr_util::nested_blocks(stmt) {
+            collect_emitted_handles(nested, live);
         }
     }
 }
@@ -1358,33 +1342,16 @@ fn count_expr_children(expr: &naga::Expression, counts: &mut [usize]) {
 fn count_block_refs(block: &naga::Block, counts: &mut Vec<usize>) {
     for stmt in block {
         match stmt {
-            naga::Statement::Emit(_) => {}
-            naga::Statement::Block(inner) => count_block_refs(inner, counts),
-            naga::Statement::If {
-                condition,
-                accept,
-                reject,
-            } => {
+            naga::Statement::If { condition, .. } => {
                 bump(counts, *condition);
-                count_block_refs(accept, counts);
-                count_block_refs(reject, counts);
             }
-            naga::Statement::Switch { selector, cases } => {
+            naga::Statement::Switch { selector, .. } => {
                 bump(counts, *selector);
-                for case in cases {
-                    count_block_refs(&case.body, counts);
-                }
             }
             naga::Statement::Loop {
-                body,
-                continuing,
-                break_if,
+                break_if: Some(h), ..
             } => {
-                count_block_refs(body, counts);
-                count_block_refs(continuing, counts);
-                if let Some(h) = break_if {
-                    bump(counts, *h);
-                }
+                bump(counts, *h);
             }
             naga::Statement::Return { value: Some(h) } => {
                 bump(counts, *h);
@@ -1500,6 +1467,9 @@ fn count_block_refs(block: &naga::Block, counts: &mut Vec<usize>) {
                 bump(counts, data.stride);
             }
             _ => {}
+        }
+        for nested in crate::passes::expr_util::nested_blocks(stmt) {
+            count_block_refs(nested, counts);
         }
     }
 }
@@ -1817,25 +1787,10 @@ fn collect_block_local_refs(
                     | naga::RayQueryFunction::Terminate => {}
                 }
             }
-            naga::Statement::Block(inner) => {
-                collect_block_local_refs(inner, expressions, expr_reads, seen);
-            }
-            naga::Statement::If { accept, reject, .. } => {
-                collect_block_local_refs(accept, expressions, expr_reads, seen);
-                collect_block_local_refs(reject, expressions, expr_reads, seen);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    collect_block_local_refs(&case.body, expressions, expr_reads, seen);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                collect_block_local_refs(body, expressions, expr_reads, seen);
-                collect_block_local_refs(continuing, expressions, expr_reads, seen);
-            }
             _ => {}
+        }
+        for nested in crate::passes::expr_util::nested_blocks(stmt) {
+            collect_block_local_refs(nested, expressions, expr_reads, seen);
         }
     }
 }
@@ -2242,60 +2197,19 @@ fn find_inlineable_calls(
                     pending.clear();
                 }
             }
-            naga::Statement::If { accept, reject, .. } => {
+            // Every other statement is (or may be) side-effecting: drop the
+            // pending set, then analyse any nested blocks independently
+            // (each starts with its own empty pending set).
+            _ => {
                 pending.clear();
-                result.extend(find_inlineable_calls(
-                    accept,
-                    ref_counts,
-                    expressions,
-                    pure_functions,
-                ));
-                result.extend(find_inlineable_calls(
-                    reject,
-                    ref_counts,
-                    expressions,
-                    pure_functions,
-                ));
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                pending.clear();
-                result.extend(find_inlineable_calls(
-                    body,
-                    ref_counts,
-                    expressions,
-                    pure_functions,
-                ));
-                result.extend(find_inlineable_calls(
-                    continuing,
-                    ref_counts,
-                    expressions,
-                    pure_functions,
-                ));
-            }
-            naga::Statement::Switch { cases, .. } => {
-                pending.clear();
-                for case in cases {
+                for nested in crate::passes::expr_util::nested_blocks(stmt) {
                     result.extend(find_inlineable_calls(
-                        &case.body,
+                        nested,
                         ref_counts,
                         expressions,
                         pure_functions,
                     ));
                 }
-            }
-            naga::Statement::Block(inner) => {
-                pending.clear();
-                result.extend(find_inlineable_calls(
-                    inner,
-                    ref_counts,
-                    expressions,
-                    pure_functions,
-                ));
-            }
-            _ => {
-                pending.clear();
             }
         }
     }
@@ -2906,24 +2820,8 @@ fn collect_block_write_effects(
 ) {
     for stmt in block.iter() {
         statement_write_effects(stmt, expressions, out);
-        match stmt {
-            naga::Statement::Block(inner) => collect_block_write_effects(inner, expressions, out),
-            naga::Statement::If { accept, reject, .. } => {
-                collect_block_write_effects(accept, expressions, out);
-                collect_block_write_effects(reject, expressions, out);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    collect_block_write_effects(&case.body, expressions, out);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                collect_block_write_effects(body, expressions, out);
-                collect_block_write_effects(continuing, expressions, out);
-            }
-            _ => {}
+        for nested in crate::passes::expr_util::nested_blocks(stmt) {
+            collect_block_write_effects(nested, expressions, out);
         }
     }
 }
@@ -3503,31 +3401,8 @@ fn scan_block_deferrable_vars(
             _ => {
                 // For control-flow and other compound statements, conservatively
                 // mark every candidate local referenced in sub-blocks as seen.
-                match stmt {
-                    naga::Statement::If { accept, reject, .. } => {
-                        collect_block_local_refs(accept, expressions, expr_reads, &mut seen);
-                        collect_block_local_refs(reject, expressions, expr_reads, &mut seen);
-                    }
-                    naga::Statement::Switch { cases, .. } => {
-                        for case in cases {
-                            collect_block_local_refs(
-                                &case.body,
-                                expressions,
-                                expr_reads,
-                                &mut seen,
-                            );
-                        }
-                    }
-                    naga::Statement::Loop {
-                        body, continuing, ..
-                    } => {
-                        collect_block_local_refs(body, expressions, expr_reads, &mut seen);
-                        collect_block_local_refs(continuing, expressions, expr_reads, &mut seen);
-                    }
-                    naga::Statement::Block(inner) => {
-                        collect_block_local_refs(inner, expressions, expr_reads, &mut seen);
-                    }
-                    _ => {}
+                for nested in crate::passes::expr_util::nested_blocks(stmt) {
+                    collect_block_local_refs(nested, expressions, expr_reads, &mut seen);
                 }
             }
         }
@@ -3844,32 +3719,13 @@ fn compute_block_ownership(
             _ => {}
         }
         // For compound statements, scan sub-blocks and attribute to `idx`.
-        match stmt {
-            naga::Statement::If { accept, reject, .. } => {
-                tmp_seen.fill(false);
-                collect_block_local_refs(accept, expressions, expr_reads, &mut tmp_seen);
-                collect_block_local_refs(reject, expressions, expr_reads, &mut tmp_seen);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                tmp_seen.fill(false);
-                for case in cases {
-                    collect_block_local_refs(&case.body, expressions, expr_reads, &mut tmp_seen);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                tmp_seen.fill(false);
-                collect_block_local_refs(body, expressions, expr_reads, &mut tmp_seen);
-                collect_block_local_refs(continuing, expressions, expr_reads, &mut tmp_seen);
-            }
-            naga::Statement::Block(inner) => {
-                tmp_seen.fill(false);
-                collect_block_local_refs(inner, expressions, expr_reads, &mut tmp_seen);
-            }
-            _ => {
-                continue; // Leaf statement - no sub-block refs to drain.
-            }
+        let mut nested = crate::passes::expr_util::nested_blocks(stmt).peekable();
+        if nested.peek().is_none() {
+            continue; // Leaf statement - no sub-block refs to drain.
+        }
+        tmp_seen.fill(false);
+        for sub in nested {
+            collect_block_local_refs(sub, expressions, expr_reads, &mut tmp_seen);
         }
         for (i, &s) in tmp_seen.iter().enumerate() {
             if s {

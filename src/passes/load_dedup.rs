@@ -27,7 +27,8 @@ use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
 
 use super::expr_util::{
-    flatten_replacement_chains, remap_statement_handles, try_map_expression_handles_in_place,
+    flatten_replacement_chains, nested_blocks, nested_blocks_mut, remap_statement_handles,
+    try_map_expression_handles_in_place,
 };
 use super::scoped_map::ScopedMap;
 
@@ -210,9 +211,11 @@ impl<'body> ExpressionScopeIndex<'body> {
     /// populates `handle_pos` / `store_pos` for the variants that
     /// contribute, and records the block's `[enter, exit)` interval
     /// on exit.  The match is exhaustive (no `_ => {}` catch-all) so
-    /// a future naga release adding a new emit-handle-bearing or
-    /// block-bearing statement variant trips the build here instead
-    /// of silently slipping past this index's coverage.
+    /// a future naga release adding a new emit-handle-bearing
+    /// statement variant trips the build here instead of silently
+    /// slipping past this index's coverage; block descent is
+    /// delegated to [`nested_blocks`] for the same guarantee on the
+    /// recursion axis.
     fn walk(&mut self, block: &'body naga::Block, pos: &mut u32) {
         let enter = *pos;
         for stmt in block.iter() {
@@ -261,31 +264,16 @@ impl<'body> ExpressionScopeIndex<'body> {
                         self.handle_pos[result.index()] = Some(here);
                     }
                 }
-                naga::Statement::Block(inner) => {
-                    self.walk(inner, pos);
-                }
-                naga::Statement::If { accept, reject, .. } => {
-                    self.walk(accept, pos);
-                    self.walk(reject, pos);
-                }
-                naga::Statement::Switch { cases, .. } => {
-                    for case in cases {
-                        self.walk(&case.body, pos);
-                    }
-                }
-                naga::Statement::Loop {
-                    body, continuing, ..
-                } => {
-                    self.walk(body, pos);
-                    self.walk(continuing, pos);
-                }
-                // Statements that introduce no expression handles
-                // (no Emit range, no result field, no Store identity)
-                // and contain no nested blocks.  Enumerated explicitly
-                // - a future naga variant that adds emit-handle
-                // semantics or carries a nested block would otherwise
-                // silently bypass this index.
-                naga::Statement::Call { result: None, .. }
+                // Statements that introduce no expression handles (no
+                // Emit range, no result field, no Store identity).
+                // Enumerated explicitly - a future naga variant that
+                // adds emit-handle semantics would otherwise silently
+                // bypass this index.  Nested blocks recurse below.
+                naga::Statement::Block(_)
+                | naga::Statement::If { .. }
+                | naga::Statement::Switch { .. }
+                | naga::Statement::Loop { .. }
+                | naga::Statement::Call { result: None, .. }
                 | naga::Statement::Atomic { result: None, .. }
                 | naga::Statement::Break
                 | naga::Statement::Continue
@@ -297,6 +285,9 @@ impl<'body> ExpressionScopeIndex<'body> {
                 | naga::Statement::ImageAtomic { .. }
                 | naga::Statement::RayPipelineFunction(_)
                 | naga::Statement::CooperativeStore { .. } => {}
+            }
+            for nested in nested_blocks(stmt) {
+                self.walk(nested, pos);
             }
         }
         self.block_interval
@@ -473,24 +464,6 @@ fn find_dead_inits(
                     pending.remove(&local);
                 }
             }
-            // Control-flow: stop tracking any local involved inside.
-            naga::Statement::If { accept, reject, .. } => {
-                invalidate_involved(&[accept, reject], expressions, &mut pending);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                let blocks: Vec<&naga::Block> = cases.iter().map(|c| &c.body).collect();
-                invalidate_involved(&blocks, expressions, &mut pending);
-            }
-            naga::Statement::Loop {
-                body: lb,
-                continuing,
-                ..
-            } => {
-                invalidate_involved(&[lb, continuing], expressions, &mut pending);
-            }
-            naga::Statement::Block(inner) => {
-                invalidate_involved(&[inner], expressions, &mut pending);
-            }
             // Statements that may modify a single local through a pointer.
             naga::Statement::Call { arguments, .. } => {
                 for &arg in arguments {
@@ -524,12 +497,19 @@ fn find_dead_inits(
                     pending.remove(&local);
                 }
             }
-            // Statements that do not touch local-variable inits and
-            // do not contain nested blocks - enumerated explicitly
-            // so a future naga release adding a new pointer-bearing
-            // statement breaks the build here instead of silently
-            // letting an init survive past a Store-through-it.
-            naga::Statement::Break
+            // Statements that neither touch local-variable inits
+            // directly nor modify one through a pointer channel -
+            // enumerated explicitly so a future naga release adding a
+            // new pointer-bearing statement breaks the build here
+            // instead of silently letting an init survive past a
+            // Store-through-it.  Nested blocks (control flow) carry no
+            // direct action; the post-match sweep invalidates every
+            // local they touch.
+            naga::Statement::Block(_)
+            | naga::Statement::If { .. }
+            | naga::Statement::Switch { .. }
+            | naga::Statement::Loop { .. }
+            | naga::Statement::Break
             | naga::Statement::Continue
             | naga::Statement::Return { .. }
             | naga::Statement::Kill
@@ -542,22 +522,24 @@ fn find_dead_inits(
             | naga::Statement::SubgroupGather { .. }
             | naga::Statement::SubgroupCollectiveOperation { .. } => {}
         }
+        invalidate_involved(stmt, expressions, &mut pending);
     }
     dead
 }
 
 /// Remove `pending` entries for any local that is loaded OR modified
-/// inside the given sub-blocks.  Used by `find_dead_inits` to drop
+/// inside `stmt`'s nested blocks.  Used by `find_dead_inits` to drop
 /// init-tracking for any local that might be observed (read) or
 /// mutated (write) on a path through a sub-block - either case means
-/// the init cannot be proved dead from a top-level scan.
+/// the init cannot be proved dead from a top-level scan.  No-op for
+/// block-free statements.
 fn invalidate_involved(
-    blocks: &[&naga::Block],
+    stmt: &naga::Statement,
     expressions: &naga::Arena<naga::Expression>,
     pending: &mut HashSet<naga::Handle<naga::LocalVariable>>,
 ) {
     let mut involved = HashSet::new();
-    for block in blocks {
+    for block in nested_blocks(stmt) {
         collect_touched_locals(block, expressions, &mut involved);
     }
     for lh in &involved {
@@ -625,31 +607,16 @@ fn collect_touched_locals(
                     touched.insert(lh);
                 }
             }
-            // Recurse into nested blocks.
-            naga::Statement::If { accept, reject, .. } => {
-                collect_touched_locals(accept, expressions, touched);
-                collect_touched_locals(reject, expressions, touched);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    collect_touched_locals(&case.body, expressions, touched);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                collect_touched_locals(body, expressions, touched);
-                collect_touched_locals(continuing, expressions, touched);
-            }
-            naga::Statement::Block(inner) => {
-                collect_touched_locals(inner, expressions, touched);
-            }
-            // Statements that neither read a local through `Load`
-            // nor write a local through any pointer-bearing field,
-            // and contain no nested blocks.  Enumerated explicitly
-            // so a future naga variant breaks the build here rather
-            // than silently mis-classifying a touch.
-            naga::Statement::Break
+            // Statements that neither read a local through `Load` nor
+            // write a local through any pointer-bearing field.
+            // Enumerated explicitly so a future naga variant breaks
+            // the build here rather than silently mis-classifying a
+            // touch.  Nested blocks recurse below.
+            naga::Statement::Block(_)
+            | naga::Statement::If { .. }
+            | naga::Statement::Switch { .. }
+            | naga::Statement::Loop { .. }
+            | naga::Statement::Break
             | naga::Statement::Continue
             | naga::Statement::Return { .. }
             | naga::Statement::Kill
@@ -661,6 +628,9 @@ fn collect_touched_locals(
             | naga::Statement::SubgroupBallot { .. }
             | naga::Statement::SubgroupGather { .. }
             | naga::Statement::SubgroupCollectiveOperation { .. } => {}
+        }
+        for nested in nested_blocks(stmt) {
+            collect_touched_locals(nested, expressions, touched);
         }
     }
 }
@@ -753,31 +723,18 @@ fn collect_nonstore_pointer_locals(
         match stmt {
             naga::Statement::Atomic { pointer, .. } => mark(*pointer, used),
             naga::Statement::WorkGroupUniformLoad { pointer, .. } => mark(*pointer, used),
-            naga::Statement::If { accept, reject, .. } => {
-                collect_nonstore_pointer_locals(accept, expressions, used);
-                collect_nonstore_pointer_locals(reject, expressions, used);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    collect_nonstore_pointer_locals(&case.body, expressions, used);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                collect_nonstore_pointer_locals(body, expressions, used);
-                collect_nonstore_pointer_locals(continuing, expressions, used);
-            }
-            naga::Statement::Block(inner) => {
-                collect_nonstore_pointer_locals(inner, expressions, used)
-            }
-            // Statements that neither observe a local through a pointer nor
-            // carry a nested block.  `Store` is excluded by design (it is the
-            // write this analysis is proving dead); callee/atomic/cooperative
-            // pointer escapes are covered by `collect_escaped_and_partially_stored`.
-            // Enumerated (no `_`) per this file's forward-compat contract, so a
-            // future block- or pointer-bearing variant trips the build here.
+            // Statements that do not observe a local through a pointer.
+            // `Store` is excluded by design (it is the write this analysis is
+            // proving dead); callee/atomic/cooperative pointer escapes are
+            // covered by `collect_escaped_and_partially_stored`.  Enumerated
+            // (no `_`) per this file's forward-compat contract, so a future
+            // pointer-bearing variant trips the build here.  Nested blocks
+            // recurse below.
             naga::Statement::Emit(_)
+            | naga::Statement::Block(_)
+            | naga::Statement::If { .. }
+            | naga::Statement::Switch { .. }
+            | naga::Statement::Loop { .. }
             | naga::Statement::Store { .. }
             | naga::Statement::Call { .. }
             | naga::Statement::Break
@@ -795,6 +752,9 @@ fn collect_nonstore_pointer_locals(
             | naga::Statement::SubgroupGather { .. }
             | naga::Statement::SubgroupCollectiveOperation { .. } => {}
         }
+        for nested in nested_blocks(stmt) {
+            collect_nonstore_pointer_locals(nested, expressions, used);
+        }
     }
 }
 
@@ -808,55 +768,15 @@ fn remove_stores_to_dead_locals(
     let mut changed = false;
     let original = std::mem::replace(block, naga::Block::new());
     for (mut stmt, span) in original.span_into_iter() {
-        match &mut stmt {
-            naga::Statement::Store { pointer, .. } => {
-                if let Some(local) = get_stored_local(expressions, *pointer)
-                    && !used.contains(&local)
-                {
-                    changed = true;
-                    continue; // drop the dead store
-                }
-            }
-            naga::Statement::If { accept, reject, .. } => {
-                changed |= remove_stores_to_dead_locals(accept, expressions, used);
-                changed |= remove_stores_to_dead_locals(reject, expressions, used);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases.iter_mut() {
-                    changed |= remove_stores_to_dead_locals(&mut case.body, expressions, used);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                changed |= remove_stores_to_dead_locals(body, expressions, used);
-                changed |= remove_stores_to_dead_locals(continuing, expressions, used);
-            }
-            naga::Statement::Block(inner) => {
-                changed |= remove_stores_to_dead_locals(inner, expressions, used);
-            }
-            // Non-`Store`, non-block statements are passed through untouched.
-            // Enumerated (no `_`) per this file's forward-compat contract, so a
-            // future block-bearing variant trips the build rather than silently
-            // skipping recursion into it.
-            naga::Statement::Emit(_)
-            | naga::Statement::Call { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::Break
-            | naga::Statement::Continue
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::CooperativeStore { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. } => {}
+        if let naga::Statement::Store { pointer, .. } = &stmt
+            && let Some(local) = get_stored_local(expressions, *pointer)
+            && !used.contains(&local)
+        {
+            changed = true;
+            continue; // drop the dead store
+        }
+        for nested in nested_blocks_mut(&mut stmt) {
+            changed |= remove_stores_to_dead_locals(nested, expressions, used);
         }
         block.push(stmt, span);
     }
@@ -873,50 +793,8 @@ fn remove_dead_stores_in_block(
 
     // Recurse into sub-blocks first.
     for stmt in block.iter_mut() {
-        match stmt {
-            naga::Statement::If { accept, reject, .. } => {
-                changed |= remove_dead_stores_in_block(accept, expressions);
-                changed |= remove_dead_stores_in_block(reject, expressions);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    changed |= remove_dead_stores_in_block(&mut case.body, expressions);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                changed |= remove_dead_stores_in_block(body, expressions);
-                changed |= remove_dead_stores_in_block(continuing, expressions);
-            }
-            naga::Statement::Block(inner) => {
-                changed |= remove_dead_stores_in_block(inner, expressions);
-            }
-            // Leaf statements - the dead-Store linear scan below
-            // handles all non-block statements; recursion only fires
-            // for block-bearing variants.  Enumerated explicitly so a
-            // future naga release adding a new block-bearing variant
-            // breaks the build here instead of silently bypassing
-            // recursion.
-            naga::Statement::Emit(_)
-            | naga::Statement::Store { .. }
-            | naga::Statement::Break
-            | naga::Statement::Continue
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Call { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
+        for nested in nested_blocks_mut(stmt) {
+            changed |= remove_dead_stores_in_block(nested, expressions);
         }
     }
 
@@ -1561,50 +1439,16 @@ fn collect_escaped_and_partially_stored(
                     escaped.insert(local);
                 }
             }
-            naga::Statement::Block(inner) => {
-                collect_escaped_and_partially_stored(inner, expressions, escaped, partially_stored);
-            }
-            naga::Statement::If { accept, reject, .. } => {
-                collect_escaped_and_partially_stored(
-                    accept,
-                    expressions,
-                    escaped,
-                    partially_stored,
-                );
-                collect_escaped_and_partially_stored(
-                    reject,
-                    expressions,
-                    escaped,
-                    partially_stored,
-                );
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    collect_escaped_and_partially_stored(
-                        &case.body,
-                        expressions,
-                        escaped,
-                        partially_stored,
-                    );
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                collect_escaped_and_partially_stored(body, expressions, escaped, partially_stored);
-                collect_escaped_and_partially_stored(
-                    continuing,
-                    expressions,
-                    escaped,
-                    partially_stored,
-                );
-            }
-            // Statements that neither escape a local through a pointer
-            // nor contain nested blocks - enumerated explicitly so a
-            // future naga release adding a new pointer-bearing variant
-            // breaks the build here instead of silently leaving a
-            // local mis-classified as un-escaped.
+            // Statements that do not escape a local through a pointer -
+            // enumerated explicitly so a future naga release adding a
+            // new pointer-bearing variant breaks the build here instead
+            // of silently leaving a local mis-classified as un-escaped.
+            // Nested blocks recurse below.
             naga::Statement::Emit(_)
+            | naga::Statement::Block(_)
+            | naga::Statement::If { .. }
+            | naga::Statement::Switch { .. }
+            | naga::Statement::Loop { .. }
             | naga::Statement::Atomic { .. }
             | naga::Statement::Break
             | naga::Statement::Continue
@@ -1618,6 +1462,9 @@ fn collect_escaped_and_partially_stored(
             | naga::Statement::SubgroupBallot { .. }
             | naga::Statement::SubgroupGather { .. }
             | naga::Statement::SubgroupCollectiveOperation { .. } => {}
+        }
+        for nested in nested_blocks(stmt) {
+            collect_escaped_and_partially_stored(nested, expressions, escaped, partially_stored);
         }
     }
 }
@@ -1664,25 +1511,10 @@ fn count_stores_recursive(
                     *counts.entry(lh).or_insert(0) += 1;
                 }
             }
-            naga::Statement::If { accept, reject, .. } => {
-                count_stores_recursive(accept, expressions, counts);
-                count_stores_recursive(reject, expressions, counts);
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                count_stores_recursive(body, expressions, counts);
-                count_stores_recursive(continuing, expressions, counts);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    count_stores_recursive(&case.body, expressions, counts);
-                }
-            }
-            naga::Statement::Block(inner) => {
-                count_stores_recursive(inner, expressions, counts);
-            }
             _ => {}
+        }
+        for nested in nested_blocks(stmt) {
+            count_stores_recursive(nested, expressions, counts);
         }
     }
 }
@@ -2365,25 +2197,10 @@ fn collect_escaped_locals(
                     escaped.insert(local);
                 }
             }
-            naga::Statement::If { accept, reject, .. } => {
-                collect_escaped_locals(accept, expressions, escaped);
-                collect_escaped_locals(reject, expressions, escaped);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    collect_escaped_locals(&case.body, expressions, escaped);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                collect_escaped_locals(body, expressions, escaped);
-                collect_escaped_locals(continuing, expressions, escaped);
-            }
-            naga::Statement::Block(inner) => {
-                collect_escaped_locals(inner, expressions, escaped);
-            }
             _ => {}
+        }
+        for nested in nested_blocks(stmt) {
+            collect_escaped_locals(nested, expressions, escaped);
         }
     }
 }
@@ -2430,31 +2247,17 @@ pub(crate) fn collect_modified_locals(
                     modified.insert(lh);
                 }
             }
-            naga::Statement::If { accept, reject, .. } => {
-                collect_modified_locals(accept, expressions, modified);
-                collect_modified_locals(reject, expressions, modified);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    collect_modified_locals(&case.body, expressions, modified);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                collect_modified_locals(body, expressions, modified);
-                collect_modified_locals(continuing, expressions, modified);
-            }
-            naga::Statement::Block(inner) => {
-                collect_modified_locals(inner, expressions, modified);
-            }
-            // Statements that neither modify a function-local through
-            // a pointer nor contain nested blocks - enumerated
-            // explicitly so a future naga release adding a new
-            // pointer-bearing variant breaks the build here instead
-            // of silently leaving a local out of the modified set
-            // (and thereby letting the caller forward a stale value).
+            // Statements that do not modify a function-local through a
+            // pointer - enumerated explicitly so a future naga release
+            // adding a new pointer-bearing variant breaks the build
+            // here instead of silently leaving a local out of the
+            // modified set (and thereby letting the caller forward a
+            // stale value).  Nested blocks recurse below.
             naga::Statement::Emit(_)
+            | naga::Statement::Block(_)
+            | naga::Statement::If { .. }
+            | naga::Statement::Switch { .. }
+            | naga::Statement::Loop { .. }
             | naga::Statement::Break
             | naga::Statement::Continue
             | naga::Statement::Return { .. }
@@ -2467,6 +2270,9 @@ pub(crate) fn collect_modified_locals(
             | naga::Statement::SubgroupBallot { .. }
             | naga::Statement::SubgroupGather { .. }
             | naga::Statement::SubgroupCollectiveOperation { .. } => {}
+        }
+        for nested in nested_blocks(stmt) {
+            collect_modified_locals(nested, expressions, modified);
         }
     }
 }
@@ -2497,7 +2303,7 @@ fn apply_to_block(
     let mut rebuilt = naga::Block::with_capacity(original.len());
 
     for (mut statement, span) in original.span_into_iter() {
-        match &mut statement {
+        match &statement {
             naga::Statement::Emit(range) => {
                 // Every entry in `replacements` is effective (target precedes
                 // the load; see the retain in `dedup_loads_in_function`), so a
@@ -2547,89 +2353,19 @@ fn apply_to_block(
                     continue;
                 }
             }
-            naga::Statement::Block(inner) => {
-                apply_to_block(
-                    inner,
-                    replacements,
-                    dead_locals,
-                    dead_store_ids,
-                    expressions,
-                    in_loop,
-                );
-            }
-            naga::Statement::If { accept, reject, .. } => {
-                apply_to_block(
-                    accept,
-                    replacements,
-                    dead_locals,
-                    dead_store_ids,
-                    expressions,
-                    in_loop,
-                );
-                apply_to_block(
-                    reject,
-                    replacements,
-                    dead_locals,
-                    dead_store_ids,
-                    expressions,
-                    in_loop,
-                );
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases.iter_mut() {
-                    apply_to_block(
-                        &mut case.body,
-                        replacements,
-                        dead_locals,
-                        dead_store_ids,
-                        expressions,
-                        in_loop,
-                    );
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                apply_to_block(
-                    body,
-                    replacements,
-                    dead_locals,
-                    dead_store_ids,
-                    expressions,
-                    true,
-                );
-                apply_to_block(
-                    continuing,
-                    replacements,
-                    dead_locals,
-                    dead_store_ids,
-                    expressions,
-                    true,
-                );
-            }
-            // Leaf statements - apply_to_block only specializes Emit
-            // (range rebuild) and Store (dead-Store filter); every
-            // other variant is preserved verbatim.  Enumerated
-            // explicitly so a future naga release adding a new
-            // block-bearing variant breaks the build here instead
-            // of silently skipping recursion through it.
-            naga::Statement::Break
-            | naga::Statement::Continue
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Call { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
+            _ => {}
+        }
+
+        let enter_loop = in_loop || matches!(statement, naga::Statement::Loop { .. });
+        for nested in nested_blocks_mut(&mut statement) {
+            apply_to_block(
+                nested,
+                replacements,
+                dead_locals,
+                dead_store_ids,
+                expressions,
+                enter_loop,
+            );
         }
 
         let mut remap = |h: naga::Handle<naga::Expression>| -> naga::Handle<naga::Expression> {
@@ -2683,19 +2419,11 @@ mod tests {
     }
 
     fn is_handle_in_any_emit(block: &naga::Block, target: naga::Handle<naga::Expression>) -> bool {
-        block.iter().any(|statement| match statement {
-            naga::Statement::Emit(range) => range.clone().any(|h| h == target),
-            naga::Statement::Block(inner) => is_handle_in_any_emit(inner, target),
-            naga::Statement::If { accept, reject, .. } => {
-                is_handle_in_any_emit(accept, target) || is_handle_in_any_emit(reject, target)
+        block.iter().any(|statement| {
+            if let naga::Statement::Emit(range) = statement {
+                return range.clone().any(|h| h == target);
             }
-            naga::Statement::Switch { cases, .. } => cases
-                .iter()
-                .any(|case| is_handle_in_any_emit(&case.body, target)),
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => is_handle_in_any_emit(body, target) || is_handle_in_any_emit(continuing, target),
-            _ => false,
+            nested_blocks(statement).any(|b| is_handle_in_any_emit(b, target))
         })
     }
 
@@ -2897,18 +2625,11 @@ fn fs_main() -> @location(0) vec4f {
         fn count_stores(block: &naga::Block) -> usize {
             let mut count = 0;
             for stmt in block {
-                match stmt {
-                    naga::Statement::Store { .. } => count += 1,
-                    naga::Statement::Block(inner) => count += count_stores(inner),
-                    naga::Statement::If { accept, reject, .. } => {
-                        count += count_stores(accept) + count_stores(reject);
-                    }
-                    naga::Statement::Loop {
-                        body, continuing, ..
-                    } => {
-                        count += count_stores(body) + count_stores(continuing);
-                    }
-                    _ => {}
+                if matches!(stmt, naga::Statement::Store { .. }) {
+                    count += 1;
+                }
+                for nested in nested_blocks(stmt) {
+                    count += count_stores(nested);
                 }
             }
             count
@@ -4400,19 +4121,11 @@ fn fs_main() -> @location(0) vec4f {
     }
 
     fn has_store_to(block: &naga::Block, ptr_h: naga::Handle<naga::Expression>) -> bool {
-        block.iter().any(|stmt| match stmt {
-            naga::Statement::Store { pointer, .. } => *pointer == ptr_h,
-            naga::Statement::Block(inner) => has_store_to(inner, ptr_h),
-            naga::Statement::If { accept, reject, .. } => {
-                has_store_to(accept, ptr_h) || has_store_to(reject, ptr_h)
+        block.iter().any(|stmt| {
+            if let naga::Statement::Store { pointer, .. } = stmt {
+                return *pointer == ptr_h;
             }
-            naga::Statement::Switch { cases, .. } => {
-                cases.iter().any(|case| has_store_to(&case.body, ptr_h))
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => has_store_to(body, ptr_h) || has_store_to(continuing, ptr_h),
-            _ => false,
+            nested_blocks(stmt).any(|b| has_store_to(b, ptr_h))
         })
     }
 
@@ -4456,31 +4169,14 @@ fn fs_main() -> @location(0) vec4f {
             count: &mut usize,
         ) {
             for stmt in block {
-                match stmt {
-                    naga::Statement::Store { pointer, .. } => {
-                        if let naga::Expression::LocalVariable(lh) = expressions[*pointer]
-                            && lh == local
-                        {
-                            *count += 1;
-                        }
-                    }
-                    naga::Statement::Block(inner) => walk(inner, expressions, local, count),
-                    naga::Statement::If { accept, reject, .. } => {
-                        walk(accept, expressions, local, count);
-                        walk(reject, expressions, local, count);
-                    }
-                    naga::Statement::Switch { cases, .. } => {
-                        for case in cases {
-                            walk(&case.body, expressions, local, count);
-                        }
-                    }
-                    naga::Statement::Loop {
-                        body, continuing, ..
-                    } => {
-                        walk(body, expressions, local, count);
-                        walk(continuing, expressions, local, count);
-                    }
-                    _ => {}
+                if let naga::Statement::Store { pointer, .. } = stmt
+                    && let naga::Expression::LocalVariable(lh) = expressions[*pointer]
+                    && lh == local
+                {
+                    *count += 1;
+                }
+                for nested in nested_blocks(stmt) {
+                    walk(nested, expressions, local, count);
                 }
             }
         }

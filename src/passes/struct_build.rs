@@ -468,6 +468,15 @@ fn visit_statement_expressions(
             f(*pointer);
             f(*result);
         }
+        // The catch-all is sound for the local-mention consumers because
+        // every COMPUTED expression is rooted through the `Emit` arm; a
+        // variant may be skipped here iff its own handle fields are all
+        // Emit'd computations, childless result expressions (which cannot
+        // mention a local), or pointers that can never root at a
+        // struct-typed function local (`RayQuery::query`,
+        // `WorkGroupUniformLoad::pointer`).  Bare-`LocalVariable` fields
+        // that CAN root at one - `Store::pointer`, `Call::arguments` -
+        // must have explicit arms above.
         _ => {}
     }
     let _ = arena;
@@ -477,26 +486,9 @@ fn visit_statement_expressions(
 /// every statement reachable through a block-bearing statement, NOT the
 /// top-level statements themselves).
 fn walk_nested(body: &naga::Block, f: &mut impl FnMut(&naga::Statement)) {
-    use naga::Statement as S;
     for stmt in body.iter() {
-        match stmt {
-            S::Block(inner) => walk_block_all(inner, f),
-            S::If { accept, reject, .. } => {
-                walk_block_all(accept, f);
-                walk_block_all(reject, f);
-            }
-            S::Switch { cases, .. } => {
-                for c in cases {
-                    walk_block_all(&c.body, f);
-                }
-            }
-            S::Loop {
-                body, continuing, ..
-            } => {
-                walk_block_all(body, f);
-                walk_block_all(continuing, f);
-            }
-            _ => {}
+        for nested in crate::passes::expr_util::nested_blocks(stmt) {
+            walk_block_all(nested, f);
         }
     }
 }
@@ -504,25 +496,8 @@ fn walk_nested(body: &naga::Block, f: &mut impl FnMut(&naga::Statement)) {
 fn walk_block_all(body: &naga::Block, f: &mut impl FnMut(&naga::Statement)) {
     for stmt in body.iter() {
         f(stmt);
-        use naga::Statement as S;
-        match stmt {
-            S::Block(inner) => walk_block_all(inner, f),
-            S::If { accept, reject, .. } => {
-                walk_block_all(accept, f);
-                walk_block_all(reject, f);
-            }
-            S::Switch { cases, .. } => {
-                for c in cases {
-                    walk_block_all(&c.body, f);
-                }
-            }
-            S::Loop {
-                body, continuing, ..
-            } => {
-                walk_block_all(body, f);
-                walk_block_all(continuing, f);
-            }
-            _ => {}
+        for nested in crate::passes::expr_util::nested_blocks(stmt) {
+            walk_block_all(nested, f);
         }
     }
 }

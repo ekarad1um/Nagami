@@ -36,6 +36,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::expr_util::{nested_blocks, nested_blocks_mut};
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
 
@@ -255,32 +256,14 @@ fn count_whole_stores(
     store_value: &mut [Option<naga::Handle<naga::Expression>>],
 ) {
     for stmt in block.iter() {
-        match stmt {
-            naga::Statement::Store { pointer, value } => {
-                if let naga::Expression::LocalVariable(l) = exprs[*pointer] {
-                    whole_stores[l.index()] += 1;
-                    store_value[l.index()] = Some(*value);
-                }
-            }
-            naga::Statement::If { accept, reject, .. } => {
-                count_whole_stores(accept, exprs, whole_stores, store_value);
-                count_whole_stores(reject, exprs, whole_stores, store_value);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    count_whole_stores(&case.body, exprs, whole_stores, store_value);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                count_whole_stores(body, exprs, whole_stores, store_value);
-                count_whole_stores(continuing, exprs, whole_stores, store_value);
-            }
-            naga::Statement::Block(inner) => {
-                count_whole_stores(inner, exprs, whole_stores, store_value);
-            }
-            _ => {}
+        if let naga::Statement::Store { pointer, value } = stmt
+            && let naga::Expression::LocalVariable(l) = exprs[*pointer]
+        {
+            whole_stores[l.index()] += 1;
+            store_value[l.index()] = Some(*value);
+        }
+        for nested in nested_blocks(stmt) {
+            count_whole_stores(nested, exprs, whole_stores, store_value);
         }
     }
 }
@@ -389,26 +372,8 @@ fn collect_forwards(
     }
     // Recurse into nested blocks (each handled independently).
     for stmt in block.iter() {
-        match stmt {
-            naga::Statement::If { accept, reject, .. } => {
-                collect_forwards(accept, exprs, census, redirects, remove_store);
-                collect_forwards(reject, exprs, census, redirects, remove_store);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    collect_forwards(&case.body, exprs, census, redirects, remove_store);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                collect_forwards(body, exprs, census, redirects, remove_store);
-                collect_forwards(continuing, exprs, census, redirects, remove_store);
-            }
-            naga::Statement::Block(inner) => {
-                collect_forwards(inner, exprs, census, redirects, remove_store);
-            }
-            _ => {}
+        for nested in nested_blocks(stmt) {
+            collect_forwards(nested, exprs, census, redirects, remove_store);
         }
     }
 }
@@ -420,26 +385,8 @@ fn remap_block_handles(
 ) {
     for stmt in block.iter_mut() {
         super::expr_util::remap_statement_handles(stmt, &mut |h| *redirects.get(&h).unwrap_or(&h));
-        match stmt {
-            naga::Statement::If { accept, reject, .. } => {
-                remap_block_handles(accept, redirects);
-                remap_block_handles(reject, redirects);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases.iter_mut() {
-                    remap_block_handles(&mut case.body, redirects);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                remap_block_handles(body, redirects);
-                remap_block_handles(continuing, redirects);
-            }
-            naga::Statement::Block(inner) => {
-                remap_block_handles(inner, redirects);
-            }
-            _ => {}
+        for nested in nested_blocks_mut(stmt) {
+            remap_block_handles(nested, redirects);
         }
     }
 }
@@ -453,26 +400,8 @@ fn remove_forwarded_stores(
     let original = std::mem::take(block);
     let mut rebuilt = naga::Block::with_capacity(original.len());
     for (mut stmt, span) in original.span_into_iter() {
-        match &mut stmt {
-            naga::Statement::If { accept, reject, .. } => {
-                remove_forwarded_stores(accept, exprs, remove_store);
-                remove_forwarded_stores(reject, exprs, remove_store);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases.iter_mut() {
-                    remove_forwarded_stores(&mut case.body, exprs, remove_store);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                remove_forwarded_stores(body, exprs, remove_store);
-                remove_forwarded_stores(continuing, exprs, remove_store);
-            }
-            naga::Statement::Block(inner) => {
-                remove_forwarded_stores(inner, exprs, remove_store);
-            }
-            _ => {}
+        for nested in nested_blocks_mut(&mut stmt) {
+            remove_forwarded_stores(nested, exprs, remove_store);
         }
         if let naga::Statement::Store { pointer, .. } = &stmt
             && let naga::Expression::LocalVariable(l) = exprs[*pointer]
@@ -634,48 +563,9 @@ fn desugar_short_circuit(
     let mut changed = 0usize;
 
     for (mut statement, span) in original.span_into_iter() {
-        // Step 1: recurse into nested blocks.  Leaf statements are
-        // enumerated explicitly so a future naga release adding a
-        // new block-bearing variant breaks the build here instead
-        // of silently bypassing recursion.
-        match &mut statement {
-            naga::Statement::Block(inner) => {
-                changed += desugar_short_circuit(inner, expressions, foldable);
-            }
-            naga::Statement::If { accept, reject, .. } => {
-                changed += desugar_short_circuit(accept, expressions, foldable);
-                changed += desugar_short_circuit(reject, expressions, foldable);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases.iter_mut() {
-                    changed += desugar_short_circuit(&mut case.body, expressions, foldable);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                changed += desugar_short_circuit(body, expressions, foldable);
-                changed += desugar_short_circuit(continuing, expressions, foldable);
-            }
-            naga::Statement::Emit(_)
-            | naga::Statement::Store { .. }
-            | naga::Statement::Break
-            | naga::Statement::Continue
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Call { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
+        // Step 1: recurse into nested blocks.
+        for nested in nested_blocks_mut(&mut statement) {
+            changed += desugar_short_circuit(nested, expressions, foldable);
         }
 
         // Step 2: check for short-circuit patterns.
@@ -897,23 +787,17 @@ fn unwrap_logical_not(
 /// result-less `Call` also trips it, at the cost of one kept-but-dead branch.
 fn block_has_result_producer(block: &naga::Block) -> bool {
     use naga::Statement as S;
-    block.iter().any(|stmt| match stmt {
-        S::Call { .. }
-        | S::Atomic { .. }
-        | S::WorkGroupUniformLoad { .. }
-        | S::RayQuery { .. }
-        | S::SubgroupBallot { .. }
-        | S::SubgroupGather { .. }
-        | S::SubgroupCollectiveOperation { .. } => true,
-        S::Block(inner) => block_has_result_producer(inner),
-        S::If { accept, reject, .. } => {
-            block_has_result_producer(accept) || block_has_result_producer(reject)
-        }
-        S::Switch { cases, .. } => cases.iter().any(|c| block_has_result_producer(&c.body)),
-        S::Loop {
-            body, continuing, ..
-        } => block_has_result_producer(body) || block_has_result_producer(continuing),
-        _ => false,
+    block.iter().any(|stmt| {
+        matches!(
+            stmt,
+            S::Call { .. }
+                | S::Atomic { .. }
+                | S::WorkGroupUniformLoad { .. }
+                | S::RayQuery { .. }
+                | S::SubgroupBallot { .. }
+                | S::SubgroupGather { .. }
+                | S::SubgroupCollectiveOperation { .. }
+        ) || nested_blocks(stmt).any(block_has_result_producer)
     })
 }
 
@@ -1692,62 +1576,12 @@ fn contains_bare_break(block: &naga::Block) -> bool {
 /// helper-invocation exit, not a loop exit (mirrors the
 /// Kill-is-not-a-terminator rule in `definitely_terminates`).
 fn contains_return(block: &naga::Block) -> bool {
-    for stmt in block.iter() {
-        match stmt {
-            naga::Statement::Return { .. } => return true,
-            naga::Statement::Block(inner) => {
-                if contains_return(inner) {
-                    return true;
-                }
-            }
-            naga::Statement::If { accept, reject, .. } => {
-                if contains_return(accept) || contains_return(reject) {
-                    return true;
-                }
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    if contains_return(&case.body) {
-                        return true;
-                    }
-                }
-            }
-            // A Return inside a nested loop still exits the function, so -
-            // unlike the bare Break/Continue scans above - recurse into
-            // loops.  (`continuing` cannot hold a Return in valid IR, but
-            // scanning it costs nothing and stays correct on any input.)
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                if contains_return(body) || contains_return(continuing) {
-                    return true;
-                }
-            }
-            // Leaf statements that cannot carry a Return and have no
-            // nested blocks.  Enumerated explicitly so a future naga
-            // release adding a new block-bearing variant breaks the
-            // build here instead of silently missing a Return.
-            naga::Statement::Emit(_)
-            | naga::Statement::Store { .. }
-            | naga::Statement::Break
-            | naga::Statement::Continue
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Call { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
-        }
-    }
-    false
+    block.iter().any(|stmt| {
+        // Unlike the bare Break/Continue scans above, recurse into every
+        // nested block including loops - a Return exits the function from
+        // any depth.
+        matches!(stmt, naga::Statement::Return { .. }) || nested_blocks(stmt).any(contains_return)
+    })
 }
 
 /// A construct's behavior set under tint's (WGSL-spec) analysis: which of
@@ -2579,25 +2413,11 @@ mod tests {
     fn count_ifs(block: &naga::Block) -> usize {
         let mut n = 0;
         for stmt in block.iter() {
-            match stmt {
-                naga::Statement::If { accept, reject, .. } => {
-                    n += 1;
-                    n += count_ifs(accept);
-                    n += count_ifs(reject);
-                }
-                naga::Statement::Block(inner) => n += count_ifs(inner),
-                naga::Statement::Switch { cases, .. } => {
-                    for case in cases {
-                        n += count_ifs(&case.body);
-                    }
-                }
-                naga::Statement::Loop {
-                    body, continuing, ..
-                } => {
-                    n += count_ifs(body);
-                    n += count_ifs(continuing);
-                }
-                _ => {}
+            if matches!(stmt, naga::Statement::If { .. }) {
+                n += 1;
+            }
+            for nested in nested_blocks(stmt) {
+                n += count_ifs(nested);
             }
         }
         n
@@ -2607,25 +2427,11 @@ mod tests {
     fn count_switches(block: &naga::Block) -> usize {
         let mut n = 0;
         for stmt in block.iter() {
-            match stmt {
-                naga::Statement::Switch { cases, .. } => {
-                    n += 1;
-                    for case in cases {
-                        n += count_switches(&case.body);
-                    }
-                }
-                naga::Statement::If { accept, reject, .. } => {
-                    n += count_switches(accept);
-                    n += count_switches(reject);
-                }
-                naga::Statement::Block(inner) => n += count_switches(inner),
-                naga::Statement::Loop {
-                    body, continuing, ..
-                } => {
-                    n += count_switches(body);
-                    n += count_switches(continuing);
-                }
-                _ => {}
+            if matches!(stmt, naga::Statement::Switch { .. }) {
+                n += 1;
+            }
+            for nested in nested_blocks(stmt) {
+                n += count_switches(nested);
             }
         }
         n
@@ -2663,16 +2469,8 @@ fn main() {
             .find(|e| e.name == "main")
             .expect("main entry point");
         fn has_switch(block: &naga::Block) -> bool {
-            block.iter().any(|s| match s {
-                naga::Statement::Switch { .. } => true,
-                naga::Statement::Block(b) => has_switch(b),
-                naga::Statement::If { accept, reject, .. } => {
-                    has_switch(accept) || has_switch(reject)
-                }
-                naga::Statement::Loop {
-                    body, continuing, ..
-                } => has_switch(body) || has_switch(continuing),
-                _ => false,
+            block.iter().any(|s| {
+                matches!(s, naga::Statement::Switch { .. }) || nested_blocks(s).any(has_switch)
             })
         }
         assert!(
@@ -2972,16 +2770,8 @@ fn fs() -> @location(0) vec4f {
         // Walk the entry point looking for any Switch statement; there
         // shouldn't be one (the matching case has been spliced in).
         fn has_switch(block: &naga::Block) -> bool {
-            block.iter().any(|s| match s {
-                naga::Statement::Switch { .. } => true,
-                naga::Statement::Block(b) => has_switch(b),
-                naga::Statement::If { accept, reject, .. } => {
-                    has_switch(accept) || has_switch(reject)
-                }
-                naga::Statement::Loop {
-                    body, continuing, ..
-                } => has_switch(body) || has_switch(continuing),
-                _ => false,
+            block.iter().any(|s| {
+                matches!(s, naga::Statement::Switch { .. }) || nested_blocks(s).any(has_switch)
             })
         }
         assert!(
@@ -3169,27 +2959,13 @@ fn fs() -> @location(0) vec4f {
     fn count_non_empty_rejects(block: &naga::Block) -> usize {
         let mut n = 0;
         for stmt in block.iter() {
-            match stmt {
-                naga::Statement::If { accept, reject, .. } => {
-                    if !reject.is_empty() {
-                        n += 1;
-                    }
-                    n += count_non_empty_rejects(accept);
-                    n += count_non_empty_rejects(reject);
-                }
-                naga::Statement::Block(inner) => n += count_non_empty_rejects(inner),
-                naga::Statement::Switch { cases, .. } => {
-                    for case in cases {
-                        n += count_non_empty_rejects(&case.body);
-                    }
-                }
-                naga::Statement::Loop {
-                    body, continuing, ..
-                } => {
-                    n += count_non_empty_rejects(body);
-                    n += count_non_empty_rejects(continuing);
-                }
-                _ => {}
+            if let naga::Statement::If { reject, .. } = stmt
+                && !reject.is_empty()
+            {
+                n += 1;
+            }
+            for nested in nested_blocks(stmt) {
+                n += count_non_empty_rejects(nested);
             }
         }
         n
@@ -3199,27 +2975,13 @@ fn fs() -> @location(0) vec4f {
     fn count_non_empty_accepts(block: &naga::Block) -> usize {
         let mut n = 0;
         for stmt in block.iter() {
-            match stmt {
-                naga::Statement::If { accept, reject, .. } => {
-                    if !accept.is_empty() {
-                        n += 1;
-                    }
-                    n += count_non_empty_accepts(accept);
-                    n += count_non_empty_accepts(reject);
-                }
-                naga::Statement::Block(inner) => n += count_non_empty_accepts(inner),
-                naga::Statement::Switch { cases, .. } => {
-                    for case in cases {
-                        n += count_non_empty_accepts(&case.body);
-                    }
-                }
-                naga::Statement::Loop {
-                    body, continuing, ..
-                } => {
-                    n += count_non_empty_accepts(body);
-                    n += count_non_empty_accepts(continuing);
-                }
-                _ => {}
+            if let naga::Statement::If { accept, .. } = stmt
+                && !accept.is_empty()
+            {
+                n += 1;
+            }
+            for nested in nested_blocks(stmt) {
+                n += count_non_empty_accepts(nested);
             }
         }
         n
@@ -3971,19 +3733,9 @@ fn fs(@location(0) v: f32) -> @location(0) vec4f {
 
         // Walk the resulting body and verify no `Block(empty)` remains.
         fn contains_empty_block(block: &naga::Block) -> bool {
-            block.iter().any(|stmt| match stmt {
-                naga::Statement::Block(inner) if inner.is_empty() => true,
-                naga::Statement::Block(inner) => contains_empty_block(inner),
-                naga::Statement::If { accept, reject, .. } => {
-                    contains_empty_block(accept) || contains_empty_block(reject)
-                }
-                naga::Statement::Switch { cases, .. } => {
-                    cases.iter().any(|c| contains_empty_block(&c.body))
-                }
-                naga::Statement::Loop {
-                    body, continuing, ..
-                } => contains_empty_block(body) || contains_empty_block(continuing),
-                _ => false,
+            block.iter().any(|stmt| {
+                matches!(stmt, naga::Statement::Block(inner) if inner.is_empty())
+                    || nested_blocks(stmt).any(contains_empty_block)
             })
         }
 
@@ -4225,12 +3977,8 @@ fn f(a: bool) -> i32 {
             .find(|(_, f)| f.name.as_deref() == Some("f"))
             .expect("helper function `f` survives the pass");
         fn has_loop(block: &naga::Block) -> bool {
-            block.iter().any(|stmt| match stmt {
-                naga::Statement::Loop { .. } => true,
-                naga::Statement::Block(inner) => has_loop(inner),
-                naga::Statement::If { accept, reject, .. } => has_loop(accept) || has_loop(reject),
-                naga::Statement::Switch { cases, .. } => cases.iter().any(|c| has_loop(&c.body)),
-                _ => false,
+            block.iter().any(|stmt| {
+                matches!(stmt, naga::Statement::Loop { .. }) || nested_blocks(stmt).any(has_loop)
             })
         }
         assert!(
@@ -4265,12 +4013,8 @@ fn f(a: bool) -> i32 {
         "#;
         let (_, module) = run_pass(src);
         fn has_loop(block: &naga::Block) -> bool {
-            block.iter().any(|stmt| match stmt {
-                naga::Statement::Loop { .. } => true,
-                naga::Statement::Block(inner) => has_loop(inner),
-                naga::Statement::If { accept, reject, .. } => has_loop(accept) || has_loop(reject),
-                naga::Statement::Switch { cases, .. } => cases.iter().any(|c| has_loop(&c.body)),
-                _ => false,
+            block.iter().any(|stmt| {
+                matches!(stmt, naga::Statement::Loop { .. }) || nested_blocks(stmt).any(has_loop)
             })
         }
         let helper = module
@@ -4318,22 +4062,13 @@ fn f(a: bool) -> i32 {
             block: &naga::Block,
         ) -> Option<Option<naga::Handle<naga::Expression>>> {
             for stmt in block.iter() {
-                match stmt {
-                    naga::Statement::Loop { break_if, .. } => return Some(*break_if),
-                    naga::Statement::Block(inner) => {
-                        if let Some(bi) = first_loop_break_if(inner) {
-                            return Some(bi);
-                        }
+                if let naga::Statement::Loop { break_if, .. } = stmt {
+                    return Some(*break_if);
+                }
+                for nested in nested_blocks(stmt) {
+                    if let Some(bi) = first_loop_break_if(nested) {
+                        return Some(bi);
                     }
-                    naga::Statement::If { accept, reject, .. } => {
-                        if let Some(bi) = first_loop_break_if(accept) {
-                            return Some(bi);
-                        }
-                        if let Some(bi) = first_loop_break_if(reject) {
-                            return Some(bi);
-                        }
-                    }
-                    _ => {}
                 }
             }
             None

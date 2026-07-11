@@ -350,25 +350,10 @@ impl<'a> Generator<'a> {
                                 crate::passes::expr_util::visit_atomic_function_handles(fun, visit);
                                 visit(*value);
                             }
-                            naga::Statement::Block(b) => {
-                                walk_block_for_atomic_lits(b, func_info, types, visit)
-                            }
-                            naga::Statement::If { accept, reject, .. } => {
-                                walk_block_for_atomic_lits(accept, func_info, types, visit);
-                                walk_block_for_atomic_lits(reject, func_info, types, visit);
-                            }
-                            naga::Statement::Switch { cases, .. } => {
-                                for case in cases {
-                                    walk_block_for_atomic_lits(&case.body, func_info, types, visit);
-                                }
-                            }
-                            naga::Statement::Loop {
-                                body, continuing, ..
-                            } => {
-                                walk_block_for_atomic_lits(body, func_info, types, visit);
-                                walk_block_for_atomic_lits(continuing, func_info, types, visit);
-                            }
                             _ => {}
+                        }
+                        for nested in crate::passes::expr_util::nested_blocks(stmt) {
+                            walk_block_for_atomic_lits(nested, func_info, types, visit);
                         }
                     }
                 }
@@ -414,56 +399,11 @@ impl<'a> Generator<'a> {
                                     visit(*value);
                                 }
                             }
-                            naga::Statement::Switch { selector, cases } => {
-                                visit(*selector);
-                                for case in cases {
-                                    walk_typed_form_lits(
-                                        &case.body,
-                                        expressions,
-                                        deferrable,
-                                        consumed,
-                                        visit,
-                                    );
-                                }
-                            }
-                            naga::Statement::Block(b) => {
-                                walk_typed_form_lits(b, expressions, deferrable, consumed, visit);
-                            }
-                            naga::Statement::If { accept, reject, .. } => {
-                                walk_typed_form_lits(
-                                    accept,
-                                    expressions,
-                                    deferrable,
-                                    consumed,
-                                    visit,
-                                );
-                                walk_typed_form_lits(
-                                    reject,
-                                    expressions,
-                                    deferrable,
-                                    consumed,
-                                    visit,
-                                );
-                            }
-                            naga::Statement::Loop {
-                                body, continuing, ..
-                            } => {
-                                walk_typed_form_lits(
-                                    body,
-                                    expressions,
-                                    deferrable,
-                                    consumed,
-                                    visit,
-                                );
-                                walk_typed_form_lits(
-                                    continuing,
-                                    expressions,
-                                    deferrable,
-                                    consumed,
-                                    visit,
-                                );
-                            }
+                            naga::Statement::Switch { selector, .. } => visit(*selector),
                             _ => {}
+                        }
+                        for nested in crate::passes::expr_util::nested_blocks(stmt) {
+                            walk_typed_form_lits(nested, expressions, deferrable, consumed, visit);
                         }
                     }
                 }

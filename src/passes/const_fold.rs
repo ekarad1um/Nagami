@@ -365,33 +365,16 @@ fn build_emit_range_map(body: &naga::Block) -> HashMap<naga::Handle<naga::Expres
         map: &mut HashMap<naga::Handle<naga::Expression>, usize>,
         next_id: &mut usize,
     ) {
-        use naga::Statement as S;
         for stmt in block.iter() {
-            match stmt {
-                S::Emit(range) => {
-                    let id = *next_id;
-                    *next_id += 1;
-                    for h in range.clone() {
-                        map.insert(h, id);
-                    }
+            if let naga::Statement::Emit(range) = stmt {
+                let id = *next_id;
+                *next_id += 1;
+                for h in range.clone() {
+                    map.insert(h, id);
                 }
-                S::Block(inner) => walk(inner, map, next_id),
-                S::If { accept, reject, .. } => {
-                    walk(accept, map, next_id);
-                    walk(reject, map, next_id);
-                }
-                S::Switch { cases, .. } => {
-                    for case in cases {
-                        walk(&case.body, map, next_id);
-                    }
-                }
-                S::Loop {
-                    body, continuing, ..
-                } => {
-                    walk(body, map, next_id);
-                    walk(continuing, map, next_id);
-                }
-                _ => {}
+            }
+            for nested in crate::passes::expr_util::nested_blocks(stmt) {
+                walk(nested, map, next_id);
             }
         }
     }

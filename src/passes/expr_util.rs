@@ -959,6 +959,129 @@ pub fn visit_statement_expression_handles<F>(
     }
 }
 
+// MARK: Nested-block traversal
+
+/// Iterator over the blocks nested directly inside one statement, in
+/// syntactic order.  Construct via [`nested_blocks`].
+pub enum NestedBlocks<'a> {
+    None,
+    Pair(Option<&'a naga::Block>, Option<&'a naga::Block>),
+    Cases(std::slice::Iter<'a, naga::SwitchCase>),
+}
+
+impl<'a> Iterator for NestedBlocks<'a> {
+    type Item = &'a naga::Block;
+
+    fn next(&mut self) -> Option<&'a naga::Block> {
+        match self {
+            NestedBlocks::None => None,
+            NestedBlocks::Pair(first, second) => first.take().or_else(|| second.take()),
+            NestedBlocks::Cases(cases) => cases.next().map(|case| &case.body),
+        }
+    }
+}
+
+/// Mutable twin of [`NestedBlocks`].  Construct via [`nested_blocks_mut`].
+pub enum NestedBlocksMut<'a> {
+    None,
+    Pair(Option<&'a mut naga::Block>, Option<&'a mut naga::Block>),
+    Cases(std::slice::IterMut<'a, naga::SwitchCase>),
+}
+
+impl<'a> Iterator for NestedBlocksMut<'a> {
+    type Item = &'a mut naga::Block;
+
+    fn next(&mut self) -> Option<&'a mut naga::Block> {
+        match self {
+            NestedBlocksMut::None => None,
+            NestedBlocksMut::Pair(first, second) => first.take().or_else(|| second.take()),
+            NestedBlocksMut::Cases(cases) => cases.next().map(|case| &mut case.body),
+        }
+    }
+}
+
+/// Every block nested directly inside `stmt`, in syntactic order (`If`:
+/// accept then reject; `Switch`: case bodies in declaration order; `Loop`:
+/// body then continuing).  The order is part of the contract: callers with
+/// order-sensitive accumulation (naming, first-appearance ranking) rely
+/// on it matching source order.
+///
+/// This pair of functions is THE crate-wide answer to "which statement
+/// variants carry blocks": recursive statement walkers delegate their
+/// descent here instead of matching block-carrying variants themselves.
+/// A future naga `Statement` variant then fails the build in this one
+/// match (naga's IR enums are not `#[non_exhaustive]`) rather than being
+/// silently treated as a leaf by dozens of hand-written walkers --
+/// historically this crate's #1 miscompile mechanism.  Walker-local `_`
+/// arms stay safe for RECURSION once the descent is delegated; variants
+/// needing per-walker special treatment still need their own arm.
+pub fn nested_blocks(stmt: &naga::Statement) -> NestedBlocks<'_> {
+    match stmt {
+        naga::Statement::Block(inner) => NestedBlocks::Pair(Some(inner), None),
+        naga::Statement::If { accept, reject, .. } => {
+            NestedBlocks::Pair(Some(accept), Some(reject))
+        }
+        naga::Statement::Switch { cases, .. } => NestedBlocks::Cases(cases.iter()),
+        naga::Statement::Loop {
+            body, continuing, ..
+        } => NestedBlocks::Pair(Some(body), Some(continuing)),
+        naga::Statement::Emit(_)
+        | naga::Statement::Break
+        | naga::Statement::Continue
+        | naga::Statement::Kill
+        | naga::Statement::Return { .. }
+        | naga::Statement::ControlBarrier(_)
+        | naga::Statement::MemoryBarrier(_)
+        | naga::Statement::Store { .. }
+        | naga::Statement::ImageStore { .. }
+        | naga::Statement::Atomic { .. }
+        | naga::Statement::ImageAtomic { .. }
+        | naga::Statement::WorkGroupUniformLoad { .. }
+        | naga::Statement::Call { .. }
+        | naga::Statement::RayQuery { .. }
+        | naga::Statement::RayPipelineFunction(_)
+        | naga::Statement::SubgroupBallot { .. }
+        | naga::Statement::SubgroupGather { .. }
+        | naga::Statement::SubgroupCollectiveOperation { .. }
+        | naga::Statement::CooperativeStore { .. } => NestedBlocks::None,
+    }
+}
+
+/// Mutable [`nested_blocks`]; same order and exhaustiveness contract.
+/// Kept in lockstep -- a variant added to one match must be added to the
+/// other, which the shared block-free arm makes a one-line diff.
+pub fn nested_blocks_mut(stmt: &mut naga::Statement) -> NestedBlocksMut<'_> {
+    match stmt {
+        naga::Statement::Block(inner) => NestedBlocksMut::Pair(Some(inner), None),
+        naga::Statement::If { accept, reject, .. } => {
+            NestedBlocksMut::Pair(Some(accept), Some(reject))
+        }
+        naga::Statement::Switch { cases, .. } => NestedBlocksMut::Cases(cases.iter_mut()),
+        naga::Statement::Loop {
+            body, continuing, ..
+        } => NestedBlocksMut::Pair(Some(body), Some(continuing)),
+        naga::Statement::Emit(_)
+        | naga::Statement::Break
+        | naga::Statement::Continue
+        | naga::Statement::Kill
+        | naga::Statement::Return { .. }
+        | naga::Statement::ControlBarrier(_)
+        | naga::Statement::MemoryBarrier(_)
+        | naga::Statement::Store { .. }
+        | naga::Statement::ImageStore { .. }
+        | naga::Statement::Atomic { .. }
+        | naga::Statement::ImageAtomic { .. }
+        | naga::Statement::WorkGroupUniformLoad { .. }
+        | naga::Statement::Call { .. }
+        | naga::Statement::RayQuery { .. }
+        | naga::Statement::RayPipelineFunction(_)
+        | naga::Statement::SubgroupBallot { .. }
+        | naga::Statement::SubgroupGather { .. }
+        | naga::Statement::SubgroupCollectiveOperation { .. }
+        | naga::Statement::CooperativeStore { .. } => NestedBlocksMut::None,
+    }
+}
+
 // MARK: Emit-range surgery
 
 /// Drop every handle in `removed` from every `Emit` range inside
@@ -1006,44 +1129,11 @@ pub fn rebuild_emit_ranges_after_removal(
                 );
                 continue;
             }
-            naga::Statement::Block(inner) => rebuild_emit_ranges_after_removal(inner, removed),
-            naga::Statement::If { accept, reject, .. } => {
-                rebuild_emit_ranges_after_removal(accept, removed);
-                rebuild_emit_ranges_after_removal(reject, removed);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases.iter_mut() {
-                    rebuild_emit_ranges_after_removal(&mut case.body, removed);
+            _ => {
+                for nested in nested_blocks_mut(&mut statement) {
+                    rebuild_emit_ranges_after_removal(nested, removed);
                 }
             }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                rebuild_emit_ranges_after_removal(body, removed);
-                rebuild_emit_ranges_after_removal(continuing, removed);
-            }
-            // Leaf statements - only `Emit` ranges and nested blocks
-            // need rebuilding.  Enumerated explicitly so a future
-            // naga release adding a new block-bearing variant breaks
-            // the build here instead of silently bypassing recursion.
-            naga::Statement::Store { .. }
-            | naga::Statement::Break
-            | naga::Statement::Continue
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Call { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
         }
         block.push(statement, span);
     }
@@ -1401,5 +1491,88 @@ mod tests {
             flatten_replacement_chains(&mut m);
         }));
         let _ = result;
+    }
+
+    /// A block holding `n` `Break` statements, so nested-block iteration
+    /// order is observable through `len()` alone.
+    fn block_of_breaks(n: usize) -> naga::Block {
+        naga::Block::from_vec(vec![naga::Statement::Break; n])
+    }
+
+    #[test]
+    fn nested_blocks_yields_if_arms_in_syntactic_order() {
+        let (_, h) = dummy_handles();
+        let stmt = naga::Statement::If {
+            condition: h,
+            accept: block_of_breaks(1),
+            reject: block_of_breaks(2),
+        };
+        let lens: Vec<usize> = nested_blocks(&stmt).map(|b| b.len()).collect();
+        assert_eq!(lens, [1, 2]);
+    }
+
+    #[test]
+    fn nested_blocks_yields_loop_body_before_continuing() {
+        let stmt = naga::Statement::Loop {
+            body: block_of_breaks(3),
+            continuing: block_of_breaks(1),
+            break_if: None,
+        };
+        let lens: Vec<usize> = nested_blocks(&stmt).map(|b| b.len()).collect();
+        assert_eq!(lens, [3, 1]);
+    }
+
+    #[test]
+    fn nested_blocks_yields_switch_cases_in_declaration_order() {
+        let (_, h) = dummy_handles();
+        let case = |n: usize, value| naga::SwitchCase {
+            value,
+            body: block_of_breaks(n),
+            fall_through: false,
+        };
+        let stmt = naga::Statement::Switch {
+            selector: h,
+            cases: vec![
+                case(2, naga::SwitchValue::I32(0)),
+                case(0, naga::SwitchValue::I32(1)),
+                case(1, naga::SwitchValue::Default),
+            ],
+        };
+        let lens: Vec<usize> = nested_blocks(&stmt).map(|b| b.len()).collect();
+        assert_eq!(lens, [2, 0, 1]);
+    }
+
+    #[test]
+    fn nested_blocks_treats_leaf_statements_as_empty() {
+        let (_, h) = dummy_handles();
+        assert_eq!(nested_blocks(&naga::Statement::Break).count(), 0);
+        assert_eq!(nested_blocks(&naga::Statement::Kill).count(), 0);
+        assert_eq!(
+            nested_blocks(&naga::Statement::Store {
+                pointer: h,
+                value: h
+            })
+            .count(),
+            0
+        );
+        assert_eq!(
+            nested_blocks(&naga::Statement::Return { value: None }).count(),
+            0
+        );
+    }
+
+    #[test]
+    fn nested_blocks_mut_reaches_every_block() {
+        let (_, h) = dummy_handles();
+        let mut stmt = naga::Statement::If {
+            condition: h,
+            accept: block_of_breaks(1),
+            reject: naga::Block::new(),
+        };
+        for block in nested_blocks_mut(&mut stmt) {
+            block.push(naga::Statement::Continue, naga::Span::UNDEFINED);
+        }
+        let lens: Vec<usize> = nested_blocks(&stmt).map(|b| b.len()).collect();
+        assert_eq!(lens, [2, 1]);
     }
 }

@@ -384,98 +384,34 @@ fn collect_cse_replacements(
                 }
             }
 
-            naga::Statement::If { accept, reject, .. } => {
+            // No canonical registered inside a nested block may leak to
+            // code after it, so roll back to the parent-scope checkpoint
+            // after EVERY nested block.  This one rule is the meet of the
+            // per-variant requirements:
+            //   * If / Switch arms and `Statement::Block` bodies are real
+            //     lexical scopes in the generated text; a leaked canonical
+            //     becomes a reference to an out-of-scope `let` - invalid
+            //     WGSL that naga's flow-insensitive validator accepts but
+            //     re-parse / tint reject.
+            //   * A loop body does not dominate its continuing block: a
+            //     `continue` jumps straight there, skipping every body
+            //     `Emit` lexically after it, so redirecting a continuing
+            //     expression to a body canonical reads a value that
+            //     iteration never produced - a silent miscompile naga
+            //     validates happily.  Rolling back to the pre-body state
+            //     conservatively forgoes body->continuing CSE in
+            //     `continue`-free loops.
+            // Leaf statements iterate zero blocks (their expression
+            // operands are keyed via their `Emit` ranges above); a future
+            // block-bearing variant inherits the conservative scoping
+            // automatically.
+            _ => {
                 let checkpoint = cse_map.checkpoint();
-
-                collect_cse_replacements(accept, expressions, cse_map, replacements);
-                cse_map.rollback_to(checkpoint);
-
-                collect_cse_replacements(reject, expressions, cse_map, replacements);
-                cse_map.rollback_to(checkpoint);
-            }
-
-            naga::Statement::Switch { cases, .. } => {
-                let checkpoint = cse_map.checkpoint();
-
-                for case in cases {
-                    collect_cse_replacements(&case.body, expressions, cse_map, replacements);
+                for nested in super::expr_util::nested_blocks(statement) {
+                    collect_cse_replacements(nested, expressions, cse_map, replacements);
                     cse_map.rollback_to(checkpoint);
                 }
             }
-
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                // Parent-scope entries dominate the first iteration,
-                // but loop-interior entries must be discarded for
-                // post-loop code because the iteration count is
-                // unknown at pass time.
-                let checkpoint = cse_map.checkpoint();
-
-                collect_cse_replacements(body, expressions, cse_map, replacements);
-
-                // Body canonicals must NOT leak into `continuing`: a
-                // `continue` jumps straight to the continuing block,
-                // skipping every body `Emit` lexically after it, so a
-                // canonical emitted past a (conditional) `continue` does
-                // NOT dominate the continuing block.  Redirecting a
-                // continuing-block expression to such a body handle reads
-                // a value the `continue` iteration never produced - a
-                // silent miscompile (naga's loop validator checks
-                // body+continuing flow-insensitively and accepts it).
-                // Roll back to the pre-body (parent-scope only) state,
-                // which always dominates the continuing block.  This
-                // conservatively forgoes legitimate body->continuing CSE
-                // in loops with no `continue`; recovering it would
-                // require proving no `continue` precedes the canonical.
-                cse_map.rollback_to(checkpoint);
-
-                collect_cse_replacements(continuing, expressions, cse_map, replacements);
-
-                cse_map.rollback_to(checkpoint);
-            }
-
-            naga::Statement::Block(inner) => {
-                // The generator emits `Statement::Block` with braces (a real
-                // lexical scope), so a canonical registered inside `inner` is in
-                // scope only within those braces.  Redirecting a later
-                // expression OUTSIDE the block to such an in-block canonical
-                // emits a reference to an out-of-scope `let` - text-invalid WGSL
-                // that naga's flow-insensitive validator accepts but re-parse /
-                // tint reject.  Checkpoint and roll back so in-block canonicals
-                // do not leak, matching the If / Switch / Loop arms.  (When the
-                // generator instead unwraps a block inline this only forgoes a
-                // legitimate CSE - safe.)
-                let checkpoint = cse_map.checkpoint();
-                collect_cse_replacements(inner, expressions, cse_map, replacements);
-                cse_map.rollback_to(checkpoint);
-            }
-
-            // Leaf statements: CSE only collects from `Emit` ranges
-            // (each expression handle is keyed and looked up there).
-            // Block-bearing variants recurse with scope-tracking.
-            // Everything else carries no Expression handles CSE
-            // dedupes - enumerated explicitly so a future naga
-            // release adding a new block-bearing variant breaks the
-            // build here and forces a scope-tracking decision.
-            naga::Statement::Store { .. }
-            | naga::Statement::Break
-            | naga::Statement::Continue
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Call { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
         }
     }
 }
@@ -494,78 +430,37 @@ fn apply_and_rebuild(
 ) {
     let original = std::mem::take(block);
     for (mut statement, span) in original.span_into_iter() {
-        match &mut statement {
-            naga::Statement::Emit(range) => {
-                let surviving: Vec<_> = range
-                    .clone()
-                    .filter(|h| !replacements.contains_key(h))
-                    .collect();
-                if surviving.is_empty() {
-                    continue;
-                }
-                // Emit the surviving handles as contiguous sub-ranges.
-                let mut start = surviving[0];
-                let mut end = surviving[0];
-                for &h in &surviving[1..] {
-                    if h.index() == end.index() + 1 {
-                        end = h;
-                    } else {
-                        block.push(
-                            naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
-                            span,
-                        );
-                        start = h;
-                        end = h;
-                    }
-                }
-                block.push(
-                    naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
-                    span,
-                );
+        if let naga::Statement::Emit(range) = &statement {
+            let surviving: Vec<_> = range
+                .clone()
+                .filter(|h| !replacements.contains_key(h))
+                .collect();
+            if surviving.is_empty() {
                 continue;
             }
-            naga::Statement::Block(inner) => {
-                apply_and_rebuild(inner, replacements);
-            }
-            naga::Statement::If { accept, reject, .. } => {
-                apply_and_rebuild(accept, replacements);
-                apply_and_rebuild(reject, replacements);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases.iter_mut() {
-                    apply_and_rebuild(&mut case.body, replacements);
+            // Emit the surviving handles as contiguous sub-ranges.
+            let mut start = surviving[0];
+            let mut end = surviving[0];
+            for &h in &surviving[1..] {
+                if h.index() == end.index() + 1 {
+                    end = h;
+                } else {
+                    block.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
+                        span,
+                    );
+                    start = h;
+                    end = h;
                 }
             }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                apply_and_rebuild(body, replacements);
-                apply_and_rebuild(continuing, replacements);
-            }
-            // Leaf statements: `remap_statement_handles` below
-            // rewrites every Expression-handle these statements
-            // reference, but they have no nested blocks for the
-            // apply-and-rebuild walk to recurse through.
-            // Enumerated explicitly so a future naga release adding
-            // a new block-bearing variant breaks the build here.
-            naga::Statement::Store { .. }
-            | naga::Statement::Break
-            | naga::Statement::Continue
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Call { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
+            block.push(
+                naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
+                span,
+            );
+            continue;
+        }
+        for nested in super::expr_util::nested_blocks_mut(&mut statement) {
+            apply_and_rebuild(nested, replacements);
         }
 
         // Remap statement-level expression handles to canonical

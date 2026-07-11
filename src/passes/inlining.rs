@@ -22,8 +22,8 @@ use crate::pipeline::{Pass, PassContext};
 use super::expr_util::{
     expression_needs_emit, is_disallowed_inline_expression, map_atomic_function_handles,
     map_cooperative_data_handles, map_gather_mode_handles, map_ray_pipeline_function_handles,
-    map_ray_query_function_handles, remap_statement_handles, try_map_expression_handles_in_place,
-    visit_expression_children,
+    map_ray_query_function_handles, nested_blocks, nested_blocks_mut, remap_statement_handles,
+    try_map_expression_handles_in_place, visit_expression_children,
 };
 
 /// Default inlining budgets (used by [`super::Profile::Aggressive`]).
@@ -162,9 +162,7 @@ fn delete_calls_to_empty_functions(module: &mut naga::Module, preserve: &[String
     changed
 }
 
-/// Recursively drop `Call`s to `empty` functions from `block`.  Compound
-/// statements are recursed explicitly (house rule: no `_ =>` on statement
-/// recursion, so a future block-bearing naga variant breaks the build here).
+/// Recursively drop `Call`s to `empty` functions from `block`.
 fn drop_empty_calls_in_block(
     block: &mut naga::Block,
     empty: &std::collections::HashSet<naga::Handle<naga::Function>>,
@@ -173,52 +171,18 @@ fn drop_empty_calls_in_block(
     let mut rebuilt = naga::Block::with_capacity(original.len());
     let mut changed = false;
     for (mut stmt, span) in original.span_into_iter() {
-        match &mut stmt {
-            naga::Statement::Call {
-                function,
-                result: None,
-                ..
-            } if empty.contains(function) => {
-                changed = true;
-                continue;
-            }
-            naga::Statement::Block(inner) => {
-                changed |= drop_empty_calls_in_block(inner, empty);
-            }
-            naga::Statement::If { accept, reject, .. } => {
-                changed |= drop_empty_calls_in_block(accept, empty);
-                changed |= drop_empty_calls_in_block(reject, empty);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases.iter_mut() {
-                    changed |= drop_empty_calls_in_block(&mut case.body, empty);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                changed |= drop_empty_calls_in_block(body, empty);
-                changed |= drop_empty_calls_in_block(continuing, empty);
-            }
-            naga::Statement::Emit(_)
-            | naga::Statement::Call { .. }
-            | naga::Statement::Store { .. }
-            | naga::Statement::Break
-            | naga::Statement::Continue
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
+        if let naga::Statement::Call {
+            function,
+            result: None,
+            ..
+        } = &stmt
+            && empty.contains(function)
+        {
+            changed = true;
+            continue;
+        }
+        for nested in nested_blocks_mut(&mut stmt) {
+            changed |= drop_empty_calls_in_block(nested, empty);
         }
         rebuilt.push(stmt, span);
     }
@@ -342,49 +306,11 @@ fn collect_call_counts_in_block(
     counts: &mut HashMap<naga::Handle<naga::Function>, usize>,
 ) {
     for statement in block {
-        match statement {
-            naga::Statement::Call { function, .. } => {
-                *counts.entry(*function).or_insert(0) += 1;
-            }
-            naga::Statement::Block(inner) => collect_call_counts_in_block(inner, counts),
-            naga::Statement::If { accept, reject, .. } => {
-                collect_call_counts_in_block(accept, counts);
-                collect_call_counts_in_block(reject, counts);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    collect_call_counts_in_block(&case.body, counts);
-                }
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                collect_call_counts_in_block(body, counts);
-                collect_call_counts_in_block(continuing, counts);
-            }
-            // Leaf statements - no Call children, no nested blocks.
-            // Enumerated explicitly so a future naga release adding
-            // a new block-bearing variant breaks the build here and
-            // forces a deliberate inclusion / exclusion decision
-            // instead of silently leaving the call count short.
-            naga::Statement::Emit(_)
-            | naga::Statement::Store { .. }
-            | naga::Statement::Break
-            | naga::Statement::Continue
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
+        if let naga::Statement::Call { function, .. } = statement {
+            *counts.entry(*function).or_insert(0) += 1;
+        }
+        for nested in nested_blocks(statement) {
+            collect_call_counts_in_block(nested, counts);
         }
     }
 }
@@ -560,36 +486,6 @@ fn inline_in_block(
                     span,
                 );
             }
-            naga::Statement::Block(mut inner) => {
-                changed += inline_in_block(&mut inner, expressions, templates, &replacements).0;
-                rebuilt.push(naga::Statement::Block(inner), span);
-            }
-            naga::Statement::If {
-                condition,
-                mut accept,
-                mut reject,
-            } => {
-                changed += inline_in_block(&mut accept, expressions, templates, &replacements).0;
-                changed += inline_in_block(&mut reject, expressions, templates, &replacements).0;
-                rebuilt.push(
-                    naga::Statement::If {
-                        condition,
-                        accept,
-                        reject,
-                    },
-                    span,
-                );
-            }
-            naga::Statement::Switch {
-                selector,
-                mut cases,
-            } => {
-                for case in cases.iter_mut() {
-                    changed +=
-                        inline_in_block(&mut case.body, expressions, templates, &replacements).0;
-                }
-                rebuilt.push(naga::Statement::Switch { selector, cases }, span);
-            }
             naga::Statement::Loop {
                 mut body,
                 mut continuing,
@@ -624,7 +520,16 @@ fn inline_in_block(
                     span,
                 );
             }
-            other => rebuilt.push(other, span),
+            // If / Switch / Block sub-blocks recurse against the CURRENT
+            // scope map and their returned maps are dropped: unlike a
+            // loop's continuing block, nothing after them may reference
+            // their interior expressions.
+            mut other => {
+                for nested in nested_blocks_mut(&mut other) {
+                    changed += inline_in_block(nested, expressions, templates, &replacements).0;
+                }
+                rebuilt.push(other, span);
+            }
         }
     }
 
@@ -965,54 +870,8 @@ fn rebuild_block_expressions(
             clone_expression_handle(h, old_expressions, new_expressions, handle_map)
         });
 
-        match &mut statement {
-            naga::Statement::Block(inner) => {
-                rebuild_block_expressions(inner, old_expressions, new_expressions, handle_map);
-            }
-            naga::Statement::If { accept, reject, .. } => {
-                rebuild_block_expressions(accept, old_expressions, new_expressions, handle_map);
-                rebuild_block_expressions(reject, old_expressions, new_expressions, handle_map);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases.iter_mut() {
-                    rebuild_block_expressions(
-                        &mut case.body,
-                        old_expressions,
-                        new_expressions,
-                        handle_map,
-                    );
-                }
-            }
-            // `Loop` is fully handled above, before the generic remap.
-            naga::Statement::Loop { .. } => {
-                unreachable!("Loop is handled before the generic remap")
-            }
-            // Leaf statements - `remap_statement_handles` above
-            // already rewrote every Expression-handle this statement
-            // references; only the block-bearing variants need
-            // explicit recursion here.  Enumerated explicitly so a
-            // future naga release adding a new block-bearing variant
-            // breaks the build here instead of silently leaving the
-            // nested body with old-arena handles.
-            naga::Statement::Emit(_)
-            | naga::Statement::Store { .. }
-            | naga::Statement::Break
-            | naga::Statement::Continue
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Call { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
+        for nested in nested_blocks_mut(&mut statement) {
+            rebuild_block_expressions(nested, old_expressions, new_expressions, handle_map);
         }
 
         rebuilt.push(statement, span);
@@ -1085,29 +944,13 @@ mod tests {
     fn count_calls_to_function(block: &naga::Block, target: naga::Handle<naga::Function>) -> usize {
         let mut count = 0usize;
         for statement in block {
-            match statement {
-                naga::Statement::Call { function, .. } if *function == target => {
-                    count += 1;
-                }
-                naga::Statement::Block(inner) => {
-                    count += count_calls_to_function(inner, target);
-                }
-                naga::Statement::If { accept, reject, .. } => {
-                    count += count_calls_to_function(accept, target);
-                    count += count_calls_to_function(reject, target);
-                }
-                naga::Statement::Switch { cases, .. } => {
-                    for case in cases {
-                        count += count_calls_to_function(&case.body, target);
-                    }
-                }
-                naga::Statement::Loop {
-                    body, continuing, ..
-                } => {
-                    count += count_calls_to_function(body, target);
-                    count += count_calls_to_function(continuing, target);
-                }
-                _ => {}
+            if let naga::Statement::Call { function, .. } = statement
+                && *function == target
+            {
+                count += 1;
+            }
+            for nested in nested_blocks(statement) {
+                count += count_calls_to_function(nested, target);
             }
         }
         count
