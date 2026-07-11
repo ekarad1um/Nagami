@@ -1230,6 +1230,7 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
     // whole-variable Store must be preserved.  (Both `partially_stored`
     // and `escaped` were populated by the combined walk above.)
 
+    let max_live_load_pos = build_max_live_load_positions(&all_loads, &replacements, &scope_idx);
     let mut dead_store_ids: HashSet<StoreId> = HashSet::new();
     for (&store_id, seeded_loads) in &loads_per_store {
         let (store_ptr, _) = store_id;
@@ -1288,14 +1289,14 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         let Some(store_pos) = scope_idx.store_position(store_id) else {
             continue;
         };
-        let has_later_live_load = all_loads.get(&local).is_some_and(|loads| {
-            loads.iter().any(|&load_h| {
-                scope_idx
-                    .handle_position(load_h)
-                    .is_some_and(|lp| lp > store_pos)
-                    && replacements.get(&load_h).is_none_or(|&r| r >= load_h)
-            })
-        });
+        // "Any live load later than this store" is exactly "the MAX live-load
+        // position exceeds store_pos", so the per-local maximum (built once,
+        // O(loads)) answers every store in O(1).  The per-store scan over all
+        // of the local's loads it replaces was O(stores x loads) - ~700 ms on
+        // a machine-generated 10k-statement single-accumulator function.
+        let has_later_live_load = max_live_load_pos
+            .get(&local)
+            .is_some_and(|&max_pos| max_pos > store_pos);
         if has_later_live_load {
             continue;
         }
@@ -1317,8 +1318,10 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
     // counted dead can regain a load whose forwarding was undone and is now
     // live.  Removing that Store while the load survives makes the load read the
     // variable's zero-init (a silent miscompile).  Re-run the later-live-load
-    // guard against the post-undo replacements and drop any Store that is no
-    // longer dead.
+    // guard against the post-undo replacements - undoing only ever resurrects
+    // loads, so the max must be rebuilt - and drop any Store that is no longer
+    // dead.
+    let max_live_load_pos = build_max_live_load_positions(&all_loads, &replacements, &scope_idx);
     dead_store_ids.retain(|&store_id| {
         let (store_ptr, _) = store_id;
         // On any lookup miss, conservatively KEEP the Store (drop it from the
@@ -1331,14 +1334,9 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         let Some(store_pos) = scope_idx.store_position(store_id) else {
             return false;
         };
-        let regained_live_load = all_loads.get(&local).is_some_and(|loads| {
-            loads.iter().any(|&load_h| {
-                scope_idx
-                    .handle_position(load_h)
-                    .is_some_and(|lp| lp > store_pos)
-                    && replacements.get(&load_h).is_none_or(|&r| r >= load_h)
-            })
-        });
+        let regained_live_load = max_live_load_pos
+            .get(&local)
+            .is_some_and(|&max_pos| max_pos > store_pos);
         !regained_live_load
     });
 
@@ -1444,6 +1442,36 @@ fn get_pointer_key(
 /// Resolve `pointer` to the root local it ultimately refers to, or
 /// `None` when the root is not a local.  Re-exported so `dead_branch`
 /// agrees with this pass on the "stored the whole local" predicate.
+/// Maximum statement-DFS position of a LIVE load, per local.  A Store at
+/// `store_pos` has a later live load iff this maximum exceeds `store_pos`,
+/// so one O(loads) build answers every store's dead-store guard in O(1)
+/// where the previous per-store scan over all of the local's loads was
+/// O(stores x loads) - quadratic on machine-generated single-accumulator
+/// functions.  "Live" mirrors the guard exactly: a load is live unless its
+/// replacement precedes it in arena order (`r < load_h`; anything else
+/// leaves the Load in place because the apply walk blocks forward
+/// references).  Positions missing from the index contribute nothing,
+/// matching the old scan's `is_some_and`.
+fn build_max_live_load_positions(
+    all_loads: &HashMap<naga::Handle<naga::LocalVariable>, Vec<naga::Handle<naga::Expression>>>,
+    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    scope_idx: &ExpressionScopeIndex<'_>,
+) -> HashMap<naga::Handle<naga::LocalVariable>, u32> {
+    let mut max_pos = HashMap::with_capacity(all_loads.len());
+    for (&local, loads) in all_loads {
+        for &load_h in loads {
+            let live = replacements.get(&load_h).is_none_or(|&r| r >= load_h);
+            if live && let Some(pos) = scope_idx.handle_position(load_h) {
+                max_pos
+                    .entry(local)
+                    .and_modify(|m: &mut u32| *m = (*m).max(pos))
+                    .or_insert(pos);
+            }
+        }
+    }
+    max_pos
+}
+
 pub(crate) fn get_stored_local(
     expressions: &naga::Arena<naga::Expression>,
     pointer_handle: naga::Handle<naga::Expression>,

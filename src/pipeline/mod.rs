@@ -191,50 +191,61 @@ fn run_ir_passes_with(
             let mut rolled_back = false;
             let mut text_validation_ok = None;
 
-            match io::validate_module(module) {
-                Ok(info) => {
-                    // Adopt the fresh info unconditionally.  Even when
-                    // this iteration did not consume `current_info`
-                    // (only the trace / validate_each_pass emission
-                    // paths do), caching it here means the next pass
-                    // whose `before_text` is needed already has a
-                    // current snapshot and avoids a redundant validation.
-                    current_info = Some(info);
-                }
-                Err(e) => {
-                    if needs_text_validation {
-                        // `validate_each_pass` escalates IR failures to
-                        // a hard `Err` so CI surfaces a regressing pass
-                        // instead of burying a warning in stderr.  The
-                        // text-validation branch further down applies
-                        // the same policy for symmetry.
-                        return Err(Error::Validation(format!(
-                            "pass '{}' produced invalid IR: {}",
+            // A pass declaring "no change" leaves the module byte-identical
+            // to the state the previous validation already blessed, so
+            // re-validating is pure redundancy - a converged sweep otherwise
+            // pays one full validator run per pass for nothing (~40% of wall
+            // time on statement-dense shaders).  The declaration is a
+            // load-bearing contract either way (it alone drives convergence);
+            // an under-reporting pass is caught by the traced debug_assert
+            // below, and `validate_each_pass` (the CI mode) still validates
+            // after every pass, changed or not.
+            if declared_changed || needs_text_validation {
+                match io::validate_module(module) {
+                    Ok(info) => {
+                        // Adopt the fresh info unconditionally.  Even when
+                        // this iteration did not consume `current_info`
+                        // (only the trace / validate_each_pass emission
+                        // paths do), caching it here means the next pass
+                        // whose `before_text` is needed already has a
+                        // current snapshot and avoids a redundant validation.
+                        current_info = Some(info);
+                    }
+                    Err(e) => {
+                        if needs_text_validation {
+                            // `validate_each_pass` escalates IR failures to
+                            // a hard `Err` so CI surfaces a regressing pass
+                            // instead of burying a warning in stderr.  The
+                            // text-validation branch further down applies
+                            // the same policy for symmetry.
+                            return Err(Error::Validation(format!(
+                                "pass '{}' produced invalid IR: {}",
+                                pass.name(),
+                                e
+                            )));
+                        }
+                        // We took the !needs_text_validation branch above
+                        // when seeding `backup`, so it is always `Some` on
+                        // this branch.  The `expect` documents the
+                        // invariant rather than introducing a runtime
+                        // fallback that would also have to return an Err.
+                        let b = backup.take().expect(
+                            "backup must be Some when validate_each_pass is off; \
+                         see pre-pass backup gate above",
+                        );
+                        eprintln!(
+                            "warning: validation failed after pass '{}', rolling back: {}",
                             pass.name(),
                             e
-                        )));
+                        );
+                        *module = b;
+                        // `current_info` (if seeded) still matches the
+                        // restored backup since it was last refreshed
+                        // against the pre-pass state, so re-validation
+                        // is unnecessary.
+                        validation_ok = false;
+                        rolled_back = true;
                     }
-                    // We took the !needs_text_validation branch above
-                    // when seeding `backup`, so it is always `Some` on
-                    // this branch.  The `expect` documents the
-                    // invariant rather than introducing a runtime
-                    // fallback that would also have to return an Err.
-                    let b = backup.take().expect(
-                        "backup must be Some when validate_each_pass is off; \
-                         see pre-pass backup gate above",
-                    );
-                    eprintln!(
-                        "warning: validation failed after pass '{}', rolling back: {}",
-                        pass.name(),
-                        e
-                    );
-                    *module = b;
-                    // `current_info` (if seeded) still matches the
-                    // restored backup since it was last refreshed
-                    // against the pre-pass state, so re-validation
-                    // is unnecessary.
-                    validation_ok = false;
-                    rolled_back = true;
                 }
             }
 
