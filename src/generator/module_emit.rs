@@ -88,6 +88,9 @@ impl<'a> Generator<'a> {
         let mut needs_cooperative_matrix = false;
         let mut needs_ray_tracing = false;
         let mut needs_binding_array = false;
+        let mut needs_ray_query = false;
+        let mut needs_ray_query_vertex_return = false;
+        let mut has_acceleration_structure = false;
 
         let check_binding = |binding: &naga::Binding,
                              needs_dual: &mut bool,
@@ -127,11 +130,22 @@ impl<'a> Generator<'a> {
 
         // Scan types: f16, cooperative matrix, acceleration structure, struct
         // member bindings (clip_distances, mesh, dual_source_blending, etc.).
-        for (_, ty) in self.module.types.iter() {
+        for (h, ty) in self.module.types.iter() {
             match ty.inner {
+                // Gated on liveness, unlike naga's writer scan of the raw
+                // arena: naga's compactor roots `special_types` (e.g. a dead
+                // `__frexp_result_f16` and its f16/i16 member scalars survive
+                // every DCE), so a raw scan emits `enable f16;` for a shader
+                // whose emitted text has no f16 token at all - the enable
+                // then drops on re-minify (non-idempotent) and retains a
+                // device-feature requirement the output no longer needs.
+                // Under-detection stays loud, not silent: output using f16
+                // without the enable fails the run() re-parse self-check.
                 naga::TypeInner::Scalar(s)
                 | naga::TypeInner::Vector { scalar: s, .. }
-                | naga::TypeInner::Matrix { scalar: s, .. } => {
+                | naga::TypeInner::Matrix { scalar: s, .. }
+                    if self.live_types.contains(&h) =>
+                {
                     needs_f16 |= s == naga::Scalar::F16;
                     needs_int16 |= s == naga::Scalar::I16 || s == naga::Scalar::U16;
                 }
@@ -151,8 +165,26 @@ impl<'a> Generator<'a> {
                 naga::TypeInner::CooperativeMatrix { .. } => {
                     needs_cooperative_matrix = true;
                 }
-                naga::TypeInner::AccelerationStructure { .. } => {
-                    needs_ray_tracing = true;
+                // `acceleration_structure` / `ray_query` parse under EITHER
+                // `wgpu_ray_query` OR `wgpu_ray_tracing_pipeline` (naga's
+                // front lists both as satisfying), so an acceleration
+                // structure resolves to an enable only after every pipeline
+                // signal (stage, payload, builtin) has been scanned - see the
+                // resolution below the stage scan.  The `vertex_return` type
+                // flag additionally requires `enable
+                // wgpu_ray_query_vertex_return;` to spell.
+                naga::TypeInner::AccelerationStructure { vertex_return } => {
+                    has_acceleration_structure = true;
+                    needs_ray_query_vertex_return |= vertex_return;
+                }
+                // naga's own writer has no `ray_query` detection (it cannot
+                // write `Statement::RayQuery` at all - `unreachable!()` in
+                // its statement arm), so this goes beyond mirroring naga:
+                // without the enable, emitted `ray_query` locals and
+                // `rayQuery*` builtins fail the naga re-parse self-check.
+                naga::TypeInner::RayQuery { vertex_return } => {
+                    needs_ray_query = true;
+                    needs_ray_query_vertex_return |= vertex_return;
                 }
                 // naga 30 requires `enable wgpu_binding_array;` for a
                 // `binding_array<...>` type; mirror its backend's detection.
@@ -282,6 +314,16 @@ impl<'a> Generator<'a> {
             needs_ray_tracing = true;
         }
 
+        // Resolve acceleration structures now that every pipeline signal has
+        // been scanned: with a pipeline signal present, the pipeline enable
+        // already covers the type; a query-only module keeps the
+        // input-faithful `enable wgpu_ray_query;` (naga parses the type under
+        // either directive, and the choice does not affect validation - the
+        // IR carries no record of which enable admitted it).
+        if has_acceleration_structure && !needs_ray_tracing {
+            needs_ray_query = true;
+        }
+
         // Note: we intentionally do NOT synthesize `enable subgroups;`.
         // This avoids known naga subgroup-directive text-parse limitations
         // and prevents non-profitable growth for tiny subgroup-only shaders.
@@ -297,7 +339,9 @@ impl<'a> Generator<'a> {
             || needs_draw_index
             || needs_primitive_index
             || needs_cooperative_matrix
-            || needs_ray_tracing;
+            || needs_ray_tracing
+            || needs_ray_query
+            || needs_ray_query_vertex_return;
         if any_enable {
             if needs_f16 {
                 self.out.push_str("enable f16;");
@@ -341,6 +385,14 @@ impl<'a> Generator<'a> {
             }
             if needs_ray_tracing {
                 self.out.push_str("enable wgpu_ray_tracing_pipeline;");
+                self.push_newline();
+            }
+            if needs_ray_query {
+                self.out.push_str("enable wgpu_ray_query;");
+                self.push_newline();
+            }
+            if needs_ray_query_vertex_return {
+                self.out.push_str("enable wgpu_ray_query_vertex_return;");
                 self.push_newline();
             }
             has_prev_section = true;
@@ -988,6 +1040,7 @@ impl<'a> Generator<'a> {
             local_used_names: std::collections::HashSet::new(),
             inlineable_calls,
             must_bind_loads,
+            render_depth_memo: vec![0; func.expressions.len()],
             display_name: displayed_name.to_string(),
         };
 

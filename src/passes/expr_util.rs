@@ -1100,6 +1100,80 @@ where
     }
 }
 
+// MARK: naga variant tripwire
+
+/// Compile-time tripwire against silently-skipped naga variants.
+///
+/// The recurring historical miscompile class in this codebase is a naga
+/// upgrade adding a `Statement`/`Expression` variant that existing walkers'
+/// `_ => {}` arms swallow - the new construct becomes invisible to liveness /
+/// effect analysis (e.g. `CooperativeLoad` was invisible to `load_dedup` and
+/// `coalescing` for a whole release).  None of naga's IR enums are
+/// `#[non_exhaustive]`, so a wildcard-free match makes any new variant a
+/// COMPILE ERROR at this single location.
+///
+/// When this function breaks on a naga upgrade:
+/// 1. Add the new variant(s) here to restore the build.
+/// 2. Audit every walker with a wildcard arm for whether the new variant
+///    carries handles / effects / nested blocks it must handle - grep
+///    `src/passes` + `src/generator` for `_ =>` near `Statement`/`Expression`
+///    matches, and review the shared walkers in this file first.
+/// 3. Extend the generator (`stmt_emit`/`expr_emit`/`syntax`) or its
+///    baseline-skip / directive scans if the variant reaches emission.
+///
+/// Never called; exists purely for the exhaustiveness check.
+#[allow(dead_code)]
+fn naga_variant_tripwire(
+    statement: &naga::Statement,
+    expression: &naga::Expression,
+    type_inner: &naga::TypeInner,
+    literal: &naga::Literal,
+) {
+    use naga::{Expression as E, Literal as L, Statement as S, TypeInner as T};
+    match statement {
+        S::Emit(_) | S::Block(_) | S::If { .. } | S::Switch { .. } | S::Loop { .. } => {}
+        S::Break | S::Continue | S::Return { .. } | S::Kill => {}
+        S::ControlBarrier(_) | S::MemoryBarrier(_) => {}
+        S::Store { .. } | S::ImageStore { .. } | S::Atomic { .. } | S::ImageAtomic { .. } => {}
+        S::WorkGroupUniformLoad { .. } | S::Call { .. } => {}
+        S::RayQuery { .. } | S::RayPipelineFunction { .. } => {}
+        S::SubgroupBallot { .. }
+        | S::SubgroupGather { .. }
+        | S::SubgroupCollectiveOperation { .. } => {}
+        S::CooperativeStore { .. } => {}
+    }
+    match expression {
+        E::Literal(_) | E::Constant(_) | E::Override(_) | E::ZeroValue(_) => {}
+        E::Compose { .. } | E::Access { .. } | E::AccessIndex { .. } => {}
+        E::Splat { .. } | E::Swizzle { .. } => {}
+        E::FunctionArgument(_) | E::GlobalVariable(_) | E::LocalVariable(_) | E::Load { .. } => {}
+        E::ImageSample { .. } | E::ImageLoad { .. } | E::ImageQuery { .. } => {}
+        E::Unary { .. } | E::Binary { .. } | E::Select { .. } => {}
+        E::Derivative { .. } | E::Relational { .. } | E::Math { .. } | E::As { .. } => {}
+        E::CallResult(_) | E::AtomicResult { .. } | E::WorkGroupUniformLoadResult { .. } => {}
+        E::ArrayLength(_) => {}
+        E::RayQueryVertexPositions { .. }
+        | E::RayQueryProceedResult
+        | E::RayQueryGetIntersection { .. } => {}
+        E::SubgroupBallotResult | E::SubgroupOperationResult { .. } => {}
+        E::CooperativeLoad { .. } | E::CooperativeMultiplyAdd { .. } => {}
+    }
+    match type_inner {
+        T::Scalar(_) | T::Vector { .. } | T::Matrix { .. } | T::CooperativeMatrix { .. } => {}
+        T::Atomic(_) | T::Pointer { .. } | T::ValuePointer { .. } => {}
+        T::Array { .. } | T::Struct { .. } => {}
+        T::Image { .. } | T::Sampler { .. } => {}
+        T::AccelerationStructure { .. } | T::RayQuery { .. } => {}
+        T::BindingArray { .. } => {}
+    }
+    match literal {
+        L::F64(_) | L::F32(_) | L::F16(_) => {}
+        L::U16(_) | L::I16(_) | L::U32(_) | L::I32(_) | L::U64(_) | L::I64(_) => {}
+        L::Bool(_) => {}
+        L::AbstractInt(_) | L::AbstractFloat(_) => {}
+    }
+}
+
 // MARK: Tests
 
 #[cfg(test)]

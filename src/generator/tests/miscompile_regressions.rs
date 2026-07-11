@@ -384,6 +384,227 @@ fn override_sized_array_does_not_abort() {
     );
 }
 
+/// naga's compactor roots `special_types`, so a dead `__frexp_result_f16`
+/// (and its f16 member scalar) survives every DCE; the directive scan must
+/// not credit those dead types with an `enable f16;` the emitted text never
+/// uses - the spurious enable dropped on re-minify (non-idempotent) and
+/// retained an f16 device-feature requirement the output no longer has.
+#[test]
+fn dead_frexp_special_type_does_not_emit_f16_enable() {
+    let out = minify("enable f16; @compute @workgroup_size(1) fn m(){ let r = frexp(1.5h); }");
+    assert!(
+        !out.contains("enable f16;"),
+        "no f16 survives DCE, so the enable must not be emitted: {out}"
+    );
+    // Control: live f16 must keep the enable.
+    let live = minify(
+        "enable f16;\
+         @group(0)@binding(0) var<storage,read_write> o: f32;\
+         @compute @workgroup_size(1) fn m(){ o = f32(f16(o) * 2h); }",
+    );
+    assert!(
+        live.contains("enable f16;"),
+        "live f16 usage must keep the enable: {live}"
+    );
+}
+
+/// tint's parser rejects expression nesting deeper than 512 while naga
+/// accepts arbitrary depth, so unbounded single-use `let` inlining can
+/// flatten a long chain into text only naga accepts.  The emitter must
+/// split such chains with forced bindings at the depth cap.
+#[test]
+fn deep_single_use_chain_is_depth_capped() {
+    // 600 distinct private scalars summed in one expression: a ~600-deep
+    // left-leaning Binary chain with nothing for const-fold/CSE to collapse.
+    let mut src = String::new();
+    for i in 0..600 {
+        src.push_str(&format!("var<private> v{i}: f32;"));
+    }
+    src.push_str("@group(0)@binding(0) var<storage,read_write> o: f32;");
+    src.push_str("@compute @workgroup_size(1) fn main() { o = v0");
+    for i in 1..600 {
+        src.push_str(&format!("+v{i}"));
+    }
+    src.push_str("; }");
+    let out = minify(&src);
+    // Without the cap the whole chain inlines into the store (zero lets);
+    // with it, at least one forced binding splits the chain below tint's
+    // 512-deep parser limit.
+    assert!(
+        out.contains("let "),
+        "a >512-deep chain must be split by at least one forced binding"
+    );
+}
+
+/// tint's loop-exit analysis is syntactic - it credits a loop with an exit
+/// for a `break` inside `if false { .. }` without const-evaluating the
+/// condition - while naga 30 validates a fully exit-less `loop{}` as legal.
+/// Folding the const-false `if` away therefore turns tint-valid input into
+/// tint-rejected output ("loop does not exit") that the naga self-check
+/// cannot catch.  The fold must keep a dropped block that carries the
+/// enclosing loop's only exit.
+#[test]
+fn loop_only_exit_inside_const_false_if_is_kept() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: u32;\
+        @compute @workgroup_size(1) fn main() {\
+            loop { o = o + 1u; if (false) { break; } }\
+        }";
+    let out = minify(src);
+    assert!(
+        out.contains("if false{break;}"),
+        "the loop's only lexical exit must survive the const-false fold: {out}"
+    );
+}
+
+/// Same class through the `break_if` spelling: `break if false;` never breaks
+/// at runtime, but it is the only lexical exit tint sees.
+#[test]
+fn loop_only_exit_break_if_false_is_kept() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: u32;\
+        @compute @workgroup_size(1) fn main() {\
+            loop { o = o + 1u; continuing { break if false; } }\
+        }";
+    let out = minify(src);
+    assert!(
+        out.contains("break if false;"),
+        "the loop's only lexical exit must survive the break-if-false fold: {out}"
+    );
+}
+
+/// Same class through a const-selector switch collapse: the dropped
+/// `default` carries the `return` that is the loop's only exit.
+#[test]
+fn loop_only_exit_in_dropped_switch_case_is_kept() {
+    let src = "fn f() -> u32 {\
+            var i: u32 = 0u;\
+            loop { i = i + 1u; switch (0u) { case 0u: { } default: { return i; } } }\
+            return 0u;\
+        }\
+        @group(0)@binding(0) var<storage,read_write> o: u32;\
+        @compute @workgroup_size(1) fn main() { o = f(); }";
+    let out = minify(src);
+    assert!(
+        out.contains("default") && out.contains("return"),
+        "the dropped switch case's return is the loop's only exit and must survive: {out}"
+    );
+}
+
+/// The guards must not pessimize regular dead-branch folding: outside a
+/// loop, a const-false `if` folds away even when it carries a `return`, and
+/// inside a loop a const-false `if` WITHOUT an exit still folds when the
+/// loop has a real exit of its own.
+#[test]
+fn loop_exit_guard_does_not_block_ordinary_folds() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: u32;\
+        fn g() -> u32 { if (false) { return 1u; } return 2u; }\
+        @compute @workgroup_size(1) fn main() {\
+            var i: u32 = 0u;\
+            loop { i = i + 1u; if (false) { o = 5u; } if (i > 3u) { break; } }\
+            o = g() + i;\
+        }";
+    let out = minify(src);
+    assert!(
+        !out.contains("if false"),
+        "const-false ifs with no load-bearing exit must still fold: {out}"
+    );
+    assert!(
+        !out.contains("=5"),
+        "the dead store inside the folded branch must be gone: {out}"
+    );
+}
+
+/// A ray-query module must minify through nagami's generator instead of
+/// SIGABRTing in naga's WGSL writer (`Statement::RayQuery => unreachable!()`),
+/// which the mandatory baseline emit used to reach before
+/// `module_needs_naga_baseline_skip` gated ray queries.  The output must carry
+/// `enable wgpu_ray_query;` - naga's own writer never emits it (it cannot
+/// write the statements at all), so nagami's directive scan goes beyond
+/// mirroring naga here; without it the self-check re-parse rejects the text.
+#[test]
+fn ray_query_minifies_without_baseline_abort() {
+    let src = "enable wgpu_ray_query;\
+        @group(0)@binding(0) var acc: acceleration_structure;\
+        @group(0)@binding(1) var<storage,read_write> out: vec4<f32>;\
+        @compute @workgroup_size(1) fn main(){\
+            var rq: ray_query;\
+            rayQueryInitialize(&rq, acc, RayDesc(4u,255u,0.1,100.0,vec3<f32>(0.0),vec3<f32>(0.0,1.0,0.0)));\
+            loop { let p = rayQueryProceed(&rq); if !p { break; } }\
+            let hit = rayQueryGetCommittedIntersection(&rq);\
+            out = vec4<f32>(hit.t, f32(hit.kind), 0.0, 1.0);\
+        }";
+    let out = minify(src);
+    assert!(
+        out.contains("enable wgpu_ray_query;"),
+        "query-only module must keep the input-faithful ray-query enable: {out}"
+    );
+    assert!(
+        out.contains("rayQueryInitialize(&") && out.contains("rayQueryGetCommittedIntersection(&"),
+        "ray-query builtins must render inline, not as `_eN` placeholders: {out}"
+    );
+    assert!(
+        !out.contains("wgpu_ray_tracing_pipeline"),
+        "no pipeline signal is present, so the pipeline enable must not appear: {out}"
+    );
+}
+
+/// `rayQueryGenerateIntersection`'s hit_t argument gets no expected-type
+/// propagation from naga's lowerer, so a whole-number f32 literal emitted in
+/// bare-int shortest form (`10.0` -> `10`) re-parses as i32 and fails
+/// validation ("Hit distance must be an f32").  The emitter must pin the
+/// typed spelling in that slot.
+#[test]
+fn ray_query_generate_intersection_hit_t_stays_f32() {
+    let src = "enable wgpu_ray_query;\
+        @group(0)@binding(0) var acc: acceleration_structure;\
+        @compute @workgroup_size(1) fn main(){\
+            var rq: ray_query;\
+            rayQueryInitialize(&rq, acc, RayDesc(4u,255u,0.1,100.0,vec3<f32>(0.0),vec3<f32>(0.0,1.0,0.0)));\
+            let kind = rayQueryGetCandidateIntersection(&rq).kind;\
+            if kind == 3u { rayQueryGenerateIntersection(&rq, 10.0); }\
+            rayQueryTerminate(&rq);\
+        }";
+    let out = minify(src);
+    assert!(
+        out.contains("rayQueryGenerateIntersection(") && out.contains("10f"),
+        "hit_t must keep a typed f32 spelling (bare `10` re-parses as i32): {out}"
+    );
+}
+
+/// The `vertex_return` flavors: the type flags must survive on both
+/// `ray_query` and `acceleration_structure`, `getCommittedHitVertexPositions`
+/// must render inline (naga's writer has it as `unreachable!()`), and BOTH
+/// enables must be present (the flag needs `wgpu_ray_query_vertex_return`,
+/// the base types still need `wgpu_ray_query`).
+#[test]
+fn ray_query_vertex_return_round_trips() {
+    let src = "enable wgpu_ray_query;\
+        enable wgpu_ray_query_vertex_return;\
+        @group(0)@binding(0) var acc: acceleration_structure<vertex_return>;\
+        @group(0)@binding(1) var<storage,read_write> out: vec3<f32>;\
+        @compute @workgroup_size(1) fn main(){\
+            var rq: ray_query<vertex_return>;\
+            rayQueryInitialize(&rq, acc, RayDesc(4u,255u,0.1,100.0,vec3<f32>(0.0),vec3<f32>(0.0,1.0,0.0)));\
+            loop { let p = rayQueryProceed(&rq); if !p { break; } }\
+            let verts = getCommittedHitVertexPositions(&rq);\
+            out = verts[0];\
+        }";
+    let out = minify(src);
+    assert!(
+        out.contains("enable wgpu_ray_query;")
+            && out.contains("enable wgpu_ray_query_vertex_return;"),
+        "both ray-query enables must be emitted: {out}"
+    );
+    assert!(
+        out.contains("ray_query<vertex_return>")
+            && out.contains("acceleration_structure<vertex_return>"),
+        "vertex_return type flags must survive the round trip: {out}"
+    );
+    assert!(
+        out.contains("getCommittedHitVertexPositions(&"),
+        "vertex-position query must render inline: {out}"
+    );
+}
+
 /// A value computed BEFORE a loop and used in its `break_if` must stay bound
 /// there: load_dedup must not forward the load to a read inside the loop,
 /// which would observe the loop-mutated place across the back-edge.  Here

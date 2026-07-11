@@ -193,6 +193,12 @@ pub(super) struct FunctionCtx<'a, 'm> {
     /// miscompile (e.g. the classic swap `let t=x;x=y;y=t`).  Computed
     /// once per function by `module_emit::compute_must_bind_loads`.
     pub(super) must_bind_loads: std::collections::HashSet<naga::Handle<naga::Expression>>,
+    /// Memo for `stmt_emit`'s rendered-nesting-depth cap, indexed by
+    /// expression handle (`0` = not yet computed).  Depths are queried
+    /// child-first in arena order, so a child bound after its entry was
+    /// taken can only make an ancestor's stored depth an overestimate -
+    /// the safe direction (at worst an extra `let`).
+    pub(super) render_depth_memo: Vec<u16>,
     /// Display name for the current function, used to decorate
     /// diagnostic messages.
     pub(super) display_name: String,
@@ -515,8 +521,19 @@ fn compute_live_types(
         if let Some(result) = &func.result {
             mark(result.ty);
         }
-        for (_, local) in func.local_variables.iter() {
-            mark(local.ty);
+        // Dead locals (never referenced) are not declared by the emitter, so
+        // their types must not count as live either - naga's compactor roots
+        // ALL locals, so a DCE'd `var res: __frexp_result_f16;` would
+        // otherwise keep pinning its special type (and, through the f16
+        // member scalars, a spurious `enable f16;`) forever.  Uses the SAME
+        // dead-local analysis the emitter's declaration skip uses
+        // (`find_deferrable_vars`), so emitted-decl and live-type views
+        // cannot disagree.
+        let (_, dead_locals) = super::module_emit::find_deferrable_vars(func);
+        for (h, local) in func.local_variables.iter() {
+            if !dead_locals[h.index()] {
+                mark(local.ty);
+            }
         }
         for (_, expr) in func.expressions.iter() {
             match expr {

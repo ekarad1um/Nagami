@@ -121,12 +121,37 @@ pub(crate) fn module_has_non_const_global_initializer(module: &naga::Module) -> 
     false
 }
 
+/// `true` when `module` uses ray queries.  naga 30's WGSL back-end has no arm
+/// for `Statement::RayQuery` or for the `RayQueryGetIntersection` /
+/// `RayQueryVertexPositions` expressions (both `unreachable!()`), so it ABORTS
+/// under the release `panic = "abort"` strategy rather than returning an
+/// error.  In a validated module every one of those constructs requires a
+/// `ray_query`-typed local, so detecting the *type* in the arena covers them
+/// all without walking statement trees.  A dead-but-declared `ray_query` type
+/// over-triggers, which only costs the naga baseline byte-count - nagami's
+/// generator emits ray-query code itself.  (Ray-tracing-*pipeline* modules
+/// without ray queries are fine: the writer handles their stages, payloads,
+/// and builtins.)
+pub(crate) fn module_has_ray_query(module: &naga::Module) -> bool {
+    module
+        .types
+        .iter()
+        .any(|(_, ty)| matches!(ty.inner, naga::TypeInner::RayQuery { .. }))
+}
+
 /// `true` when callers must skip the naga WGSL baseline/fallback emit because
 /// naga's back-end would abort (`panic = "abort"`) rather than error on this
 /// module.  Every site that emits via naga's WGSL backend gates on this so the
 /// abort-trigger set stays defined in one place.
+///
+/// Known residual hole (unreachable from [`run`]): exotic subgroup collective
+/// combinations hit `unimplemented!()` in naga's writer, but naga's WGSL
+/// front-end cannot parse `enable subgroups;` at all, so no text input reaches
+/// them; only a hand-built module fed to [`run_module`] could.
 pub(crate) fn module_needs_naga_baseline_skip(module: &naga::Module) -> bool {
-    module_has_override_sized_array(module) || module_has_non_const_global_initializer(module)
+    module_has_override_sized_array(module)
+        || module_has_non_const_global_initializer(module)
+        || module_has_ray_query(module)
 }
 
 /// Normalise `source` so naga's front-end accepts it: rewrite lone-CR endings
@@ -1273,6 +1298,41 @@ mod tests {
         .unwrap();
         assert!(module_has_non_const_global_initializer(&m));
         assert!(module_needs_naga_baseline_skip(&m));
+    }
+
+    #[test]
+    fn ray_query_predicate_flags_module() {
+        // naga's WGSL writer aborts on `Statement::RayQuery`
+        // (`unreachable!()`), so any module holding a `ray_query` type must
+        // skip the naga baseline/fallback emit.
+        let m = io::parse_wgsl(
+            "enable wgpu_ray_query;\
+             @group(0)@binding(0) var acc: acceleration_structure;\
+             @compute @workgroup_size(1) fn m(){\
+                 var rq: ray_query;\
+                 rayQueryInitialize(&rq, acc, RayDesc(4u,255u,0.1,100.0,vec3<f32>(0.0),vec3<f32>(0.0,1.0,0.0)));\
+             }",
+        )
+        .unwrap();
+        assert!(module_has_ray_query(&m));
+        assert!(module_needs_naga_baseline_skip(&m));
+    }
+
+    #[test]
+    fn ray_tracing_pipeline_without_query_keeps_naga_baseline() {
+        // A ray-tracing-*pipeline* module without ray queries stays on the
+        // naga baseline: the writer handles its stages, payloads, and
+        // builtins fine, and skipping needlessly would forgo the byte
+        // comparison.
+        let m = io::parse_wgsl(
+            "enable wgpu_ray_tracing_pipeline;\
+             struct P { hit: u32 }\
+             var<ray_payload> payload: P;\
+             @ray_generation fn rgen(){ payload = P(0u); }",
+        )
+        .unwrap();
+        assert!(!module_has_ray_query(&m));
+        assert!(!module_needs_naga_baseline_skip(&m));
     }
 
     #[test]

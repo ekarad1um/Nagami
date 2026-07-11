@@ -11,6 +11,17 @@ use crate::error::Error;
 
 use super::core::{FunctionCtx, Generator};
 
+/// Cap on the rendered nesting depth of any single emitted expression.
+///
+/// tint's WGSL parser enforces a hard limit of 512 nested expressions and
+/// rejects deeper text ("maximum parser recursive depth reached"), while naga
+/// parses and validates arbitrary depth - so nagami's own self-check cannot
+/// catch an overflow.  Single-use `let` inlining is the only unbounded
+/// depth source; capping at 256 leaves the other half of tint's budget for
+/// enclosing statement/parenthesis nesting.  Chain interiors bind at most one
+/// level past the cap, so emitted expressions stay <= 257 deep.
+const MAX_RENDER_DEPTH: u16 = 256;
+
 /// Count how many times emitting the expression tree rooted at `root` will
 /// materialise `target`.  `target` is a for-loop preload result that the
 /// caller has bound to inline `workgroupUniformLoad(&p)` text; every distinct
@@ -585,7 +596,19 @@ impl<'a> Generator<'a> {
                     // threshold below.
                     let force_bind =
                         ctx.must_bind_loads.contains(&h) || self.is_uniformity_pinned(h, ctx);
-                    if !force_bind && !self.should_bind_expression(h, ctx) {
+                    // tint's parser rejects expression nesting past 512 while
+                    // naga accepts arbitrary depth so single-use inlining must
+                    // not flatten without bound: once inlining `h` would render
+                    // deeper than the cap, bind it regardless of the byte-cost
+                    // threshold.  Restricted to `should_bind_expression` shapes
+                    // (never pointers / statement-result names) and live values;
+                    // depth passes through unbindable nodes to their first
+                    // bindable ancestor.
+                    let depth_capped = !force_bind
+                        && ctx.ref_counts[h.index()] > 0
+                        && self.should_bind_expression(h, ctx)
+                        && self.render_depth(h, ctx) > MAX_RENDER_DEPTH;
+                    if !force_bind && !depth_capped && !self.should_bind_expression(h, ctx) {
                         continue;
                     }
                     // Skip binding when the expression has too few references
@@ -593,7 +616,7 @@ impl<'a> Generator<'a> {
                     // expressions (e.g. `-x`, `v.y`, `a*b`) the threshold is
                     // higher because inlining them at each use site is cheaper.
                     let refs = ctx.ref_counts[h.index()];
-                    if !force_bind && refs < self.min_binding_refs(h, ctx) {
+                    if !force_bind && !depth_capped && refs < self.min_binding_refs(h, ctx) {
                         continue;
                     }
                     // For subsequent bindings, start a new indented line.
@@ -1134,7 +1157,15 @@ impl<'a> Generator<'a> {
                         self.out.push_str("rayQueryGenerateIntersection(&");
                         self.out.push_str(&query_text);
                         self.out.push_str(sep);
-                        self.out.push_str(&self.emit_expr(*hit_t, ctx)?);
+                        // naga's lowerer does not propagate an expected type
+                        // into this builtin's argument, so a bare literal
+                        // (`10`) concretizes to i32 and fails validation
+                        // ("Hit distance must be an f32"); pin the hint.
+                        self.out.push_str(&self.emit_expr_with_scalar_hint(
+                            *hit_t,
+                            Some(naga::Scalar::F32),
+                            ctx,
+                        )?);
                         self.out.push_str(");");
                     }
                     naga::RayQueryFunction::ConfirmIntersection => {
@@ -1218,6 +1249,40 @@ impl<'a> Generator<'a> {
             }
             _ => false,
         }
+    }
+
+    /// Rendered-text nesting depth of `h` if it were inlined at its use site
+    /// right now: expressions with a binding (current or just-emitted, per
+    /// `expr_names`) render as identifiers and count 1; everything else
+    /// counts one level over its deepest child.  Memoized per function in
+    /// `ctx.render_depth_memo`; each node is computed at most once, so a
+    /// whole-arena sweep is linear (the unmemoized version of this walk was
+    /// this codebase's past 2^depth hang).
+    fn render_depth(
+        &self,
+        h: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> u16 {
+        if ctx.expr_names.contains_key(&h) {
+            return 1;
+        }
+        let memoized = ctx.render_depth_memo[h.index()];
+        if memoized != 0 {
+            return memoized;
+        }
+        // Materialise the child list first: the visitor borrows the arena
+        // immutably while the recursion below needs `ctx` mutably.
+        let mut children = Vec::new();
+        crate::passes::expr_util::visit_expression_children(&ctx.func.expressions[h], |c| {
+            children.push(c)
+        });
+        let mut max_child = 0u16;
+        for child in children {
+            max_child = max_child.max(self.render_depth(child, ctx));
+        }
+        let depth = max_child.saturating_add(1);
+        ctx.render_depth_memo[h.index()] = depth;
+        depth
     }
 
     fn should_bind_expression(

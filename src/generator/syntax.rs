@@ -922,6 +922,16 @@ pub(super) fn type_inner_name(
                 "acceleration_structure".to_string()
             }
         }
+        // Same `vertex_return` contract as `acceleration_structure` above;
+        // dropping the flag on re-parse would silently lose the
+        // vertex-position query capability.
+        naga::TypeInner::RayQuery { vertex_return } => {
+            if *vertex_return {
+                "ray_query<vertex_return>".to_string()
+            } else {
+                "ray_query".to_string()
+            }
+        }
         _ => {
             return Err(Error::Emit(format!("unsupported type: {:?}", inner,)));
         }

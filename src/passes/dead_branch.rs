@@ -509,8 +509,13 @@ impl Pass for DeadBranchPass {
                 desugar_short_circuit(&mut function.body, &mut function.expressions, &foldable);
             changed += usize::from(forward_single_store_locals(function));
             changed += eliminate_redundant_else_stores_in_function(function, &const_lits);
-            changed +=
-                eliminate_dead_branches(&mut function.body, &function.expressions, &const_lits);
+            changed += eliminate_dead_branches(
+                &mut function.body,
+                &function.expressions,
+                &const_lits,
+                /*in_loop=*/ false,
+                /*break_binds_to_loop=*/ false,
+            );
         }
         for entry in module.entry_points.iter_mut() {
             changed += {
@@ -528,6 +533,8 @@ impl Pass for DeadBranchPass {
                 &mut entry.function.body,
                 &entry.function.expressions,
                 &const_lits,
+                /*in_loop=*/ false,
+                /*break_binds_to_loop=*/ false,
             );
         }
 
@@ -909,10 +916,20 @@ fn block_has_result_producer(block: &naga::Block) -> bool {
 /// compile-time literal `true` / `false` and pruning unreachable switch
 /// cases.  Returns the number of transformations applied so the caller can
 /// aggregate change counts across phases.
+///
+/// `in_loop` / `break_binds_to_loop` thread the enclosing-loop context for
+/// the loop-exit-preservation guards (see [`contains_return`]): a fold must
+/// not drop a block carrying what tint counts as the enclosing loop's only
+/// exit.  `in_loop` is true anywhere inside a loop (a dropped `Return` exits
+/// it from any depth); `break_binds_to_loop` is true only where a bare
+/// `Break` would target that loop (false inside switch cases, which capture
+/// `Break`).
 fn eliminate_dead_branches(
     block: &mut naga::Block,
     expressions: &naga::Arena<naga::Expression>,
     const_lits: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
+    in_loop: bool,
+    break_binds_to_loop: bool,
 ) -> usize {
     let original = std::mem::take(block);
     let mut rebuilt = naga::Block::with_capacity(original.len());
@@ -929,22 +946,52 @@ fn eliminate_dead_branches(
         // silently bypassing recursion.
         match &mut statement {
             naga::Statement::Block(inner) => {
-                changed += eliminate_dead_branches(inner, expressions, const_lits);
+                changed += eliminate_dead_branches(
+                    inner,
+                    expressions,
+                    const_lits,
+                    in_loop,
+                    break_binds_to_loop,
+                );
             }
             naga::Statement::If { accept, reject, .. } => {
-                changed += eliminate_dead_branches(accept, expressions, const_lits);
-                changed += eliminate_dead_branches(reject, expressions, const_lits);
+                changed += eliminate_dead_branches(
+                    accept,
+                    expressions,
+                    const_lits,
+                    in_loop,
+                    break_binds_to_loop,
+                );
+                changed += eliminate_dead_branches(
+                    reject,
+                    expressions,
+                    const_lits,
+                    in_loop,
+                    break_binds_to_loop,
+                );
             }
             naga::Statement::Switch { cases, .. } => {
                 for case in cases.iter_mut() {
-                    changed += eliminate_dead_branches(&mut case.body, expressions, const_lits);
+                    // A bare `Break` inside a case targets the SWITCH, so it
+                    // stops binding to any enclosing loop; `Return` still
+                    // exits the loop from inside a case.
+                    changed += eliminate_dead_branches(
+                        &mut case.body,
+                        expressions,
+                        const_lits,
+                        in_loop,
+                        false,
+                    );
                 }
             }
             naga::Statement::Loop {
                 body, continuing, ..
             } => {
-                changed += eliminate_dead_branches(body, expressions, const_lits);
-                changed += eliminate_dead_branches(continuing, expressions, const_lits);
+                changed += eliminate_dead_branches(body, expressions, const_lits, true, true);
+                // `continuing` cannot hold a bare `Break` in valid IR;
+                // `false` is the precise binding context either way.
+                changed +=
+                    eliminate_dead_branches(continuing, expressions, const_lits, true, false);
             }
             naga::Statement::Emit(_)
             | naga::Statement::Store { .. }
@@ -990,7 +1037,15 @@ fn eliminate_dead_branches(
                     // pass back every sweep.  Keep the `if` intact in that case:
                     // the branch is dead-but-valid, and leaving it avoids both
                     // the invalid IR and the wasted per-sweep revalidation.
-                    if block_has_result_producer(&reject) {
+                    //
+                    // Also keep it when the dropped block may carry the
+                    // enclosing loop's only exit as tint counts them
+                    // (syntactically, without const-evaluating this
+                    // condition) - see `contains_return`.
+                    if block_has_result_producer(&reject)
+                        || (in_loop && contains_return(&reject))
+                        || (break_binds_to_loop && contains_bare_break(&reject))
+                    {
                         rebuilt.push(
                             naga::Statement::If {
                                 condition,
@@ -1005,8 +1060,12 @@ fn eliminate_dead_branches(
                     }
                 }
                 Some(naga::Literal::Bool(false)) => {
-                    // `accept` is dropped: same orphaned-result hazard.
-                    if block_has_result_producer(&accept) {
+                    // `accept` is dropped: same orphaned-result and
+                    // loop-exit hazards as the `true` arm above.
+                    if block_has_result_producer(&accept)
+                        || (in_loop && contains_return(&accept))
+                        || (break_binds_to_loop && contains_bare_break(&accept))
+                    {
                         rebuilt.push(
                             naga::Statement::If {
                                 condition,
@@ -1072,7 +1131,17 @@ fn eliminate_dead_branches(
                     // splice below emits the default body and drops only empty
                     // prefix cases, orphaning no result producer, so it needs no
                     // such guard.)
-                    if cases.iter().any(|c| block_has_result_producer(&c.body)) {
+                    //
+                    // Inside a loop, also keep it when any case holds a
+                    // `Return` - a dropped case's Return can be the exit tint
+                    // credits the loop with (bare `Break`s here target the
+                    // switch itself, so only Returns matter).  Checking ALL
+                    // cases (not just dropped ones) over-keeps when the
+                    // matched chain has the Return; that shape is rare and
+                    // the cost is a kept-but-dead wrapper.
+                    if cases.iter().any(|c| block_has_result_producer(&c.body))
+                        || (in_loop && cases.iter().any(|c| contains_return(&c.body)))
+                    {
                         rebuilt.push(naga::Statement::Switch { selector, cases }, span);
                     } else {
                         match find_matching_case_index(&cases, value) {
@@ -1157,8 +1226,19 @@ fn eliminate_dead_branches(
                         );
                     }
                 }
-                Some(naga::Literal::Bool(false)) => {
-                    // `break if false` -> never breaks via break_if; drop it.
+                // `break if false` never breaks at RUNTIME, but tint's
+                // loop-exit analysis is syntactic (it does not
+                // const-evaluate the condition): when this is the loop's
+                // only lexical exit, dropping it turns tint-valid input
+                // into tint-rejected output ("loop does not exit"), while
+                // naga 30 happily validates the exit-less `loop{}`.  Drop
+                // it only when the body proves another exit (the guard);
+                // otherwise fall through to the keep-as-is arm below.
+                // `continuing` cannot carry a bare Break or Return in
+                // valid IR.
+                Some(naga::Literal::Bool(false))
+                    if contains_bare_break(&body) || contains_return(&body) =>
+                {
                     rebuilt.push(
                         naga::Statement::Loop {
                             body,
@@ -1553,6 +1633,79 @@ fn contains_bare_break(block: &naga::Block) -> bool {
             | naga::Statement::Store { .. }
             | naga::Statement::Continue
             | naga::Statement::Return { .. }
+            | naga::Statement::Kill
+            | naga::Statement::ControlBarrier(_)
+            | naga::Statement::MemoryBarrier(_)
+            | naga::Statement::ImageStore { .. }
+            | naga::Statement::ImageAtomic { .. }
+            | naga::Statement::Call { .. }
+            | naga::Statement::Atomic { .. }
+            | naga::Statement::RayQuery { .. }
+            | naga::Statement::RayPipelineFunction(_)
+            | naga::Statement::WorkGroupUniformLoad { .. }
+            | naga::Statement::SubgroupBallot { .. }
+            | naga::Statement::SubgroupGather { .. }
+            | naga::Statement::SubgroupCollectiveOperation { .. }
+            | naga::Statement::CooperativeStore { .. } => {}
+        }
+    }
+    false
+}
+
+/// Returns `true` if `block` contains a `Return` at ANY nesting depth,
+/// including inside nested loops and switches - a `Return` exits the function
+/// (and therefore every enclosing loop) from anywhere.
+///
+/// Used by the loop-exit-preservation guards: tint's behavior analysis
+/// requires every `loop` to have a reachable-looking exit (`break` targeting
+/// it, `break if`, or a `Return` somewhere inside), but does NOT
+/// const-evaluate conditions - so a `Return`/`Break` inside `if false { .. }`
+/// still counts for tint while naga 30 validates a fully exit-less `loop{}`
+/// as legal.  Folding away such a block can turn tint-valid input into
+/// tint-rejected output ("loop does not exit"); the guards keep those
+/// dead-but-load-bearing blocks.  `Kill` deliberately does NOT count: tint
+/// demotes `discard` to a helper-invocation exit, not a loop exit (mirrors
+/// the Kill-is-not-a-terminator rule in `definitely_terminates`).
+fn contains_return(block: &naga::Block) -> bool {
+    for stmt in block.iter() {
+        match stmt {
+            naga::Statement::Return { .. } => return true,
+            naga::Statement::Block(inner) => {
+                if contains_return(inner) {
+                    return true;
+                }
+            }
+            naga::Statement::If { accept, reject, .. } => {
+                if contains_return(accept) || contains_return(reject) {
+                    return true;
+                }
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases {
+                    if contains_return(&case.body) {
+                        return true;
+                    }
+                }
+            }
+            // A Return inside a nested loop still exits the function, so -
+            // unlike the bare Break/Continue scans above - recurse into
+            // loops.  (`continuing` cannot hold a Return in valid IR, but
+            // scanning it costs nothing and stays correct on any input.)
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => {
+                if contains_return(body) || contains_return(continuing) {
+                    return true;
+                }
+            }
+            // Leaf statements that cannot carry a Return and have no
+            // nested blocks.  Enumerated explicitly so a future naga
+            // release adding a new block-bearing variant breaks the
+            // build here instead of silently missing a Return.
+            naga::Statement::Emit(_)
+            | naga::Statement::Store { .. }
+            | naga::Statement::Break
+            | naga::Statement::Continue
             | naga::Statement::Kill
             | naga::Statement::ControlBarrier(_)
             | naga::Statement::MemoryBarrier(_)

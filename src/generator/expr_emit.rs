@@ -1431,12 +1431,37 @@ impl<'a> Generator<'a> {
             | E::WorkGroupUniformLoadResult { .. }
             | E::SubgroupBallotResult
             | E::SubgroupOperationResult { .. }
-            | E::RayQueryProceedResult
-            | E::RayQueryGetIntersection { .. } => ctx
+            | E::RayQueryProceedResult => ctx
                 .expr_names
                 .get(&expr)
                 .cloned()
                 .unwrap_or_else(|| format!("_e{}", expr.index())),
+            // Unlike `RayQueryProceedResult` above (bound by the enclosing
+            // `Statement::RayQuery { fun: Proceed }`), these two are
+            // free-standing builtin calls with no binding statement, so they
+            // render inline.  `query` is a `ray_query` local per naga's
+            // validator (`InvalidRayQueryExpression` otherwise), spelled with
+            // an explicit `&` exactly like the `Statement::RayQuery` emitter.
+            E::RayQueryGetIntersection { query, committed } => {
+                let mut s = String::from(if *committed {
+                    "rayQueryGetCommittedIntersection(&"
+                } else {
+                    "rayQueryGetCandidateIntersection(&"
+                });
+                s.push_str(&self.emit_expr(*query, ctx)?);
+                s.push(')');
+                s
+            }
+            E::RayQueryVertexPositions { query, committed } => {
+                let mut s = String::from(if *committed {
+                    "getCommittedHitVertexPositions(&"
+                } else {
+                    "getCandidateHitVertexPositions(&"
+                });
+                s.push_str(&self.emit_expr(*query, ctx)?);
+                s.push(')');
+                s
+            }
             E::ArrayLength(e) => {
                 let mut s = String::from("arrayLength(&");
                 s.push_str(&self.emit_expr(*e, ctx)?);
@@ -2758,6 +2783,16 @@ impl<'a> Generator<'a> {
                 (naga::ScalarKind::Uint, 8) => Some(L::U64(v)),
                 _ => None,
             },
+            // Already-concrete floats matching the hint still need the TYPED
+            // spelling: the default emit path renders whole-number floats in
+            // bare-int form (`10.0` -> `10`), which only re-parses as a float
+            // in positions where naga applies abstract coercion.  A hinted
+            // position is by definition one where it does not (e.g. the
+            // `rayQueryGenerateIntersection` hit_t slot or a `Derivative`
+            // argument, which concretize a bare literal to i32 instead).
+            L::F32(v) if target == naga::Scalar::F32 => Some(L::F32(v)),
+            L::F64(v) if target == naga::Scalar::F64 => Some(L::F64(v)),
+            L::F16(v) if target == naga::Scalar::F16 => Some(L::F16(v)),
             L::AbstractInt(v) => match (target.kind, target.width) {
                 (naga::ScalarKind::Sint, 4) => i32::try_from(v).ok().map(L::I32),
                 (naga::ScalarKind::Sint, 8) => Some(L::I64(v)),
