@@ -94,15 +94,21 @@ fn elide_tail_void_returns(stmt: &naga::Statement) -> Option<naga::Statement> {
     }
 }
 
-/// Cap on the rendered nesting depth of any single emitted expression.
-///
-/// tint's WGSL parser enforces a hard limit of 512 nested expressions and
-/// rejects deeper text ("maximum parser recursive depth reached"), while naga
-/// parses and validates arbitrary depth - so nagami's own self-check cannot
-/// catch an overflow.  Single-use `let` inlining is the only unbounded
-/// depth source; capping at 256 leaves the other half of tint's budget for
-/// enclosing statement/parenthesis nesting.  Chain interiors bind at most one
-/// level past the cap, so emitted expressions stay <= 257 deep.
+/// Cap on the rendered nesting cost of any single emitted expression, in
+/// approximate tint parser recursion FRAMES - the unit of tint's hard
+/// limit of 512 recursive parser frames ("maximum parser recursive depth
+/// reached").  Measured against tint's parser: a parenthesized / call /
+/// index nesting level costs ~4 frames (~126 levels max), a parenthesized
+/// unary level ~8 (~63), a flat un-parenthesized binary chain element ~1,
+/// and STATEMENT brace nesting draws from the same budget.  naga's own
+/// frontend additionally stops near 197 nesting levels ("Parser recursion
+/// limit exceeded"), which the self-check re-parse must survive.
+/// [`Generator::render_depth`] therefore weighs every node at 4 frames (8
+/// for `Unary`), so this cap keeps one expression at <= 64 call/paren
+/// levels or 32 unary levels - inside tint's budget with ~64 brace levels
+/// to spare, and inside naga's frontend limit.  Single-use `let` inlining
+/// is the only unbounded depth source; chain interiors bind at most one
+/// node past the cap.
 const MAX_RENDER_DEPTH: u16 = 256;
 
 /// Count how many times emitting the expression tree rooted at `root` will
@@ -320,6 +326,55 @@ pub(super) fn parse_for_loop_shape<'a>(
 /// Each preload must therefore be emitted exactly once (`count == 1`); any
 /// other count refuses the for-loop conversion so plain-loop emission - which
 /// keeps the preload as its own statement - preserves the barrier.
+/// `true` when rendering `shape`'s guard condition or update statement
+/// inline in a `for(...)` header would exceed [`MAX_RENDER_DEPTH`].  Header
+/// clauses bypass the `S::Emit` depth gate entirely - their `Emit` ranges
+/// are consumed by the for-conversion, never processed as statements - so
+/// an over-deep chain must stay on the plain `loop` path, where the gate
+/// binds it.  (The init value's `Emit`s precede the loop and are gated
+/// normally, so init depth needs no check here.)
+///
+/// Deliberately ignores `expr_names`/binding state: like
+/// [`for_loop_preload_inlining_is_safe`], both `is_for_loop_candidate`
+/// (counter-`var` suppression) and [`Generator::try_emit_for_loop`]
+/// (emission) call this on the SAME [`ForLoopShape`] with the same inputs,
+/// so the two decisions can never drift toward "suppressed + undeclared".
+pub(super) fn for_header_exceeds_depth_cap(
+    shape: &ForLoopShape,
+    expressions: &naga::Arena<naga::Expression>,
+) -> bool {
+    fn depth(
+        h: naga::Handle<naga::Expression>,
+        expressions: &naga::Arena<naga::Expression>,
+        memo: &mut std::collections::HashMap<naga::Handle<naga::Expression>, u16>,
+    ) -> u16 {
+        if let Some(&d) = memo.get(&h) {
+            return d;
+        }
+        let mut children = Vec::new();
+        crate::passes::expr_util::visit_expression_children(&expressions[h], |c| children.push(c));
+        let mut max_child = 0u16;
+        for child in children {
+            max_child = max_child.max(depth(child, expressions, memo));
+        }
+        let weight = match expressions[h] {
+            naga::Expression::Unary { .. } => 8,
+            _ => 4,
+        };
+        let d = max_child.saturating_add(weight);
+        memo.insert(h, d);
+        d
+    }
+    let mut memo = std::collections::HashMap::new();
+    let mut exceeded = depth(shape.condition, expressions, &mut memo) > MAX_RENDER_DEPTH;
+    if let Some(stmt) = shape.update_stmt {
+        crate::passes::expr_util::visit_statement_expression_handles(stmt, false, &mut |h| {
+            exceeded |= depth(h, expressions, &mut memo) > MAX_RENDER_DEPTH;
+        });
+    }
+    exceeded
+}
+
 pub(super) fn for_loop_preload_inlining_is_safe(
     shape: &ForLoopShape,
     body: &naga::Block,
@@ -588,21 +643,28 @@ impl<'a> Generator<'a> {
                 rewritten_tail = Some(rewritten);
             }
         }
-        self.emit_stmts(&stmts, ctx)?;
-        if let Some(rewritten) = &rewritten_tail {
-            // Mirror `emit_stmts`' per-statement framing (indent, then drop
-            // the speculative indent if the statement emitted nothing).
-            let before = self.out.len();
-            self.push_indent();
-            let after_indent = self.out.len();
-            self.generate_statement(rewritten, ctx)?;
-            if self.out.len() > after_indent {
-                self.push_newline();
-            } else {
-                self.out.truncate(before);
+        // Re-attach the rewritten tail to the slice `emit_stmts` sees: the
+        // for-init absorption's later-use scope scan must include it (a
+        // counter read only inside the tail would otherwise be invisible,
+        // get absorbed into a for-scoped `var`, and leave the tail's
+        // reference out of scope).  The rewrite can also drain the statement
+        // entirely (`if c { return; }` -> `if c {}`); conditions/selectors
+        // are pure expressions in WGSL, so the empty shell is dead bytes -
+        // skip it, which is also what a re-minify's dead_branch would do.
+        let vacuous = match &rewritten_tail {
+            Some(naga::Statement::If { accept, reject, .. }) => {
+                accept.is_empty() && reject.is_empty()
             }
+            Some(naga::Statement::Switch { cases, .. }) => cases.iter().all(|c| c.body.is_empty()),
+            Some(naga::Statement::Block(inner)) => inner.is_empty(),
+            Some(_) | None => false,
+        };
+        if let Some(rewritten) = &rewritten_tail
+            && !vacuous
+        {
+            stmts.push(rewritten);
         }
-        Ok(())
+        self.emit_stmts(&stmts, ctx)
     }
 
     /// Emit a slice of statement references while attempting to
@@ -706,14 +768,13 @@ impl<'a> Generator<'a> {
                     // threshold below.
                     let force_bind =
                         ctx.must_bind_loads.contains(&h) || self.is_uniformity_pinned(h, ctx);
-                    // tint's parser rejects expression nesting past 512 while
-                    // naga accepts arbitrary depth so single-use inlining must
-                    // not flatten without bound: once inlining `h` would render
-                    // deeper than the cap, bind it regardless of the byte-cost
-                    // threshold.  Restricted to `should_bind_expression` shapes
-                    // (never pointers / statement-result names) and live values;
-                    // depth passes through unbindable nodes to their first
-                    // bindable ancestor.
+                    // Both parsers bound nesting (see [`MAX_RENDER_DEPTH`]), so
+                    // single-use inlining must not flatten without bound: once
+                    // inlining `h` would render past the cap, bind it regardless
+                    // of the byte-cost threshold.  Restricted to
+                    // `should_bind_expression` shapes (never pointers /
+                    // statement-result names) and live values; depth passes
+                    // through unbindable nodes to their first bindable ancestor.
                     let depth_capped = !force_bind
                         && ctx.ref_counts[h.index()] > 0
                         && self.should_bind_expression(h, ctx)
@@ -1361,11 +1422,13 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// Rendered-text nesting depth of `h` if it were inlined at its use site
-    /// right now: expressions with a binding (current or just-emitted, per
-    /// `expr_names`) render as identifiers and count 1; everything else
-    /// counts one level over its deepest child.  Memoized per function in
-    /// `ctx.render_depth_memo`; each node is computed at most once, so a
+    /// Rendered nesting cost of `h` if it were inlined at its use site right
+    /// now, in the frame units of [`MAX_RENDER_DEPTH`]: expressions with a
+    /// binding (current or just-emitted, per `expr_names`) render as
+    /// identifiers and cost one leaf; everything else adds its own frame
+    /// weight - 8 for `Unary` (a parenthesized `-(...)` level costs tint
+    /// double), 4 otherwise - over its deepest child.  Memoized per function
+    /// in `ctx.render_depth_memo`; each node is computed at most once, so a
     /// whole-arena sweep is linear (the unmemoized version of this walk was
     /// this codebase's past 2^depth hang).
     fn render_depth(
@@ -1374,7 +1437,7 @@ impl<'a> Generator<'a> {
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> u16 {
         if ctx.expr_names.contains_key(&h) {
-            return 1;
+            return 4;
         }
         let memoized = ctx.render_depth_memo[h.index()];
         if memoized != 0 {
@@ -1390,7 +1453,11 @@ impl<'a> Generator<'a> {
         for child in children {
             max_child = max_child.max(self.render_depth(child, ctx));
         }
-        let depth = max_child.saturating_add(1);
+        let weight = match ctx.func.expressions[h] {
+            naga::Expression::Unary { .. } => 8,
+            _ => 4,
+        };
+        let depth = max_child.saturating_add(weight);
         ctx.render_depth_memo[h.index()] = depth;
         depth
     }
@@ -1407,8 +1474,7 @@ impl<'a> Generator<'a> {
             | E::WorkGroupUniformLoadResult { .. }
             | E::SubgroupBallotResult
             | E::SubgroupOperationResult { .. }
-            | E::RayQueryProceedResult
-            | E::RayQueryGetIntersection { .. } => return false,
+            | E::RayQueryProceedResult => return false,
             // Load from a bare local/global variable emits as just the
             // variable name (1-2 chars after rename).  A `let` binding
             // would introduce overhead (`let X=Y;`) with zero savings
@@ -1559,6 +1625,13 @@ impl<'a> Generator<'a> {
             &ctx.func.expressions,
             &ctx.must_bind_loads,
         ) {
+            return Ok(false);
+        }
+
+        // Over-deep guard/update chains must not inline into the header
+        // (see `for_header_exceeds_depth_cap`); plain `loop` emission
+        // routes them through the S::Emit depth gate instead.
+        if for_header_exceeds_depth_cap(&shape, &ctx.func.expressions) {
             return Ok(false);
         }
 

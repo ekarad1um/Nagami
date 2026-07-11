@@ -8,12 +8,16 @@
 //!
 //! Scheduled immediately after `CompactPass`: compaction culls
 //! statement-unreachable expressions first, so "no `LocalVariable(h)`
-//! expression left in the arena" is exactly "dead local" here - no statement
-//! walking and no expression-arena surgery.  A local whose last reference
-//! dies later in the same sweep is caught by the next sweep's
-//! compact -> dead-local prefix; the convergence loop already runs until no
-//! pass reports a change.  A floating expression this removal orphans (a
-//! dead local's initialiser) is valid IR and is culled by the next compact.
+//! expression left in the arena" means "dead local" here - no statement
+//! walking and no expression-arena surgery.  (A sound under-approximation:
+//! naga's compact also roots `named_expressions`, which can keep a
+//! statement-unreachable reference - and with it the local - alive.)  A
+//! local whose last reference dies later in the same sweep is caught by the
+//! next sweep's compact -> dead-local prefix; the convergence loop already
+//! runs until no pass reports a change.  A floating expression this removal
+//! orphans (a dead local's initialiser) is valid IR and is culled by the
+//! next compact; if the sweep cap lands first, it reaches the generator
+//! outside any `Emit` range and is simply never rendered.
 
 use std::collections::HashSet;
 

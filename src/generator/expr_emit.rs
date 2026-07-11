@@ -401,6 +401,24 @@ impl<'a> Generator<'a> {
         self.emit_expr_uncached(expr, ctx)
     }
 
+    /// Render a ray-query builtin's `query` operand.  naga's expression
+    /// validator admits any `ptr<function, ray_query>` here: a `ray_query`
+    /// LOCAL is a WGSL reference and needs `&`, while the only other legal
+    /// producer - a pointer-typed function argument (`ray_query` cannot live
+    /// in composites, so no access chain yields one) - is already a pointer
+    /// value and passes through verbatim.
+    fn emit_ray_query_arg(
+        &self,
+        query: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<String, Error> {
+        let text = self.emit_expr(query, ctx)?;
+        Ok(match ctx.func.expressions[query] {
+            naga::Expression::LocalVariable(_) => format!("&{text}"),
+            _ => text,
+        })
+    }
+
     /// Emit an expression that appears inside a type constructor
     /// (`Compose` / `Splat`).  An uncached literal is rendered in the
     /// suffix-free bare form because the enclosing constructor type
@@ -1478,29 +1496,30 @@ impl<'a> Generator<'a> {
                 .get(&expr)
                 .cloned()
                 .unwrap_or_else(|| format!("_e{}", expr.index())),
-            // Unlike `RayQueryProceedResult` above (bound by the enclosing
-            // `Statement::RayQuery { fun: Proceed }`), these two are
-            // free-standing builtin calls with no binding statement, so they
-            // render inline.  `query` is a `ray_query` local per naga's
-            // validator (`InvalidRayQueryExpression` otherwise), spelled with
-            // an explicit `&` exactly like the `Statement::RayQuery` emitter.
+            // Free-standing builtin calls with no binding statement (contrast
+            // `RayQueryProceedResult`, which the enclosing
+            // `Statement::RayQuery { fun: Proceed }` binds).  They read the
+            // query's CURRENT traversal state, so `compute_must_bind_loads`
+            // tracks them like loads and force-binds any read that would
+            // otherwise re-evaluate at a use site past a query-mutating
+            // statement.
             E::RayQueryGetIntersection { query, committed } => {
                 let mut s = String::from(if *committed {
-                    "rayQueryGetCommittedIntersection(&"
+                    "rayQueryGetCommittedIntersection("
                 } else {
-                    "rayQueryGetCandidateIntersection(&"
+                    "rayQueryGetCandidateIntersection("
                 });
-                s.push_str(&self.emit_expr(*query, ctx)?);
+                s.push_str(&self.emit_ray_query_arg(*query, ctx)?);
                 s.push(')');
                 s
             }
             E::RayQueryVertexPositions { query, committed } => {
                 let mut s = String::from(if *committed {
-                    "getCommittedHitVertexPositions(&"
+                    "getCommittedHitVertexPositions("
                 } else {
-                    "getCandidateHitVertexPositions(&"
+                    "getCandidateHitVertexPositions("
                 });
-                s.push_str(&self.emit_expr(*query, ctx)?);
+                s.push_str(&self.emit_ray_query_arg(*query, ctx)?);
                 s.push(')');
                 s
             }
@@ -2146,13 +2165,14 @@ impl<'a> Generator<'a> {
     /// type.
     ///
     /// Soundness of the non-literal arm rests on the pin component
-    /// rendering in TYPED form.  A non-literal `ZeroValue` or unnamed
-    /// `Constant` would resolve to the right scalar yet still emit a bare
-    /// token, so it cannot be the sole pinner - but it never is:
-    /// `const_fold` runs first and folds away any all-constant `Compose`,
-    /// so a vector reaching the generator always has a runtime (typed)
-    /// component.  A future pass that leaves an unnamed const / `ZeroValue`
-    /// as a Compose's only non-literal component must revisit this gate.
+    /// rendering in TYPED form.  An unnamed `Constant` with a literal init
+    /// resolves to the right scalar yet still emits its init's bare token,
+    /// so it cannot be the sole pinner - but it never is: `const_fold` runs
+    /// first and folds away any all-constant `Compose`, so a vector
+    /// reaching the generator always has a runtime (typed) component.
+    /// (`ZeroValue` is fine either way - it emits typed `0f` / `vec2f()`
+    /// forms.)  A future pass that leaves an unnamed const as a Compose's
+    /// only non-literal component must revisit this gate.
     fn vector_ctor_name(
         &self,
         ty: naga::Handle<naga::Type>,
@@ -2749,12 +2769,11 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// Emit `expr`, but if it's an uncached abstract literal and a scalar
-    /// hint is provided, emit the literal concretized to that scalar type.
     /// Emit `expr` while forcing any bare literal it contains to the
-    /// supplied scalar hint.  Used when the surrounding operator
-    /// requires a specific concrete type (for example `Derivative`
-    /// on a bare literal, where naga would otherwise infer `i32`).
+    /// supplied scalar hint's TYPED spelling.  Used where the emitted
+    /// position gets no abstract coercion from naga's lowerer, so a bare
+    /// literal would re-concretize to i32: the `rayQueryGenerateIntersection`
+    /// hit_t slot and subgroup-op operands.
     pub(super) fn emit_expr_with_scalar_hint(
         &self,
         expr: naga::Handle<naga::Expression>,
@@ -2837,9 +2856,9 @@ impl<'a> Generator<'a> {
             // spelling: the default emit path renders whole-number floats in
             // bare-int form (`10.0` -> `10`), which only re-parses as a float
             // in positions where naga applies abstract coercion.  A hinted
-            // position is by definition one where it does not (e.g. the
-            // `rayQueryGenerateIntersection` hit_t slot or a `Derivative`
-            // argument, which concretize a bare literal to i32 instead).
+            // position is by definition one where it does not (the
+            // `rayQueryGenerateIntersection` hit_t slot, subgroup-op
+            // operands), so a bare literal would concretize to i32 there.
             L::F32(v) if target == naga::Scalar::F32 => Some(L::F32(v)),
             L::F64(v) if target == naga::Scalar::F64 => Some(L::F64(v)),
             L::F16(v) if target == naga::Scalar::F16 => Some(L::F16(v)),

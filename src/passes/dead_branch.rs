@@ -13,12 +13,17 @@
 //!    cooperative simplifications in the same walk:
 //!    * empty-If / empty-Switch / empty-Block elision,
 //!    * else-block elision when the accept branch unconditionally
-//!      terminates (return / break / continue / kill),
+//!      terminates (return / break / continue; `discard` continues under
+//!      demote-to-helper and never counts),
 //!    * dead code after a terminating statement,
 //!    * `loop { ... break if true; }` unwrap when no bare break/continue
 //!      would mis-target after unwrapping,
-//!    * `break if false` dropped (loop never terminates via that branch),
+//!    * `break if false` dropped when the loop body proves another exit,
 //!    * single-default-case Switch splicing.
+//!
+//!    Every fold that could delete - or, by splicing a never-falls-through
+//!    arm, make unreachable - what tint credits as a loop's only exit is
+//!    guarded; see [`contains_return`] and [`splice_loses_tint_loop_exit`].
 //!
 //! Phase order is load-bearing: short-circuit patterns rely on the
 //! untransformed frontend output, so re-sugaring must run before the
@@ -1038,13 +1043,20 @@ fn eliminate_dead_branches(
                     // the branch is dead-but-valid, and leaving it avoids both
                     // the invalid IR and the wasted per-sweep revalidation.
                     //
-                    // Also keep it when the dropped block may carry the
-                    // enclosing loop's only exit as tint counts them
-                    // (syntactically, without const-evaluating this
-                    // condition) - see `contains_return`.
+                    // Also keep it for either loop-exit hazard - tint counts
+                    // exits syntactically, without const-evaluating this
+                    // condition, but WITH reachability sequencing:
+                    // (a) the dropped block may carry the enclosing loop's
+                    //     only exit (see `contains_return`);
+                    // (b) splicing a kept block that never falls through
+                    //     (e.g. `continue`) makes every statement after the
+                    //     `if` unreachable to tint, un-crediting a trailing
+                    //     `break`/`return` even though its text survives
+                    //     (see `splice_loses_tint_loop_exit`).
                     if block_has_result_producer(&reject)
                         || (in_loop && contains_return(&reject))
                         || (break_binds_to_loop && contains_bare_break(&reject))
+                        || (in_loop && splice_loses_tint_loop_exit(&accept, break_binds_to_loop))
                     {
                         rebuilt.push(
                             naga::Statement::If {
@@ -1065,6 +1077,7 @@ fn eliminate_dead_branches(
                     if block_has_result_producer(&accept)
                         || (in_loop && contains_return(&accept))
                         || (break_binds_to_loop && contains_bare_break(&accept))
+                        || (in_loop && splice_loses_tint_loop_exit(&reject, break_binds_to_loop))
                     {
                         rebuilt.push(
                             naga::Statement::If {
@@ -1145,7 +1158,15 @@ fn eliminate_dead_branches(
                         rebuilt.push(naga::Statement::Switch { selector, cases }, span);
                     } else {
                         match find_matching_case_index(&cases, value) {
-                            Some(start_idx) if !case_body_has_bare_break(&cases, start_idx) => {
+                            Some(start_idx)
+                                if !(case_body_has_bare_break(&cases, start_idx)
+                                    || (in_loop
+                                        && switch_chain_splice_loses_tint_loop_exit(
+                                            &cases,
+                                            start_idx,
+                                            break_binds_to_loop,
+                                        ))) =>
+                            {
                                 let body = collect_case_body(cases, start_idx);
                                 splice_block(&mut rebuilt, body);
                                 changed += 1;
@@ -1154,9 +1175,11 @@ fn eliminate_dead_branches(
                                 // No match and no default -> the switch is a no-op.
                                 changed += 1;
                             }
-                            // Matched case body has a bare Break that targets the
-                            // switch.  Splicing would mis-target it, so keep the
-                            // switch as-is.
+                            // Matched chain has a bare Break that targets the
+                            // switch (splicing would mis-target it) or would
+                            // shade the loop's trailing exit (see
+                            // `splice_loses_tint_loop_exit`); keep the switch
+                            // as-is.
                             Some(_) => {
                                 rebuilt.push(naga::Statement::Switch { selector, cases }, span);
                             }
@@ -1231,11 +1254,10 @@ fn eliminate_dead_branches(
                 // const-evaluate the condition): when this is the loop's
                 // only lexical exit, dropping it turns tint-valid input
                 // into tint-rejected output ("loop does not exit"), while
-                // naga 30 happily validates the exit-less `loop{}`.  Drop
-                // it only when the body proves another exit (the guard);
-                // otherwise fall through to the keep-as-is arm below.
-                // `continuing` cannot carry a bare Break or Return in
-                // valid IR.
+                // naga 30 validates the exit-less `loop{}`.  Drop it only
+                // when the body proves another exit (the guard); otherwise
+                // fall through to the keep-as-is arm below.  `continuing`
+                // cannot carry a bare Break or Return in valid IR.
                 Some(naga::Literal::Bool(false))
                     if contains_bare_break(&body) || contains_return(&body) =>
                 {
@@ -1657,15 +1679,18 @@ fn contains_bare_break(block: &naga::Block) -> bool {
 /// (and therefore every enclosing loop) from anywhere.
 ///
 /// Used by the loop-exit-preservation guards: tint's behavior analysis
-/// requires every `loop` to have a reachable-looking exit (`break` targeting
-/// it, `break if`, or a `Return` somewhere inside), but does NOT
-/// const-evaluate conditions - so a `Return`/`Break` inside `if false { .. }`
-/// still counts for tint while naga 30 validates a fully exit-less `loop{}`
-/// as legal.  Folding away such a block can turn tint-valid input into
-/// tint-rejected output ("loop does not exit"); the guards keep those
-/// dead-but-load-bearing blocks.  `Kill` deliberately does NOT count: tint
-/// demotes `discard` to a helper-invocation exit, not a loop exit (mirrors
-/// the Kill-is-not-a-terminator rule in `definitely_terminates`).
+/// requires every `loop` to exit (`break` targeting it, `break if`, or a
+/// `Return` inside), and does NOT const-evaluate conditions - so a
+/// `Return`/`Break` inside `if false { .. }` still counts for tint while
+/// naga 30 validates a fully exit-less `loop{}` as legal.  Folding away
+/// such a block can turn tint-valid input into tint-rejected output ("loop
+/// does not exit"); the guards keep those dead-but-load-bearing blocks.
+/// This scan is reachability-blind, over-approximating what tint credits -
+/// safe for the KEEP direction it drives; [`tint_block_behavior`] is the
+/// reachability-aware complement guarding the splice direction.  `Kill`
+/// deliberately does NOT count: tint demotes `discard` to a
+/// helper-invocation exit, not a loop exit (mirrors the
+/// Kill-is-not-a-terminator rule in `definitely_terminates`).
 fn contains_return(block: &naga::Block) -> bool {
     for stmt in block.iter() {
         match stmt {
@@ -1723,6 +1748,197 @@ fn contains_return(block: &naga::Block) -> bool {
         }
     }
     false
+}
+
+/// A construct's behavior set under tint's (WGSL-spec) analysis: which of
+/// {Next, Return, Break, Continue} executing it can produce, WITHOUT
+/// const-evaluating conditions.  `brk`/`cont` are the raw bare-Break /
+/// bare-Continue behaviors at the construct's own level; `Switch` and `Loop`
+/// absorb them structurally, so no binding context needs threading.  `Kill`
+/// is `next` (demote-to-helper), mirroring `definitely_terminates`.
+#[derive(Clone, Copy)]
+struct TintBehavior {
+    next: bool,
+    ret: bool,
+    brk: bool,
+    cont: bool,
+}
+
+impl TintBehavior {
+    const NEXT_ONLY: Self = Self {
+        next: true,
+        ret: false,
+        brk: false,
+        cont: false,
+    };
+
+    /// Behavior of `self` followed by `then`: `then` is unreachable (and
+    /// contributes nothing) unless `self` can fall through.
+    fn then(self, then: Self) -> Self {
+        if !self.next {
+            return self;
+        }
+        Self {
+            next: then.next,
+            ret: self.ret || then.ret,
+            brk: self.brk || then.brk,
+            cont: self.cont || then.cont,
+        }
+    }
+
+    /// Behavior of exclusive alternatives (e.g. the two arms of an `If`).
+    fn union(self, other: Self) -> Self {
+        Self {
+            next: self.next || other.next,
+            ret: self.ret || other.ret,
+            brk: self.brk || other.brk,
+            cont: self.cont || other.cont,
+        }
+    }
+}
+
+/// Sequenced behavior of a block: statements after one that cannot fall
+/// through are unreachable and contribute nothing - the property the
+/// reachability-blind `contains_*` scans cannot express.
+fn tint_block_behavior(block: &naga::Block) -> TintBehavior {
+    let mut acc = TintBehavior::NEXT_ONLY;
+    for stmt in block.iter() {
+        if !acc.next {
+            break;
+        }
+        acc = acc.then(tint_stmt_behavior(stmt));
+    }
+    acc
+}
+
+fn tint_stmt_behavior(stmt: &naga::Statement) -> TintBehavior {
+    match stmt {
+        naga::Statement::Return { .. } => TintBehavior {
+            next: false,
+            ret: true,
+            brk: false,
+            cont: false,
+        },
+        naga::Statement::Break => TintBehavior {
+            next: false,
+            ret: false,
+            brk: true,
+            cont: false,
+        },
+        naga::Statement::Continue => TintBehavior {
+            next: false,
+            ret: false,
+            brk: false,
+            cont: true,
+        },
+        naga::Statement::Block(inner) => tint_block_behavior(inner),
+        naga::Statement::If { accept, reject, .. } => {
+            tint_block_behavior(accept).union(tint_block_behavior(reject))
+        }
+        naga::Statement::Switch { cases, .. } => {
+            // Entering case `i` executes its body, then - on
+            // `fall_through` - the next case's, so effective behaviors
+            // fold right-to-left; falling past the last case exits the
+            // switch (Next).  The switch absorbs its cases' bare Breaks
+            // into Next, and a selector matching no case (no Default)
+            // also falls through.
+            let mut union = TintBehavior {
+                next: false,
+                ret: false,
+                brk: false,
+                cont: false,
+            };
+            let mut next_case = TintBehavior::NEXT_ONLY;
+            for case in cases.iter().rev() {
+                let body = tint_block_behavior(&case.body);
+                let effective = if case.fall_through {
+                    body.then(next_case)
+                } else {
+                    body
+                };
+                union = union.union(effective);
+                next_case = effective;
+            }
+            let has_default = cases.iter().any(|c| c.value == naga::SwitchValue::Default);
+            TintBehavior {
+                next: union.next || union.brk || !has_default,
+                ret: union.ret,
+                brk: false,
+                cont: union.cont,
+            }
+        }
+        naga::Statement::Loop {
+            body,
+            continuing,
+            break_if,
+        } => {
+            // The loop absorbs its body's Break/Continue; it falls
+            // through only via a bare Break or a `break if` (valid IR
+            // bars Break in `continuing`, but including it costs
+            // nothing), and propagates only Return outward.
+            let body = tint_block_behavior(body);
+            let continuing = tint_block_behavior(continuing);
+            TintBehavior {
+                next: body.brk || continuing.brk || break_if.is_some(),
+                ret: body.ret || continuing.ret,
+                brk: false,
+                cont: false,
+            }
+        }
+        // Straight-line statements, including `Kill`: tint's
+        // demote-to-helper semantics continue past `discard`.
+        naga::Statement::Emit(_)
+        | naga::Statement::Store { .. }
+        | naga::Statement::Kill
+        | naga::Statement::ControlBarrier(_)
+        | naga::Statement::MemoryBarrier(_)
+        | naga::Statement::ImageStore { .. }
+        | naga::Statement::ImageAtomic { .. }
+        | naga::Statement::Call { .. }
+        | naga::Statement::Atomic { .. }
+        | naga::Statement::RayQuery { .. }
+        | naga::Statement::RayPipelineFunction(_)
+        | naga::Statement::WorkGroupUniformLoad { .. }
+        | naga::Statement::SubgroupBallot { .. }
+        | naga::Statement::SubgroupGather { .. }
+        | naga::Statement::SubgroupCollectiveOperation { .. }
+        | naga::Statement::CooperativeStore { .. } => TintBehavior::NEXT_ONLY,
+    }
+}
+
+/// `true` when splicing `spliced` in place of a const-folded wrapper would
+/// deny the enclosing loop its tint-credited exit.  The wrapper's dead arm
+/// kept `Next` alive under tint's no-const-eval sequencing (the input was
+/// valid); the bare spliced content is safe only if it still falls through
+/// (every following statement - e.g. a trailing `break` - stays reachable)
+/// or itself carries an exit tint credits the loop with: a `Return`, or a
+/// bare `Break` where one binds to the loop.  Reachability matters where
+/// the `contains_*` scans are blind: a `return` sequenced behind a
+/// `continue` is never credited, so it cannot rescue the splice.
+fn splice_loses_tint_loop_exit(spliced: &naga::Block, break_binds_to_loop: bool) -> bool {
+    let b = tint_block_behavior(spliced);
+    !(b.next || b.ret || (break_binds_to_loop && b.brk))
+}
+
+/// [`splice_loses_tint_loop_exit`] over the exact statement sequence
+/// `collect_case_body` would splice: the matched case plus its
+/// fall-through successors, ending at the first non-fall-through case.
+fn switch_chain_splice_loses_tint_loop_exit(
+    cases: &[naga::SwitchCase],
+    start_idx: usize,
+    break_binds_to_loop: bool,
+) -> bool {
+    let mut b = TintBehavior::NEXT_ONLY;
+    for case in &cases[start_idx..] {
+        if !b.next {
+            break;
+        }
+        b = b.then(tint_block_behavior(&case.body));
+        if !case.fall_through {
+            break;
+        }
+    }
+    !(b.next || b.ret || (break_binds_to_loop && b.brk))
 }
 
 // Redundant else-store elimination.  naga's WGSL frontend lowers short-circuit

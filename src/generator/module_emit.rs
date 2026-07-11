@@ -139,8 +139,9 @@ impl<'a> Generator<'a> {
                 // whose emitted text has no f16 token at all - the enable
                 // then drops on re-minify (non-idempotent) and retains a
                 // device-feature requirement the output no longer needs.
-                // Under-detection stays loud, not silent: output using f16
-                // without the enable fails the run() re-parse self-check.
+                // Under-detection stays fail-safe, not silent-invalid:
+                // output using f16 without the enable fails the run()
+                // re-parse self-check and ships via the naga fallback.
                 naga::TypeInner::Scalar(s)
                 | naga::TypeInner::Vector { scalar: s, .. }
                 | naga::TypeInner::Matrix { scalar: s, .. }
@@ -316,10 +317,10 @@ impl<'a> Generator<'a> {
 
         // Resolve acceleration structures now that every pipeline signal has
         // been scanned: with a pipeline signal present, the pipeline enable
-        // already covers the type; a query-only module keeps the
-        // input-faithful `enable wgpu_ray_query;` (naga parses the type under
-        // either directive, and the choice does not affect validation - the
-        // IR carries no record of which enable admitted it).
+        // already covers the type; otherwise emit `enable wgpu_ray_query;`
+        // (naga parses the type under either directive and the IR carries no
+        // record of which enable admitted it, so a pipeline-enabled but
+        // signal-free input is deliberately rewritten to the query enable).
         if has_acceleration_structure && !needs_ray_tracing {
             needs_ray_query = true;
         }
@@ -3092,6 +3093,25 @@ fn analyze_statement(
                             );
                         }
                     }
+                    // Both read the query object's CURRENT traversal state; a
+                    // later `Statement::RayQuery` (Proceed / Confirm /
+                    // Terminate / GenerateIntersection - all modeled as
+                    // `WriteEffect::Place(query)`) stales them exactly like a
+                    // buffer `Load` crossing a `Store`, so a crossing read
+                    // must bind rather than re-evaluate at its use site.  The
+                    // query is always function-address-space (a `ray_query`
+                    // local, or a pointer argument resolving to `None` place),
+                    // so there is no writability gate to consult.
+                    naga::Expression::RayQueryGetIntersection { query, .. }
+                    | naga::Expression::RayQueryVertexPositions { query, .. } => {
+                        pending.insert(
+                            h,
+                            PendingLoad {
+                                place: resolve_place(*query, expressions),
+                                written: false,
+                            },
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -3277,13 +3297,11 @@ pub(super) fn find_deferrable_vars(func: &naga::Function) -> (Vec<bool>, Vec<boo
     (deferrable, dead)
 }
 
-/// Recursively scan a block looking for deferrable-var opportunities.
-///
-/// `candidates[i]` is `true` when local `i` has all of its references within
-/// `block` and has not already been marked deferrable.
-/// DFS walker used by [`find_deferrable_vars`] to classify each
-/// local's first-touch kind (read vs. store) and detect locals whose
-/// only uses are stores.
+/// DFS walker for [`find_deferrable_vars`]: marks a candidate deferrable
+/// when its first program-order touch at this block level is a direct
+/// whole-variable `Store`, recursing into sub-blocks that own all of a
+/// candidate's references.  `candidates[i]` is `true` when local `i` has
+/// all of its references within `block` and is not already deferrable.
 fn scan_block_deferrable_vars(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
@@ -3898,14 +3916,15 @@ fn is_for_loop_candidate(
     }
     // And the preloads must be safe to inline into the for-header, else
     // try_emit_for_loop bails to plain `loop` emission and the suppressed
-    // counter `var` would be left undeclared.
+    // counter `var` would be left undeclared.  The header depth cap is
+    // mirrored for the same reason.
     super::stmt_emit::for_loop_preload_inlining_is_safe(
         &shape,
         body,
         continuing,
         expressions,
         must_bind_loads,
-    )
+    ) && !super::stmt_emit::for_header_exceeds_depth_cap(&shape, expressions)
 }
 
 /// Recursively scan a block (and its nested sub-blocks) looking for

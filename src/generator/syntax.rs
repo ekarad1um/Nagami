@@ -1011,12 +1011,10 @@ pub(super) fn storage_access(access: naga::StorageAccess) -> &'static str {
     }
 }
 
-/// Render the binding attributes attached to a struct member or function
-/// parameter (`@location`, `@builtin`, `@interpolate`, `@invariant`,
-/// `@blend_src`, `@per_primitive`), omitting defaults to keep the output
-/// compact.
-/// Render a binding's attribute list, gap-terminated for the identifier that
-/// follows (member/param name or return type).  In `compact` mode the
+/// Render the binding attributes attached to a struct member, function
+/// parameter, or return type (`@location`, `@builtin`, `@interpolate`,
+/// `@invariant`, `@blend_src`, `@per_primitive`), omitting defaults, and
+/// gap-terminated for the identifier that follows.  In `compact` mode the
 /// attributes join directly - `@` always ends the previous token, so
 /// `@invariant@builtin(position)` lexes identically - and the trailing gap
 /// survives only after a bare-word attribute (`@per_primitive`), where

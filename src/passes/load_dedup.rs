@@ -1289,11 +1289,6 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         let Some(store_pos) = scope_idx.store_position(store_id) else {
             continue;
         };
-        // "Any live load later than this store" is exactly "the MAX live-load
-        // position exceeds store_pos", so the per-local maximum (built once,
-        // O(loads)) answers every store in O(1).  The per-store scan over all
-        // of the local's loads it replaces was O(stores x loads) - ~700 ms on
-        // a machine-generated 10k-statement single-accumulator function.
         let has_later_live_load = max_live_load_pos
             .get(&local)
             .is_some_and(|&max_pos| max_pos > store_pos);
@@ -1439,9 +1434,6 @@ fn get_pointer_key(
     }
 }
 
-/// Resolve `pointer` to the root local it ultimately refers to, or
-/// `None` when the root is not a local.  Re-exported so `dead_branch`
-/// agrees with this pass on the "stored the whole local" predicate.
 /// Maximum statement-DFS position of a LIVE load, per local.  A Store at
 /// `store_pos` has a later live load iff this maximum exceeds `store_pos`,
 /// so one O(loads) build answers every store's dead-store guard in O(1)
@@ -1472,6 +1464,9 @@ fn build_max_live_load_positions(
     max_pos
 }
 
+/// Resolve `pointer` to the root local it ultimately refers to, or
+/// `None` when the root is not a local.  Re-exported so `dead_branch`
+/// agrees with this pass on the "stored the whole local" predicate.
 pub(crate) fn get_stored_local(
     expressions: &naga::Arena<naga::Expression>,
     pointer_handle: naga::Handle<naga::Expression>,

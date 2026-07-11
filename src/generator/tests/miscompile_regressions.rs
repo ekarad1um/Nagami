@@ -608,6 +608,221 @@ fn loop_exit_guard_does_not_block_ordinary_folds() {
     );
 }
 
+/// Splice-shading variant of the loop-exit class: collapsing
+/// `if (true) { continue; }` splices a never-falls-through arm, which makes
+/// the trailing `break` unreachable under tint's behavior sequencing (and
+/// step-3 dead-code stripping then deletes it outright) - "loop does not
+/// exit".  The kept `if` preserves `Next` via its empty dead arm.
+#[test]
+fn loop_exit_shading_const_if_continue_is_kept() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: array<u32, 8>;\
+        @compute @workgroup_size(1) fn main() {\
+            var i: u32 = 0u;\
+            loop { o[i % 8u] = i; i = i + 1u; if (true) { continue; } break; }\
+        }";
+    let out = minify(src);
+    assert!(
+        out.contains("if true{continue;}") && out.contains("break;"),
+        "splicing the all-continue arm shades the trailing break from tint: {out}"
+    );
+}
+
+/// Same shading class through a const-selector switch collapse: the matched
+/// chain is `{ continue; }`, so splicing it would shade the trailing `break`.
+#[test]
+fn loop_exit_shading_const_switch_chain_is_kept() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: array<u32, 8>;\
+        @compute @workgroup_size(1) fn main() {\
+            var i: u32 = 0u;\
+            loop {\
+                o[i % 8u] = i; i = i + 1u;\
+                switch (1i) { case 1i: { continue; } case 2i: { o[0] = 9u; } default: { } }\
+                break;\
+            }\
+        }";
+    let out = minify(src);
+    assert!(
+        out.contains("switch") && out.contains("break;"),
+        "splicing the all-continue matched chain shades the trailing break: {out}"
+    );
+}
+
+/// Cross-level shading: the collapse happens inside a DYNAMIC switch's sole
+/// case; the spliced `continue` makes the whole switch never-falls-through
+/// and the loop-level `break` after it gets stripped/shaded.
+#[test]
+fn loop_exit_shading_nested_case_collapse_keeps_outer_break() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: array<u32, 8>;\
+        @compute @workgroup_size(1) fn main() {\
+            var i: u32 = 0u;\
+            loop {\
+                o[i % 8u] = i; i = i + 1u;\
+                switch (i32(i)) { default: { if (true) { continue; } } }\
+                break;\
+            }\
+        }";
+    let out = minify(src);
+    assert!(
+        out.contains("break;"),
+        "the loop-level break must stay reachable after the nested collapse: {out}"
+    );
+}
+
+/// The shading guard must not block the valuable splice: an all-paths-`break`
+/// arm IS the loop's exit, so `if (true) { break; }` still folds to a bare
+/// `break`.
+#[test]
+fn loop_exit_shading_guard_still_folds_break_splice() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: array<u32, 8>;\
+        @compute @workgroup_size(1) fn main() {\
+            var i: u32 = 0u;\
+            loop { o[i % 8u] = i; i = i + 1u; if (true) { break; } }\
+        }";
+    let out = minify(src);
+    assert!(
+        !out.contains("if true") && out.contains("break;"),
+        "an exit-carrying splice is safe and must still fold: {out}"
+    );
+}
+
+/// `rayQueryGetCandidateIntersection` reads the query's CURRENT traversal
+/// state; a read held across `rayQueryProceed` must be bound at its Emit
+/// point, not re-evaluated (and duplicated) at its use sites after the
+/// second Proceed - a silent value miscompile the naga self-check cannot
+/// see.
+#[test]
+fn ray_query_candidate_read_stays_between_proceeds() {
+    let src = "enable wgpu_ray_query;\
+        @group(0) @binding(0) var acc: acceleration_structure;\
+        @group(0) @binding(1) var<storage, read_write> out: vec4<f32>;\
+        @compute @workgroup_size(1) fn main() {\
+            var q: ray_query;\
+            rayQueryInitialize(&q, acc, RayDesc(0u, 0xFFu, 0.1, 100.0, vec3<f32>(1.0, 2.0, 3.0), vec3<f32>(0.0, 1.0, 0.0)));\
+            let p1 = rayQueryProceed(&q);\
+            let i = rayQueryGetCandidateIntersection(&q);\
+            let p2 = rayQueryProceed(&q);\
+            out = vec4<f32>(i.t, f32(i.kind), f32(u32(p1)), f32(u32(p2)));\
+        }";
+    let out = minify(src);
+    assert_eq!(
+        out.matches("rayQueryGetCandidateIntersection").count(),
+        1,
+        "the stateful read must not be duplicated per use: {out}"
+    );
+    let first_proceed = out.find("rayQueryProceed").expect("first proceed");
+    let get = out
+        .find("rayQueryGetCandidateIntersection")
+        .expect("intersection read");
+    let second_proceed = out[first_proceed + 1..]
+        .find("rayQueryProceed")
+        .map(|p| p + first_proceed + 1)
+        .expect("second proceed");
+    assert!(
+        first_proceed < get && get < second_proceed,
+        "the read must stay between the two Proceeds: {out}"
+    );
+}
+
+/// naga's EXPRESSION validator (unlike its statement validator) admits a
+/// `ptr<function, ray_query>` function argument as the query operand; the
+/// emitter must pass the pointer value through verbatim instead of taking
+/// `&` of it.
+#[test]
+fn ray_query_read_through_pointer_param_minifies() {
+    let src = "enable wgpu_ray_query;\
+        @group(0) @binding(0) var acc: acceleration_structure;\
+        @group(0) @binding(1) var<storage, read_write> out: f32;\
+        fn get_t(p: ptr<function, ray_query>) -> f32 {\
+            return rayQueryGetCommittedIntersection(p).t;\
+        }\
+        @compute @workgroup_size(1) fn main() {\
+            var q: ray_query;\
+            rayQueryInitialize(&q, acc, RayDesc(0u, 0xFFu, 0.1, 100.0, vec3<f32>(1.0, 2.0, 3.0), vec3<f32>(0.0, 1.0, 0.0)));\
+            let p1 = rayQueryProceed(&q);\
+            out = get_t(&q);\
+        }";
+    let out = minify(src);
+    assert!(
+        out.contains("rayQueryGetCommittedIntersection("),
+        "pointer-parameter query reads must emit without a spurious `&`: {out}"
+    );
+}
+
+/// A void function's tail `if` gets its arm-`return;`s elided and POPPED off
+/// the emission slice; the for-init absorption's later-use scope scan must
+/// still see it, or a counter read only inside the popped tail is absorbed
+/// into a for-scoped `var` and the tail references an out-of-scope name
+/// (self-check failure -> input shipped verbatim, silently un-minified).
+#[test]
+fn void_tail_if_use_blocks_for_init_absorption() {
+    let src = "@group(0)@binding(0) var<storage,read_write> o: f32;\
+        @group(0)@binding(1) var<storage> s: f32;\
+        @compute @workgroup_size(1) fn main() {\
+            var i: i32;\
+            o = s + 1.0;\
+            i = i32(o);\
+            for (; i < 10; i++) { o = o + 1.0; }\
+            if s > 0.5 { o = f32(i); }\
+        }";
+    let out = minify(src);
+    assert!(
+        out.len() < src.len() - 40,
+        "the scope bug ships the input verbatim (0% minification): {out}"
+    );
+}
+
+/// Right-nested subtraction forces one PARENTHESIZED nesting level per node,
+/// which costs tint's recursive parser ~4 frames (vs ~1 for a flat chain) and
+/// naga's own frontend stops near 197 levels - so the depth cap must fire
+/// well before the raw 512 frame budget, in frame-weighted units.
+#[test]
+fn deep_paren_chain_is_bound_within_parser_budgets() {
+    let mut expr = String::from("s");
+    for _ in 0..150 {
+        expr = format!("(s - {expr})");
+    }
+    let src = format!(
+        "@group(0)@binding(0) var<storage,read_write> o: f32;\
+         @group(0)@binding(1) var<storage> s: f32;\
+         @compute @workgroup_size(1) fn main() {{ o = {expr}; }}"
+    );
+    let out = minify(&src);
+    assert!(
+        out.matches("let ").count() >= 2,
+        "a 150-level paren chain must be split by the frame-weighted cap: {out}"
+    );
+}
+
+/// A for-loop guard renders inline into the `for(...)` header BEFORE any
+/// Emit-range processing, bypassing the depth gate - an over-deep guard
+/// chain must fall back to plain `loop` emission where the gate binds it.
+#[test]
+fn deep_for_guard_chain_falls_back_to_loop_emission() {
+    let mut cond = String::from("f32(i)");
+    for _ in 0..80 {
+        cond = format!("abs({cond} + 0.5)");
+    }
+    let src = format!(
+        "@group(0)@binding(0) var<storage,read_write> o: f32;\
+         @compute @workgroup_size(1) fn main() {{\
+             var i: i32 = 0;\
+             loop {{\
+                 if ({cond} > 1e30) {{ break; }}\
+                 o = o + 1.0; i = i + 1;\
+             }}\
+         }}"
+    );
+    let out = minify(&src);
+    assert!(
+        !out.contains("for("),
+        "an over-deep guard must not inline into a for-header: {out}"
+    );
+    assert!(
+        out.matches("let ").count() >= 2,
+        "the guard chain must be depth-bound on the loop path: {out}"
+    );
+}
+
 /// A ray-query module must minify through nagami's generator instead of
 /// SIGABRTing in naga's WGSL writer (`Statement::RayQuery => unreachable!()`),
 /// which the mandatory baseline emit used to reach before

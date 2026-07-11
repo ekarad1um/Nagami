@@ -454,10 +454,14 @@ fn strip_front_end_appended_returns(module: &mut naga::Module) {
 ///
 /// * `wgpu_binding_array` - tint supports binding arrays NATIVELY without an
 ///   enable, so a stripped output is fully tint-valid.
-/// * `wgpu_int16` - tint has no `i16`/`u16`, so an output that actually uses
-///   16-bit integers is not tint-valid regardless; stripping only ever fixes
-///   the SPURIOUS case (a dead `frexp(f16)` whose i16 exponent lingers in the
-///   type arena) where the emitted body uses no 16-bit integer at all.
+/// * `wgpu_int16` - tint has no `i16`/`u16`, so stripping is right only in
+///   the SPURIOUS case (a dead `frexp(f16)` whose i16 exponent lingers in
+///   the type arena, the emitted body free of 16-bit tokens).  Text that
+///   genuinely uses them - only the naga FALLBACK can produce it, since the
+///   generator has no i16/u16 spelling and always falls back - keeps the
+///   enable: such output is wgpu-facing by necessity, and stripping would
+///   leave it invalid for every consumer.  `strip_naga_only_enables` gates
+///   on that token check.
 const NAGA_ONLY_ENABLES: [&str; 2] = ["enable wgpu_binding_array;", "enable wgpu_int16;"];
 
 /// Remove the [`NAGA_ONLY_ENABLES`] directives (each with one immediately
@@ -465,6 +469,13 @@ const NAGA_ONLY_ENABLES: [&str; 2] = ["enable wgpu_binding_array;", "enable wgpu
 /// once.
 fn strip_naga_only_enables(mut source: String) -> String {
     for directive in NAGA_ONLY_ENABLES {
+        // `wgpu_int16` is load-bearing when the text uses 16-bit integer
+        // tokens; strip only the spurious lingering-type-arena case.
+        if directive == "enable wgpu_int16;"
+            && (references_whole_token(&source, "i16") || references_whole_token(&source, "u16"))
+        {
+            continue;
+        }
         if let Some(pos) = source.find(directive) {
             let after = &source[pos + directive.len()..];
             let tail = after.strip_prefix('\n').unwrap_or(after).to_owned();
@@ -483,8 +494,8 @@ fn strip_naga_only_enables(mut source: String) -> String {
 ///
 /// Grammar-agnostic and token-safe by construction, so it needs no parser:
 /// * a space survives between two identifier-ish chars (Unicode-aware -
-///   WGSL identifiers are XID, approximated by `char::is_alphanumeric`),
-///   covering `enable f16`, `else if`, `let x`;
+///   WGSL identifiers are XID, approximated by `char::is_alphanumeric` plus
+///   `_`), covering `enable f16`, `else if`, `let x`;
 /// * a space survives where maximal munch would fuse two tokens of valid
 ///   WGSL into one: `- -x` (`--` is reserved), `+ +` (likewise), `& &x` /
 ///   `| |` (would form `&&`/`||`), and `x / *p` (would open a `/*` comment);
@@ -549,18 +560,16 @@ fn naga_only_enable_prefix(emit_source: &str) -> String {
     prefix
 }
 
-/// `true` when `source` uses the `binding_array` type-generator as a whole
-/// token (so a longer identifier like `my_binding_array` never triggers).
-/// naga 30 requires `enable wgpu_binding_array;` to PARSE such a type, so the
-/// preprocessor injects the directive when it is used without one.
-fn references_binding_array_token(source: &str) -> bool {
+/// `true` when comment-stripped `source` uses `token` as a whole identifier
+/// token (so a longer identifier like `my_binding_array` never triggers for
+/// `binding_array`).
+fn references_whole_token(source: &str, token: &str) -> bool {
     let cleaned = strip_wgsl_comments(source);
     let bytes = cleaned.as_bytes();
-    let needle = b"binding_array";
     let mut i = 0;
-    while let Some(off) = cleaned[i..].find("binding_array") {
+    while let Some(off) = cleaned[i..].find(token) {
         let start = i + off;
-        let end = start + needle.len();
+        let end = start + token.len();
         let before_ok = start == 0 || !is_ident_char(bytes[start - 1]);
         let after_ok = end >= bytes.len() || !is_ident_char(bytes[end]);
         if before_ok && after_ok {
@@ -569,6 +578,13 @@ fn references_binding_array_token(source: &str) -> bool {
         i = start + 1;
     }
     false
+}
+
+/// naga 30 requires `enable wgpu_binding_array;` to PARSE a `binding_array`
+/// type, so the preprocessor injects the directive when the type-generator is
+/// used without one.
+fn references_binding_array_token(source: &str) -> bool {
+    references_whole_token(source, "binding_array")
 }
 
 /// Split `source` into its leading directive block and the remaining body.
@@ -1098,7 +1114,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
 
     let info = io::validate_module(&module)?;
     // Skip the naga baseline/fallback emit for modules naga's back-end would
-    // abort on (override-sized arrays, non-const override/global initializers);
+    // abort on (the trigger set lives on `module_needs_naga_baseline_skip`);
     // nagami's generator emits these itself, and the baseline byte count falls
     // back to the input length.
     let naga_output: Option<String> = if module_needs_naga_baseline_skip(&module) {
@@ -1273,15 +1289,17 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                         emitted.duration_us,
                     )
                 } else {
-                    // No naga baseline (override-sized array): the generator
-                    // output is invalid and there is no fallback emitter.
+                    // No naga baseline (the module is in naga's writer-abort
+                    // set): the generator output is invalid and there is no
+                    // fallback emitter.
                     let underlying = match validation_result {
                         Err(e) => e.to_string(),
                         Ok(()) => "(no underlying error)".to_string(),
                     };
                     return Err(Error::Emit(format!(
                         "generator output failed validation and no naga fallback \
-                         is available (override-sized array): {underlying}"
+                         is available (naga's writer would abort on this module): \
+                         {underlying}"
                     )));
                 }
             }
@@ -1314,8 +1332,9 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
                         0,
                     )
                 }
-                // No naga fallback available (override-sized array): the
-                // generator's own error is the only diagnosis.
+                // No naga fallback available (the module is in naga's
+                // writer-abort set): the generator's own error is the only
+                // diagnosis.
                 None => return Err(e),
             },
         };
@@ -2060,6 +2079,34 @@ mod tests {
         assert!(!compacted.contains("--") && !compacted.contains("/*"));
         // Idempotent: a second pass is byte-identical.
         assert_eq!(compact_wgsl_text(&compacted), compacted);
+    }
+
+    #[test]
+    fn int16_fallback_keeps_enable_and_compacted_text_validates() {
+        // The generator has no i16/u16 spelling, so int16 modules always ship
+        // via the naga fallback; its text genuinely uses 16-bit tokens, so
+        // `strip_naga_only_enables` must KEEP `enable wgpu_int16;` (stripping
+        // shipped naga-invalid text), and the fallback compaction must
+        // round-trip.
+        let src = "enable wgpu_int16;\n\
+                   @group(0) @binding(0) var<storage, read_write> o: u32;\n\
+                   @compute @workgroup_size(1) fn m() {\n  var x: i16;\n  o = u32(x);\n}\n";
+        let compacted = compact_wgsl_text(src);
+        assert!(
+            io::validate_wgsl_text(&compacted).is_ok(),
+            "compacted int16 text must re-validate: {compacted}"
+        );
+        let out = run(src, &Config::default()).expect("int16 module should minify via fallback");
+        assert!(
+            out.source.contains("enable wgpu_int16;"),
+            "load-bearing enable stripped: {}",
+            out.source
+        );
+        assert!(
+            io::validate_wgsl_text(&out.source).is_ok(),
+            "shipped int16 output must be naga-valid: {}",
+            out.source
+        );
     }
 
     #[test]
