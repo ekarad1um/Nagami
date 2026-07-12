@@ -192,35 +192,44 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// Emit a `Call` expression (`name(arg0, arg1, ...)`).  Inserts
-    /// an explicit `&` before pointer-typed arguments that WGSL would
-    /// otherwise treat as references, skipping the `&` for forwarded
-    /// function-argument pointers which are already pointer values.
     /// `true` when `handle` renders with a bare top-level `<`: an uncached
-    /// `Less` binary.  Inside a comma-delimited argument list, a later
-    /// argument's top-level `>` then pairs with it in WGSL's template-list
-    /// scanner (`f(a<b,c>d)` scans as the template `a<b,c>` applied to `d`)
-    /// and strict parsers reject the file - such arguments are wrapped in
-    /// parens.  Only bare `<` opens a candidate (`<=` / `<<` never do), a
-    /// cached expression renders as its let-name, and no other uncached
-    /// root renders a top-level `<`.  The LAST argument of a list never
-    /// needs the wrap: the closing `)` discards the candidate before any
-    /// `>` can pair with it.
+    /// `Less` binary, or an uncached `&&`/`||` whose rendered right spine ends
+    /// in one (those operators do not parenthesise a comparison child, so
+    /// `x && a<b` renders `x&&a<b`).  Inside a comma-delimited argument list, a
+    /// later argument's top-level `>` then pairs with it in WGSL's
+    /// template-list scanner (`f(a<b,c>d)` scans as the template `a<b,c>`
+    /// applied to `d`) and strict parsers reject the file - such arguments are
+    /// wrapped in parens.  Only bare `<` opens a candidate (`<=` / `<<` never
+    /// do), a cached expression renders as its let-name, and no other uncached
+    /// root renders a top-level `<`.  The LAST argument of a list never needs
+    /// the wrap: the closing `)` discards the candidate before any `>` can pair
+    /// with it.
     fn renders_as_bare_less(
         &self,
         handle: naga::Handle<naga::Expression>,
         ctx: &FunctionCtx<'a, '_>,
     ) -> bool {
-        !ctx.expr_names.contains_key(&handle)
-            && matches!(
-                ctx.func.expressions[handle],
-                naga::Expression::Binary {
-                    op: naga::BinaryOperator::Less,
-                    ..
-                }
-            )
+        if ctx.expr_names.contains_key(&handle) {
+            return false;
+        }
+        match &ctx.func.expressions[handle] {
+            naga::Expression::Binary {
+                op: naga::BinaryOperator::Less,
+                ..
+            } => true,
+            naga::Expression::Binary {
+                op: naga::BinaryOperator::LogicalAnd | naga::BinaryOperator::LogicalOr,
+                right,
+                ..
+            } => self.renders_as_bare_less(*right, ctx),
+            _ => false,
+        }
     }
 
+    /// Emit a `Call` expression (`name(arg0, arg1, ...)`).  Inserts an explicit
+    /// `&` before pointer-typed arguments that WGSL would otherwise treat as
+    /// references, skipping the `&` for forwarded function-argument pointers
+    /// which are already pointer values.
     pub(super) fn emit_call(
         &self,
         function: naga::Handle<naga::Function>,
@@ -478,10 +487,17 @@ impl<'a> Generator<'a> {
                 // the shortest output when the literal is not extracted.
                 return Ok(bare);
             }
-            if let naga::Expression::Binary { op, .. } = &ctx.func.expressions[arg]
-                && matches!(
-                    op,
-                    naga::BinaryOperator::Less | naga::BinaryOperator::LessEqual
+            // Template-list guard (see `renders_as_bare_less`): wrap an arg that
+            // renders ending in a bare `<` - a root `Less` or an `&&`/`||` whose
+            // right spine ends in one - so a later arg's `>` cannot form a
+            // spurious template.  `<=` is wrapped too (harmless, historical).
+            if self.renders_as_bare_less(arg, ctx)
+                || matches!(
+                    &ctx.func.expressions[arg],
+                    naga::Expression::Binary {
+                        op: naga::BinaryOperator::LessEqual,
+                        ..
+                    }
                 )
             {
                 let s = self.emit_expr_uncached(arg, ctx)?;
@@ -1581,10 +1597,16 @@ impl<'a> Generator<'a> {
                 s
             }
             E::ArrayLength(e) => {
-                let mut s = String::from("arrayLength(&");
-                s.push_str(&self.emit_expr(*e, ctx)?);
-                s.push(')');
-                s
+                // A forwarded `ptr<storage, array<T>>` argument is already a
+                // pointer value; prepending `&` would form an invalid
+                // ptr-to-ptr `arrayLength(&p)` (mirrors `emit_ray_query_arg` /
+                // the atomic-load path).
+                let inner = self.emit_expr(*e, ctx)?;
+                if self.pointer_is_ptr_value(*e, ctx) {
+                    format!("arrayLength({inner})")
+                } else {
+                    format!("arrayLength(&{inner})")
+                }
             }
             _ => {
                 return Err(Error::Emit(format!(

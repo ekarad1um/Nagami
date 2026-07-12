@@ -5,20 +5,23 @@
 //! can emit directly.  The pass operates in three arenas:
 //!
 //! * `module.global_expressions` for `const` initializers and global
-//!   splats, seeded with every other constant via
-//!   `build_constant_literal_cache`.
+//!   splats.
 //! * each function's `expressions` arena, folded with a per-function
-//!   pass that tracks which handles must drop out of their `Emit`
-//!   range (folded literals are declarative, not emittable).
+//!   pass that resolves `Constant` operands through
+//!   `build_constant_literal_cache` and tracks which handles must drop
+//!   out of their `Emit` range (folded literals are declarative, not
+//!   emittable).
 //! * the `Emit` ranges themselves, rebuilt in place via
 //!   `rebuild_emit_ranges_after_removal` after each function fold.
 //!
 //! Structural folding covers scalar arithmetic, binary and unary
 //! operators, casts, relational built-ins, and a subset of math
 //! built-ins; composite folding handles vector construction, swizzle
-//! collapse, and splat elision.  NaN- and overflow-sensitive math
-//! built-ins are intentionally not folded because the emitted WGSL
-//! must match the runtime's behaviour bit-for-bit.
+//! collapse, and splat elision.  Exactly-rounded built-ins fold
+//! bit-exactly; the accuracy-tolerant transcendentals (sin/cos/exp/log/
+//! pow/...) fold to a value within WGSL's permitted error envelope - the
+//! same conformance-tolerance doctrine as the float divide/modulo folds,
+//! not bit-identical.  Overflow- and NaN-sensitive cases decline.
 
 use std::collections::{HashMap, HashSet};
 
@@ -453,7 +456,7 @@ fn fold_local_expressions(
         match value {
             Some(ConstValue::Scalar(literal)) => {
                 // Abstract literals trip `WidthError::Abstract` in
-                // function-arena contexts; eval_binary / eval_math1
+                // function-arena contexts; eval_binary / eval_math_scalar
                 // preserve abstract types when both operands were
                 // abstract, so we must refuse the write rather than
                 // let the whole pass roll back.
@@ -1635,18 +1638,20 @@ fn eval_binary(
         (B::Subtract, L::F32(a), L::F32(b)) if (a - b).is_finite() => Some(L::F32(a - b)),
         (B::Multiply, L::F32(a), L::F32(b)) if (a * b).is_finite() => Some(L::F32(a * b)),
         (B::Divide, L::F32(a), L::F32(b)) if b != 0.0 && (a / b).is_finite() => Some(L::F32(a / b)),
-        // Float `%`: WGSL specifies `a - b*trunc(a/b)` in operand precision.
-        // Rust's `%` is exact fmod, which stays inside WGSL's 2.5-ULP
-        // division tolerance only while `trunc(a/b)` is exactly
-        // representable, i.e. `|a/b|` below the type's integer-precision
-        // limit (2^24 for f32, 2^53 for f64) - beyond it the divergence is
-        // unbounded (the truncated quotient itself rounds), so decline.
-        // Within the limit a rounded quotient can still cross an integer
-        // boundary the exact one does not; that residue is the same
-        // conformant-implementation-choice class as the float-divide fold
-        // above, not a correctness gap.
+        // Float `%`: WGSL lowers `a % b` to `a - b*trunc(a/b)` evaluated in
+        // OPERAND precision, so a round-to-nearest device diverges from Rust's
+        // exact fmod whenever the rounded quotient crosses an integer the exact
+        // one does not - by a FULL divisor, not a ULP (e.g. `33554432f % 3f` is
+        // fmod 2.0 but 0.0 on every round-to-nearest GPU).  Fold only when the
+        // exact result equals the operand-precision stepwise value, so the baked
+        // constant is what the hardware computes; the `|a/b|` cap keeps a quotient
+        // whose own trunc is unrepresentable off the comparison.  Declining leaves
+        // the runtime `%`, which the device evaluates correctly.
         (B::Modulo, L::F32(a), L::F32(b))
-            if b != 0.0 && (a % b).is_finite() && (a / b).abs() < 16_777_216.0 =>
+            if b != 0.0
+                && (a % b).is_finite()
+                && (a / b).abs() < 16_777_216.0
+                && a % b == a - b * (a / b).trunc() =>
         {
             Some(L::F32(a % b))
         }
@@ -1655,8 +1660,13 @@ fn eval_binary(
         (B::Subtract, L::F64(a), L::F64(b)) if (a - b).is_finite() => Some(L::F64(a - b)),
         (B::Multiply, L::F64(a), L::F64(b)) if (a * b).is_finite() => Some(L::F64(a * b)),
         (B::Divide, L::F64(a), L::F64(b)) if b != 0.0 && (a / b).is_finite() => Some(L::F64(a / b)),
+        // Same stepwise-agreement guard as the f32 arm above (WGSL has no
+        // runtime f64, so this covers only non-WGSL-frontend IR).
         (B::Modulo, L::F64(a), L::F64(b))
-            if b != 0.0 && (a % b).is_finite() && (a / b).abs() < 9_007_199_254_740_992.0 =>
+            if b != 0.0
+                && (a % b).is_finite()
+                && (a / b).abs() < 9_007_199_254_740_992.0
+                && a % b == a - b * (a / b).trunc() =>
         {
             Some(L::F64(a % b))
         }
@@ -1829,10 +1839,12 @@ fn eval_binary(
 
 /// Fold a WGSL math built-in over scalar literal arguments.  Covers
 /// Tier 1 (comparison, decomposition, computational), Tier 2
-/// (trigonometric, exponential), and Tier 3 (integer bit) functions
-/// whose results are IEEE-stable across implementations.  Returns
-/// `None` for unsupported functions, type mismatches, NaN-sensitive
-/// branches, and domain errors so the call survives to runtime.
+/// (trigonometric, exponential), and Tier 3 (integer bit) functions.
+/// Tier 1/3 are bit-exact; Tier 2 has WGSL-defined accuracy (an error
+/// envelope, not correct rounding), so those folds substitute a
+/// conformant value within that envelope, not a bit-identical one.
+/// Returns `None` for unsupported functions, type mismatches,
+/// NaN-sensitive branches, and domain errors so the call survives to runtime.
 fn eval_math_scalar(
     fun: naga::MathFunction,
     arg: naga::Literal,

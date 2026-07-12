@@ -188,7 +188,7 @@ fn preprocess_source_for_naga(source: &str) -> String {
 /// `\r` exists.
 //
 // UTF-8 safety: `0x0D` cannot appear inside a multi-byte sequence
-// (continuation bytes are `0x80..=0xBF`, lead bytes `0xC0..=0xFD`),
+// (continuation bytes are `0x80..=0xBF`, valid lead bytes `0xC2..=0xF4`),
 // so byte-level `\r` matches always land on character boundaries -
 // the slicing below is guaranteed valid UTF-8.
 fn normalize_line_endings(source: &str) -> String {
@@ -408,8 +408,10 @@ fn has_enable_directive(source: &str, ext: &str) -> bool {
             continue;
         };
         // `enable` must be followed by whitespace to be the keyword, not an
-        // identifier prefix like `enablef16` / `enable_x`.
-        if !list.starts_with([' ', '\t']) {
+        // identifier prefix like `enablef16` / `enable_x`.  Line breaks count
+        // (`enable\nf16;` is valid WGSL), matching `split_directives`; omitting
+        // them makes the f16 preamble guard reject a preamble that DOES enable f16.
+        if !list.starts_with([' ', '\t', '\n', '\r']) {
             continue;
         }
         if list.split(',').any(|e| e.trim() == ext) {
@@ -625,15 +627,6 @@ fn references_binding_array_token(source: &str) -> bool {
     references_whole_token(source, "binding_array")
 }
 
-/// Split `source` into its leading directive block and the remaining body.
-///
-/// WGSL requires every `enable`, `requires`, and `diagnostic` directive
-/// to appear before any global declaration.  When a preamble full of
-/// declarations is prepended to user source, the source's own
-/// directives end up after the preamble's declarations and the combined
-/// text stops being spec-compliant.  Extracting the leading directives
-/// here lets the caller splice them in front of the preamble before
-/// concatenation so the result remains valid.
 /// If `bytes[i..]` begins a `//` line comment or a (nesting-aware) `/* */`
 /// block comment, return the byte index just past it; otherwise `None`.  An
 /// unterminated block comment returns `len`.  Shared by [`split_directives`]'
@@ -641,8 +634,13 @@ fn references_binding_array_token(source: &str) -> bool {
 /// identically - a `;` inside a comment must never terminate a directive.
 fn skip_comment(bytes: &[u8], i: usize, len: usize) -> Option<usize> {
     if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+        // WGSL ends a line comment at ANY line break, not just `\n`; stopping at
+        // `\n` alone would swallow a directive that follows a `\r`/VT-terminated
+        // comment into the "comment", so `split_directives` would misplace it
+        // (matches `strip_wgsl_comments`; a directive lost here ships past a
+        // preamble's declarations - invalid, exit 0).
         let mut j = i + 2;
-        while j < len && bytes[j] != b'\n' {
+        while j < len && !wgsl_line_break_at(bytes, j) {
             j += 1;
         }
         return Some(j);
@@ -666,6 +664,15 @@ fn skip_comment(bytes: &[u8], i: usize, len: usize) -> Option<usize> {
     None
 }
 
+/// Split `source` into its leading directive block and the remaining body.
+///
+/// WGSL requires every `enable`, `requires`, and `diagnostic` directive
+/// to appear before any global declaration.  When a preamble full of
+/// declarations is prepended to user source, the source's own
+/// directives end up after the preamble's declarations and the combined
+/// text stops being spec-compliant.  Extracting the leading directives
+/// here lets the caller splice them in front of the preamble before
+/// concatenation so the result remains valid.
 fn split_directives(source: &str) -> (&str, &str) {
     let bytes = source.as_bytes();
     let len = bytes.len();
@@ -681,13 +688,16 @@ fn split_directives(source: &str) -> (&str, &str) {
     loop {
         // Skip whitespace and `//` / `/* */` comments WITHOUT committing the
         // boundary, so leading trivia before a NON-directive is not hoisted.
-        // Only ASCII whitespace is skipped (directives are ASCII); a UTF-8
-        // lead byte (>= 0xC2) is never ASCII whitespace, so the byte cursor
+        // Only ASCII blankspace is skipped (directives are ASCII); a UTF-8
+        // lead byte (>= 0xC2) is never ASCII blankspace, so the byte cursor
         // can never land inside a multi-byte sequence - `&source[scan..]`
-        // below is always on a char boundary.
+        // below is always on a char boundary.  VT (0x0B) is WGSL blankspace
+        // but `is_ascii_whitespace` omits it, so a `//` comment ended by a VT
+        // (see `skip_comment`) would otherwise leave the VT unskipped and the
+        // following directive unrecognised.
         let mut scan = pos;
         loop {
-            while scan < len && bytes[scan].is_ascii_whitespace() {
+            while scan < len && (bytes[scan].is_ascii_whitespace() || bytes[scan] == 0x0B) {
                 scan += 1;
             }
             if let Some(next) = skip_comment(bytes, scan, len) {

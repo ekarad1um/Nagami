@@ -8,11 +8,32 @@
 use super::helpers::assert_valid_wgsl;
 use crate::config::{Config, TraceConfig};
 
+/// Run `f` on a large stack, matching how the CLI drives minification (on its
+/// own big-stack worker).  The deep-chain tests recurse through the parser /
+/// render-depth / const-fold walks and otherwise overflow the default
+/// test-thread stack in the debug profile.  A failed assertion inside `f`
+/// still fails the test - its panic is re-raised via `resume_unwind`.
+fn on_big_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+    match std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn big-stack test thread")
+        .join()
+    {
+        Ok(r) => r,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 /// Run the full pipeline at the default profile and return minified text.
+/// On a large stack, so the deep-chain regression tests do not overflow.
 fn minify(src: &str) -> String {
-    let out = crate::run(src, &Config::default()).expect("run failed");
-    assert_valid_wgsl(&out.source);
-    out.source
+    let src = src.to_string();
+    on_big_stack(move || {
+        let out = crate::run(&src, &Config::default()).expect("run failed");
+        assert_valid_wgsl(&out.source);
+        out.source
+    })
 }
 
 /// An identity fold (`0 + x`) over a single-use storage `Load` must NOT
@@ -820,6 +841,42 @@ fn deep_for_guard_chain_falls_back_to_loop_emission() {
     assert!(
         out.matches("let ").count() >= 2,
         "the guard chain must be depth-bound on the loop path: {out}"
+    );
+}
+
+/// A `workgroupUniformLoad` guard PRELOAD pointer is emitted inline in the
+/// `for(...)` header, but its `result` renders as a childless leaf that hides
+/// the POINTER's depth from the header cap - so a deep preload pointer must
+/// also force plain-`loop` fallback (the guard-chain gate, extended to
+/// preloads).  A shallow preload still converts to `for(`.
+#[test]
+fn deep_for_preload_pointer_falls_back_to_loop_emission() {
+    let mut idx = String::from("r");
+    for _ in 0..90 {
+        idx = format!("{idx}+r");
+    }
+    let src = format!(
+        "@group(0)@binding(0) var<storage,read_write> o: u32;\
+         @group(0)@binding(1) var<uniform> r: u32;\
+         var<workgroup> wg: array<u32,8>;\
+         @compute @workgroup_size(1) fn main() {{\
+             for (var i: u32 = 0u; i < workgroupUniformLoad(&wg[({idx})%8u]); i = i + 1u) {{ o = o + 1u; }}\
+         }}"
+    );
+    let out = minify(&src);
+    assert!(
+        !out.contains("for("),
+        "an over-deep preload pointer must not inline into a for-header: {out}"
+    );
+    // Control: a shallow preload pointer still converts to `for(`.
+    let shallow = "@group(0)@binding(0) var<storage,read_write> o: u32;\
+         var<workgroup> wg: array<u32,8>;\
+         @compute @workgroup_size(1) fn main() {\
+             for (var i: u32 = 0u; i < workgroupUniformLoad(&wg[2]); i = i + 1u) { o = o + 1u; }\
+         }";
+    assert!(
+        minify(shallow).contains("for("),
+        "a shallow preload pointer must still convert to a for-header"
     );
 }
 

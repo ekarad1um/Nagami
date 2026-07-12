@@ -556,13 +556,11 @@ pub(super) fn find_for_loop_vars(
         }
     }
 
-    // All locals are candidates at the top level.
-    // Variables without an explicit init are zero-initialised in WGSL and can
-    // still serve as for-loop counters (e.g. after a dead-init removal pass).
-    let mut candidates = vec![false; local_len];
-    for (h, _local) in func.local_variables.iter() {
-        candidates[h.index()] = true;
-    }
+    // Every local is a candidate at the top level (naga arena handles are
+    // contiguous `0..local_len`).  Variables without an explicit init are
+    // zero-initialised in WGSL and can still serve as for-loop counters
+    // (e.g. after a dead-init removal pass).
+    let candidates = vec![true; local_len];
 
     let mut result = vec![false; local_len];
     scan_block_for_loop_vars(
@@ -583,10 +581,6 @@ const MULTI_OWNER: usize = usize::MAX;
 
 /// Mark a local as referenced by statement `idx` in a block.  If it was
 /// already referenced by a different statement, set it to `MULTI_OWNER`.
-/// Tag each local's `ref_owner` slot with the loop index that owns
-/// it.  `None` means no owner yet, `Some(idx)` pins the local to one
-/// loop, and `Some(sentinel)` marks it as conflicted (used outside
-/// any candidate loop).
 fn mark_owner(ref_owner: &mut [Option<usize>], lh_idx: usize, idx: usize) {
     match ref_owner[lh_idx] {
         None => ref_owner[lh_idx] = Some(idx),
@@ -598,10 +592,8 @@ fn mark_owner(ref_owner: &mut [Option<usize>], lh_idx: usize, idx: usize) {
 /// For each local variable, compute which statement index in `block` "owns"
 /// all of its references.  Returns `None` if the local is not referenced in
 /// this block, `Some(idx)` if all references are within statement `idx`, or
-/// `Some(MULTI_OWNER)` if referenced by multiple statements.
-/// Traverse `block`, assigning loop ownership to every local
-/// reference and flagging cross-loop escapes.  Cooperating helper
-/// for [`find_for_loop_vars`].
+/// `Some(MULTI_OWNER)` if referenced by multiple statements.  Shared by the
+/// deferred-var and for-loop-counter analyses.
 fn compute_block_ownership(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
@@ -823,10 +815,6 @@ fn is_for_loop_candidate(
 ///
 /// `candidates[i]` is `true` when local `i` has all of its references
 /// within `block` and is eligible for for-loop absorption.
-/// DFS walker that identifies candidate loops and records which
-/// locals are safe to absorb into each.  Complements
-/// [`compute_block_ownership`], which handles the liveness half of
-/// the decision.
 #[allow(clippy::too_many_arguments)]
 fn scan_block_for_loop_vars(
     block: &naga::Block,

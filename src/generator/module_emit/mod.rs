@@ -72,10 +72,11 @@ impl<'a> Generator<'a> {
             )
             .collect();
 
-        // Per-function purity, computed once: `find_inlineable_calls` inlines a
-        // single-use call result only when its callee is pure (no observable
-        // side effect), so an impure call is never relocated past a read of the
-        // memory it writes.
+        // Per-function purity, computed once: `pure_functions` gates the general
+        // relocate-to-any-use-site case, so a pure single-use call inlines freely.
+        // An impure single-use call is inlined only into a consumer that touches
+        // no other memory (see `impure_call_inlines_safely`), so nothing reorders
+        // against its write.
         self.pure_functions = compute_pure_functions(self.module);
 
         // Pre-scan for repeated literals to extract as shared consts.

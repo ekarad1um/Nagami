@@ -74,11 +74,12 @@ fn emit_wgsl_with_info(
     if crate::module_needs_naga_baseline_skip(module) {
         return Ok("// (naga WGSL backend skipped: unsupported emit)\n".to_string());
     }
-    // Debug-only drift guard: re-validate so a future caller that
-    // forgets to refresh after mutating `module` sees a clean panic
-    // here instead of a cryptic crash inside the backend.  Release
-    // builds skip the check entirely; see the doc-comment above for
-    // the debug-vs-release cost trade-off.
+    // Debug-only drift guard: re-validate so a mutation that left `module`
+    // INVALID surfaces as a clean panic here rather than a cryptic crash in
+    // the backend.  It does NOT verify `info` still matches the module's
+    // arena, so a valid-but-stale `info` (e.g. after the arena grew) can still
+    // fault inside `write_string`.  Release builds skip the check entirely;
+    // see the doc-comment above for the debug-vs-release cost trade-off.
     #[cfg(debug_assertions)]
     {
         debug_assert!(

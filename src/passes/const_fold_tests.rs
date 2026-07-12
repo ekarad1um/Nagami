@@ -5364,3 +5364,30 @@ fn float_modulo_beyond_trunc_precision_declines() {
         None
     );
 }
+
+/// Even BELOW the `|a/b| < 2^24` cap the exact fmod can diverge from the
+/// hardware's `a - b*trunc(a/b)` by a full divisor when the rounded quotient
+/// crosses an integer the exact one does not: `33554432f % 3f` is fmod 2.0 but
+/// 0.0 on every round-to-nearest device (`f32(a/b)` rounds 11184810.67 up to
+/// 11184811, so `a - 3*11184811 == 0`).  The stepwise-agreement guard declines
+/// it rather than baking the wrong constant; agreeing cases still fold.
+#[test]
+fn float_modulo_boundary_crossing_within_cap_declines() {
+    use naga::BinaryOperator as B;
+    use naga::Literal as L;
+    // Diverges (exact fmod 2.0 vs stepwise 0.0) -> decline.
+    assert_eq!(
+        eval_binary(B::Modulo, L::F32(33_554_432.0), L::F32(3.0)),
+        None
+    );
+    // Exact multiple within the cap: stepwise agrees, still folds.
+    assert_eq!(
+        eval_binary(B::Modulo, L::F32(30.0), L::F32(3.0)),
+        Some(L::F32(0.0))
+    );
+    // Non-boundary quotient: stepwise agrees, still folds.
+    assert_eq!(
+        eval_binary(B::Modulo, L::F32(7.0), L::F32(2.0)),
+        Some(L::F32(1.0))
+    );
+}

@@ -284,9 +284,10 @@ impl Pass for ConstHoistPass {
             }
             let rep = &candidates[members[0]];
             // Estimated inline length: aliased type name (~2) + parens + literal
-            // tokens + separators.  vecN constructor with all-literal args never
-            // collapses to a swizzle, only to a splat/zero form; those short
-            // forms are filtered out by the savings check below anyway.
+            // tokens + separators.  vecN constructors that would collapse to a
+            // splat / zero form are already excluded upstream by
+            // `full_literal_vector`'s all-same-value guard, so `rep.lits` is a
+            // genuine multi-value vector priced by its full token list.
             let lit_len: usize = rep.lits.iter().map(|&l| est_lit_len(l)).sum();
             let inline_len = 2 + 2 + lit_len + rep.lits.len().saturating_sub(1);
             // savings = count*(inline - name) - (decl boilerplate + name + decl body)

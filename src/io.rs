@@ -45,8 +45,9 @@ pub fn validate_module(module: &naga::Module) -> Result<naga::valid::ModuleInfo,
     }
     thread_local! {
         /// One `Validator` per thread: the pipeline validates after every
-        /// pass, and reuse keeps container capacity across calls
-        /// (`validate` resets per-module state itself).
+        /// pass, and reuse keeps container capacity across calls (`validate`
+        /// resets MOST per-module state itself - not the ray-pipeline pins,
+        /// hence the fresh-retry below).
         static VALIDATOR: std::cell::RefCell<naga::valid::Validator> =
             std::cell::RefCell::new(fresh_validator());
     }

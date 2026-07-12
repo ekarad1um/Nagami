@@ -1,20 +1,18 @@
 //! Grammar-aware helpers shared across the generator.
 //!
-//! Holds four clusters of functionality that must stay in one place
+//! Holds two clusters of functionality that must stay in one place
 //! because every emit site consults them:
 //!
-//! * Literal formatting (shortest decimal / hex / scientific form
-//!   that still round-trips, plus per-type [`PrecisionMode`] rounding).
-//! * Type-to-string rendering for WGSL type constructors, including
-//!   alias lookup, plus binding-attribute printing
+//! * Literal formatting (shortest decimal / hex / scientific form that
+//!   still round-trips, plus per-type [`PrecisionMode`] rounding), and
+//!   the literal-extraction key [`super::literal_extract`] shares.
+//! * Type / attribute / enum-name rendering for WGSL type constructors,
+//!   including alias lookup, binding attributes
 //!   (`@location`/`@builtin`/`@interpolate`/`@invariant`/`@blend_src`/
-//!   `@per_primitive`) via `binding_attrs`.  (Struct-member `@align`/
-//!   `@size` LAYOUT reconstruction is NOT here - it lives in the struct
-//!   emitter in `super::module_emit`.)
-//! * Operator precedence and parenthesisation decisions.
-//! * Identifier classification (keywords, builtins, extractable
-//!   constants) shared between [`super::literal_extract`] and the
-//!   statement / expression emitters.
+//!   `@per_primitive`) via `binding_attrs`, builtins, and math names.
+//!   (Struct-member `@align`/`@size` LAYOUT reconstruction is NOT here -
+//!   it lives in the struct emitter in `super::module_emit`; operator
+//!   precedence / parenthesisation lives in `super::expr_emit`.)
 
 use crate::config::{FloatPrecision, PrecisionMode};
 use crate::error::Error;
@@ -1093,8 +1091,9 @@ pub(super) fn sampling_name(s: naga::Sampling) -> &'static str {
     }
 }
 
-/// Map a [`naga::BuiltIn`] to its WGSL `@builtin(...)` keyword.
-/// Returns [`Error::Emit`] for builtins WGSL does not expose.
+/// Map a [`naga::BuiltIn`] to its WGSL `@builtin(...)` keyword.  Infallible for
+/// WGSL-frontend input (every reachable variant maps); the `Result` mirrors the
+/// other rendering helpers so callers stay uniform.
 pub(super) fn builtin_name(bi: naga::BuiltIn) -> Result<&'static str, Error> {
     Ok(match bi {
         naga::BuiltIn::PrimitiveIndex => "primitive_index",

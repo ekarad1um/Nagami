@@ -68,9 +68,11 @@ pub struct CoalescingPass;
 /// `coalesce_safe` reflects a per-control-flow-scope correctness
 /// gate: it stays `true` iff in *every* block scope where the local
 /// is touched, the first touch within that scope is a write
-/// (`Statement::Store` or `CooperativeStore` destination), AND every
-/// Read of the local resolves to an element provably written before
-/// that Read on every reaching path.  Either gate failing means at
+/// (`Statement::Store` or `CooperativeStore` destination) - or is
+/// preceded by a child block (`If` both arms / nested `Block`) that
+/// unconditionally writes the local, per the `block_writes`
+/// propagation - AND every Read of the local resolves to an element
+/// provably written before that Read on every reaching path.  Either gate failing means at
 /// least one runtime execution reads the slot's pre-coalesce
 /// contents - the prior local's residue instead of either
 /// zero-init or the local's own writes - so the local cannot be
@@ -560,9 +562,6 @@ fn scan_block_usage(
     // body's writes only count when the loop is provably executed
     // and contains no early `break`/`Return`).
     let mut block_writes: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
-
-    // Helper closure-equivalents are expanded inline below to keep
-    // the borrow checker happy with `local_init`'s `&mut`.
 
     for stmt in block {
         let current = *pos;

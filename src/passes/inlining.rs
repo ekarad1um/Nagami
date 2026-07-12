@@ -1,4 +1,6 @@
-//! Function inlining for pure, expression-only helpers.
+//! Function inlining for expression-only helpers (no side-effecting
+//! statements; global/texture reads are allowed and keep their call-time
+//! timing because the body is re-emitted at the call site).
 //!
 //! The pass only touches functions whose body is a clean
 //! `[Emit*, Return { value }]` sequence with no locals, stores, calls,
@@ -203,12 +205,13 @@ fn drop_empty_calls_in_block(
 /// Collect every function eligible for inlining and build its
 /// [`InlineTemplate`].
 ///
-/// Safety invariant: only pure, expression-only functions are eligible.
-/// The body must be `[Emit*, Return { value }]` with no locals, no
-/// stores, no calls, and no other side-effecting statements, which
-/// guarantees the template's expression DAG can be cloned into the
-/// caller's arena without invalidating any assumptions about stores or
-/// control flow between statements.
+/// Safety invariant: only expression-only functions with no side-effecting
+/// STATEMENTS are eligible.  The body must be `[Emit*, Return { value }]`
+/// with no locals, no stores, no calls, and no other side-effecting
+/// statements, which guarantees the template's expression DAG can be cloned
+/// into the caller's arena without invalidating any assumptions about stores
+/// or control flow between statements.  (Global/texture READS in the body are
+/// fine - re-emitting at the call site preserves their call-time timing.)
 fn collect_inline_templates(
     module: &naga::Module,
     max_node_count: usize,
@@ -615,7 +618,7 @@ fn push_emit_ranges_for_new_expressions(
 /// shared after cloning.
 ///
 /// `memo` is pre-sized to `template.expressions.len()` by the caller
-/// (see `inline_in_function`).  Every `handle` reached through the
+/// (see `inline_in_block`).  Every `handle` reached through the
 /// recursion below comes from `template.expressions` (the recursion
 /// only traverses children of the just-cloned expression, which is
 /// itself a clone of an entry in the template's arena), so

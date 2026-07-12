@@ -4,6 +4,22 @@
 
 use super::*;
 
+/// Run `f` on a large stack (as the CLI runs minification on its big-stack
+/// worker) so a deep-chain test does not overflow the default test-thread
+/// stack in the debug profile.  A failed assertion still fails the test - its
+/// panic is re-raised via `resume_unwind`.
+fn on_big_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+    match std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(f)
+        .expect("spawn big-stack test thread")
+        .join()
+    {
+        Ok(r) => r,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 const TRIVIAL_SHADER: &str = r#"
         @vertex fn main() -> @builtin(position) vec4<f32> {
             return vec4<f32>(0.0, 0.0, 0.0, 1.0);
@@ -358,7 +374,7 @@ fn e2e_flat_reassignment_chain_stays_depth_bounded() {
         src.push_str("    a = a * 2.0 + 1.0;\n");
     }
     src.push_str("    s = a;\n}\n");
-    let output = run(&src, &Config::default()).unwrap();
+    let output = on_big_stack(move || run(&src, &Config::default()).unwrap());
     let (mut depth, mut max_depth) = (0i32, 0i32);
     for ch in output.source.chars() {
         match ch {
@@ -985,6 +1001,34 @@ fn split_directives_diagnostic() {
     let (dirs, rest) = split_directives(src);
     assert_eq!(dirs, "diagnostic(off, derivative_uniformity);\n");
     assert_eq!(rest, "fn f() {}\n");
+}
+
+#[test]
+fn split_directives_line_comment_ends_at_vertical_tab() {
+    // A `//` comment ends at ANY WGSL line break (VT/CR/FF/...), not just `\n`.
+    // A directive after such a comment must still be hoisted; otherwise the
+    // preamble path ships it after the preamble's declarations (invalid, exit 0).
+    for brk in ["\u{0b}", "\r", "\u{0c}"] {
+        let src = format!("//x{brk}diagnostic(off, derivative_uniformity);\nfn f() {{}}\n");
+        let (dirs, rest) = split_directives(&src);
+        assert!(
+            dirs.contains("diagnostic(off, derivative_uniformity);"),
+            "directive after a line comment ended by {brk:?} must be hoisted: {dirs:?}"
+        );
+        assert_eq!(rest, "fn f() {}\n");
+    }
+}
+
+#[test]
+fn has_enable_directive_accepts_line_break_after_keyword() {
+    // `enable` may be separated from the extension by any blankspace, incl. a
+    // line break (`enable\nf16;` is valid WGSL); the guard must not read that as
+    // an identifier and miss the directive (which spuriously fires the f16
+    // preamble guard on a preamble that DOES enable f16).
+    assert!(has_enable_directive("enable\nf16;", "f16"));
+    assert!(has_enable_directive("enable\r\nf16;", "f16"));
+    assert!(has_enable_directive("enable f16;", "f16"));
+    assert!(!has_enable_directive("enablef16;", "f16"));
 }
 
 /// Regression: when `split_directives` returns a fragment that

@@ -1,4 +1,4 @@
-//! Load / store dataflow cleanup.  Three phases run per function on
+//! Load / store dataflow cleanup.  Four phases run per function on
 //! every sweep:
 //!
 //! 1. **Dead-store removal.**  Discards `Store` statements whose
@@ -10,7 +10,10 @@
 //!    might alias a cached load invalidate it; loop handlers drain
 //!    the cache before the body runs because iteration counts are
 //!    unknown at pass time.
-//! 3. **Dead-init removal.**  After phase 2 has forwarded seeded
+//! 3. **Write-only-local elimination.**  A whole-function scan drops
+//!    every `Store` (whole or partial) to a local that is never
+//!    observed - stronger than phase 1's per-block, whole-var reach.
+//! 4. **Dead-init removal.**  After phase 2 has forwarded seeded
 //!    loads, init values that are overwritten before any surviving
 //!    read can be dropped.  Zero inits (`T(0)`) are also removed
 //!    because WGSL already zero-initialises uninitialised locals.
@@ -32,7 +35,7 @@ use super::expr_util::{
 };
 use super::scoped_map::ScopedMap;
 
-/// Pass object for the three-phase load / store cleanup.  See the
+/// Pass object for the four-phase load / store cleanup.  See the
 /// module-level doc for phase ordering.
 #[derive(Debug, Default)]
 pub struct LoadDedupPass;
@@ -1405,10 +1408,15 @@ const SUBSTITUTION_DEPTH_CAP: u32 = 128;
 /// replacement's tree, an un-forwarded one as its POINTER chain - subscript
 /// expressions are real rendered tree content and can absorb a previous
 /// iteration's forwarded tree, e.g. `x = a[x & 3] + 1;` chains).
-/// Level-order walk, saturating at `cap + 1`; the shared visited set and
-/// node budget keep it O(cap) per call, at worst UNDER-counting a diamond
-/// whose deep path re-enters a shared node - acceptable slack against
-/// consumers with thousands of frames of headroom.
+/// Level-order (BFS) walk, saturating at `cap + 1`.  The shared visited set
+/// makes this the SHORTEST-path depth, so a node reachable via both a short
+/// and a long path is under-counted versus the longest-path depth the
+/// recursive consumers (`render_depth`, naga's writer) actually stack; the
+/// gap is bounded by the `budget` node cap, not one diamond.  This pass never
+/// synthesizes such sharing (forwarding only substitutes handles into existing
+/// nodes, and re-absorption chains grow both paths in lockstep), and the naga
+/// parser recursion limit caps any pre-existing input, so the under-count is
+/// unreachable here in practice.
 fn effective_forwarded_depth(
     value: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,

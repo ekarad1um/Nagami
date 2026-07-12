@@ -300,39 +300,13 @@ pub(super) fn parse_for_loop_shape<'a>(
     })
 }
 
-/// Single source of truth for "can a for-shaped loop's `WorkGroupUniformLoad`
-/// preloads be safely inlined into the `for(...)` header?".  Both
-/// [`Generator::try_emit_for_loop`] (which emits) and
-/// `module_emit::is_for_loop_candidate` (which decides whether to suppress
-/// the counter's top-level `var`) call this on the SAME [`ForLoopShape`], so
-/// the two never disagree (a disagreement would leave the counter undeclared).
-/// Returns `false` only when inlining a preload would be wrong.
-///
-/// A `WorkGroupUniformLoad` preload carries a barrier side effect, so it must
-/// execute EXACTLY ONCE per iteration.  When the loop becomes a `for(...)`,
-/// a preload is materialised only where its `result` is emitted (inlined into
-/// the condition for a guard preload, into the update statement for an update
-/// preload); it has no statement of its own.  Three hazards are checked:
-/// * tail use - a guard preload result used AFTER the guard (in the body tail
-///   or the `continuing` block, both in scope for it) would lose its `let`
-///   binding when the preload is inlined into the condition;
-/// * multi-emit - a preload reused within the condition or update expression
-///   would execute the barrier more than once per iteration;
-/// * dropped - a preload whose `result` is NOT referenced by the condition /
-///   update (count 0) would never be emitted at all, silently deleting the
-///   barrier.  This also covers a `continuing` block that holds preloads but
-///   no core update statement (no update clause to carry them).
-///
-/// Each preload must therefore be emitted exactly once (`count == 1`); any
-/// other count refuses the for-loop conversion so plain-loop emission - which
-/// keeps the preload as its own statement - preserves the barrier.
-/// `true` when rendering `shape`'s guard condition or update statement
-/// inline in a `for(...)` header would exceed [`MAX_RENDER_DEPTH`].  Header
-/// clauses bypass the `S::Emit` depth gate entirely - their `Emit` ranges
-/// are consumed by the for-conversion, never processed as statements - so
-/// an over-deep chain must stay on the plain `loop` path, where the gate
-/// binds it.  (The init value's `Emit`s precede the loop and are gated
-/// normally, so init depth needs no check here.)
+/// `true` when rendering `shape`'s guard condition, update statement, or a
+/// preload POINTER inline in a `for(...)` header would exceed
+/// [`MAX_RENDER_DEPTH`].  Header clauses bypass the `S::Emit` depth gate
+/// entirely - their `Emit` ranges are consumed by the for-conversion, never
+/// processed as statements - so an over-deep chain must stay on the plain
+/// `loop` path, where the gate binds it.  (The init value's `Emit`s precede
+/// the loop and are gated normally, so init depth needs no check here.)
 ///
 /// Deliberately ignores `expr_names`/binding state: like
 /// [`for_loop_preload_inlining_is_safe`], both `is_for_loop_candidate`
@@ -372,9 +346,42 @@ pub(super) fn for_header_exceeds_depth_cap(
             exceeded |= depth(h, expressions, &mut memo) > MAX_RENDER_DEPTH;
         });
     }
+    // A preload's `result` renders as a childless leaf, so the walks above miss
+    // the POINTER's depth - yet the pointer is emitted inline in the header as
+    // `workgroupUniformLoad(&<pointer>)` (the `+4` covers that wrapper).  Without
+    // this a deep preload pointer bypasses the cap exactly like a deep condition.
+    for &(pointer, _) in shape.guard_preloads.iter().chain(&shape.update_preloads) {
+        exceeded |= depth(pointer, expressions, &mut memo).saturating_add(4) > MAX_RENDER_DEPTH;
+    }
     exceeded
 }
 
+/// Single source of truth for "can a for-shaped loop's `WorkGroupUniformLoad`
+/// preloads be safely inlined into the `for(...)` header?".  Both
+/// [`Generator::try_emit_for_loop`] (which emits) and
+/// `module_emit::is_for_loop_candidate` (which decides whether to suppress
+/// the counter's top-level `var`) call this on the SAME [`ForLoopShape`], so
+/// the two never disagree (a disagreement would leave the counter undeclared).
+/// Returns `false` only when inlining a preload would be wrong.
+///
+/// A `WorkGroupUniformLoad` preload carries a barrier side effect, so it must
+/// execute EXACTLY ONCE per iteration.  When the loop becomes a `for(...)`,
+/// a preload is materialised only where its `result` is emitted (inlined into
+/// the condition for a guard preload, into the update statement for an update
+/// preload); it has no statement of its own.  Three hazards are checked:
+/// * tail use - a guard preload result used AFTER the guard (in the body tail
+///   or the `continuing` block, both in scope for it) would lose its `let`
+///   binding when the preload is inlined into the condition;
+/// * multi-emit - a preload reused within the condition or update expression
+///   would execute the barrier more than once per iteration;
+/// * dropped - a preload whose `result` is NOT referenced by the condition /
+///   update (count 0) would never be emitted at all, silently deleting the
+///   barrier.  This also covers a `continuing` block that holds preloads but
+///   no core update statement (no update clause to carry them).
+///
+/// Each preload must therefore be emitted exactly once (`count == 1`); any
+/// other count refuses the for-loop conversion so plain-loop emission - which
+/// keeps the preload as its own statement - preserves the barrier.
 pub(super) fn for_loop_preload_inlining_is_safe(
     shape: &ForLoopShape,
     body: &naga::Block,

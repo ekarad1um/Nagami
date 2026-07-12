@@ -1,17 +1,23 @@
-//! Dead-branch elimination.  Three primary phases plus several
+//! Dead-branch elimination.  Four primary phases plus several
 //! structural simplifications folded into the constant-condition pass:
 //!
 //! 1. Short-circuit re-sugaring folds the `if/else store false`
 //!    patterns naga's WGSL frontend emits for `&&` and `||` back into
 //!    compact [`naga::Expression::Binary`] `LogicalAnd` / `LogicalOr`
 //!    expressions before the next phase destroys their shape.
-//! 2. Redundant `else`-store elimination removes writes that assign
+//! 2. Register promotion (`forward_single_store_locals`) forwards a
+//!    same-block single-store / single-load local to its value so the
+//!    re-sugar and const-fold collapses become idempotent.
+//! 3. Redundant `else`-store elimination removes writes that assign
 //!    the same known literal already present in the variable on the
 //!    opposite branch, shrinking unbalanced two-arm ifs into one arm.
-//! 3. Constant-condition / structural cleanup (`eliminate_dead_branches`)
+//! 4. Constant-condition / structural cleanup (`eliminate_dead_branches`)
 //!    strips `if (true)` / `if (false)` arms AND performs several
 //!    cooperative simplifications in the same walk:
-//!    * empty-If / empty-Switch / empty-Block elision,
+//!    * empty-If / empty-Block elision and all-arms-noop Switch deletion
+//!      (every case empty or a lone switch-local `break`) - the latter
+//!      drops the selector too, since naga expressions carry no effects,
+//!    * empty-Switch elision,
 //!    * else-block elision when the accept branch unconditionally
 //!      terminates (return / break / continue; `discard` continues under
 //!      demote-to-helper and never counts),
@@ -344,7 +350,7 @@ fn collect_forwards(
             }
         }
     }
-    for (&t, _) in store_idx.iter() {
+    for &t in store_idx.keys() {
         let Some(loads_here) = found.get(&t) else {
             continue;
         };
@@ -417,8 +423,8 @@ fn remove_forwarded_stores(
 use super::load_dedup::{collect_modified_locals, get_stored_local, is_zero_literal};
 use super::scoped_map::ScopedMap;
 
-/// Dead-branch pass.  See the module-level doc for the three phases
-/// this pass runs per function on every sweep.
+/// Dead-branch pass.  See the module-level doc for the phases this pass
+/// runs per function on every sweep.
 #[derive(Debug, Default)]
 pub struct DeadBranchPass;
 
