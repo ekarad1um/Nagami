@@ -359,7 +359,7 @@ impl<'body> ExpressionScopeIndex<'body> {
 fn remove_dead_inits(function: &mut naga::Function) -> bool {
     let mut changed = false;
 
-    // Phase 1: zero inits are always redundant in WGSL.
+    // Sub-phase 1: zero inits are always redundant in WGSL.
     for (_, lvar) in function.local_variables.iter_mut() {
         if let Some(init) = lvar.init
             && is_zero_init(&function.expressions, init)
@@ -369,7 +369,7 @@ fn remove_dead_inits(function: &mut naga::Function) -> bool {
         }
     }
 
-    // Phase 2: non-zero inits overwritten before first load.
+    // Sub-phase 2: non-zero inits overwritten before first load.
     let dead = find_dead_inits(
         &function.body,
         &function.expressions,
@@ -965,6 +965,163 @@ fn remove_dead_stores_in_block(
 
 // MARK: Load deduplication
 
+/// `true` when `lit` is an integer-typed zero.  Narrower than
+/// [`is_zero_literal`] (which also matches `0.0`): only INTEGER divide /
+/// modulo by zero is a WGSL shader-creation error - float `x / 0.0` yields a
+/// defined `inf`/`nan` and must stay foldable, so it must NOT count as a
+/// dangerous divisor.
+fn is_integer_zero_literal(lit: &naga::Literal) -> bool {
+    matches!(
+        lit,
+        naga::Literal::I16(0)
+            | naga::Literal::U16(0)
+            | naga::Literal::I32(0)
+            | naga::Literal::U32(0)
+            | naga::Literal::I64(0)
+            | naga::Literal::U64(0)
+            | naga::Literal::AbstractInt(0)
+    )
+}
+
+/// `true` when a shift by the constant `lit` is a WGSL shader-creation error
+/// for a 32-bit operand (`e2 >= bit width of e1`).  The shift amount is a
+/// `u32` in WGSL, and `>= 32` covers the ubiquitous 32-bit `e1`.  A 16-bit
+/// `e1` with an amount in `[16, 32)` is deliberately NOT caught (the pass's
+/// existing rollback still covers that rarer case, fail-safe); a 64-bit `e1`
+/// is over-declined harmlessly (one legal forward skipped, never a miscompile).
+fn shift_amount_is_static_error(lit: &naga::Literal) -> bool {
+    let amount: i128 = match lit {
+        naga::Literal::U32(v) => i128::from(*v),
+        naga::Literal::U16(v) => i128::from(*v),
+        naga::Literal::I32(v) => i128::from(*v),
+        naga::Literal::I16(v) => i128::from(*v),
+        naga::Literal::U64(v) => i128::from(*v),
+        naga::Literal::I64(v) => i128::from(*v),
+        naga::Literal::AbstractInt(v) => i128::from(*v),
+        _ => return false,
+    };
+    amount >= 32
+}
+
+/// Resolve `start` through the forward chain in `replacements` to the literal
+/// it would be rewritten to, or `None` when the final target is not a literal.
+/// The budget guards against a malformed cycle (chains are acyclic by
+/// construction, so it is a safety net, not an expected path).
+fn resolve_forward_literal(
+    expressions: &naga::Arena<naga::Expression>,
+    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    start: naga::Handle<naga::Expression>,
+) -> Option<naga::Literal> {
+    let mut handle = start;
+    let mut budget = expressions.len() + 1;
+    while let Some(&next) = replacements.get(&handle) {
+        handle = next;
+        budget -= 1;
+        if budget == 0 {
+            return None;
+        }
+    }
+    match &expressions[handle] {
+        naga::Expression::Literal(lit) => Some(*lit),
+        _ => None,
+    }
+}
+
+/// Drop store-to-load forwards that would substitute a constant into the RHS
+/// of an integer `/`, `%`, `<<`, or `>>` and thereby turn a legal RUNTIME
+/// operation into a const-expression WGSL rejects at shader-creation time
+/// (integer divide/modulo by zero; shift amount `>=` the bit width).  Left
+/// in place, naga rejects the const form and the post-pass validation rolls
+/// the WHOLE module back - discarding every other valid forward the pass made
+/// and printing a warning - even though the pre-forward runtime read was
+/// valid.  Declining just these forwards keeps that read and lets the rest of
+/// the pass stand.
+///
+/// MUST run before the dead-local scan: dropping a load's replacement keeps
+/// the load live, so its store must not be classed dead.  Removal is always
+/// the safe direction (a declined forward only ever keeps more state live).
+fn decline_static_error_forwards(
+    expressions: &naga::Arena<naga::Expression>,
+    replacements: &mut HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+) {
+    let mut to_decline: Vec<naga::Handle<naga::Expression>> = Vec::new();
+    for (_, expr) in expressions.iter() {
+        let naga::Expression::Binary { op, right, .. } = expr else {
+            continue;
+        };
+        // The RHS may be the operand directly, or - for a componentwise
+        // `vecN <op> scalar` - a `Splat`/`Compose` naga wraps around the
+        // forwarded leaf; recurse to the leaves and decline any that turn a
+        // lane into a static error (WGSL componentwise `/` `%` `<<` `>>` make
+        // it a shader-creation error if ANY const lane is offending).
+        match op {
+            naga::BinaryOperator::Divide | naga::BinaryOperator::Modulo => {
+                collect_static_error_leaves(
+                    expressions,
+                    replacements,
+                    *right,
+                    &is_integer_zero_literal,
+                    &mut to_decline,
+                );
+            }
+            naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight => {
+                collect_static_error_leaves(
+                    expressions,
+                    replacements,
+                    *right,
+                    &shift_amount_is_static_error,
+                    &mut to_decline,
+                );
+            }
+            _ => {}
+        }
+    }
+    for handle in to_decline {
+        replacements.remove(&handle);
+    }
+}
+
+/// Walk a divisor / shift-amount operand collecting the forward-chain leaves
+/// (`replacements` keys) that would resolve to a literal `is_dangerous`
+/// accepts.  Recurses `Splat`/`Compose` so a scalar-broadcast divisor
+/// (`a / vec3(b)`) and an element-wise one (`a / vec3(x, y, b)`) are both
+/// covered.  A non-forwarded literal is never collected - an offending
+/// constant already present in the input is naga's to reject, not ours.
+fn collect_static_error_leaves<F: Fn(&naga::Literal) -> bool>(
+    expressions: &naga::Arena<naga::Expression>,
+    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    handle: naga::Handle<naga::Expression>,
+    is_dangerous: &F,
+    out: &mut Vec<naga::Handle<naga::Expression>>,
+) {
+    if replacements.contains_key(&handle) {
+        if resolve_forward_literal(expressions, replacements, handle)
+            .as_ref()
+            .is_some_and(is_dangerous)
+        {
+            out.push(handle);
+        }
+        return;
+    }
+    match &expressions[handle] {
+        naga::Expression::Splat { value, .. } => {
+            collect_static_error_leaves(expressions, replacements, *value, is_dangerous, out);
+        }
+        naga::Expression::Compose { components, .. } => {
+            for &component in components {
+                collect_static_error_leaves(
+                    expressions,
+                    replacements,
+                    component,
+                    is_dangerous,
+                    out,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Run phase 2: forward repeated `Load` expressions to the most
 /// recent dominating stored value, using a dominance-scoped
 /// [`ScopedMap`] to track per-pointer-key cache state across control
@@ -1014,6 +1171,14 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         &mut HashSet::new(),
     );
 
+    if replacements.is_empty() {
+        return false;
+    }
+
+    // Decline forwards that would make an integer `/ % << >>` a static
+    // shader-creation error.  MUST precede the dead-local scan so a declined
+    // load, left live, keeps its backing store from being culled.
+    decline_static_error_forwards(&function.expressions, &mut replacements);
     if replacements.is_empty() {
         return false;
     }

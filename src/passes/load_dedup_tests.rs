@@ -2553,3 +2553,108 @@ fn test_fn(a: bool, b: bool, c: bool) -> bool {
         out,
     );
 }
+
+/// `true` when any `Divide`/`Modulo` in `function` has a right operand that
+/// IS an integer-zero literal - directly, or through the `Splat`/`Compose`
+/// naga wraps a scalar divisor in for a component-wise `vecN / scalar`.  This
+/// is the exact shape `decline_static_error_forwards` prevents load_dedup
+/// from materialising.
+fn has_const_zero_divisor(function: &naga::Function) -> bool {
+    fn operand_is_zero(
+        exprs: &naga::Arena<naga::Expression>,
+        handle: naga::Handle<naga::Expression>,
+    ) -> bool {
+        match &exprs[handle] {
+            naga::Expression::Literal(lit) => is_integer_zero_literal(lit),
+            naga::Expression::Splat { value, .. } => operand_is_zero(exprs, *value),
+            naga::Expression::Compose { components, .. } => {
+                components.iter().any(|&c| operand_is_zero(exprs, c))
+            }
+            _ => false,
+        }
+    }
+    function.expressions.iter().any(|(_, e)| {
+        matches!(
+            e,
+            naga::Expression::Binary {
+                op: naga::BinaryOperator::Divide | naga::BinaryOperator::Modulo,
+                right,
+                ..
+            } if operand_is_zero(&function.expressions, *right)
+        )
+    })
+}
+
+#[test]
+fn declines_forwarding_zero_into_scalar_divisor() {
+    // `b` is a zero-init var used only as a divisor.  Forwarding `b -> 0u`
+    // makes `a / 0u` a const divide-by-zero (a WGSL shader-creation error):
+    // naga rejects it and the WHOLE pass rolls back with a spurious warning.
+    // `run_pass` validates the post-pass module, so without the guard this
+    // panics; with it, the divisor stays a runtime read.
+    let src = "\
+@compute @workgroup_size(1)
+fn f() {
+    var a = 10u;
+    var b = 0u;
+    let r = a / b;
+}";
+    let (_changed, module) = run_pass(src);
+    assert!(
+        !has_const_zero_divisor(&module.entry_points[0].function),
+        "guard must decline forwarding zero into a scalar divisor"
+    );
+}
+
+#[test]
+fn declines_forwarding_zero_into_vector_divisor() {
+    // `vecN / scalar` splats the scalar divisor, so the forwarded zero hides
+    // under a `Splat` - the guard must recurse into it.
+    let src = "\
+@compute @workgroup_size(1)
+fn f() {
+    var a = vec3<u32>(1u, 2u, 3u);
+    var b = 0u;
+    let r = a / b;
+}";
+    let (_changed, module) = run_pass(src);
+    assert!(
+        !has_const_zero_divisor(&module.entry_points[0].function),
+        "guard must decline forwarding zero into a splatted vector divisor"
+    );
+}
+
+#[test]
+fn declines_forwarding_overflow_into_shift_amount() {
+    // Forwarding `s -> 40u` makes `1i << 40u` a const shift past the 32-bit
+    // width (a shader-creation error).  `run_pass`'s post-pass validation is
+    // the assertion: without the guard the module is invalid and it panics.
+    let src = "\
+@compute @workgroup_size(1)
+fn f() {
+    var a = 1i;
+    var s = 40u;
+    let r = a << s;
+}";
+    let (_changed, _module) = run_pass(src);
+}
+
+#[test]
+fn still_forwards_legal_shift_and_divisor() {
+    // Control: an in-range shift amount and a non-zero divisor must STILL
+    // forward (the guard is surgical, not a blanket ban on shift/div RHS).
+    let src = "\
+@compute @workgroup_size(1)
+fn f() {
+    var a = 256u;
+    var sh = 2u;
+    var d = 4u;
+    let r = (a >> sh) / d;
+}";
+    let (changed, module) = run_pass(src);
+    assert!(changed, "legal shift/divide forwards must still fire");
+    assert!(
+        !has_const_zero_divisor(&module.entry_points[0].function),
+        "a non-zero divisor is never flagged"
+    );
+}
