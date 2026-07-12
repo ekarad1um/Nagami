@@ -72,9 +72,8 @@ export default defineConfig({
             handler: 'CacheFirst',
             options: {
               cacheName: 'nagami-wasm',
-              // A few entries cover old+new hashes during an update; LRU evicts stale.
-              expiration: { maxEntries: 4, maxAgeSeconds: 60 * 60 * 24 * 30 },
-              cacheableResponse: { statuses: [0, 200] },
+              expiration: { maxEntries: 4, maxAgeSeconds: 60 * 60 * 24 },
+              cacheableResponse: { statuses: [200] },
             },
           },
         ],
