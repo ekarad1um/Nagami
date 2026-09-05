@@ -36,6 +36,7 @@ Nagami lowers WGSL into [Naga IR](https://github.com/gfx-rs/wgpu/tree/trunk/naga
 - Float precision trimming - cap decimal places or significant figures, per type (lossy, opt-in)
 - Preamble support - external declarations excluded from output
 - Library modules - shader fragments without entry points preserved
+- Name map - original -> final identifier mapping for hosts that address shaders by source names
 
 Runs passes in fixed-point sweeps until the output stops shrinking. Typically converges in 3 sweeps.
 
@@ -56,6 +57,9 @@ nagami shader.wgsl -o out.wgsl -p baseline          # lighter touch, no mangle
 cat shader.wgsl | nagami - > out.wgsl               # stdin -> stdout
 nagami shader.wgsl --check                          # exit 1 if not minified
 nagami shader.wgsl --preamble env.wgsl -o out.wgsl  # external declarations
+nagami shader.wgsl -o out.wgsl --name-map map.json  # original -> final identifier map
+nagami shader.wgsl --format json                    # one JSON document on stdout
+nagami shader.wgsl -o out.wgsl --strict-fallback    # fail instead of shipping a text-only bailout
 nagami shader.wgsl --decimal-places 6 -o out.wgsl   # lossy: cap fractional digits
 nagami shader.wgsl --sig-figs 4 -o out.wgsl         # lossy: cap significant figures
 ```
@@ -135,9 +139,13 @@ Browser / bundler:
 ```js
 import init, { run } from 'nagami-rs';
 await init(); // load the WASM module once
-const { source, report } = run(shader);
-console.log(source); // minified WGSL
-console.log(report); // optimization report
+const { source, report, nameMap } = run(shader);
+console.log(source);  // minified WGSL
+console.log(report);  // optimization report; report.bailout holds naga's
+                      // error when the output is text-compacted only
+console.log(nameMap); // original -> final names for bindings, functions,
+                      // overrides, entry points, struct members - null when
+                      // output names match the input
 ```
 
 With config (all fields optional):

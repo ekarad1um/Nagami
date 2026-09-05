@@ -493,6 +493,9 @@ impl<'a> Generator<'a> {
                 if special_type_handles.contains(&h) {
                     continue;
                 }
+                // Host-addressable past the special-type gate, preamble-owned
+                // included.
+                self.map_visible_structs.insert(h);
                 if !preamble.is_empty()
                     && let Some(name) = ty.name.as_deref()
                     && preamble.contains(name)

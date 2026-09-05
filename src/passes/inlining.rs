@@ -1082,6 +1082,7 @@ mod tests {
         let ctx = PassContext {
             config: &config,
             trace_run_dir: None,
+            name_log: None,
         };
 
         let changed = pass
@@ -1332,6 +1333,7 @@ fn fs_main() -> @location(0) vec4f {
         let ctx = PassContext {
             config: &config,
             trace_run_dir: None,
+            name_log: None,
         };
         let changed = pass.run(&mut module, &ctx).expect("inlining should run");
         assert!(changed, "helper should be inlined");

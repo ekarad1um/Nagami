@@ -8,6 +8,7 @@ fn run_pass(source: &str) -> (bool, naga::Module) {
     let ctx = PassContext {
         config: &config,
         trace_run_dir: None,
+        name_log: None,
     };
 
     let changed = pass
@@ -1636,6 +1637,7 @@ fn run_dead_branch_then_load_dedup(source: &str) -> (bool, naga::Module) {
     let ctx = PassContext {
         config: &config,
         trace_run_dir: None,
+        name_log: None,
     };
 
     let mut db = crate::passes::dead_branch::DeadBranchPass;

@@ -118,6 +118,9 @@ pub(super) struct Generator<'a> {
     /// Types reachable from live code.  Dead struct declarations are
     /// skipped during emission.
     pub(super) live_types: HashSet<naga::Handle<naga::Type>>,
+    /// Struct types a host can address: live, not naga-predeclared,
+    /// preamble-owned included (declared in the consumer's preamble text).
+    pub(super) map_visible_structs: HashSet<naga::Handle<naga::Type>>,
     /// Pre-computed type layouts used when reconstructing `@size` and
     /// `@align` attributes on struct members.
     pub(super) layouter: naga::proc::Layouter,
@@ -1099,6 +1102,7 @@ impl<'a> Generator<'a> {
             expr_to_const: HashMap::new(),
             live_constants,
             live_types,
+            map_visible_structs: HashSet::new(),
             layouter,
             layouter_complete,
             ref_count_cache: Vec::new(),

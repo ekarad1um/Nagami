@@ -54,6 +54,7 @@ pub mod inlining;
 pub mod load_dedup;
 pub mod rename;
 pub mod scoped_map;
+pub mod specialize_ptr_params;
 pub mod struct_build;
 
 /// Build the pass pipeline for `config.profile`; ordering rationale

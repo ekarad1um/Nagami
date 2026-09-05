@@ -32,6 +32,7 @@ pub fn compact(src: &str) -> String {
         },
     )
     .expect("generate failed")
+    .0
 }
 
 /// Compact variant with mangling enabled and no preserved symbols.
@@ -63,6 +64,7 @@ pub fn compact_aliased(src: &str) -> String {
         },
     )
     .expect("generate failed")
+    .0
 }
 
 /// Compact variant with both mangling and type aliasing active;
@@ -89,6 +91,7 @@ pub fn compact_mangled_aliased(src: &str) -> String {
         },
     )
     .expect("generate failed")
+    .0
 }
 
 /// Compact mangled variant that preserves the given symbol names.
@@ -115,6 +118,7 @@ pub fn compact_mangled_preserved(src: &str, preserve: &[&str]) -> String {
         },
     )
     .expect("generate failed")
+    .0
 }
 
 /// Assert that `out` parses and validates as WGSL: the emitter's
@@ -169,6 +173,7 @@ pub fn compact_beautified(src: &str) -> String {
         },
     )
     .expect("generate failed")
+    .0
 }
 
 /// Compact variant with `DecimalPlaces(prec)` applied to every float
@@ -203,6 +208,7 @@ pub fn compact_with_float_precision(src: &str, float_precision: FloatPrecision) 
         },
     )
     .expect("generate failed")
+    .0
 }
 
 /// Run the full `parse -> validate -> IR passes -> generate`

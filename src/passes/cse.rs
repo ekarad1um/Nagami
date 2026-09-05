@@ -488,6 +488,7 @@ mod tests {
         let ctx = PassContext {
             config: &config,
             trace_run_dir: None,
+            name_log: None,
         };
         let changed = pass.run(&mut module, &ctx).expect("pass should succeed");
         let _ = crate::io::validate_module(&module).expect("module should remain valid");

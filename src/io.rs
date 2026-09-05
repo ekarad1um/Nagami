@@ -68,12 +68,25 @@ pub fn validate_module(module: &naga::Module) -> Result<naga::valid::ModuleInfo,
                 let mut fresh = fresh_validator();
                 let info = fresh
                     .validate(module)
-                    .map_err(|e| Error::Validation(e.to_string()))?;
+                    .map_err(|e| Error::Validation(render_error_chain(&e)))?;
                 *validator.borrow_mut() = fresh;
                 Ok(info)
             }
         }
     })
+}
+
+/// `e` and its `source()` chain on one line: naga's `Display` shows only
+/// the outermost frame, the actionable detail sits below it.
+fn render_error_chain(e: &dyn std::error::Error) -> String {
+    let mut msg = e.to_string();
+    let mut src = e.source();
+    while let Some(s) = src {
+        msg.push_str(": ");
+        msg.push_str(&s.to_string());
+        src = s.source();
+    }
+    msg
 }
 
 /// Validate a naga module and render failures against `source`.

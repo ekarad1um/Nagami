@@ -190,6 +190,7 @@ mod tests {
         let ctx = PassContext {
             config: &config,
             trace_run_dir: None,
+            name_log: None,
         };
         let mut pass = EmitMergePass;
         let changed = pass.run(&mut module, &ctx).unwrap();
@@ -213,6 +214,7 @@ mod tests {
         let ctx = PassContext {
             config: &config,
             trace_run_dir: None,
+            name_log: None,
         };
         let mut pass = EmitMergePass;
         let changed = pass.run(&mut module, &ctx).unwrap();
@@ -236,6 +238,7 @@ mod tests {
         let ctx = PassContext {
             config: &config,
             trace_run_dir: None,
+            name_log: None,
         };
         let mut pass = EmitMergePass;
         let _ = pass.run(&mut module, &ctx).unwrap();
@@ -275,6 +278,7 @@ mod tests {
         let ctx = PassContext {
             config: &config,
             trace_run_dir: None,
+            name_log: None,
         };
         let mut pass = EmitMergePass;
 
@@ -316,6 +320,7 @@ mod tests {
         let ctx = PassContext {
             config: &config,
             trace_run_dir: None,
+            name_log: None,
         };
         let mut pass = EmitMergePass;
         let changed = pass.run(&mut module, &ctx).unwrap();

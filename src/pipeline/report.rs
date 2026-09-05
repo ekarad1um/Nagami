@@ -46,6 +46,10 @@ pub struct Report {
     pub converged: bool,
     /// Number of full pass sweeps executed.
     pub sweeps: usize,
+    /// naga's rendered error, prefixed with the stage that gave up, when
+    /// the input shipped compacted instead of the pipeline's output;
+    /// `None` on every normal path.
+    pub bailout: Option<String>,
 }
 
 impl Report {
@@ -68,6 +72,7 @@ impl Report {
             pass_reports: Vec::new(),
             converged: true,
             sweeps: 0,
+            bailout: None,
         }
     }
 }

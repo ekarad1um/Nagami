@@ -1121,7 +1121,8 @@ fn beautify_mangle_roundtrip() {
             ..Default::default()
         },
     )
-    .expect("generate failed");
+    .expect("generate failed")
+    .0;
     assert!(
         out.contains('\n'),
         "beautified output should have newlines: {out}"

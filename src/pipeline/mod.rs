@@ -109,7 +109,7 @@ pub fn run_ir_passes(
     module: &mut naga::Module,
     config: &Config,
     report: &mut Report,
-) -> Result<(), Error> {
+) -> Result<crate::name_map::NameLog, Error> {
     let passes = crate::passes::build_ir_passes(config);
     run_ir_passes_with(module, config, report, passes)
 }
@@ -122,9 +122,11 @@ fn run_ir_passes_with(
     config: &Config,
     report: &mut Report,
     mut passes: Vec<Box<dyn Pass>>,
-) -> Result<(), Error> {
+) -> Result<crate::name_map::NameLog, Error> {
     let trace_run_dir = prepare_trace_dir(config)?;
     let mut sweeps = 0usize;
+    // Module-scope renames across sweeps, for the name map.
+    let name_log = std::cell::RefCell::new(crate::name_map::NameLog::default());
 
     // Thread a `ModuleInfo` across pass boundaries so neither text
     // emission nor per-pass validation ever re-runs the validator
@@ -175,12 +177,16 @@ fn run_ir_passes_with(
             } else {
                 Some(module.clone())
             };
+            // Snapshot the log with the module: a rollback that kept the
+            // log would report renames the shipped names do not carry.
+            let log_backup = backup.as_ref().map(|_| name_log.borrow().clone());
 
             #[cfg(not(target_arch = "wasm32"))]
             let start = Instant::now();
             let ctx = PassContext {
                 config,
                 trace_run_dir: trace_run_dir.as_deref(),
+                name_log: Some(&name_log),
             };
 
             let declared_changed = pass.run(module, &ctx)?;
@@ -240,6 +246,9 @@ fn run_ir_passes_with(
                             e
                         );
                         *module = b;
+                        if let Some(lb) = log_backup {
+                            *name_log.borrow_mut() = lb;
+                        }
                         // `current_info` (if seeded) still matches the
                         // restored backup since it was last refreshed
                         // against the pre-pass state, so re-validation
@@ -380,7 +389,7 @@ fn run_ir_passes_with(
     }
 
     report.sweeps = sweeps;
-    Ok(())
+    Ok(name_log.into_inner())
 }
 
 // MARK: Trace directory allocation

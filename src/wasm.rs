@@ -2,9 +2,9 @@
 //!
 //! Mirrors the native [`crate::run`] entry point as a `JsValue -> JsValue`
 //! boundary: JS config objects are validated and decoded into [`Config`],
-//! the pipeline runs unchanged, and [`crate::pipeline::Report`] is
-//! projected back to a plain JS object.  TypeScript declarations for
-//! the wire types live in the `TS_TYPES` block at the bottom of the file.
+//! the pipeline runs unchanged, and the result comes back as the parsed
+//! [`crate::json`] document.  TypeScript declarations for the wire types
+//! live in the `TS_TYPES` block at the bottom of the file.
 //!
 //! Only useful when compiled for the wasm32 target: the `wasm-bindgen`
 //! ABI emits intrinsics that are linker errors on native.  `lib.rs`
@@ -329,95 +329,19 @@ fn parse_config(config: JsValue) -> Result<Config, JsError> {
     Ok(cfg)
 }
 
-// MARK: Report projection
-
-/// Project a [`crate::pipeline::PassReport`] into a plain JS object.
-/// Numeric fields that are `None` become `null` rather than missing so
-/// TypeScript consumers can rely on a closed field set.
-fn pass_report_to_js(pr: &crate::pipeline::PassReport) -> JsValue {
-    let obj = js_sys::Object::new();
-    let set = |k: &str, v: JsValue| {
-        js_sys::Reflect::set(&obj, &JsValue::from_str(k), &v).unwrap_or(false);
-    };
-    set("passName", JsValue::from_str(&pr.pass_name));
-    set(
-        "beforeBytes",
-        match pr.before_bytes {
-            Some(v) => JsValue::from_f64(v as f64),
-            None => JsValue::NULL,
-        },
-    );
-    set(
-        "afterBytes",
-        match pr.after_bytes {
-            Some(v) => JsValue::from_f64(v as f64),
-            None => JsValue::NULL,
-        },
-    );
-    set("changed", JsValue::from_bool(pr.changed));
-    set("durationUs", JsValue::from_f64(pr.duration_us as f64));
-    set("validationOk", JsValue::from_bool(pr.validation_ok));
-    set(
-        "textValidationOk",
-        match pr.text_validation_ok {
-            Some(v) => JsValue::from_bool(v),
-            None => JsValue::NULL,
-        },
-    );
-    set("rolledBack", JsValue::from_bool(pr.rolled_back));
-    obj.into()
-}
-
-/// Project a [`crate::pipeline::Report`] into a plain JS object,
-/// inlining every pass report so consumers need only a single
-/// `Reflect.get` traversal.
-fn report_to_js(report: &crate::pipeline::Report) -> JsValue {
-    let obj = js_sys::Object::new();
-    let set = |k: &str, v: JsValue| {
-        js_sys::Reflect::set(&obj, &JsValue::from_str(k), &v).unwrap_or(false);
-    };
-    set("inputBytes", JsValue::from_f64(report.input_bytes as f64));
-    set("outputBytes", JsValue::from_f64(report.output_bytes as f64));
-    set("converged", JsValue::from_bool(report.converged));
-    set("sweeps", JsValue::from_f64(report.sweeps as f64));
-
-    let passes = js_sys::Array::new();
-    for pr in &report.pass_reports {
-        passes.push(&pass_report_to_js(pr));
-    }
-    set("passReports", passes.into());
-
-    obj.into()
-}
-
 // MARK: Public entry points
 
-/// Minify a WGSL source string.  Returns a JS object matching the
-/// TypeScript `Output` interface declared below.
-///
-/// # Errors
-///
-/// Propagates any [`crate::error::Error`] from the pipeline as a
-/// [`JsError`] carrying the rendered message.
+/// Minify `source`; the result is the parsed [`crate::json`] document
+/// (TS `Output` below).  Pipeline errors surface as a thrown `JsError`.
 #[wasm_bindgen(skip_typescript)]
 pub fn run(source: &str, config: JsValue) -> Result<JsValue, JsError> {
     let config = parse_config(config)?;
     let output = crate::run(source, &config).map_err(|e| JsError::new(&e.to_string()))?;
 
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("source"),
-        &JsValue::from_str(&output.source),
-    )
-    .unwrap_or(false);
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("report"),
-        &report_to_js(&output.report),
-    )
-    .unwrap_or(false);
-    Ok(obj.into())
+    // The CLI prints this string and the binding parses it, so the TS
+    // interfaces cannot drift from `--format json`.
+    js_sys::JSON::parse(&crate::json::render_output(&output))
+        .map_err(|e| JsError::new(&e.as_string().unwrap_or_else(|| format!("{e:?}"))))
 }
 
 /// Return the `CARGO_PKG_VERSION` baked into the wasm bundle.
@@ -473,12 +397,29 @@ export interface Report {
     outputBytes: number;
     converged: boolean;
     sweeps: number;
+    /** naga's error when the output is the input lexically compacted only. */
+    bailout: string | null;
     passReports: PassReport[];
+}
+
+export interface StructRename {
+    name: string;
+    members: Record<string, string>;
+}
+
+export interface NameMap {
+    entryPoints: Record<string, string>;
+    globals: Record<string, string>;
+    functions: Record<string, string>;
+    constants: Record<string, string>;
+    overrides: Record<string, string>;
+    structs: Record<string, StructRename>;
 }
 
 export interface Output {
     source: string;
     report: Report;
+    nameMap: NameMap | null;
 }
 
 export function run(source: string, config?: Config): Output;

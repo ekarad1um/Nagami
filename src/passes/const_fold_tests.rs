@@ -143,6 +143,7 @@ fn run_pass(module: &mut naga::Module) -> bool {
     let ctx = PassContext {
         config: &config,
         trace_run_dir: None,
+        name_log: None,
     };
 
     pass.run(module, &ctx).expect("const fold pass should run")

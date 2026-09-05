@@ -1,12 +1,12 @@
-//! Nagami CLI binary.  Thin wrapper that translates command-line
-//! arguments into a [`nagami::config::Config`], drives [`nagami::run`],
-//! and reports results through stdout, stderr, or an in-place rewrite.
+//! Nagami CLI: arguments -> [`nagami::config::Config`] -> [`nagami::run`],
+//! output to stdout, a file, or in place.
 //!
 //! Exit codes:
 //!
 //! * `0` - success (or `--check` passed with no proposed changes).
 //! * `1` - `--check` detected that minification would modify the input.
-//! * `2` - any other failure (I/O, parse, validation, emit).
+//! * `2` - any other failure (I/O, parse, validation, emit), including a
+//!   text-only bailout under `--strict-fallback`.
 
 #![cfg(feature = "cli")]
 
@@ -16,6 +16,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
+
+/// `json`: one document on stdout with the source as a field, so agent
+/// callers parse a single stream; diagnostics stay on stderr either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+}
 
 /// CLI-facing mirror of [`nagami::config::Profile`].  Kept separate so
 /// the `clap` derives do not leak into the library's public surface.
@@ -69,7 +78,7 @@ struct Args {
 
     #[arg(
         long,
-        conflicts_with_all = ["output", "in_place", "trace", "trace_dir", "validate_each_pass"],
+        conflicts_with_all = ["output", "in_place", "trace", "trace_dir", "validate_each_pass", "name_map"],
         help = "Exit with status 1 if minification would change the input. \
                 Read-only - no output, trace, or validation side effects."
     )]
@@ -164,14 +173,28 @@ struct Args {
         help = "Round every float literal to at most N significant figures (lossy)."
     )]
     sig_figs: Option<u8>,
+
+    #[arg(long, help = "Fail instead of shipping a text-only bailout.")]
+    strict_fallback: bool,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write the original -> final identifier map as JSON."
+    )]
+    name_map: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t,
+        help = "Stdout format: raw WGSL, or one JSON document with source, report, and name map."
+    )]
+    format: OutputFormat,
 }
 
-/// Translate the two CLI precision flags into a [`FloatPrecision`].
-/// Clap rejects `--decimal-places` and `--sig-figs` together at parse
-/// time (`conflicts_with = "sig_figs"` on `decimal_places`), so this
-/// helper only needs to map the at-most-one-set case.  When neither
-/// flag is given, all float kinds default to
-/// [`nagami::config::PrecisionMode::Full`].
+/// Clap rejects both flags together, so only the at-most-one-set case
+/// needs mapping; neither set means `Full` for every float kind.
 fn precision_from_cli(
     decimal_places: Option<u8>,
     sig_figs: Option<u8>,
@@ -187,14 +210,12 @@ fn precision_from_cli(
 }
 
 fn main() -> ExitCode {
-    // Forward-substitution can build expression trees whose depth scales
-    // with the input's STATEMENT count (flat `a = a*2+1;` chains), and
-    // several IR walks recurse once per depth level - the 8 MiB default
+    // Forward-substitution builds expression trees as deep as the input's
+    // statement count and several IR walks recurse per level: the 8 MiB
     // main stack overflows (SIGABRT under `panic = "abort"`) near ~9k
-    // chained reassignments.  A worker with a large reserved stack (pages
-    // commit lazily) moves that cliff ~30x beyond any real shader; the
-    // per-pass substitution-depth cap that would bound it outright is
-    // tracked in docs/PLAN.md.
+    // chained reassignments.  A lazily-committed 256 MiB worker stack moves
+    // that cliff far past any real shader; the depth cap that would bound
+    // it is tracked in docs/PLAN.md.
     const WORKER_STACK_BYTES: usize = 256 * 1024 * 1024;
     match std::thread::Builder::new()
         .name("nagami".into())
@@ -203,26 +224,18 @@ fn main() -> ExitCode {
     {
         Ok(worker) => match worker.join() {
             Ok(code) => code,
-            // Unreachable under `panic = "abort"` (a worker panic aborts the
-            // process), but a defined exit beats an unwrap if the panic
-            // strategy ever changes.
+            // Unreachable under `panic = "abort"`; a defined exit beats an
+            // unwrap if that ever changes.
             Err(_) => ExitCode::from(2),
         },
-        // Stack reservation failed: degrade to the default stack rather
-        // than refuse to run at all.
+        // Stack reservation failed: run on the default stack.
         Err(_) => cli_main(),
     }
 }
 
 fn cli_main() -> ExitCode {
     match run_cli() {
-        Ok(should_fail_check) => {
-            if should_fail_check {
-                ExitCode::from(1)
-            } else {
-                ExitCode::SUCCESS
-            }
-        }
+        Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprintln!("{err}");
             ExitCode::from(2)
@@ -230,12 +243,8 @@ fn cli_main() -> ExitCode {
     }
 }
 
-/// Parse arguments, load input, run the pipeline, and emit output.
-///
-/// Returns `Ok(true)` when `--check` was requested and the pipeline
-/// would modify the input (the `main` wrapper translates this into
-/// exit code 1).  Every other success path returns `Ok(false)`.
-fn run_cli() -> Result<bool, Box<dyn std::error::Error>> {
+/// Exit code per the module header; hard failures are the `Err` arm.
+fn run_cli() -> Result<u8, Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     if args.in_place && is_dash_path(&args.input) {
@@ -246,15 +255,10 @@ fn run_cli() -> Result<bool, Box<dyn std::error::Error>> {
         .into());
     }
 
-    // Refuse to write the minified output over the `--preamble` file: the
-    // run strips the preamble's declarations from the output, so writing
-    // that result back would silently and permanently destroy them.  The
-    // destructive destination is reachable via `--in-place` (writes the
-    // input) and `-o <path>` (writes that path); `-o -` (stdout) has no
-    // file.  `same_file` matches by inode where possible, so symlinks and
-    // hard links to the preamble are caught too, and a not-yet-created
-    // output (or a missing preamble, which errors at the read below) never
-    // false-matches.
+    // Refuse to write the output over the `--preamble` file: the run strips
+    // the preamble's declarations, so writing back would destroy them.
+    // `same_file` matches by inode (symlinks and hard links included); a
+    // not-yet-created output never false-matches.
     if let Some(preamble_path) = args.preamble.as_ref() {
         let dest: Option<&Path> = if args.in_place {
             Some(args.input.as_path())
@@ -278,6 +282,52 @@ fn run_cli() -> Result<bool, Box<dyn std::error::Error>> {
             )
             .into());
         }
+    }
+
+    // Preflight --name-map destinations so a refusal changes nothing on
+    // disk (a late guard would fire after --in-place rewrote the input);
+    // a not-yet-created -o falls back to path equality.
+    if let Some(map_path) = args.name_map.as_deref() {
+        if is_dash_path(map_path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--name-map cannot write to stdout ('-'); use --format json, \
+                 whose document embeds the map",
+            )
+            .into());
+        }
+        let hits = |other: &Path| same_file(map_path, other) || map_path == other;
+        let clobbered = if hits(&args.input) && !is_dash_path(&args.input) {
+            Some("the input")
+        } else if args.preamble.as_deref().is_some_and(hits) {
+            Some("the preamble")
+        } else if args
+            .output
+            .as_deref()
+            .filter(|p| !is_dash_path(p))
+            .is_some_and(hits)
+        {
+            Some("the -o output")
+        } else {
+            None
+        };
+        if let Some(what) = clobbered {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--name-map {} would overwrite {what}", map_path.display()),
+            )
+            .into());
+        }
+    }
+
+    // stdout carries raw WGSL or the JSON document, never both.
+    if args.format == OutputFormat::Json && args.output.as_deref().is_some_and(is_dash_path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "-o - conflicts with --format json (the JSON document on stdout \
+             embeds the source; drop -o - or use -o <file>)",
+        )
+        .into());
     }
 
     let input = read_input(&args.input)
@@ -317,31 +367,46 @@ fn run_cli() -> Result<bool, Box<dyn std::error::Error>> {
     let output = nagami::run(&input, &config)?;
     let changed = output.source != input;
 
+    // Say the degradation out loud (not gated on --quiet, which silences
+    // the success summary only); under --strict-fallback it is an error and
+    // nothing is written.
+    if let Some(reason) = &output.report.bailout {
+        if args.strict_fallback {
+            return Err(format!("--strict-fallback: {reason}").into());
+        }
+        eprintln!(
+            "warning: output is lexically compacted only, the IR pipeline did not apply:\n{reason}"
+        );
+    }
+
     if args.check {
-        if args.stats {
+        if args.format == OutputFormat::Json {
+            println!("{}", nagami::json::render_output(&output));
+        } else if args.stats {
             print_summary(&output.report);
         }
-        return Ok(changed);
+        return Ok(u8::from(changed));
+    }
+
+    // Before the shader, so an auxiliary-write failure leaves the user's
+    // files untouched.
+    if let Some(path) = args.name_map.as_deref() {
+        fs::write(
+            path,
+            nagami::json::render_name_map(output.name_map.as_ref()),
+        )
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
     }
 
     if args.in_place {
-        // Write through a sibling temp file plus an atomic rename so a
-        // crash mid-write cannot corrupt the user's input.  A direct
-        // `fs::write` would leave the input truncated on power loss or
-        // an interrupted process.
+        // Sibling temp file + atomic rename: a crash mid-write cannot
+        // truncate the input.
         write_atomic(&args.input, &output.source)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", args.input.display())))?;
     } else if let Some(path) = args.output.as_deref() {
-        // Prefix the offending path on failure, matching read_input / the
-        // preamble read / the in-place write above - EXCEPT for explicit
-        // `-o -` (stdout), where `-` is not a meaningful path to report, so
-        // the error stays bare (consistent with the no-`-o` stdout branch).
-        //
-        // When `-o` targets the input file itself, write atomically (like
-        // --in-place) so a crash mid-write cannot corrupt the source.  The
-        // input was fully read into memory before any write, so there is no
-        // read-after-write hazard either way; this only closes the crash
-        // window the plain `fs::write` would otherwise leave open.
+        // Prefix the offending path like the other file errors, except for
+        // `-o -` where `-` is no path.  `-o` onto the input file itself
+        // writes atomically like --in-place.
         let r = if !is_dash_path(path) && same_file(path, &args.input) {
             write_atomic(path, &output.source)
         } else {
@@ -352,29 +417,29 @@ fn run_cli() -> Result<bool, Box<dyn std::error::Error>> {
         } else {
             r.map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
         }
-    } else {
+    } else if args.format == OutputFormat::Text {
         write_output(Path::new("-"), &output.source)?;
     }
 
-    let show_summary = args.stats || (!args.quiet && (args.in_place || args.output.is_some()));
-    if show_summary {
-        print_summary(&output.report);
+    if args.format == OutputFormat::Json {
+        println!("{}", nagami::json::render_output(&output));
+    } else {
+        let show_summary = args.stats || (!args.quiet && (args.in_place || args.output.is_some()));
+        if show_summary {
+            print_summary(&output.report);
+        }
     }
 
-    Ok(false)
+    Ok(0)
 }
 
-/// `true` when `path` is the single dash convention for stdin/stdout.
 fn is_dash_path(path: &Path) -> bool {
     path == Path::new("-")
 }
 
-/// `true` when both paths resolve to the same on-disk file.  On Unix this
-/// compares device + inode, which also equates hard links (distinct names
-/// sharing one inode that path canonicalization cannot match); elsewhere it
-/// falls back to canonical-path comparison.  Returns `false` when either
-/// path is missing or cannot be stat-ed, so a not-yet-created output is
-/// never mistaken for an existing file.
+/// Same on-disk file: device + inode on Unix (hard links included),
+/// canonical paths elsewhere.  `false` when either path cannot be
+/// stat-ed, so a not-yet-created output never matches.
 fn same_file(a: &Path, b: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -393,7 +458,6 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Read input from `path` or from stdin when `path` is the `-` sentinel.
 fn read_input(path: &Path) -> Result<String, io::Error> {
     if is_dash_path(path) {
         let mut buffer = String::new();
@@ -404,9 +468,7 @@ fn read_input(path: &Path) -> Result<String, io::Error> {
     }
 }
 
-/// Write `content` to `path`, redirecting to stdout when `path` is the
-/// `-` sentinel.  Flushes stdout on completion so short runs are not
-/// truncated by a buffered writer left open at process exit.
+/// Flushes stdout so short runs are not truncated at process exit.
 fn write_output(path: &Path, content: &str) -> Result<(), io::Error> {
     if is_dash_path(path) {
         let mut stdout = io::stdout().lock();
@@ -418,36 +480,19 @@ fn write_output(path: &Path, content: &str) -> Result<(), io::Error> {
     }
 }
 
-/// Atomic file replace: write `content` to a sibling temp path then
-/// `rename` over `path`.  The rename is atomic on POSIX (and acts as
-/// `MoveFileEx(MOVEFILE_REPLACE_EXISTING)` on Windows via
-/// `std::fs::rename`), so the destination contains either the old or
-/// the new contents at every observable moment - never a truncated or
-/// half-written intermediate.
-///
-/// Errors during temp-file creation, write, or rename are surfaced
-/// to the caller verbatim - there is no non-atomic direct-write
-/// fallback.  A fallback would non-atomically overwrite the user's
-/// input on exactly the failures (ENOSPC mid-write, EACCES on the
-/// parent directory, ENOTSUP on the FS) the atomic write defends
-/// against, defeating the invariant.  Surfacing the error up front
-/// keeps the user's existing file intact.
-///
-/// Temp filenames are salted with pid + nanos and opened with
-/// `create_new`, so two concurrent invocations cannot share or
-/// silently clobber each other's staged content even if their
-/// timestamps collide.
+/// Sibling temp file, then `rename` over `path`: atomic on POSIX and
+/// `MoveFileEx(REPLACE_EXISTING)` on Windows, so the destination always
+/// holds the old or the new contents.  No non-atomic fallback: it would
+/// overwrite the input on exactly the failures (ENOSPC, EACCES, ENOTSUP)
+/// the atomic write defends against.  Temp names are salted with pid +
+/// nanos and opened `create_new`, so concurrent invocations cannot
+/// clobber each other.
 fn write_atomic(path: &Path, content: &str) -> Result<(), io::Error> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
     let pid = std::process::id();
-    // Salt with pid + nanos to keep concurrent invocations from
-    // colliding on the same temp name without pulling in a tempfile
-    // dependency.  `create_new` below guarantees we never overwrite
-    // an existing temp; on collision we surface `AlreadyExists` so
-    // the caller can retry or report.
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -459,14 +504,9 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), io::Error> {
         None => PathBuf::from(&tmp_name),
     };
 
-    // Open with create_new so the open fails with `AlreadyExists` on
-    // collision rather than silently truncating another process's
-    // staged file.  Drop the file handle before rename so Windows
-    // can unlink the source.  The stage-and-rename block runs inside
-    // a closure so every error path (open / write_all / sync_all /
-    // rename) routes through the same best-effort cleanup of the
-    // staged temp file; otherwise a mid-write failure would leave a
-    // `.nagami-tmp-*` file alongside the input.
+    // The handle is dropped before rename (Windows cannot unlink an open
+    // source); the closure routes every error path through one temp-file
+    // cleanup.
     let result: io::Result<()> = (|| {
         {
             let mut file = fs::OpenOptions::new()
@@ -474,34 +514,22 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), io::Error> {
                 .create_new(true)
                 .open(&tmp_path)?;
             file.write_all(content.as_bytes())?;
-            // Propagate `sync_all` errors so ENOSPC-at-flush is
-            // surfaced to the caller.  Page-cache writes succeed even
-            // when the underlying device is out of space; ENOSPC then
-            // shows up on `sync_all`, and if we swallow it the
-            // subsequent `rename` succeeds on a file whose contents
-            // never reached the disk - a power loss immediately after
-            // would leave the user with a renamed-but-torn file and
-            // no error signal.  On filesystems where `sync_all` is a
-            // no-op (most modern filesystems return success), this
-            // costs nothing; on filesystems where it spuriously
-            // fails, the user gets a clear durability error rather
-            // than silent data loss.
+            // Page-cache writes succeed on a full device; ENOSPC surfaces at
+            // `sync_all`, and swallowing it would rename a file whose
+            // contents never reached the disk.
             file.sync_all()?;
         }
         fs::rename(&tmp_path, path)
     })();
     if result.is_err() {
-        // Best-effort cleanup; ignored if the temp was never
-        // created (open failed) or already moved (rename succeeded).
+        // Ignored when the temp was never created or already renamed.
         let _ = fs::remove_file(&tmp_path);
     }
     result
 }
 
-/// Print a human-readable byte-delta summary to stderr.  Handles the
-/// degenerate `input == 0` case without dividing by zero and reports
-/// both shrink ("saved") and growth ("grew by") deltas so an upstream
-/// tool can still parse the line after a regression.
+/// Byte-delta summary on stderr; growth is reported too so a parser
+/// survives a regression.
 fn print_summary(report: &nagami::pipeline::Report) {
     let input = report.input_bytes;
     let output = report.output_bytes;
@@ -537,21 +565,14 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    /// Run clap's internal `debug_assert` on the derived `Args`
-    /// command so arg-name drift in `conflicts_with` / `requires`
-    /// lists is caught at test time instead of at user-invocation
-    /// time.  Without this guard, renaming a field (e.g. `trace_dir`
-    /// -> `trace_dump_dir`) without updating every conflict list that
-    /// mentions it would compile fine and only panic when a user ran
-    /// `nagami --check --trace-dir /x`.
+    /// Clap's `debug_assert` catches arg-name drift in `conflicts_with` /
+    /// `requires` lists, which otherwise panics only at user invocation.
     #[test]
     fn args_command_definition_is_internally_consistent() {
         Args::command().debug_assert();
     }
 
-    /// Pin the flag -> [`FloatPrecision`] translation.  Clap rejects the
-    /// both-set case at parse time, so only the at-most-one-set arms are
-    /// reachable; this covers each of them plus the neither-set default.
+    /// Clap rejects the both-set case; each single-set arm plus the default.
     #[test]
     fn precision_from_cli_maps_flags_to_modes() {
         use nagami::config::{FloatPrecision, PrecisionMode};

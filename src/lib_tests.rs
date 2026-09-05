@@ -766,41 +766,184 @@ fn run_strips_naga_only_binding_array_enable_from_output() {
     );
 }
 
-/// When the source declares an extension naga cannot parse,
-/// `run` returns the original input verbatim plus a synthetic
-/// `unsupported_extension_bailout` PassReport so downstream
-/// tooling can distinguish "ran the pipeline" from "bailed out".
-/// `subgroups` remains a parse-time error in naga 30 (its
-/// `enable subgroups;` is the sole `UnimplementedEnableExtension`,
-/// matched here by `UNSUPPORTED_EXTENSION_PATTERNS`); a future naga
-/// release that lands subgroup support will need a different
-/// trigger here.
+/// Unparseable extension: ship the input compacted, no pass reports,
+/// naga's error in `report.bailout`.  `subgroups` is naga 30's sole
+/// `UnimplementedEnableExtension`; a release that lands it needs a new
+/// trigger.
 #[test]
-fn unsupported_extension_bailout_includes_synthetic_pass_report() {
+fn unsupported_extension_bailout_sets_reason() {
     let src = "enable subgroups; // naga cannot parse this extension\n\
                    @compute @workgroup_size(1) fn m() {}";
     let output = run(src, &Config::default()).expect("bailout returns Ok");
-    // The bailout path never reaches the pipeline, but it still ships the
-    // source lexically compacted (comments stripped, whitespace collapsed,
-    // token-fusing joins kept apart).
+    // Compacted, not verbatim: comments stripped, token-fusing joins kept.
     assert_eq!(
         output.source, "enable subgroups;@compute@workgroup_size(1)fn m(){}",
         "bailout must ship the lexically compacted source"
     );
-    let bailout = output
-        .report
-        .pass_reports
-        .iter()
-        .find(|p| p.pass_name == "unsupported_extension_bailout");
     assert!(
-        bailout.is_some(),
-        "synthetic bailout pass report must be present so callers can detect the short-circuit"
+        output.report.pass_reports.is_empty(),
+        "the IR pipeline must not have run"
     );
-    let b = bailout.unwrap();
-    assert!(b.changed, "compaction shrank the text, so changed=true");
-    assert!(!b.rolled_back);
-    assert_eq!(b.before_bytes, Some(src.len()));
-    assert_eq!(b.after_bytes, Some(output.source.len()));
+    let reason = output
+        .report
+        .bailout
+        .as_deref()
+        .expect("bailout runs must carry the triggering naga error");
+    assert!(
+        reason.starts_with("naga cannot parse the input: "),
+        "reason must name the stage that gave up: {reason}"
+    );
+}
+
+/// Validator-reject twin: const division by zero parses but fails
+/// validation; ship compacted with the reason, not `Err`.
+#[test]
+fn validation_bailout_sets_reason_and_ships_compacted() {
+    let src = "@compute @workgroup_size(1) fn m() { var x = 1; let d = x / 0; }";
+    let output = run(src, &Config::default()).expect("bailout returns Ok");
+    assert_eq!(
+        output.source, "@compute@workgroup_size(1)fn m(){var x=1;let d=x/0;}",
+        "bailout must ship the lexically compacted source"
+    );
+    assert!(
+        output.report.pass_reports.is_empty(),
+        "the IR pipeline must not have run"
+    );
+    let reason = output
+        .report
+        .bailout
+        .as_deref()
+        .expect("bailout runs must carry the triggering naga error");
+    assert!(
+        reason.starts_with("naga rejects the input: "),
+        "reason must name the stage that gave up: {reason}"
+    );
+
+    // Control: `Some` alone is the degradation signal.
+    let ok = run(
+        "@compute @workgroup_size(1) fn m() { var x = 1; let d = x / 2; }",
+        &Config::default(),
+    )
+    .expect("valid shader minifies");
+    assert!(ok.report.bailout.is_none());
+}
+
+/// The preamble guard fires on the validation bailout too: a body-leading
+/// directive would land after the preamble's declarations.
+#[test]
+fn preamble_plus_validation_bailout_with_directives_hard_errors() {
+    let src = "enable f16;\n@compute @workgroup_size(1) fn m() { var x = 1; let d = x / 0; }";
+    let config = Config {
+        preamble: Some("const K: f32 = 1.0;".to_string()),
+        ..Default::default()
+    };
+    assert!(
+        run(src, &config).is_err(),
+        "directive-carrying validation bailout must not ship"
+    );
+}
+
+// MARK: Pointer-parameter recovery
+//
+// naga's validator rejects pointer arguments into workgroup / storage /
+// uniform space that tint accepts (unrestricted_pointer_parameters);
+// `specialize_ptr_params` recovers whole-variable call sites so these
+// shaders run the FULL pipeline.  The element-root case stays out of
+// scope and must keep bailing.
+
+/// No bailout, the pass on the report, and the helper name mangled away
+/// (a surviving name would prove the pipeline was skipped).
+fn assert_ptr_param_recovered(src: &str, helper_name: &str) {
+    let output = run(src, &Config::default()).expect("recovered run returns Ok");
+    assert!(
+        output.report.bailout.is_none(),
+        "ptr-param shader must be specialized, not bailed out"
+    );
+    assert!(
+        output
+            .report
+            .pass_reports
+            .iter()
+            .any(|p| p.pass_name == "specialize_ptr_params"),
+        "recovery must be visible on the report"
+    );
+    assert!(
+        !output.source.contains(helper_name),
+        "full pipeline (incl. mangling) must have run, got: {}",
+        output.source
+    );
+}
+
+#[test]
+fn ptr_workgroup_param_whole_var_root_is_recovered() {
+    assert_ptr_param_recovered(
+        "var<workgroup> sh: array<vec2f, 256>;\n\
+         fn touch(a: ptr<workgroup, array<vec2f, 256>>, i: u32) { (*a)[i] = vec2f(1.0); }\n\
+         @compute @workgroup_size(64) fn m(@builtin(local_invocation_id) lid: vec3u) {\n\
+           touch(&sh, lid.x);\n\
+           workgroupBarrier();\n\
+         }",
+        "touch",
+    );
+}
+
+/// The first clone of a specialized helper carries the helper's own name,
+/// so the name map keys it by the original and `--preserve-symbol` keeps
+/// it verbatim; a second root's clone carries a `_sp` suffix.
+#[test]
+fn ptr_param_clone_keeps_the_original_name() {
+    let src = "var<workgroup> a: array<f32, 8>;\n\
+               var<workgroup> b: array<f32, 8>;\n\
+               fn touch(p: ptr<workgroup, array<f32, 8>>, i: u32) { (*p)[i] = 1.0; }\n\
+               @compute @workgroup_size(8) fn m(@builtin(local_invocation_id) l: vec3u) {\n\
+                 touch(&a, l.x);\n\
+                 touch(&b, l.x);\n\
+               }";
+    let output = run(src, &Config::default()).expect("recovers");
+    let functions = output.name_map.expect("recovered run has a map").functions;
+    assert!(
+        functions.contains_key("touch") && functions.keys().any(|k| k.starts_with("touch_sp")),
+        "one clone keyed by the original name, one suffixed: {functions:?}"
+    );
+
+    let preserved = run(
+        src,
+        &Config {
+            preserve_symbols: vec!["touch".to_string()],
+            ..Default::default()
+        },
+    )
+    .expect("recovers");
+    assert!(
+        preserved.source.contains("fn touch("),
+        "preserved helper must survive by name: {}",
+        preserved.source
+    );
+    assert_eq!(preserved.name_map.expect("map").functions["touch"], "touch");
+}
+
+#[test]
+fn ptr_param_element_chain_root_takes_validation_bailout() {
+    // A pointer rooted at an ELEMENT (`&a[i]`) carries a call-site-dependent
+    // index into the callee, which whole-var specialization cannot express;
+    // this case is expected to keep bailing even after whole-var roots are
+    // lifted.
+    let src = "var<workgroup> a: array<f32, 64>;\n\
+               fn setf(p: ptr<workgroup, f32>) { *p = 1.0; }\n\
+               @compute @workgroup_size(64) fn m(@builtin(local_invocation_id) lid: vec3u) {\n\
+                 setf(&a[lid.x]);\n\
+               }";
+    let output = run(src, &Config::default()).expect("bailout returns Ok");
+    let reason = output
+        .report
+        .bailout
+        .as_deref()
+        .expect("element-rooted ptr<workgroup> argument must take the validation bailout");
+    assert!(
+        reason.contains("is a pointer of space") && reason.contains("whole-variable"),
+        "the reason must carry naga's error and the recovery-scope note: {reason}"
+    );
+    assert!(output.source.contains("setf"));
 }
 
 #[test]
@@ -2144,4 +2287,187 @@ fn split_directives_does_not_capture_diagnostic_prefixed_identifier() {
         "identifier starting with 'diagnostic' must not be treated as a directive"
     );
     assert_eq!(body, source);
+}
+
+// MARK: Name map
+
+/// Every surviving module-scope symbol keyed by ORIGINAL name, values
+/// present in the shipped text, entry points identity, members through
+/// the generator's tables.
+#[test]
+fn name_map_maps_originals_to_shipped_names() {
+    let src = "struct Params { scale_factor: f32, offset_amount: f32, }\n\
+               @group(0) @binding(0) var<uniform> long_params: Params;\n\
+               fn compute_value(x: f32) -> f32 { return x * long_params.scale_factor + long_params.offset_amount; }\n\
+               @fragment fn fs_main() -> @location(0) vec4f {\n\
+                 return vec4f(compute_value(1.0));\n\
+               }";
+    let output = run(src, &Config::default()).expect("valid shader minifies");
+    let map = output.name_map.as_ref().expect("pipeline runs carry a map");
+
+    let global = map.globals.get("long_params").expect("binding is mapped");
+    assert!(
+        output.source.contains(global.as_str()),
+        "mapped global name {global} must appear in the output: {}",
+        output.source
+    );
+    assert_ne!(global, "long_params", "max profile mangles the binding");
+
+    assert_eq!(
+        map.entry_points.get("fs_main").map(String::as_str),
+        Some("fs_main"),
+        "entry points are identity"
+    );
+
+    // `compute_value` may be renamed or inlined away; either way the map
+    // must agree with the text.
+    match map.functions.get("compute_value") {
+        Some(new) => assert!(output.source.contains(new.as_str())),
+        None => assert!(!output.source.contains("compute_value")),
+    }
+
+    let params = map.structs.get("Params").expect("uniform struct is mapped");
+    assert!(output.source.contains(params.name.as_str()));
+    let member = params
+        .members
+        .get("scale_factor")
+        .expect("member is mapped");
+    assert!(
+        output.source.contains(member.as_str()),
+        "mapped member {member} must appear in the output: {}",
+        output.source
+    );
+}
+
+/// Preserved symbols appear as identity entries.
+#[test]
+fn name_map_preserved_symbols_are_identity() {
+    let src = "@group(0) @binding(0) var<uniform> kept_name: f32;\n\
+               @fragment fn fs_main() -> @location(0) vec4f { return vec4f(kept_name); }";
+    let config = Config {
+        preserve_symbols: vec!["kept_name".to_string()],
+        ..Default::default()
+    };
+    let output = run(src, &config).expect("valid shader minifies");
+    let map = output.name_map.as_ref().expect("map present");
+    assert_eq!(
+        map.globals.get("kept_name").map(String::as_str),
+        Some("kept_name")
+    );
+}
+
+/// Absence means eliminated, never unchanged.
+#[test]
+fn name_map_omits_eliminated_declarations() {
+    let src = "fn never_called() -> f32 { return 1.0; }\n\
+               @fragment fn fs_main() -> @location(0) vec4f { return vec4f(0.0); }";
+    let output = run(src, &Config::default()).expect("valid shader minifies");
+    let map = output.name_map.as_ref().expect("map present");
+    assert!(
+        !map.functions.contains_key("never_called"),
+        "dead function must be absent from the map"
+    );
+}
+
+/// Bailouts ship input names: no map.
+#[test]
+fn name_map_is_none_on_bailout() {
+    let src = "var<workgroup> arr: array<f32, 64>;\n\
+               fn setf(p: ptr<workgroup, f32>) { *p = 1.0; }\n\
+               @compute @workgroup_size(64) fn m(@builtin(local_invocation_id) l: vec3u) {\n\
+                 setf(&arr[l.x]);\n\
+               }";
+    let output = run(src, &Config::default()).expect("bailout returns Ok");
+    assert!(output.report.bailout.is_some(), "fixture must bail");
+    assert!(output.name_map.is_none());
+}
+
+// MARK: Review-round regressions
+
+/// A preamble-declared banned helper must keep bailing out gracefully:
+/// its text re-ships verbatim, so no module repair helps, and a
+/// "successful" repair used to turn exit-0 degradation into a hard error.
+#[test]
+fn preamble_declared_ptr_param_helper_still_bails_out() {
+    let preamble = "var<workgroup> sh: array<f32, 8>;\n\
+                    fn touch(p: ptr<workgroup, array<f32, 8>>, i: u32) { (*p)[i] = 1.0; }";
+    let src = "@compute @workgroup_size(8) fn m(@builtin(local_invocation_id) l: vec3u) {\n\
+                 touch(&sh, l.x);\n\
+               }";
+    let config = Config {
+        preamble: Some(preamble.to_string()),
+        ..Default::default()
+    };
+    let output = run(src, &config).expect("must degrade gracefully, not Err");
+    let reason = output
+        .report
+        .bailout
+        .as_deref()
+        .expect("expected the validation bailout");
+    assert!(
+        reason.starts_with("naga rejects the input: "),
+        "expected the validation bailout, got: {reason}"
+    );
+}
+
+/// A constant whose every use folds away gets no declaration and must not
+/// be mapped.
+#[test]
+fn name_map_omits_constants_folded_out_of_the_text() {
+    let src = "const MODULE_CONST: f32 = 3.25;\n\
+               @fragment fn fs_main() -> @location(0) vec4f { return vec4f(MODULE_CONST); }";
+    let output = run(src, &Config::default()).expect("valid shader minifies");
+    let map = output.name_map.as_ref().expect("map present");
+    // Every mapped value must exist in the shipped text.
+    for (orig, new) in &map.constants {
+        assert!(
+            output.source.contains(new.as_str()),
+            "constants entry {orig}->{new} missing from output"
+        );
+    }
+}
+
+/// Dead structs and naga-predeclared result types are never declared, so
+/// never mapped.
+#[test]
+fn name_map_omits_undeclared_structs() {
+    let src = "struct Dead { x: f32, }\n\
+               @fragment fn fs_main() -> @location(0) vec4f {\n\
+                 let r = frexp(1.5);\n\
+                 return vec4f(r.fract);\n\
+               }";
+    let output = run(src, &Config::default()).expect("valid shader minifies");
+    let map = output.name_map.as_ref().expect("map present");
+    assert!(
+        !map.structs.contains_key("Dead"),
+        "dead struct must be absent from the map"
+    );
+    assert!(
+        !map.structs.keys().any(|k| k.starts_with("__")),
+        "predeclared result types must be absent, got {:?}",
+        map.structs.keys().collect::<Vec<_>>()
+    );
+}
+
+/// An `@id` override is renameable and mapped; an `@id`-less one is the
+/// host's pipeline-constant key and must stay identity.
+#[test]
+fn name_map_covers_both_override_flavors() {
+    let src = "@id(7) override numbered_override: f32 = 1.0;\n\
+               override named_override: f32 = 2.0;\n\
+               @fragment fn fs_main() -> @location(0) vec4f {\n\
+                 return vec4f(numbered_override + named_override);\n\
+               }";
+    let output = run(src, &Config::default()).expect("valid shader minifies");
+    let map = output.name_map.as_ref().expect("map present");
+    let numbered = map
+        .overrides
+        .get("numbered_override")
+        .expect("@id override mapped");
+    assert!(output.source.contains(numbered.as_str()));
+    assert_eq!(
+        map.overrides.get("named_override").map(String::as_str),
+        Some("named_override"),
+        "@id-less override is the host's pipeline-constant key and must be identity"
+    );
 }

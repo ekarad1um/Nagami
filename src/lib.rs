@@ -17,7 +17,9 @@ pub mod config;
 pub mod error;
 pub mod generator;
 mod io;
+pub mod json;
 pub mod name_gen;
+pub mod name_map;
 pub mod passes;
 pub mod pipeline;
 #[cfg(feature = "wasm")]
@@ -567,6 +569,26 @@ fn preamble_bailout_guard(effective_preamble: Option<&str>, source: &str) -> Res
     Ok(())
 }
 
+/// Ship the input compacted; `reason` is the ORIGINAL naga error (a
+/// partially repaired module's second error would not describe the input).
+/// No pass report: callers key on [`Report::bailout`].
+fn bailout_output(
+    reason: String,
+    source: &str,
+    effective_preamble: Option<&str>,
+    mut report: Report,
+) -> Result<Output, Error> {
+    preamble_bailout_guard(effective_preamble, source)?;
+    let compacted = compact_wgsl_text(source);
+    report.bailout = Some(reason);
+    report.output_bytes = compacted.len();
+    Ok(Output {
+        source: compacted,
+        report,
+        name_map: None,
+    })
+}
+
 /// Finish the naga-emitter fallback text for shipping: lexically compact it
 /// (naga's writer pretty-prints), then drop the naga-only enables exactly
 /// like the generator path - the shipped, tint-facing output must not carry
@@ -819,6 +841,10 @@ pub struct Output {
     pub source: String,
     /// Aggregate report with input/output sizes and per-pass details.
     pub report: Report,
+    /// [`name_map::NameMap`], or `None` whenever the shipped text does not
+    /// carry the pipeline's renames (bailouts, the verbatim guard, the
+    /// naga-emitter fallback): names unchanged from the visible output.
+    pub name_map: Option<name_map::NameMap>,
 }
 
 /// Apply IR-level optimization passes to an already-parsed naga module.
@@ -1033,6 +1059,8 @@ struct EmitOutcome {
     /// Generator wall-clock cost; zero when the generator never
     /// produced text.
     duration_us: u64,
+    /// Untextable-IR rung only; forwarded into [`Report::bailout`].
+    untextable_reason: Option<String>,
 }
 
 /// The last rung of the fallback ladder: both the generator output AND the
@@ -1041,7 +1069,7 @@ struct EmitOutcome {
 /// runtime value is const-eval-rejected, e.g. `5f/0f` -> inf).  Ship the
 /// INPUT lexically compacted, mirroring the parse/validation bailouts, so a
 /// batch run gets un-optimized-but-correct output instead of a hard error.
-fn untextable_ir_bailout(source: &str, before_bytes: usize) -> EmitOutcome {
+fn untextable_ir_bailout(source: &str, before_bytes: usize, reason: String) -> EmitOutcome {
     let compacted = compact_wgsl_text(source);
     let bytes = compacted.len();
     EmitOutcome {
@@ -1051,6 +1079,7 @@ fn untextable_ir_bailout(source: &str, before_bytes: usize) -> EmitOutcome {
         rolled_back: true,
         validation_ok: false,
         duration_us: 0,
+        untextable_reason: Some(reason),
     }
 }
 
@@ -1160,6 +1189,7 @@ fn resolve_generator_output(
                     rolled_back: false,
                     validation_ok: true,
                     duration_us: emitted.duration_us,
+                    untextable_reason: None,
                 })
             } else if has_preamble {
                 // The naga fallback already embeds the preamble's declarations,
@@ -1175,13 +1205,14 @@ fn resolve_generator_output(
                          cannot fall back safely when a preamble is active: {underlying}",
                 )))
             } else if let Some(naga_output) = naga_output {
-                if trace_enabled {
-                    if let Err(e) = &validation_result {
-                        eprintln!("warning: generator WGSL validation error: {e}");
-                    }
-                    eprintln!(
-                        "warning: generator output failed text validation; falling back to naga emitter"
-                    );
+                // Ungated like the bailout warning; the codespan block stays
+                // trace-gated.
+                eprintln!(
+                    "warning: generator output failed text validation; \
+                     shipping naga emitter output (still IR-minified)"
+                );
+                if trace_enabled && let Err(e) = &validation_result {
+                    eprintln!("warning: generator WGSL validation error: {e}");
                 }
                 // The naga-emitter fallback is *usually* valid, but it is
                 // not guaranteed: naga's own wgsl-out can emit tokens its
@@ -1199,7 +1230,7 @@ fn resolve_generator_output(
                         "warning: minified IR cannot round-trip WGSL text ({ve}); \
                          shipping the input lexically compacted"
                     );
-                    return Ok(untextable_ir_bailout(source, before_bytes));
+                    return Ok(untextable_ir_bailout(source, before_bytes, ve.to_string()));
                 }
                 let fallback = finalize_naga_fallback_text(naga_output);
                 let final_bytes = fallback.len();
@@ -1210,6 +1241,7 @@ fn resolve_generator_output(
                     rolled_back: true,
                     validation_ok: false,
                     duration_us: emitted.duration_us,
+                    untextable_reason: None,
                 })
             } else {
                 // No naga baseline (the module is in naga's writer-abort
@@ -1231,9 +1263,10 @@ fn resolve_generator_output(
                 if has_preamble {
                     return Err(e);
                 }
-                if trace_enabled {
-                    eprintln!("warning: generator emit failed ({e}); falling back to naga emitter");
-                }
+                eprintln!(
+                    "warning: generator emit failed ({e}); \
+                     shipping naga emitter output (still IR-minified)"
+                );
                 // Re-validate the naga fallback; doubly-invalid degrades to the
                 // compacted-input bailout (see the un-textable-IR note above).
                 if let Err(ve) = io::validate_wgsl_text(&naga_output) {
@@ -1241,7 +1274,7 @@ fn resolve_generator_output(
                         "warning: generator emit failed ({e}); minified IR cannot \
                          round-trip WGSL text ({ve}); shipping the input lexically compacted"
                     );
-                    return Ok(untextable_ir_bailout(source, before_bytes));
+                    return Ok(untextable_ir_bailout(source, before_bytes, ve.to_string()));
                 }
                 let fallback = finalize_naga_fallback_text(naga_output);
                 let final_bytes = fallback.len();
@@ -1252,6 +1285,7 @@ fn resolve_generator_output(
                     rolled_back: true,
                     validation_ok: false,
                     duration_us: 0,
+                    untextable_reason: None,
                 })
             }
             // No naga fallback available (the module is in naga's
@@ -1334,30 +1368,13 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
             // comments and whitespace need no parser to remove, and
             // this path otherwise ships fully un-minified text - so
             // the caller still gets something runnable on backends
-            // that DO understand the extension.  The synthetic
-            // `unsupported_extension_bailout` PassReport lets
-            // downstream tooling distinguish bailout from "ran with
-            // no changes"; `validation_ok = true` is "no failure
-            // observed" (no IR ever built), set true so CI gates
-            // asserting `all validation_ok` don't fail spuriously.
-            preamble_bailout_guard(effective_preamble, source)?;
-            let compacted = compact_wgsl_text(source);
-            let mut report = Report::new(source.len());
-            report.output_bytes = compacted.len();
-            report.pass_reports.push(PassReport {
-                pass_name: "unsupported_extension_bailout".to_string(),
-                before_bytes: Some(source.len()),
-                after_bytes: Some(compacted.len()),
-                changed: compacted != source,
-                duration_us: 0,
-                validation_ok: true,
-                text_validation_ok: None,
-                rolled_back: false,
-            });
-            return Ok(Output {
-                source: compacted,
-                report,
-            });
+            // that DO understand the extension.
+            return bailout_output(
+                format!("naga cannot parse the input: {e}"),
+                source,
+                effective_preamble,
+                Report::new(source.len()),
+            );
         }
         Err(e) => return Err(e),
     };
@@ -1390,30 +1407,36 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     // error and break a batch run.  Doing this BEFORE the passes also means the
     // post-pass `validate_module` failure below provably indicates a pass bug
     // (valid in, invalid out) and rightly stays a hard error.
-    if io::validate_module(&module).is_err() {
-        // Same lexical compaction as the unsupported-extension bailout:
-        // rejected-but-parseable input (e.g. const division by zero) still
-        // deserves comment/whitespace removal on its way through.
-        preamble_bailout_guard(effective_preamble, source)?;
-        let compacted = compact_wgsl_text(source);
-        report.pass_reports.push(PassReport {
-            pass_name: "validation_bailout".to_string(),
-            before_bytes: Some(source.len()),
-            after_bytes: Some(compacted.len()),
-            changed: compacted != source,
-            duration_us: 0,
-            validation_ok: false,
-            text_validation_ok: None,
-            rolled_back: true,
-        });
-        report.output_bytes = compacted.len();
-        return Ok(Output {
-            source: compacted,
-            report,
-        });
+    if let Err(validation_err) = io::validate_module(&module) {
+        // One repair attempt; an incomplete repair reports the ORIGINAL
+        // error, which describes the input.
+        let recovered =
+            passes::specialize_ptr_params::specialize_ptr_params(&mut module, &preamble_names)
+                && io::validate_module(&module).is_ok();
+        if recovered {
+            report.pass_reports.push(PassReport {
+                pass_name: "specialize_ptr_params".to_string(),
+                before_bytes: None,
+                after_bytes: None,
+                changed: true,
+                duration_us: 0,
+                validation_ok: true,
+                text_validation_ok: None,
+                rolled_back: false,
+            });
+        } else {
+            let mut reason = format!("naga rejects the input: {validation_err}");
+            if reason.contains("is a pointer of space") {
+                reason.push_str(
+                    "\nnote: pointer-parameter recovery covers whole-variable arguments \
+                     only (f(&v), not f(&v.m) or f(&v[i]))",
+                );
+            }
+            return bailout_output(reason, source, effective_preamble, report);
+        }
     }
 
-    pipeline::run_ir_passes(&mut module, &effective_config, &mut report)?;
+    let name_log = pipeline::run_ir_passes(&mut module, &effective_config, &mut report)?;
 
     let info = io::validate_module(&module)?;
     // Skip the naga baseline/fallback emit for modules naga's back-end would
@@ -1446,6 +1469,12 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
 
     let has_preamble = effective_preamble.is_some();
 
+    // Taken before `resolve_generator_output` consumes the result.
+    let gen_name_tables = gen_result
+        .as_ref()
+        .ok()
+        .map(|emission| (emission.structs.clone(), emission.live_const_names.clone()));
+
     let EmitOutcome {
         source: final_source,
         bytes: final_bytes,
@@ -1453,6 +1482,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         rolled_back,
         validation_ok: compacted_valid,
         duration_us,
+        untextable_reason,
     } = resolve_generator_output(
         gen_result,
         naga_output,
@@ -1463,6 +1493,13 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         config.trace.enabled,
     )?;
 
+    // Same signal as the parse/validation bailouts.
+    if let Some(reason) = untextable_reason {
+        report.bailout = Some(format!(
+            "the optimized IR has no valid WGSL text form, the input shipped compacted: {reason}"
+        ));
+    }
+
     // Never ship output larger than the input.  Rare shapes can grow (an
     // already-minimal file whose emission spends more on scaffolding than it
     // saves, or a loop-exit-preservation keep).  Two exemptions: beautify
@@ -1471,12 +1508,17 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     // forbids, so the original text is not a valid substitute.  The input is
     // shipped VERBATIM, not compacted - it never went through the emit
     // self-checks.
-    let (final_source, final_bytes, changed) =
+    let (final_source, final_bytes, changed, shipped_input_verbatim) =
         if !config.beautify && !has_preamble && final_bytes > source.len() {
-            (source.to_string(), source.len(), false)
+            (source.to_string(), source.len(), false, true)
         } else {
-            (final_source, final_bytes, changed)
+            (final_source, final_bytes, changed, false)
         };
+
+    let name_map = (!rolled_back && !shipped_input_verbatim).then(|| {
+        let (structs, live_const_names) = gen_name_tables.unwrap_or_default();
+        name_map::NameMap::assemble(&module, &name_log, structs, &live_const_names)
+    });
 
     report.pass_reports.push(PassReport {
         pass_name: "generator_emit".to_string(),
@@ -1493,6 +1535,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     Ok(Output {
         source: final_source,
         report,
+        name_map,
     })
 }
 

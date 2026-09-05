@@ -8,6 +8,7 @@ fn run_pass(source: &str) -> (bool, naga::Module) {
     let ctx = PassContext {
         config: &config,
         trace_run_dir: None,
+        name_log: None,
     };
     let changed = pass.run(&mut module, &ctx).expect("pass should run");
 
@@ -1440,6 +1441,7 @@ fn empty_nested_block_is_dropped() {
     let ctx = PassContext {
         config: &config,
         trace_run_dir: None,
+        name_log: None,
     };
     let changed = pass.run(&mut module, &ctx).expect("pass should run");
     assert!(

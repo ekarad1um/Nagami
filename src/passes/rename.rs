@@ -54,7 +54,7 @@ impl Pass for RenamePass {
         "rename_identifiers"
     }
 
-    fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
+    fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
         let mut used_names = collect_reserved_names(module, &self.preserve, self.mangle);
 
         // Occurrence weights approximate how often each identifier's name
@@ -157,23 +157,42 @@ impl Pass for RenamePass {
             assigned.insert(*target, name);
         }
 
+        // Module-scope only (locals are neither unique nor host-visible),
+        // one batch per sweep so `record_batch` can resolve swaps.
+        let mut module_renames: Vec<(String, String)> = Vec::new();
         let mut changed = false;
         if self.mangle {
             for (h, c) in module.constants.iter_mut() {
-                apply_name(&mut c.name, assigned.constant.remove(&h), &mut changed);
+                apply_module_name(
+                    &mut c.name,
+                    assigned.constant.remove(&h),
+                    &mut changed,
+                    &mut module_renames,
+                );
             }
             for (h, ov) in module.overrides.iter_mut() {
-                apply_name(&mut ov.name, assigned.over.remove(&h), &mut changed);
+                apply_module_name(
+                    &mut ov.name,
+                    assigned.over.remove(&h),
+                    &mut changed,
+                    &mut module_renames,
+                );
             }
         }
         for (h, global) in module.global_variables.iter_mut() {
-            apply_name(&mut global.name, assigned.global.remove(&h), &mut changed);
+            apply_module_name(
+                &mut global.name,
+                assigned.global.remove(&h),
+                &mut changed,
+                &mut module_renames,
+            );
         }
         for (fh, function) in module.functions.iter_mut() {
-            apply_name(
+            apply_module_name(
                 &mut function.name,
                 assigned.function.remove(&fh),
                 &mut changed,
+                &mut module_renames,
             );
             apply_locals(function, FuncRef::Function(fh), &mut assigned, &mut changed);
             changed |= clear_named_expressions(function);
@@ -186,6 +205,11 @@ impl Pass for RenamePass {
                 &mut changed,
             );
             changed |= clear_named_expressions(&mut entry.function);
+        }
+        if let Some(log) = ctx.name_log
+            && !module_renames.is_empty()
+        {
+            log.borrow_mut().record_batch(&module_renames);
         }
 
         Ok(changed)
@@ -318,6 +342,24 @@ fn apply_name(slot: &mut Option<String>, name: Option<String>, changed: &mut boo
     if let Some(name) = name {
         *changed |= slot.as_deref() != Some(name.as_str());
         *slot = Some(name);
+    }
+}
+
+/// [`apply_name`] that logs (old, new) for a NAMED slot; an unnamed slot
+/// gaining a name is synthetic and applied unlogged.
+fn apply_module_name(
+    slot: &mut Option<String>,
+    name: Option<String>,
+    changed: &mut bool,
+    renames: &mut Vec<(String, String)>,
+) {
+    if let Some(name) = name {
+        if let Some(old) = slot.as_deref()
+            && old != name
+        {
+            renames.push((old.to_string(), name.clone()));
+        }
+        apply_name(slot, Some(name), changed);
     }
 }
 
@@ -637,6 +679,7 @@ mod tests {
         let ctx = PassContext {
             config: &config,
             trace_run_dir: None,
+            name_log: None,
         };
 
         let changed = pass.run(&mut module, &ctx).expect("rename pass should run");
@@ -1029,6 +1072,7 @@ fn fs_main() -> @location(0) vec4f {
         let ctx = PassContext {
             config: &config,
             trace_run_dir: None,
+            name_log: None,
         };
         let changed2 = pass
             .run(&mut module2, &ctx)
