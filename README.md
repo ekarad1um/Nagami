@@ -45,7 +45,7 @@ Runs passes in fixed-point sweeps until the output stops shrinking. Typically co
 Install with cargo:
 
 ```sh
-cargo install nagami --features cli
+cargo install nagami
 ```
 
 Example usage:
@@ -53,7 +53,7 @@ Example usage:
 ```sh
 nagami shader.wgsl -o shader.min.wgsl               # minify (max profile by default)
 nagami shader.wgsl --in-place --stats               # in-place, print savings
-nagami shader.wgsl -o out.wgsl -p baseline          # lighter touch, no mangle
+nagami shader.wgsl -o out.wgsl -p baseline          # DCE + folding only
 cat shader.wgsl | nagami - > out.wgsl               # stdin -> stdout
 nagami shader.wgsl --check                          # exit 1 if not minified
 nagami shader.wgsl --preamble env.wgsl -o out.wgsl  # external declarations
@@ -74,16 +74,16 @@ Three optimization profiles control which IR passes run. Generator-level optimiz
 | Constant folding | ✓ | ✓ | ✓ |
 | Dead parameter elimination | ✓ | ✓ | ✓ |
 | Emit merge | ✓ | ✓ | ✓ |
-| Rename (preserve names) | ✓ | ✓ | ✓ |
+| Identifier renaming (globals, functions, params, locals) | ✓ | ✓ | ✓ |
 | Function inlining | - | ✓ (24 nodes / 3 call sites) | ✓ (48 nodes / 6 call sites) |
 | Load dedup + dead stores | - | ✓ | ✓ |
 | Variable coalescing | - | ✓ | ✓ |
 | Struct-build coalescing | - | ✓ | ✓ |
 | Vector-constant hoisting | - | - | ✓ |
 | Common subexpression elim | - | - | ✓ |
-| Identifier mangling | - | - | ✓ |
+| Mangling (struct types/members, constants, overrides) | - | - | ✓ |
 
-Passes run in fixed-point sweeps (up to 16) until the output stops shrinking. `baseline` is fast and safe; `aggressive` adds the full IR pipeline without mangling; `max` raises inlining limits and enables CSE and vector-constant hoisting (both only while mangling is on) for maximum compression.
+The `baseline` is fast and safe; `aggressive` adds the full IR pipeline without mangling; `max` raises inlining limits and enables CSE and vector-constant hoisting (both only while mangling is on) for maximum compression. `--no-mangle` disables mangling in any profile.
 
 ## Preamble
 
@@ -106,14 +106,14 @@ Preamble names are automatically preserved from renaming so that member access e
 Install with cargo:
 
 ```sh
-cargo add nagami
+cargo add nagami --no-default-features
 ```
 
 Run with default config:
 
 ```rust
 let output = nagami::run(src, &nagami::config::Config::default())?;
-println!("{}", output.source); // smol shader
+println!("{}", output.source);
 ```
 
 With a preamble (external declarations excluded from output):
@@ -138,15 +138,15 @@ Browser / bundler:
 
 ```js
 import init, { run } from 'nagami-rs';
-await init(); // load the WASM module once
+await init();          // load the WASM module once
 const { source, report, nameMap } = run(shader);
-console.log(source);  // minified WGSL
-console.log(report);  // optimization report; report.bailout holds naga's
-                      // error when the output is text-compacted only
-console.log(nameMap); // original -> final names for bindings, functions,
-                      // overrides, entry points, struct members; null when
-                      // the shipped text is not the generator's output
-                      // (bailout, emitter fallback, input already smaller)
+console.log(source);   // minified WGSL
+console.log(report);   // optimization report; report.bailout holds naga's
+                       // error when the output is text-compacted only
+console.log(nameMap);  // original -> final names for bindings, functions,
+                       // overrides, entry points, struct members; null when
+                       // the shipped text is not the generator's output
+                       // (bailout, emitter fallback, input already smaller)
 ```
 
 With config (all fields optional):
@@ -154,7 +154,7 @@ With config (all fields optional):
 ```js
 const { source, report } = run(shader, {
   profile: 'max',             // "baseline" | "aggressive" | "max" (default)
-  mangle: true,               // rename identifiers (default: on for "max")
+  mangle: true,               // also rename struct types/members, constants, overrides (default: on for "max")
   preserveSymbols: ['main'],  // names to keep untouched
   beautify: false,            // compact output (default: false)
   indent: 2,                  // spaces per level when beautify is true
@@ -162,20 +162,20 @@ const { source, report } = run(shader, {
                               // also accepts { decimalPlaces: 6 }, { significantFigures: 4 },
                               // or per-type: { f32: 6, f64: { significantFigures: 12 } }
   maxInlineNodeCount: 48,     // inlining budget per function
-  maxInlineCallSites: 6,      // inlining budget per call site
+  maxInlineCallSites: 6,      // max call sites a function may have and still inline
   preamble: preambleSrc,      // external decls prepended for parsing, stripped from output
   validateEachPass: false,    // re-validate WGSL after every pass
 });
 ```
 
-Node.js (synchronous init):
+Node.js 20.6+ (synchronous init):
 
 ```js
 import { readFileSync } from 'node:fs';
 import { initSync, run } from 'nagami-rs';
 const wasm = readFileSync(new URL('nagami_bg.wasm', import.meta.resolve('nagami-rs')));
 initSync({ module: wasm });
-const { source, report } = run(shader); // or with config as above
+const { source, report } = run(shader);
 ```
 
 ## License
