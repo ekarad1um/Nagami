@@ -2,6 +2,7 @@
 
 use super::local_resolve::resolve_local_var;
 use crate::passes::expr_util::visit_expression_children;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// A single-use `Call` result that may still be inlined into a later use
 /// site, paired with the set of function-locals its arguments load.  The
@@ -19,7 +20,7 @@ struct PendingCall {
     /// control-flow clearing rules guarding it, so a single-use carrier cannot
     /// float the (pure) call past an intervening store to memory it reads.
     carrier: naga::Handle<naga::Expression>,
-    reads_locals: std::collections::HashSet<naga::Handle<naga::LocalVariable>>,
+    reads_locals: FxHashSet<naga::Handle<naga::LocalVariable>>,
 }
 
 /// Collect every function-local whose VALUE a call argument's evaluation
@@ -45,8 +46,8 @@ fn collect_loaded_locals(
     expr: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
     call_reads: &CallReads,
-    out: &mut std::collections::HashSet<naga::Handle<naga::LocalVariable>>,
-    visited: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+    out: &mut FxHashSet<naga::Handle<naga::LocalVariable>>,
+    visited: &mut FxHashSet<naga::Handle<naga::Expression>>,
 ) {
     // A common subexpression shared across argument positions forms a diamond
     // in the expression DAG; without a visited set it would be re-walked once
@@ -87,10 +88,8 @@ fn collect_loaded_locals(
 /// cone (the binding name is evaluated once, at the call site), and an
 /// over-approximated read set only RETAINS a pending call longer - the safe
 /// direction.
-type CallReads = std::collections::HashMap<
-    naga::Handle<naga::Expression>,
-    std::collections::HashSet<naga::Handle<naga::LocalVariable>>,
->;
+type CallReads =
+    FxHashMap<naga::Handle<naga::Expression>, FxHashSet<naga::Handle<naga::LocalVariable>>>;
 
 /// The root a pointer expression resolves to, for the write-effect analysis.
 enum PointerRoot {
@@ -135,7 +134,7 @@ fn resolve_pointer_root(
 #[derive(Clone)]
 struct FnEffects {
     escapes: bool,
-    written_params: std::collections::HashSet<u32>,
+    written_params: FxHashSet<u32>,
 }
 
 /// Fold the effect of one statement into `eff`.  Nested control-flow blocks are
@@ -241,12 +240,12 @@ fn function_effects(
     }
     memo[h.index()] = Some(FnEffects {
         escapes: true,
-        written_params: std::collections::HashSet::new(),
+        written_params: FxHashSet::default(),
     });
     let func = &module.functions[h];
     let mut eff = FnEffects {
         escapes: false,
-        written_params: std::collections::HashSet::new(),
+        written_params: FxHashSet::default(),
     };
     accumulate_block_effects(&func.body, &func.expressions, module, memo, &mut eff);
     memo[h.index()] = Some(eff.clone());
@@ -305,11 +304,11 @@ pub(super) fn find_inlineable_calls(
     ref_counts: &[usize],
     expressions: &naga::Arena<naga::Expression>,
     pure_functions: &[bool],
-) -> std::collections::HashSet<naga::Handle<naga::Expression>> {
+) -> FxHashSet<naga::Handle<naga::Expression>> {
     // The call-reads memo spans the whole function: an inner call's arguments
     // are recorded where the call statement lives, but its stashed text is
     // re-evaluated wherever an OUTER pending call that consumed it ends up.
-    let mut call_reads = CallReads::new();
+    let mut call_reads = CallReads::default();
     find_inlineable_calls_in_block(
         block,
         ref_counts,
@@ -325,8 +324,8 @@ fn find_inlineable_calls_in_block(
     expressions: &naga::Arena<naga::Expression>,
     pure_functions: &[bool],
     call_reads: &mut CallReads,
-) -> std::collections::HashSet<naga::Handle<naga::Expression>> {
-    let mut result = std::collections::HashSet::new();
+) -> FxHashSet<naga::Handle<naga::Expression>> {
+    let mut result = FxHashSet::default();
     let mut pending: Vec<PendingCall> = Vec::new();
     // The result of an IMPURE call from an earlier statement, still eligible to
     // be inlined into the statement that consumes it.  An impure call writes
@@ -351,7 +350,7 @@ fn find_inlineable_calls_in_block(
                 // write being relocated), so a range that is otherwise
                 // memory-free is safe to skip.
                 let mut found = false;
-                let mut memo = std::collections::HashMap::new();
+                let mut memo = FxHashMap::default();
                 range
                     .clone()
                     .all(|root| expr_is_memory_free(root, h, expressions, &mut found, &mut memo))
@@ -406,8 +405,8 @@ fn find_inlineable_calls_in_block(
                     // Phase 1 already moved any pending consumed by THIS call's
                     // arguments into `result`, so the survivors are exactly the
                     // ones whose evaluation is unaffected by this pure call.
-                    let mut reads_locals = std::collections::HashSet::new();
-                    let mut visited = std::collections::HashSet::new();
+                    let mut reads_locals = FxHashSet::default();
+                    let mut visited = FxHashSet::default();
                     for &arg in arguments {
                         collect_loaded_locals(
                             arg,
@@ -508,7 +507,7 @@ fn impure_call_inlines_safely(
 ) -> bool {
     use naga::Statement as S;
     let mut found = false;
-    let mut memo = std::collections::HashMap::new();
+    let mut memo = FxHashMap::default();
     let mut memfree =
         |root| expr_is_memory_free(root, call_result, expressions, &mut found, &mut memo);
     let all_memfree = match stmt {
@@ -541,7 +540,7 @@ fn expr_is_memory_free(
     call_result: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
     found: &mut bool,
-    memo: &mut std::collections::HashMap<naga::Handle<naga::Expression>, bool>,
+    memo: &mut FxHashMap<naga::Handle<naga::Expression>, bool>,
 ) -> bool {
     if root == call_result {
         // The inlined call is reached on a unique path (`ref_count == 1`), so
@@ -597,7 +596,7 @@ fn consume_pending_for_statement(
     stmt: &naga::Statement,
     expressions: &naga::Arena<naga::Expression>,
     pending: &mut Vec<PendingCall>,
-    result: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+    result: &mut FxHashSet<naga::Handle<naga::Expression>>,
 ) {
     // A NON-`Emit` statement is a real consumption site: relocate the pending
     // call's result into the inlineable set (matched against its current
@@ -606,14 +605,13 @@ fn consume_pending_for_statement(
     // single-use pure calls (`if a()==b()`) are merged onto one wrapper carrier
     // by the `Emit` arm, and all are safe to inline at this shared use site
     // (each survived the same Store / control-flow clears).
-    let check =
-        |h: naga::Handle<naga::Expression>,
-         pending: &mut Vec<PendingCall>,
-         result: &mut std::collections::HashSet<naga::Handle<naga::Expression>>| {
-            while let Some(pos) = pending.iter().position(|p| p.carrier == h) {
-                result.insert(pending.swap_remove(pos).result);
-            }
-        };
+    let check = |h: naga::Handle<naga::Expression>,
+                 pending: &mut Vec<PendingCall>,
+                 result: &mut FxHashSet<naga::Handle<naga::Expression>>| {
+        while let Some(pos) = pending.iter().position(|p| p.carrier == h) {
+            result.insert(pending.swap_remove(pos).result);
+        }
+    };
 
     match stmt {
         naga::Statement::Emit(range) => {

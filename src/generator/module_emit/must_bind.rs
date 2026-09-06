@@ -2,6 +2,7 @@
 //! `let` bindings because a write to their place intervenes before a use.
 
 use crate::passes::expr_util::visit_expression_children;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// The memory location a pointer refers to, resolved to a root variable
 /// plus one level of refinement off that root.  Two places that share a
@@ -333,7 +334,45 @@ struct PendingLoad {
     written: bool,
 }
 
-type Pending = std::collections::HashMap<naga::Handle<naga::Expression>, PendingLoad>;
+type Pending = FxHashMap<naga::Handle<naga::Expression>, PendingLoad>;
+
+/// "Already entered" marks over the expression arena, one stamp per handle;
+/// a walk is a generation, so starting one is a counter bump, not a fresh set.
+struct Visited {
+    stamps: Vec<u32>,
+    generation: u32,
+}
+
+impl Visited {
+    fn new(expression_count: usize) -> Self {
+        Self {
+            stamps: vec![0; expression_count],
+            generation: 0,
+        }
+    }
+
+    fn walk(&mut self) -> Walk<'_> {
+        self.generation += 1;
+        Walk(self)
+    }
+}
+
+/// One walk's marks; only [`Visited::walk`] hands one out, so no walk can
+/// start on a previous walk's marks.
+struct Walk<'a>(&'a mut Visited);
+
+impl Walk<'_> {
+    /// `true` the first time `h` is entered in this walk.
+    fn enter(&mut self, h: naga::Handle<naga::Expression>) -> bool {
+        let slot = &mut self.0.stamps[h.index()];
+        if *slot == self.0.generation {
+            false
+        } else {
+            *slot = self.0.generation;
+            true
+        }
+    }
+}
 
 /// Merge two control-flow successor states: a load is "written" after the
 /// join if it was written on EITHER path (conservative).  Keys from both
@@ -351,15 +390,15 @@ fn merge_pending(mut a: Pending, b: Pending) -> Pending {
 /// Walk the operand cone of `root`, flagging every in-flight load that is
 /// (a) reachable from `root` and (b) already marked written.  Such a load
 /// is read AFTER its place was overwritten, so it must be bound.  The
-/// `visited` set keeps the walk linear over shared sub-DAGs.
+/// `walk` keeps it linear over shared sub-DAGs.
 fn flag_used_loads(
     root: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
     pending: &Pending,
-    must_bind: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
-    visited: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+    must_bind: &mut FxHashSet<naga::Handle<naga::Expression>>,
+    walk: &mut Walk<'_>,
 ) {
-    if !visited.insert(root) {
+    if !walk.enter(root) {
         return;
     }
     if let Some(pl) = pending.get(&root)
@@ -373,12 +412,12 @@ fn flag_used_loads(
         // including any nested written load reachable only via `root`.
         // Re-pinning a child would therefore change nothing.  A child also used
         // OUTSIDE this parent is still pinned at that other use: the early
-        // return records only `root` in `visited` (children stay walkable), and
-        // each statement walk starts a fresh `visited`.
+        // return marks only `root` (children stay enterable), and each
+        // statement starts a fresh walk.
         return;
     }
     visit_expression_children(&expressions[root], |child| {
-        flag_used_loads(child, expressions, pending, must_bind, visited);
+        flag_used_loads(child, expressions, pending, must_bind, walk);
     });
 }
 
@@ -389,10 +428,11 @@ fn analyze_block(
     expressions: &naga::Arena<naga::Expression>,
     module: &naga::Module,
     pending: &mut Pending,
-    must_bind: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+    must_bind: &mut FxHashSet<naga::Handle<naga::Expression>>,
+    visited: &mut Visited,
 ) {
     for stmt in block.iter() {
-        analyze_statement(stmt, expressions, module, pending, must_bind);
+        analyze_statement(stmt, expressions, module, pending, must_bind, visited);
     }
 }
 
@@ -421,7 +461,8 @@ fn analyze_statement(
     expressions: &naga::Arena<naga::Expression>,
     module: &naga::Module,
     pending: &mut Pending,
-    must_bind: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+    must_bind: &mut FxHashSet<naga::Handle<naga::Expression>>,
+    visited: &mut Visited,
 ) {
     use naga::Statement as S;
     match stmt {
@@ -429,9 +470,9 @@ fn analyze_statement(
             // Uses first (a write never occurs within an Emit): a load defined
             // in this same range is not yet pending, so a sibling consuming it
             // is correctly not flagged.
-            let mut visited = std::collections::HashSet::new();
+            let mut walk = visited.walk();
             for h in range.clone() {
-                flag_used_loads(h, expressions, pending, must_bind, &mut visited);
+                flag_used_loads(h, expressions, pending, must_bind, &mut walk);
             }
             // Then register the loads this Emit introduces.
             for h in range.clone() {
@@ -512,23 +553,47 @@ fn analyze_statement(
                 }
             }
         }
-        S::Block(inner) => analyze_block(inner, expressions, module, pending, must_bind),
+        S::Block(inner) => analyze_block(inner, expressions, module, pending, must_bind, visited),
         S::If {
             condition,
             accept,
             reject,
         } => {
-            let mut visited = std::collections::HashSet::new();
-            flag_used_loads(*condition, expressions, pending, must_bind, &mut visited);
+            flag_used_loads(
+                *condition,
+                expressions,
+                pending,
+                must_bind,
+                &mut visited.walk(),
+            );
             let mut accept_state = pending.clone();
-            analyze_block(accept, expressions, module, &mut accept_state, must_bind);
+            analyze_block(
+                accept,
+                expressions,
+                module,
+                &mut accept_state,
+                must_bind,
+                visited,
+            );
             let mut reject_state = pending.clone();
-            analyze_block(reject, expressions, module, &mut reject_state, must_bind);
+            analyze_block(
+                reject,
+                expressions,
+                module,
+                &mut reject_state,
+                must_bind,
+                visited,
+            );
             *pending = merge_pending(accept_state, reject_state);
         }
         S::Switch { selector, cases } => {
-            let mut visited = std::collections::HashSet::new();
-            flag_used_loads(*selector, expressions, pending, must_bind, &mut visited);
+            flag_used_loads(
+                *selector,
+                expressions,
+                pending,
+                must_bind,
+                &mut visited.walk(),
+            );
             if cases.iter().any(|c| c.fall_through) {
                 // A fall-through case chains into the next, so a write in one
                 // case can reach a use in a later one.  WGSL source never
@@ -537,7 +602,7 @@ fn analyze_statement(
                 // over-approximation: it also assumes a directly-entered case
                 // ran after its predecessors, which only ever over-binds).
                 for case in cases {
-                    analyze_block(&case.body, expressions, module, pending, must_bind);
+                    analyze_block(&case.body, expressions, module, pending, must_bind, visited);
                 }
             } else {
                 // Cases are mutually exclusive: analyse each from the pre-switch
@@ -546,7 +611,14 @@ fn analyze_statement(
                 let mut merged: Option<Pending> = None;
                 for case in cases {
                     let mut case_state = pending.clone();
-                    analyze_block(&case.body, expressions, module, &mut case_state, must_bind);
+                    analyze_block(
+                        &case.body,
+                        expressions,
+                        module,
+                        &mut case_state,
+                        must_bind,
+                        visited,
+                    );
                     merged = Some(match merged {
                         None => case_state,
                         Some(m) => merge_pending(m, case_state),
@@ -578,18 +650,17 @@ fn analyze_statement(
             // Loads emitted INSIDE the loop are re-evaluated each iteration
             // (expression values never cross the back-edge - only memory does),
             // so a single linear pass over body+continuing is exact for them.
-            analyze_block(body, expressions, module, pending, must_bind);
-            analyze_block(continuing, expressions, module, pending, must_bind);
+            analyze_block(body, expressions, module, pending, must_bind, visited);
+            analyze_block(continuing, expressions, module, pending, must_bind, visited);
             if let Some(h) = break_if {
-                let mut visited = std::collections::HashSet::new();
-                flag_used_loads(*h, expressions, pending, must_bind, &mut visited);
+                flag_used_loads(*h, expressions, pending, must_bind, &mut visited.walk());
             }
         }
         // Leaf statements: their operands are uses, then their writes apply.
         _ => {
-            let mut visited = std::collections::HashSet::new();
+            let mut walk = visited.walk();
             crate::passes::expr_util::visit_statement_expression_handles(stmt, false, &mut |h| {
-                flag_used_loads(h, expressions, pending, must_bind, &mut visited);
+                flag_used_loads(h, expressions, pending, must_bind, &mut walk);
             });
             apply_writes(stmt, expressions, pending);
         }
@@ -611,15 +682,17 @@ fn analyze_statement(
 pub(super) fn compute_must_bind_loads(
     func: &naga::Function,
     module: &naga::Module,
-) -> std::collections::HashSet<naga::Handle<naga::Expression>> {
-    let mut pending: Pending = std::collections::HashMap::new();
-    let mut must_bind = std::collections::HashSet::new();
+) -> FxHashSet<naga::Handle<naga::Expression>> {
+    let mut pending: Pending = FxHashMap::default();
+    let mut must_bind = FxHashSet::default();
+    let mut visited = Visited::new(func.expressions.len());
     analyze_block(
         &func.body,
         &func.expressions,
         module,
         &mut pending,
         &mut must_bind,
+        &mut visited,
     );
     must_bind
 }

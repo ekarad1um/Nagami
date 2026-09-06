@@ -19,7 +19,7 @@
 //! next compact; if the sweep cap lands first, it reaches the generator
 //! outside any `Emit` range and is simply never rendered.
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
@@ -49,7 +49,7 @@ fn remove_dead_locals(func: &mut naga::Function) -> bool {
     if func.local_variables.is_empty() {
         return false;
     }
-    let referenced: HashSet<naga::Handle<naga::LocalVariable>> = func
+    let referenced: FxHashSet<naga::Handle<naga::LocalVariable>> = func
         .expressions
         .iter()
         .filter_map(|(_, e)| match e {
@@ -96,7 +96,6 @@ mod tests {
         let config = Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
         let changed = DeadLocalPass

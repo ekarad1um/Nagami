@@ -50,7 +50,7 @@
 //! missed optimisations to avoid mis-classifying case-fallthrough
 //! or early-`break` paths.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
@@ -389,7 +389,7 @@ fn coalesce_function_locals(
 fn collect_local_usage(
     function: &naga::Function,
     types: &naga::UniqueArena<naga::Type>,
-) -> HashMap<naga::Handle<naga::LocalVariable>, LocalUse> {
+) -> FxHashMap<naga::Handle<naga::LocalVariable>, LocalUse> {
     let mut usage = function
         .local_variables
         .iter()
@@ -411,7 +411,7 @@ fn collect_local_usage(
                 },
             )
         })
-        .collect::<HashMap<_, _>>();
+        .collect::<FxHashMap<_, _>>();
 
     // Pre-resolve every `Load` to `(root_local, element_spec)` so
     // the DFS attributes reads to the correct handle without
@@ -453,7 +453,8 @@ fn collect_local_usage(
     // post-state are unused at function-body scope (there is no
     // enclosing scope to propagate to).
     let mut pos = 0usize;
-    let mut local_init: HashMap<naga::Handle<naga::LocalVariable>, ElementInit> = HashMap::new();
+    let mut local_init: FxHashMap<naga::Handle<naga::LocalVariable>, ElementInit> =
+        FxHashMap::default();
     let _ = scan_block_usage(
         &function.body,
         &function.expressions,
@@ -474,7 +475,7 @@ fn collect_local_usage(
 /// so per-block first-touch tracking is independent of the source-
 /// order monotonic position used for live ranges.
 fn mark_used(
-    usage: &mut HashMap<naga::Handle<naga::LocalVariable>, LocalUse>,
+    usage: &mut FxHashMap<naga::Handle<naga::LocalVariable>, LocalUse>,
     local: naga::Handle<naga::LocalVariable>,
     pos: usize,
 ) {
@@ -501,8 +502,8 @@ fn mark_used(
 /// (loop body's first touch reads the back-edge value) and the
 /// if/else hazard (one arm reads zero-init while the other writes).
 fn mark_block_first(
-    usage: &mut HashMap<naga::Handle<naga::LocalVariable>, LocalUse>,
-    block_seen: &mut HashSet<naga::Handle<naga::LocalVariable>>,
+    usage: &mut FxHashMap<naga::Handle<naga::LocalVariable>, LocalUse>,
+    block_seen: &mut FxHashSet<naga::Handle<naga::LocalVariable>>,
     local: naga::Handle<naga::LocalVariable>,
     is_store: bool,
 ) {
@@ -539,9 +540,9 @@ fn scan_block_usage(
     load_to_local_and_element: &[Option<(naga::Handle<naga::LocalVariable>, ElementSpec)>],
     local_element_count: &[Option<u32>],
     pos: &mut usize,
-    usage: &mut HashMap<naga::Handle<naga::LocalVariable>, LocalUse>,
-    local_init: &mut HashMap<naga::Handle<naga::LocalVariable>, ElementInit>,
-) -> HashSet<naga::Handle<naga::LocalVariable>> {
+    usage: &mut FxHashMap<naga::Handle<naga::LocalVariable>, LocalUse>,
+    local_init: &mut FxHashMap<naga::Handle<naga::LocalVariable>, ElementInit>,
+) -> FxHashSet<naga::Handle<naga::LocalVariable>> {
     // Per-block first-touch ledger.  Reset (by virtue of being a fresh
     // local on every recursive entry) at every control-flow scope:
     // function body, each If arm, each Switch case, Loop body and
@@ -549,7 +550,7 @@ fn scan_block_usage(
     // scope, the *first* touch of a given local decides whether the
     // local stays `coalesce_safe`; later touches in the same scope do
     // not relax the verdict.
-    let mut block_seen: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
+    let mut block_seen: FxHashSet<naga::Handle<naga::LocalVariable>> = FxHashSet::default();
     // Per-block "unconditional writes" set.  Membership means every
     // runtime path through this block (so far) performs at least one
     // top-level `Store` to the local before the block exits.  A
@@ -561,7 +562,7 @@ fn scan_block_usage(
     // case + fall-through + per-case write-set analysis; a `Loop`
     // body's writes only count when the loop is provably executed
     // and contains no early `break`/`Return`).
-    let mut block_writes: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
+    let mut block_writes: FxHashSet<naga::Handle<naga::LocalVariable>> = FxHashSet::default();
 
     for stmt in block {
         let current = *pos;
@@ -976,11 +977,12 @@ fn load_covers(init: Option<&ElementInit>, spec: ElementSpec) -> bool {
 /// `block_seen` ledger, so a subsequent post-If Load is not
 /// mis-flagged as the parent's first touch.
 fn merge_inits_into(
-    local_init: &mut HashMap<naga::Handle<naga::LocalVariable>, ElementInit>,
-    accept: HashMap<naga::Handle<naga::LocalVariable>, ElementInit>,
-    reject: HashMap<naga::Handle<naga::LocalVariable>, ElementInit>,
-) -> HashSet<naga::Handle<naga::LocalVariable>> {
-    let mut newly_fully_covered: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
+    local_init: &mut FxHashMap<naga::Handle<naga::LocalVariable>, ElementInit>,
+    accept: FxHashMap<naga::Handle<naga::LocalVariable>, ElementInit>,
+    reject: FxHashMap<naga::Handle<naga::LocalVariable>, ElementInit>,
+) -> FxHashSet<naga::Handle<naga::LocalVariable>> {
+    let mut newly_fully_covered: FxHashSet<naga::Handle<naga::LocalVariable>> =
+        FxHashSet::default();
     // Only locals appearing in BOTH arms can contribute new
     // guarantees; a write on one arm only is not a post-If
     // guarantee, so we skip those locals entirely (their parent
@@ -1046,8 +1048,8 @@ fn merge_inits_into(
 /// `first`, which greedily maximises reuse of already-hot lanes
 /// while still respecting non-overlap.
 fn build_alias_map(
-    usage: &HashMap<naga::Handle<naga::LocalVariable>, LocalUse>,
-) -> HashMap<naga::Handle<naga::LocalVariable>, naga::Handle<naga::LocalVariable>> {
+    usage: &FxHashMap<naga::Handle<naga::LocalVariable>, LocalUse>,
+) -> FxHashMap<naga::Handle<naga::LocalVariable>, naga::Handle<naga::LocalVariable>> {
     let mut locals = usage
         .iter()
         .filter_map(|(&handle, info)| {
@@ -1062,8 +1064,8 @@ fn build_alias_map(
 
     locals.sort_by_key(|s| (s.ty, s.first, s.last, s.handle));
 
-    let mut lanes_by_type: HashMap<naga::Handle<naga::Type>, Vec<Lane>> = HashMap::new();
-    let mut alias = HashMap::new();
+    let mut lanes_by_type: FxHashMap<naga::Handle<naga::Type>, Vec<Lane>> = FxHashMap::default();
+    let mut alias = FxHashMap::default();
 
     for local in locals {
         let lanes = lanes_by_type.entry(local.ty).or_default();
@@ -1095,7 +1097,7 @@ fn build_alias_map(
 /// self-loops to avoid infinite chains if the map ever produced one.
 fn resolve_alias(
     mut handle: naga::Handle<naga::LocalVariable>,
-    alias: &HashMap<naga::Handle<naga::LocalVariable>, naga::Handle<naga::LocalVariable>>,
+    alias: &FxHashMap<naga::Handle<naga::LocalVariable>, naga::Handle<naga::LocalVariable>>,
 ) -> naga::Handle<naga::LocalVariable> {
     while let Some(next) = alias.get(&handle).copied() {
         if next == handle {
@@ -1119,7 +1121,6 @@ mod tests {
         let config = Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
 
@@ -1139,7 +1140,7 @@ mod tests {
                 naga::Expression::LocalVariable(h) => Some(*h),
                 _ => None,
             })
-            .collect::<std::collections::HashSet<_>>()
+            .collect::<FxHashSet<_>>()
             .len()
     }
 
@@ -1318,7 +1319,7 @@ fn fs_main() -> @location(0) vec4f {
                 naga::Expression::LocalVariable(h) => Some(*h),
                 _ => None,
             })
-            .collect::<std::collections::HashSet<_>>()
+            .collect::<FxHashSet<_>>()
             .len()
     }
 

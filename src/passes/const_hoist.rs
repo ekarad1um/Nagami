@@ -22,7 +22,7 @@
 //! expressions are never scanned (the hoisted constant's own initializer lives
 //! there) so the pass reaches a fixed point after one application.
 
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
@@ -211,7 +211,7 @@ impl Pass for ConstHoistPass {
         // constant a 1-char name, so this only ever UNDER-hoists - never grows).
         // Key = (vector type index, per-lane literal bits).
         type GroupKey = (usize, Vec<LitKey>);
-        let mut groups: HashMap<GroupKey, Vec<usize>> = HashMap::new();
+        let mut groups: FxHashMap<GroupKey, Vec<usize>> = FxHashMap::default();
         for (idx, c) in candidates.iter().enumerate() {
             let key = (c.ty.index(), c.lits.iter().map(|&l| lit_key(l)).collect());
             groups.entry(key).or_default().push(idx);
@@ -243,9 +243,9 @@ impl Pass for ConstHoistPass {
         let mut changed = false;
         // Per-function set of handles converted Compose -> Constant, so their
         // Emit ranges can be rebuilt afterwards (a `Constant` is not emittable).
-        type ExprSet = std::collections::HashSet<naga::Handle<naga::Expression>>;
-        let mut hoisted_fn: HashMap<naga::Handle<naga::Function>, ExprSet> = HashMap::new();
-        let mut hoisted_ep: HashMap<usize, ExprSet> = HashMap::new();
+        type ExprSet = FxHashSet<naga::Handle<naga::Expression>>;
+        let mut hoisted_fn: FxHashMap<naga::Handle<naga::Function>, ExprSet> = FxHashMap::default();
+        let mut hoisted_ep: FxHashMap<usize, ExprSet> = FxHashMap::default();
 
         for (_key, members) in group_list {
             let count = members.len();

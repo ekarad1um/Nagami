@@ -12,12 +12,11 @@ use crate::config::Config;
 fn fold_local(
     arena: &mut naga::Arena<naga::Expression>,
     refcounts: &[u32],
-    const_literals: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
+    const_literals: &FxHashMap<naga::Handle<naga::Constant>, naga::Literal>,
     types: &naga::UniqueArena<naga::Type>,
-    vector_type_cache: &HashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>>,
-) -> (HashSet<naga::Handle<naga::Expression>>, usize) {
-    let ranges: HashMap<naga::Handle<naga::Expression>, usize> =
-        arena.iter().map(|(h, _)| (h, 0usize)).collect();
+    vector_type_cache: &FxHashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>>,
+) -> (FxHashSet<naga::Handle<naga::Expression>>, usize) {
+    let ranges = vec![0u32; arena.len()];
     fold_local_expressions(
         arena,
         refcounts,
@@ -142,7 +141,6 @@ fn run_pass(module: &mut naga::Module) -> bool {
     let config = Config::default();
     let ctx = PassContext {
         config: &config,
-        trace_run_dir: None,
         name_log: None,
     };
 
@@ -185,9 +183,9 @@ fn folds_binary_add_in_local_expression_arena() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert_eq!(
         changed.len(),
@@ -232,9 +230,9 @@ fn folds_nested_binary_expressions() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert_eq!(changed.len(), 2, "both nested operations should be folded");
     assert_f32_literal(&arena, add, 3.0);
@@ -273,9 +271,9 @@ fn de_morgan_negated_equality_folds_in_place() {
         let (folded, _) = fold_local(
             &mut arena,
             &refcounts,
-            &HashMap::new(),
+            &FxHashMap::default(),
             &naga::UniqueArena::new(),
-            &HashMap::new(),
+            &FxHashMap::default(),
         );
         assert!(
             matches!(
@@ -322,9 +320,9 @@ fn de_morgan_shared_equality_is_not_folded() {
     let (folded, _) = fold_local(
         &mut arena,
         &refcounts,
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(
         matches!(
@@ -369,9 +367,9 @@ fn folds_select_expression_with_literal_condition() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert_eq!(
         changed.len(),
@@ -408,7 +406,7 @@ fn folds_local_constant_reference_using_cache() {
         Default::default(),
     );
 
-    let mut const_literals = HashMap::new();
+    let mut const_literals = FxHashMap::default();
     const_literals.insert(constant_handle, naga::Literal::F32(41.0));
 
     let (changed, _) = fold_local(
@@ -416,7 +414,7 @@ fn folds_local_constant_reference_using_cache() {
         &[],
         &const_literals,
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert_eq!(
         changed.len(),
@@ -450,9 +448,9 @@ fn does_not_fold_divide_by_zero() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert_eq!(changed.len(), 0, "division by zero should not be folded");
 
@@ -1416,9 +1414,9 @@ fn identity_fold_non_emittable_added_to_folded() {
     let (folded, identity) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(
         identity > 0,
@@ -1468,9 +1466,9 @@ fn identity_fold_emittable_not_in_folded() {
     let (folded, identity) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(
         identity > 0,
@@ -1538,9 +1536,9 @@ fn identity_fold_unique_impure_clone_drops_source() {
     let (folded, identity) = fold_local(
         &mut arena,
         &refcounts,
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(
         identity > 0,
@@ -1602,15 +1600,16 @@ fn identity_fold_unique_impure_cross_emit_range_blocked() {
 
     // Load lives in Emit range 0, the Binary in range 1: a
     // statement (a store) separates them.  The guard must refuse.
-    let ranges: HashMap<naga::Handle<naga::Expression>, usize> =
-        HashMap::from([(load, 0usize), (add, 1usize)]);
+    let mut ranges = vec![NO_EMIT; arena.len()];
+    ranges[load.index()] = 0;
+    ranges[add.index()] = 1;
     let (folded, identity) = fold_local_expressions(
         &mut arena,
         &refcounts,
         &ranges,
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert_eq!(
         identity, 0,
@@ -1666,15 +1665,17 @@ fn involution_fold_unique_impure_cross_emit_range_blocked() {
 
     // Inner Load in Emit range 0; the outer Unary in range 1 - a
     // statement (a store) separates them, so relocation is unsound.
-    let ranges: HashMap<naga::Handle<naga::Expression>, usize> =
-        HashMap::from([(load, 0usize), (neg1, 1usize), (neg2, 1usize)]);
+    let mut ranges = vec![NO_EMIT; arena.len()];
+    ranges[load.index()] = 0;
+    ranges[neg1.index()] = 1;
+    ranges[neg2.index()] = 1;
     let (folded, identity) = fold_local_expressions(
         &mut arena,
         &refcounts,
         &ranges,
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert_eq!(
         identity, 0,
@@ -1737,9 +1738,9 @@ fn identity_fold_multi_ref_impure_blocked() {
     let (folded, identity) = fold_local(
         &mut arena,
         &refcounts,
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert_eq!(
         identity, 0,
@@ -1786,14 +1787,14 @@ fn identity_fold_constant_added_to_folded() {
 
     // With const in literal cache -> const_expr folds to Literal(41.0) first,
     // then 1 * 41.0 is identity-eliminated.
-    let mut const_literals = HashMap::new();
+    let mut const_literals = FxHashMap::default();
     const_literals.insert(constant_handle, naga::Literal::F32(41.0));
     let (folded, _) = fold_local(
         &mut arena,
         &[],
         &const_literals,
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(folded.contains(&mul), "result should be in folded set");
     assert_f32_literal(&arena, mul, 41.0);
@@ -1820,9 +1821,9 @@ fn identity_fold_constant_added_to_folded() {
     let (folded2, identity2) = fold_local(
         &mut arena2,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(
         identity2 > 0,
@@ -2141,9 +2142,9 @@ fn involution_double_negate() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(count > 0, "-(-x) should be simplified");
     // neg2 should now be FunctionArgument(0) (non-emittable -> in folded)
@@ -2177,9 +2178,9 @@ fn involution_double_logical_not() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(count > 0, "!(!x) should be simplified");
     assert!(
@@ -2212,9 +2213,9 @@ fn involution_double_bitwise_not() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(count > 0, "~(~x) should be simplified");
     assert!(
@@ -2247,9 +2248,9 @@ fn involution_different_ops_not_simplified() {
     let (_, count) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert_eq!(count, 0, "different unary ops should not be simplified");
     assert!(
@@ -2297,9 +2298,9 @@ fn involution_emittable_inner_not_in_folded() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(count > 0, "-(-Binary(Mul)) should be simplified");
     assert!(
@@ -2339,9 +2340,9 @@ fn select_same_arms_simplified() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(count > 0, "select(x, x, cond) should be simplified");
     assert!(
@@ -2373,9 +2374,9 @@ fn select_different_arms_not_simplified() {
     let (folded, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     // With constant condition, resolve_literal will fold this to param_b's value.
     // But param_b is FunctionArgument(1), not a literal, so resolve_literal returns None.
@@ -2420,9 +2421,9 @@ fn absorbing_fold_mul_zero_param_not_rewritten() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert_eq!(
         count, 0,
@@ -2457,9 +2458,9 @@ fn absorbing_fold_and_zero_u32_param_not_rewritten() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert_eq!(
         count, 0,
@@ -2501,9 +2502,9 @@ fn absorbing_fold_mul_zero_both_literal_produces_literal() {
     let (_folded, _count) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     // Either eval_binary or absorbing must have collapsed this to a literal 0.
     assert_f32_literal(&arena, mul, 0.0);
@@ -2538,9 +2539,9 @@ fn absorbing_fold_logical_and_false_with_non_literal_rhs_rewritten() {
     let (_folded, count) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
 
     assert!(count > 0, "false && rhs must be absorbed to false");
@@ -2576,9 +2577,9 @@ fn absorbing_fold_logical_or_true_with_non_literal_rhs_rewritten() {
     let (_folded, count) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
 
     assert!(count > 0, "true || rhs must be absorbed to true");
@@ -2672,7 +2673,7 @@ fn vector_splat_folds_to_compose() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -2750,7 +2751,7 @@ fn vector_compose_binary_add_folds() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -2807,7 +2808,7 @@ fn vector_negate_folds() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -2853,7 +2854,7 @@ fn vector_access_index_folds_to_scalar() {
     let (folded, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -2913,7 +2914,7 @@ fn vector_swizzle_folds() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -2975,7 +2976,7 @@ fn vector_scalar_broadcast_mul() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -2999,7 +3000,7 @@ fn vector_zero_value_stays_non_emittable() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -3048,7 +3049,7 @@ fn vector_add_zero_value_folds() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -3103,7 +3104,7 @@ fn vector_splat_binary_scalar_add() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -3188,7 +3189,7 @@ fn vector_nested_chain_folds() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -3254,7 +3255,7 @@ fn vector_integer_types_fold() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -3327,7 +3328,7 @@ fn vector_no_matching_literal_skips_materialization() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -3382,7 +3383,7 @@ fn vector_compose_mixed_scalar_and_vector() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -3449,7 +3450,7 @@ fn vector_relational_op_produces_bool_vector() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -3523,7 +3524,7 @@ fn vector_select_constant_true() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -3549,7 +3550,7 @@ fn scalar_zero_value_resolves() {
     let (folded, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -4555,9 +4556,9 @@ fn folds_math_sqrt_in_local_arena() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(
         !changed.is_empty(),
@@ -4591,9 +4592,9 @@ fn folds_math_max_in_local_arena() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(
         !changed.is_empty(),
@@ -4631,9 +4632,9 @@ fn folds_math_clamp_in_local_arena() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(!changed.is_empty(), "clamp(5.0, 0.0, 1.0) should be folded");
     assert_f32_literal(&arena, clamp_expr, 1.0);
@@ -4657,9 +4658,9 @@ fn does_not_fold_math_with_non_constant_arg() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
     assert!(
         changed.is_empty(),
@@ -4869,9 +4870,9 @@ fn simplify_vec_times_zero_does_not_rewrite_to_scalar() {
     let (_folded, simplified) = fold_local(
         &mut arena,
         &[],
-        &HashMap::new(),
+        &FxHashMap::default(),
         &naga::UniqueArena::new(),
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
 
     // The Binary must NOT be replaced by the scalar literal.
@@ -5312,9 +5313,9 @@ fn access_with_const_index_into_array_compose_folds_to_element() {
     let (folded, _) = fold_local(
         &mut arena,
         &refcounts,
-        &HashMap::new(),
+        &FxHashMap::default(),
         &types,
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
 
     assert!(

@@ -7,7 +7,7 @@
 //! entry points.  Each section is gated on liveness and on the alias
 //! plan computed up front in [`super::core::Generator::new`].
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::Error;
 
@@ -79,7 +79,7 @@ impl Enables {
         }
     }
 
-    fn scan(module: &naga::Module, live_types: &HashSet<naga::Handle<naga::Type>>) -> Self {
+    fn scan(module: &naga::Module, live_types: &FxHashSet<naga::Handle<naga::Type>>) -> Self {
         let mut e = Enables {
             mesh_shaders: module.uses_mesh_shaders(),
             ..Default::default()
@@ -232,11 +232,9 @@ fn any_expression(module: &naga::Module, pred: impl Fn(&naga::Expression) -> boo
 /// `RayIntersection`, `__modf_result_*`, `__atomic_compare_exchange_result`,
 /// ...); mirrors naga's own `is_builtin_wgsl_struct`.  Neither declared nor
 /// renamed by the emitter.
-pub(super) fn special_struct_handles(
-    module: &naga::Module,
-) -> std::collections::HashSet<naga::Handle<naga::Type>> {
+pub(super) fn special_struct_handles(module: &naga::Module) -> FxHashSet<naga::Handle<naga::Type>> {
     let st = &module.special_types;
-    let mut set: std::collections::HashSet<_> = [
+    let mut set: FxHashSet<_> = [
         st.ray_desc,
         st.ray_intersection,
         st.ray_vertex_return,
@@ -967,8 +965,8 @@ impl<'a> Generator<'a> {
             func,
             info: finfo,
             argument_names: Vec::with_capacity(func.arguments.len()),
-            local_names: HashMap::new(),
-            expr_names: HashMap::new(),
+            local_names: FxHashMap::default(),
+            expr_names: FxHashMap::default(),
             ref_counts,
             deferred_vars,
             dead_vars,
@@ -979,7 +977,7 @@ impl<'a> Generator<'a> {
             inlineable_calls,
             must_bind_loads,
             render_depth_memo: vec![0; func.expressions.len()],
-            stashed_call_depth: HashMap::new(),
+            stashed_call_depth: FxHashMap::default(),
             const_hazard_bindings: Vec::new(),
             display_name: displayed_name.to_string(),
         };

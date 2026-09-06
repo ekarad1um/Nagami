@@ -65,7 +65,9 @@ fn emit_wgsl_with_info(
 /// in order, repeated until no pass reports a change, capped at
 /// `MAX_PIPELINE_SWEEPS`.  Every declared change is validated; a failure
 /// rolls back, or escalates under
-/// [`crate::config::TraceConfig::validate_each_pass`].
+/// [`crate::config::TraceConfig::validate_each_pass`].  `info` must
+/// describe `module` as passed in; the returned info describes it as
+/// returned, so a caller never validates the same state twice.
 ///
 /// # Errors
 ///
@@ -73,20 +75,22 @@ fn emit_wgsl_with_info(
 /// failure when rollback is disabled.
 pub fn run_ir_passes(
     module: &mut naga::Module,
+    info: naga::valid::ModuleInfo,
     config: &Config,
     report: &mut Report,
-) -> Result<crate::name_map::NameLog, Error> {
+) -> Result<(crate::name_map::NameLog, naga::valid::ModuleInfo), Error> {
     let passes = crate::passes::build_ir_passes(config);
-    run_ir_passes_with(module, config, report, passes)
+    run_ir_passes_with(module, info, config, report, passes)
 }
 
 /// Driver parameterised on the pass list so tests can inject synthetic passes.
 fn run_ir_passes_with(
     module: &mut naga::Module,
+    info: naga::valid::ModuleInfo,
     config: &Config,
     report: &mut Report,
     mut passes: Vec<Box<dyn Pass>>,
-) -> Result<crate::name_map::NameLog, Error> {
+) -> Result<(crate::name_map::NameLog, naga::valid::ModuleInfo), Error> {
     let trace_run_dir = prepare_trace_dir(config)?;
     let mut sweeps = 0usize;
     // Module-scope renames across sweeps, for the name map.
@@ -96,13 +100,9 @@ fn run_ir_passes_with(
     // Trace / CI runs report every pass; the plain path skips idle ones.
     let full_fidelity = trace_enabled || needs_text_validation;
 
-    // Validator info reused by the trace / CI text emissions; plain
-    // minification emits no intermediate text and leaves it unseeded.
-    let mut current_info: Option<naga::valid::ModuleInfo> = if full_fidelity {
-        Some(io::validate_module(module)?)
-    } else {
-        None
-    };
+    // Always describes the current `module`: replaced on every accepted
+    // change, and a rollback restores the state it was computed for.
+    let mut current_info = info;
 
     // `version` counts accepted changes; `clean_at[i]` is the version at
     // which pass `i` last contributed none (no change, or rejected).  Passes
@@ -112,19 +112,18 @@ fn run_ir_passes_with(
     let mut version = 0u64;
     let mut clean_at: Vec<Option<u64>> = vec![None; passes.len()];
 
+    // Rollback state: module + name log (a stale log would report renames
+    // the shipped names lack) as of the run start, plus every accepted pass
+    // run since, in order.  A failure restores it and replays exactly those:
+    // determinism rebuilds the pre-pass state, and a rejected pass never
+    // joins the list, so a second failure cannot resurrect the first one's
+    // output.  One clone per run, taken before the first pass that runs;
+    // never under `validate_each_pass`, where every failure is an `Err`.
+    let mut backup: Option<(naga::Module, crate::name_map::NameLog)> = None;
+    let mut accepted: Vec<usize> = Vec::new();
+
     loop {
         let mut any_changed = false;
-
-        // Rollback state: module + name log (a stale log would report renames
-        // the shipped names lack) as of the sweep start, and the passes whose
-        // accepted changes it lacks.  A validation failure restores it and
-        // replays exactly those passes: determinism reproduces the pre-pass
-        // state, and a rejected pass never joins the list, so a second
-        // failure cannot resurrect the first one's output.  Taken before the
-        // first pass that runs (an all-idle sweep clones nothing); never
-        // under `validate_each_pass`, where every failure is an `Err`.
-        let mut backup: Option<(naga::Module, crate::name_map::NameLog)> = None;
-        let mut accepted: Vec<usize> = Vec::new();
 
         for i in 0..passes.len() {
             if !full_fidelity && clean_at[i] == Some(version) {
@@ -135,10 +134,7 @@ fn run_ir_passes_with(
             }
 
             let before_text = if trace_enabled {
-                let info = current_info
-                    .as_ref()
-                    .expect("current_info is seeded whenever trace/validate_each_pass is on");
-                Some(emit_wgsl_with_info(module, info)?)
+                Some(emit_wgsl_with_info(module, &current_info)?)
             } else {
                 None
             };
@@ -148,7 +144,6 @@ fn run_ir_passes_with(
             let start = Instant::now();
             let ctx = PassContext {
                 config,
-                trace_run_dir: trace_run_dir.as_deref(),
                 name_log: Some(&name_log),
             };
 
@@ -167,7 +162,7 @@ fn run_ir_passes_with(
             if declared_changed || needs_text_validation {
                 match io::validate_module(module) {
                     Ok(info) => {
-                        current_info = Some(info);
+                        current_info = info;
                         if declared_changed {
                             version += 1;
                             accepted.push(i);
@@ -187,8 +182,8 @@ fn run_ir_passes_with(
                             passes[i].name(),
                             e
                         );
-                        // Pre-pass state again, which `current_info` (if
-                        // seeded) already describes.
+                        // Pre-pass state again, which `current_info` already
+                        // describes.
                         let (saved_module, saved_log) = backup
                             .as_ref()
                             .expect("backup is taken whenever validate_each_pass is off");
@@ -214,10 +209,7 @@ fn run_ir_passes_with(
                     None
                 }
             } else if full_fidelity {
-                let info = current_info
-                    .as_ref()
-                    .expect("current_info is refreshed after every successful pass");
-                Some(emit_wgsl_with_info(module, info)?)
+                Some(emit_wgsl_with_info(module, &current_info)?)
             } else {
                 None
             };
@@ -275,9 +267,9 @@ fn run_ir_passes_with(
                 rolled_back,
             };
 
-            if trace_enabled {
+            if let Some(run_dir) = trace_run_dir.as_deref() {
                 dump_trace_step(
-                    &ctx,
+                    run_dir,
                     report.pass_reports.len(),
                     before_text
                         .as_deref()
@@ -313,7 +305,7 @@ fn run_ir_passes_with(
     }
 
     report.sweeps = sweeps;
-    Ok(name_log.into_inner())
+    Ok((name_log.into_inner(), current_info))
 }
 
 // MARK: Trace directory allocation
@@ -382,30 +374,22 @@ pub(crate) fn allocate_trace_run_dir(
 }
 
 /// Write one `step-NNN-<pass>/` directory (`before.wgsl`, `after.wgsl`,
-/// `meta.txt`) under the run's trace folder; a no-op on wasm or with
-/// tracing off.
+/// `meta.txt`) under `run_dir`; a no-op on wasm.
 fn dump_trace_step(
-    ctx: &PassContext<'_>,
+    run_dir: &std::path::Path,
     step_index: usize,
     before_text: &str,
     after_text: &str,
     report: &PassReport,
 ) -> Result<(), Error> {
-    if !ctx.config.trace.enabled {
-        return Ok(());
-    }
-
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (ctx, step_index, before_text, after_text, report);
+        let _ = (run_dir, step_index, before_text, after_text, report);
         Ok(())
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let Some(run_dir) = ctx.trace_run_dir else {
-            return Ok(());
-        };
         let step_dir = run_dir.join(format!("step-{step_index:03}-{}", report.pass_name));
         std::fs::create_dir_all(&step_dir)?;
         std::fs::write(step_dir.join("before.wgsl"), before_text)?;
@@ -574,9 +558,9 @@ mod driver_tests {
         }
     }
 
-    /// Adds `var t: u32;` once: a valid, idempotent change the rollback
-    /// tests can watch survive.
-    struct AddLocalPass;
+    /// Adds `var t: u32;` when exactly `.0` locals exist: a valid change the
+    /// rollback tests can watch survive, stageable across sweeps.
+    struct AddLocalPass(usize);
 
     impl Pass for AddLocalPass {
         fn name(&self) -> &'static str {
@@ -587,6 +571,9 @@ mod driver_tests {
             module: &mut naga::Module,
             _ctx: &PassContext<'_>,
         ) -> Result<bool, Error> {
+            if first_function(module).local_variables.len() != self.0 {
+                return Ok(false);
+            }
             let ty = module.types.insert(
                 naga::Type {
                     name: None,
@@ -595,9 +582,6 @@ mod driver_tests {
                 naga::Span::UNDEFINED,
             );
             let function = first_function(module);
-            if !function.local_variables.is_empty() {
-                return Ok(false);
-            }
             function.local_variables.append(
                 naga::LocalVariable {
                     name: Some("t".to_owned()),
@@ -642,7 +626,8 @@ mod driver_tests {
         let cfg = baseline_config(/*validate_each_pass=*/ true);
         let mut report = Report::new(0);
         let passes: Vec<Box<dyn Pass>> = vec![Box::new(CorruptingPass)];
-        let result = run_ir_passes_with(&mut module, &cfg, &mut report, passes);
+        let info = io::validate_module(&module).expect("valid input");
+        let result = run_ir_passes_with(&mut module, info, &cfg, &mut report, passes);
         match result {
             Err(Error::Validation(msg)) => {
                 assert!(
@@ -664,7 +649,8 @@ mod driver_tests {
         let cfg = baseline_config(/*validate_each_pass=*/ false);
         let mut report = Report::new(0);
         let passes: Vec<Box<dyn Pass>> = vec![Box::new(CorruptingPass)];
-        let result = run_ir_passes_with(&mut module, &cfg, &mut report, passes);
+        let info = io::validate_module(&module).expect("valid input");
+        let result = run_ir_passes_with(&mut module, info, &cfg, &mut report, passes);
         assert!(
             result.is_ok(),
             "without the flag, rollback must keep the pipeline on the happy path; got {result:?}"
@@ -693,10 +679,11 @@ mod driver_tests {
         let mut report = Report::new(0);
         let passes: Vec<Box<dyn Pass>> = vec![
             Box::new(CorruptingPass),
-            Box::new(AddLocalPass),
+            Box::new(AddLocalPass(0)),
             Box::new(CorruptingPass),
         ];
-        run_ir_passes_with(&mut module, &cfg, &mut report, passes)
+        let info = io::validate_module(&module).expect("valid input");
+        run_ir_passes_with(&mut module, info, &cfg, &mut report, passes)
             .expect("rollbacks keep the pipeline on the happy path");
         io::validate_module(&module).expect("both corruptions must be rolled back");
         let function = first_function(&mut module);
@@ -731,6 +718,33 @@ mod driver_tests {
 
     /// An idle pass is not re-run until the module changes; trace / CI
     /// modes keep every run.
+    /// The backup is taken once per run, so a rejection in sweep two must
+    /// replay sweep one's accepted work as well as its own.
+    #[test]
+    fn rollback_replays_accepted_passes_from_earlier_sweeps() {
+        let mut module = parsed_module();
+        let cfg = baseline_config(/*validate_each_pass=*/ false);
+        let mut report = Report::new(0);
+        // Sweep 1: the second pass adds the first local; sweep 2: the first
+        // pass adds the second.  The corrupting pass is rejected in both.
+        let passes: Vec<Box<dyn Pass>> = vec![
+            Box::new(AddLocalPass(1)),
+            Box::new(AddLocalPass(0)),
+            Box::new(CorruptingPass),
+        ];
+        let info = io::validate_module(&module).expect("valid input");
+        run_ir_passes_with(&mut module, info, &cfg, &mut report, passes).expect("converges");
+        io::validate_module(&module).expect("both corruptions must be rolled back");
+        assert_eq!(first_function(&mut module).local_variables.len(), 2);
+        let adds = report
+            .pass_reports
+            .iter()
+            .filter(|r| r.pass_name == "synthetic_add_local" && r.changed)
+            .count();
+        let rollbacks = report.pass_reports.iter().filter(|r| r.rolled_back).count();
+        assert_eq!((adds, rollbacks, report.sweeps), (2, 2, 3));
+    }
+
     #[test]
     fn idle_passes_are_skipped_until_the_module_changes() {
         for (validate_each_pass, expected_runs, expected_reports) in [(false, 1, 3), (true, 2, 4)] {
@@ -739,10 +753,11 @@ mod driver_tests {
             let cfg = baseline_config(validate_each_pass);
             let mut report = Report::new(0);
             let passes: Vec<Box<dyn Pass>> = vec![
-                Box::new(AddLocalPass),
+                Box::new(AddLocalPass(0)),
                 Box::new(CountingPass(Rc::clone(&runs))),
             ];
-            run_ir_passes_with(&mut module, &cfg, &mut report, passes).expect("converges");
+            let info = io::validate_module(&module).expect("valid input");
+            run_ir_passes_with(&mut module, info, &cfg, &mut report, passes).expect("converges");
             // Sweep 2 re-runs only the pass that changed (now idle) and
             // skips the one already clean at that version.
             assert_eq!(report.sweeps, 2, "validate_each_pass={validate_each_pass}");

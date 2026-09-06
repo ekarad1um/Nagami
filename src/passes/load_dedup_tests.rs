@@ -7,7 +7,6 @@ fn run_pass(source: &str) -> (bool, naga::Module) {
     let config = Config::default();
     let ctx = PassContext {
         config: &config,
-        trace_run_dir: None,
         name_log: None,
     };
 
@@ -512,10 +511,10 @@ fn trace_ray_payload_invalidates_cache_and_marks_escaped() {
     function.body = body;
 
     // Run the core redundant-load collection.
-    let mut replacements = HashMap::new();
+    let mut replacements = FxHashMap::default();
     let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
-    let mut all_loads = HashMap::new();
-    let mut seeded_by_store = HashMap::new();
+    let mut all_loads = FxHashMap::default();
+    let mut seeded_by_store = FxHashMap::default();
     let scope_idx = ExpressionScopeIndex::build(&function.body, &function.expressions);
     collect_redundant_loads(
         &function.body,
@@ -526,7 +525,7 @@ fn trace_ray_payload_invalidates_cache_and_marks_escaped() {
         &mut all_loads,
         &mut seeded_by_store,
         false,
-        &mut HashSet::new(),
+        &mut FxHashSet::default(),
     );
 
     // load2 must NOT be in replacements - TraceRay should have cleared
@@ -644,10 +643,10 @@ fn cooperative_store_through_data_pointer_invalidates_cache() {
     function.body = body;
 
     // Run the core redundant-load collection.
-    let mut replacements = HashMap::new();
+    let mut replacements = FxHashMap::default();
     let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
-    let mut all_loads = HashMap::new();
-    let mut seeded_by_store = HashMap::new();
+    let mut all_loads = FxHashMap::default();
+    let mut seeded_by_store = FxHashMap::default();
     let scope_idx = ExpressionScopeIndex::build(&function.body, &function.expressions);
     collect_redundant_loads(
         &function.body,
@@ -658,7 +657,7 @@ fn cooperative_store_through_data_pointer_invalidates_cache() {
         &mut all_loads,
         &mut seeded_by_store,
         false,
-        &mut HashSet::new(),
+        &mut FxHashSet::default(),
     );
 
     // load2 must NOT be in replacements: the CooperativeStore wrote
@@ -673,8 +672,8 @@ fn cooperative_store_through_data_pointer_invalidates_cache() {
     // Verify partial-store tracking: `mat_var` should be flagged as
     // partially-stored because the matrix write through
     // `data.pointer` may not cover the local's full type.
-    let mut escaped = HashSet::new();
-    let mut partially_stored = HashSet::new();
+    let mut escaped = FxHashSet::default();
+    let mut partially_stored = FxHashSet::default();
     collect_escaped_and_partially_stored(
         &function.body,
         &function.expressions,
@@ -780,10 +779,10 @@ fn atomic_invalidates_cache_and_counts_as_store() {
     );
 
     // Verify the load cache is invalidated by Atomic.
-    let mut replacements = HashMap::new();
+    let mut replacements = FxHashMap::default();
     let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
-    let mut all_loads = HashMap::new();
-    let mut seeded_by_store = HashMap::new();
+    let mut all_loads = FxHashMap::default();
+    let mut seeded_by_store = FxHashMap::default();
     let scope_idx = ExpressionScopeIndex::build(&function.body, &function.expressions);
     collect_redundant_loads(
         &function.body,
@@ -794,7 +793,7 @@ fn atomic_invalidates_cache_and_counts_as_store() {
         &mut all_loads,
         &mut seeded_by_store,
         false,
-        &mut HashSet::new(),
+        &mut FxHashSet::default(),
     );
 
     assert!(
@@ -1636,7 +1635,6 @@ fn run_dead_branch_then_load_dedup(source: &str) -> (bool, naga::Module) {
     let config = Config::default();
     let ctx = PassContext {
         config: &config,
-        trace_run_dir: None,
         name_log: None,
     };
 

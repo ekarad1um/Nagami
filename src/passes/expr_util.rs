@@ -1154,9 +1154,9 @@ pub fn nested_blocks_mut(stmt: &mut naga::Statement) -> NestedBlocksMut<'_> {
 /// shape is no longer allowed inside `Emit` (folded literals).  One
 /// implementation here prevents drift between per-pass copies when
 /// new control-flow statements are introduced upstream.
-pub fn rebuild_emit_ranges_after_removal(
+pub fn rebuild_emit_ranges_after_removal<S: std::hash::BuildHasher>(
     block: &mut naga::Block,
-    removed: &std::collections::HashSet<naga::Handle<naga::Expression>>,
+    removed: &std::collections::HashSet<naga::Handle<naga::Expression>, S>,
 ) {
     let original = std::mem::replace(block, naga::Block::new());
     for (mut statement, span) in original.span_into_iter() {
@@ -1222,9 +1222,10 @@ pub fn rebuild_emit_ranges_after_removal(
 /// of the map untouched - a debug build fails loudly, release builds
 /// degrade to a single-level resolution rather than hanging the
 /// pipeline.
-pub fn flatten_replacement_chains<H>(replacements: &mut std::collections::HashMap<H, H>)
+pub fn flatten_replacement_chains<H, S>(replacements: &mut std::collections::HashMap<H, H, S>)
 where
     H: Copy + Eq + std::hash::Hash,
+    S: std::hash::BuildHasher,
 {
     let keys: Vec<H> = replacements.keys().copied().collect();
     let max_hops = replacements.len();
@@ -1327,6 +1328,7 @@ fn naga_variant_tripwire(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustc_hash::FxHashMap;
 
     /// Build a minimal arena and return a real `Handle<Expression>`
     /// usable as a placeholder inside variants whose body fields the
@@ -1485,8 +1487,7 @@ mod tests {
 
     #[test]
     fn flatten_replacement_chains_collapses_transitive_edges() {
-        use std::collections::HashMap;
-        let mut m: HashMap<u32, u32> = HashMap::new();
+        let mut m: FxHashMap<u32, u32> = FxHashMap::default();
         // Build the chain `1 -> 2 -> 3 -> 4` and a standalone edge `5 -> 6`.
         m.insert(1, 2);
         m.insert(2, 3);
@@ -1501,8 +1502,7 @@ mod tests {
 
     #[test]
     fn flatten_replacement_chains_is_noop_on_direct_edges() {
-        use std::collections::HashMap;
-        let mut m: HashMap<u32, u32> = HashMap::new();
+        let mut m: FxHashMap<u32, u32> = FxHashMap::default();
         m.insert(1, 10);
         m.insert(2, 20);
         flatten_replacement_chains(&mut m);
@@ -1522,7 +1522,7 @@ mod tests {
         // bound the inner `while let Some(&next) = ...` would loop
         // forever; with it, the function returns in at most `len`
         // iterations per key and leaves the map in a consistent state.
-        let mut m: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut m: FxHashMap<u32, u32> = FxHashMap::default();
         m.insert(1, 2);
         m.insert(2, 1);
 
@@ -1541,7 +1541,7 @@ mod tests {
         // Same defence in depth as the two-node cycle above, but with
         // `1 -> 2 -> 3 -> 1` so the hop count must reach 3 before the
         // guard kicks in.
-        let mut m: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut m: FxHashMap<u32, u32> = FxHashMap::default();
         m.insert(1, 2);
         m.insert(2, 3);
         m.insert(3, 1);

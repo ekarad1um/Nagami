@@ -23,7 +23,7 @@
 //! same conformance-tolerance doctrine as the float divide/modulo folds,
 //! not bit-identical.  Overflow- and NaN-sensitive cases decline.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use naga::Handle;
 
@@ -118,7 +118,7 @@ impl Pass for ConstFoldPass {
             // checks the original count, not whatever it would be
             // mid-loop after partial rewrites.
             let refcounts = count_handle_refs(function);
-            let emit_ranges = build_emit_range_map(&function.body);
+            let emit_ranges = build_emit_range_map(&function.body, function.expressions.len());
             let (folded, simplified) = fold_local_expressions(
                 &mut function.expressions,
                 &refcounts,
@@ -135,7 +135,8 @@ impl Pass for ConstFoldPass {
         }
         for entry in module.entry_points.iter_mut() {
             let refcounts = count_handle_refs(&entry.function);
-            let emit_ranges = build_emit_range_map(&entry.function.body);
+            let emit_ranges =
+                build_emit_range_map(&entry.function.body, entry.function.expressions.len());
             let (folded, simplified) = fold_local_expressions(
                 &mut entry.function.expressions,
                 &refcounts,
@@ -164,13 +165,13 @@ impl Pass for ConstFoldPass {
 /// the inner materialisation pass stays `O(1)` per handle.
 fn fold_global_expressions(
     module: &mut naga::Module,
-    vector_type_cache: &HashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>>,
+    vector_type_cache: &FxHashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>>,
 ) -> usize {
     let const_inits = module
         .constants
         .iter()
         .map(|(h, c)| (h, c.init))
-        .collect::<HashMap<_, _>>();
+        .collect::<FxHashMap<_, _>>();
 
     let handles = module
         .global_expressions
@@ -186,7 +187,7 @@ fn fold_global_expressions(
     // identical optimisation in `fold_local_expressions`).  The memo
     // survives the in-loop rewrites because they only ever replace an
     // expression with a same-value Literal / Compose (see `ConstValueMemo`).
-    let mut visiting = HashSet::new();
+    let mut visiting = FxHashSet::default();
     let mut memo: ConstValueMemo = vec![None; module.global_expressions.len()];
     for handle in handles {
         visiting.clear();
@@ -249,19 +250,19 @@ fn fold_global_expressions(
 /// guard is defensive against future relaxation.
 fn build_constant_literal_cache(
     module: &naga::Module,
-) -> HashMap<naga::Handle<naga::Constant>, naga::Literal> {
+) -> FxHashMap<naga::Handle<naga::Constant>, naga::Literal> {
     let const_inits = module
         .constants
         .iter()
         .map(|(h, c)| (h, c.init))
-        .collect::<HashMap<_, _>>();
+        .collect::<FxHashMap<_, _>>();
     let context = GlobalLiteralContext {
         arena: &module.global_expressions,
         const_inits: &const_inits,
     };
 
-    let mut out = HashMap::new();
-    let mut visiting = HashSet::new();
+    let mut out = FxHashMap::default();
+    let mut visiting = FxHashSet::default();
     for (ch, c) in module.constants.iter() {
         visiting.clear();
         if let Some(lit) = resolve_literal(c.init, &context, &mut visiting) {
@@ -345,10 +346,12 @@ fn count_handle_refs(function: &naga::Function) -> Vec<u32> {
     counts
 }
 
-/// Map every materialised expression handle to the id of the
-/// `Statement::Emit` range that produces it.  Two handles share an id
-/// IFF the *same* `Emit` statement materialises both - i.e. no
-/// statement of any kind separates them in program order.
+const NO_EMIT: u32 = u32::MAX;
+
+/// Per-handle id of the `Statement::Emit` range that materialises it
+/// (`NO_EMIT` when none does).  Two handles share an id IFF the *same*
+/// `Emit` statement materialises both - i.e. no statement of any kind
+/// separates them in program order.
 ///
 /// The identity / involution folds consult this to decide when an
 /// impure operand (a `Load`) may be relocated to its consumer's `Emit`
@@ -365,15 +368,15 @@ fn count_handle_refs(function: &naga::Function) -> Vec<u32> {
 /// blocks never collide on an id; the map is read-only for the duration
 /// of one fold pass (the body's `Emit` ranges are rebuilt only
 /// afterwards by `rebuild_emit_ranges_after_removal`).
-fn build_emit_range_map(body: &naga::Block) -> HashMap<naga::Handle<naga::Expression>, usize> {
-    let mut map = HashMap::new();
-    let mut next_id = 0usize;
+fn build_emit_range_map(body: &naga::Block, expression_count: usize) -> Vec<u32> {
+    let mut map = vec![NO_EMIT; expression_count];
+    let mut next_id = 0u32;
     crate::passes::expr_util::for_each_statement(body, &mut |stmt| {
         if let naga::Statement::Emit(range) = stmt {
             let id = next_id;
             next_id += 1;
             for h in range.clone() {
-                map.insert(h, id);
+                map[h.index()] = id;
             }
         }
     });
@@ -396,24 +399,27 @@ fn build_emit_range_map(body: &naga::Block) -> HashMap<naga::Handle<naga::Expres
 fn fold_local_expressions(
     arena: &mut naga::Arena<naga::Expression>,
     refcounts: &[u32],
-    emit_ranges: &HashMap<naga::Handle<naga::Expression>, usize>,
-    const_literals: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
+    emit_ranges: &[u32],
+    const_literals: &FxHashMap<naga::Handle<naga::Constant>, naga::Literal>,
     types: &naga::UniqueArena<naga::Type>,
-    vector_type_cache: &HashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>>,
-) -> (HashSet<naga::Handle<naga::Expression>>, usize) {
+    vector_type_cache: &FxHashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>>,
+) -> (FxHashSet<naga::Handle<naga::Expression>>, usize) {
     // Two handles are co-located (no statement, hence no memory write,
     // between them) when they belong to the same `Emit` range.  Absent
-    // ids default to "not co-located" - sound: it only ever suppresses
-    // an impure-operand relocation.
-    let same_emit_range = |a: naga::Handle<naga::Expression>, b: naga::Handle<naga::Expression>| {
-        emit_ranges
-            .get(&a)
-            .zip(emit_ranges.get(&b))
-            .is_some_and(|(x, y)| x == y)
-    };
+    // ids (`NO_EMIT`, or a handle appended past the map by this fold)
+    // default to "not co-located" - sound: it only ever suppresses an
+    // impure-operand relocation.
+    let same_emit_range =
+        |a: naga::Handle<naga::Expression>, b: naga::Handle<naga::Expression>| match (
+            emit_ranges.get(a.index()),
+            emit_ranges.get(b.index()),
+        ) {
+            (Some(&x), Some(&y)) => x != NO_EMIT && x == y,
+            _ => false,
+        };
     let mut handles = Vec::with_capacity(arena.len());
     handles.extend(arena.iter().map(|(h, _)| h));
-    let mut folded = HashSet::new();
+    let mut folded = FxHashSet::default();
 
     // O(N) one-time setup for O(1) materialize_vector lookups.
     // The literal cache maps each scalar literal -> smallest handle carrying
@@ -429,7 +435,7 @@ fn fold_local_expressions(
     // in-loop rewrites (same-value Literal / Compose only; see
     // `ConstValueMemo`) - without it every handle re-descends its whole
     // operand chain, quadratic on the deep chains load_dedup builds.
-    let mut visiting = HashSet::new();
+    let mut visiting = FxHashSet::default();
     let mut memo: ConstValueMemo = vec![None; arena.len()];
     for handle in handles.iter().copied() {
         visiting.clear();
@@ -692,13 +698,13 @@ trait LiteralContext {
     fn resolve_constant(
         &self,
         handle: naga::Handle<naga::Constant>,
-        visiting: &mut HashSet<naga::Handle<naga::Expression>>,
+        visiting: &mut FxHashSet<naga::Handle<naga::Expression>>,
     ) -> Option<naga::Literal>;
 }
 
 struct GlobalLiteralContext<'a> {
     arena: &'a naga::Arena<naga::Expression>,
-    const_inits: &'a HashMap<naga::Handle<naga::Constant>, naga::Handle<naga::Expression>>,
+    const_inits: &'a FxHashMap<naga::Handle<naga::Constant>, naga::Handle<naga::Expression>>,
 }
 
 impl LiteralContext for GlobalLiteralContext<'_> {
@@ -709,7 +715,7 @@ impl LiteralContext for GlobalLiteralContext<'_> {
     fn resolve_constant(
         &self,
         handle: naga::Handle<naga::Constant>,
-        visiting: &mut HashSet<naga::Handle<naga::Expression>>,
+        visiting: &mut FxHashSet<naga::Handle<naga::Expression>>,
     ) -> Option<naga::Literal> {
         let init = *self.const_inits.get(&handle)?;
         resolve_literal(init, self, visiting)
@@ -770,7 +776,7 @@ trait ConstFoldContext {
     fn resolve_constant_value(
         &self,
         handle: naga::Handle<naga::Constant>,
-        visiting: &mut HashSet<Handle<naga::Expression>>,
+        visiting: &mut FxHashSet<Handle<naga::Expression>>,
         memo: &mut ConstValueMemo,
     ) -> Option<ConstValue>;
 }
@@ -778,7 +784,7 @@ trait ConstFoldContext {
 struct GlobalConstFoldContext<'a> {
     arena: &'a naga::Arena<naga::Expression>,
     types: &'a naga::UniqueArena<naga::Type>,
-    const_inits: &'a HashMap<naga::Handle<naga::Constant>, naga::Handle<naga::Expression>>,
+    const_inits: &'a FxHashMap<naga::Handle<naga::Constant>, naga::Handle<naga::Expression>>,
 }
 
 impl ConstFoldContext for GlobalConstFoldContext<'_> {
@@ -791,7 +797,7 @@ impl ConstFoldContext for GlobalConstFoldContext<'_> {
     fn resolve_constant_value(
         &self,
         handle: naga::Handle<naga::Constant>,
-        visiting: &mut HashSet<Handle<naga::Expression>>,
+        visiting: &mut FxHashSet<Handle<naga::Expression>>,
         memo: &mut ConstValueMemo,
     ) -> Option<ConstValue> {
         let init = *self.const_inits.get(&handle)?;
@@ -802,7 +808,7 @@ impl ConstFoldContext for GlobalConstFoldContext<'_> {
 struct LocalConstFoldContext<'a> {
     arena: &'a naga::Arena<naga::Expression>,
     types: &'a naga::UniqueArena<naga::Type>,
-    const_literals: &'a HashMap<naga::Handle<naga::Constant>, naga::Literal>,
+    const_literals: &'a FxHashMap<naga::Handle<naga::Constant>, naga::Literal>,
 }
 
 impl ConstFoldContext for LocalConstFoldContext<'_> {
@@ -815,7 +821,7 @@ impl ConstFoldContext for LocalConstFoldContext<'_> {
     fn resolve_constant_value(
         &self,
         handle: naga::Handle<naga::Constant>,
-        _visiting: &mut HashSet<Handle<naga::Expression>>,
+        _visiting: &mut FxHashSet<Handle<naga::Expression>>,
         _memo: &mut ConstValueMemo,
     ) -> Option<ConstValue> {
         self.const_literals
@@ -897,7 +903,7 @@ fn cast_width8_to(src: naga::Literal, target: naga::Scalar) -> Option<naga::Lite
 fn resolve_const_value<C: ConstFoldContext>(
     handle: Handle<naga::Expression>,
     ctx: &C,
-    visiting: &mut HashSet<Handle<naga::Expression>>,
+    visiting: &mut FxHashSet<Handle<naga::Expression>>,
     memo: &mut ConstValueMemo,
 ) -> Option<ConstValue> {
     if let Some(Some(cached)) = memo.get(handle.index()) {
@@ -923,7 +929,7 @@ fn resolve_const_value<C: ConstFoldContext>(
 fn resolve_const_value_uncached<C: ConstFoldContext>(
     handle: Handle<naga::Expression>,
     ctx: &C,
-    visiting: &mut HashSet<Handle<naga::Expression>>,
+    visiting: &mut FxHashSet<Handle<naga::Expression>>,
     memo: &mut ConstValueMemo,
 ) -> Option<ConstValue> {
     let expr = &ctx.arena()[handle];
@@ -1110,7 +1116,7 @@ fn resolve_composite_element<C: ConstFoldContext>(
     base: Handle<naga::Expression>,
     idx: usize,
     ctx: &C,
-    visiting: &mut HashSet<Handle<naga::Expression>>,
+    visiting: &mut FxHashSet<Handle<naga::Expression>>,
     memo: &mut ConstValueMemo,
 ) -> Option<ConstValue> {
     match &ctx.arena()[base] {
@@ -1153,7 +1159,7 @@ fn resolve_vector_component<C: ConstFoldContext>(
     base: Handle<naga::Expression>,
     idx: usize,
     ctx: &C,
-    visiting: &mut HashSet<Handle<naga::Expression>>,
+    visiting: &mut FxHashSet<Handle<naga::Expression>>,
     memo: &mut ConstValueMemo,
 ) -> Option<ConstValue> {
     match resolve_const_value(base, ctx, visiting, memo)? {
@@ -1197,7 +1203,7 @@ fn resolve_compose<C: ConstFoldContext>(
     ty: Handle<naga::Type>,
     components: &[Handle<naga::Expression>],
     ctx: &C,
-    visiting: &mut HashSet<Handle<naga::Expression>>,
+    visiting: &mut FxHashSet<Handle<naga::Expression>>,
     memo: &mut ConstValueMemo,
 ) -> Option<ConstValue> {
     let inner = &ctx.types()[ty].inner;
@@ -1396,8 +1402,8 @@ fn materialize_vector(
     literals: &[naga::Literal],
     size: naga::VectorSize,
     scalar: naga::Scalar,
-    literal_cache: &HashMap<LiteralKey, Handle<naga::Expression>>,
-    vector_type_cache: &HashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>>,
+    literal_cache: &FxHashMap<LiteralKey, Handle<naga::Expression>>,
+    vector_type_cache: &FxHashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>>,
 ) -> Option<naga::Expression> {
     let ty = *vector_type_cache.get(&(size, scalar))?;
 
@@ -1463,8 +1469,8 @@ fn literal_key(lit: naga::Literal) -> LiteralKey {
 /// the invariant as the fold pass writes new literals into the arena.
 fn build_literal_cache(
     arena: &naga::Arena<naga::Expression>,
-) -> HashMap<LiteralKey, Handle<naga::Expression>> {
-    let mut cache: HashMap<LiteralKey, Handle<naga::Expression>> = HashMap::new();
+) -> FxHashMap<LiteralKey, Handle<naga::Expression>> {
+    let mut cache: FxHashMap<LiteralKey, Handle<naga::Expression>> = FxHashMap::default();
     for (h, expr) in arena.iter() {
         if let naga::Expression::Literal(lit) = expr {
             cache
@@ -1485,8 +1491,8 @@ fn build_literal_cache(
 /// result type without scanning the type arena each call.
 fn build_vector_type_cache(
     types: &naga::UniqueArena<naga::Type>,
-) -> HashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>> {
-    let mut cache = HashMap::new();
+) -> FxHashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>> {
+    let mut cache = FxHashMap::default();
     for (h, t) in types.iter() {
         if let naga::TypeInner::Vector { size, scalar } = t.inner {
             cache.entry((size, scalar)).or_insert(h);
@@ -1500,7 +1506,7 @@ fn build_vector_type_cache(
 /// branch writes a new `Literal` into the arena so subsequent
 /// [`materialize_vector`] calls can find it.
 fn note_literal_in_cache(
-    cache: &mut HashMap<LiteralKey, Handle<naga::Expression>>,
+    cache: &mut FxHashMap<LiteralKey, Handle<naga::Expression>>,
     handle: Handle<naga::Expression>,
     literal: naga::Literal,
 ) {
@@ -1523,7 +1529,7 @@ fn note_literal_in_cache(
 fn resolve_literal<C: LiteralContext>(
     handle: naga::Handle<naga::Expression>,
     context: &C,
-    visiting: &mut HashSet<naga::Handle<naga::Expression>>,
+    visiting: &mut FxHashSet<naga::Handle<naga::Expression>>,
 ) -> Option<naga::Literal> {
     if !visiting.insert(handle) {
         return None;

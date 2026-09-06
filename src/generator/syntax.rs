@@ -17,7 +17,7 @@
 use crate::config::{FloatPrecision, PrecisionMode};
 use crate::error::Error;
 use naga::proc::TypeResolution;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 // MARK: Literal formatting
 
@@ -772,7 +772,7 @@ pub(super) fn vector_size_num(size: naga::VectorSize) -> u8 {
 pub(super) fn type_resolution_name(
     resolution: &TypeResolution,
     module: &naga::Module,
-    struct_names: &HashMap<naga::Handle<naga::Type>, String>,
+    struct_names: &FxHashMap<naga::Handle<naga::Type>, String>,
     override_names: &[String],
 ) -> Result<String, Error> {
     match resolution {
@@ -811,7 +811,7 @@ pub(super) fn type_resolution_name(
 pub(super) fn type_inner_name(
     inner: &naga::TypeInner,
     module: &naga::Module,
-    struct_names: &HashMap<naga::Handle<naga::Type>, String>,
+    struct_names: &FxHashMap<naga::Handle<naga::Type>, String>,
     override_names: &[String],
 ) -> Result<String, Error> {
     Ok(match inner {
@@ -941,7 +941,7 @@ pub(super) fn type_inner_name(
 pub(super) fn type_ref_from_handle(
     ty: naga::Handle<naga::Type>,
     module: &naga::Module,
-    struct_names: &HashMap<naga::Handle<naga::Type>, String>,
+    struct_names: &FxHashMap<naga::Handle<naga::Type>, String>,
     override_names: &[String],
 ) -> Result<String, Error> {
     if let Some(name) = struct_names.get(&ty) {

@@ -40,7 +40,7 @@
 //! it lives at emit time in `generator::stmt_emit` (search for
 //! "flip the condition").
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::expr_util::{nested_blocks, nested_blocks_mut};
 use crate::error::Error;
@@ -222,8 +222,8 @@ fn forward_single_store_locals(function: &mut naga::Function) -> bool {
     }
 
     // === Locate the forwards that satisfy block-local dominance ===
-    let mut redirects: HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>> =
-        HashMap::new();
+    let mut redirects: FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>> =
+        FxHashMap::default();
     let mut remove_store = vec![false; nlocals];
     let census = ForwardCensus {
         candidate: &candidate,
@@ -306,11 +306,11 @@ fn collect_forwards(
     block: &naga::Block,
     exprs: &naga::Arena<naga::Expression>,
     census: &ForwardCensus<'_>,
-    redirects: &mut HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    redirects: &mut FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
     remove_store: &mut [bool],
 ) {
     // Top-level candidate stores in this block, keyed by local, with index.
-    let mut store_idx: HashMap<usize, usize> = HashMap::new();
+    let mut store_idx: FxHashMap<usize, usize> = FxHashMap::default();
     for (i, stmt) in block.iter().enumerate() {
         if let naga::Statement::Store { pointer, .. } = stmt
             && let naga::Expression::LocalVariable(l) = exprs[*pointer]
@@ -332,7 +332,8 @@ fn collect_forwards(
     // recursion below reaches it, never forwarded out to an enclosing store
     // (which could fold a loop-invariant into a guard and expose an infinite
     // loop Tint rejects).
-    let mut found: HashMap<usize, HashSet<naga::Handle<naga::Expression>>> = HashMap::new();
+    let mut found: FxHashMap<usize, FxHashSet<naga::Handle<naga::Expression>>> =
+        FxHashMap::default();
     for (i, stmt) in block.iter().enumerate() {
         let naga::Statement::Emit(range) = stmt else {
             continue;
@@ -384,7 +385,7 @@ fn collect_forwards(
 /// Apply the load-redirect map to every statement (recursively).
 fn remap_block_handles(
     block: &mut naga::Block,
-    redirects: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    redirects: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
 ) {
     for stmt in block.iter_mut() {
         super::expr_util::remap_statement_handles(stmt, &mut |h| *redirects.get(&h).unwrap_or(&h));
@@ -880,7 +881,7 @@ fn statement_has_result_producer(stmt: &naga::Statement) -> bool {
 fn eliminate_dead_branches(
     block: &mut naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    const_lits: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
+    const_lits: &FxHashMap<naga::Handle<naga::Constant>, naga::Literal>,
     in_loop: bool,
     break_binds_to_loop: bool,
 ) -> usize {
@@ -1428,7 +1429,7 @@ fn case_body_terminates_beyond_switch(block: &naga::Block) -> bool {
 fn resolve_switch_value(
     handle: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
-    const_lits: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
+    const_lits: &FxHashMap<naga::Handle<naga::Constant>, naga::Literal>,
 ) -> Option<naga::SwitchValue> {
     match resolve_to_literal(expressions, handle, const_lits)? {
         naga::Literal::I32(v) => Some(naga::SwitchValue::I32(v)),
@@ -1912,7 +1913,7 @@ enum KnownValue {
 /// re-borrowing `module.constants` in the inner loop.
 fn build_const_literal_cache(
     module: &naga::Module,
-) -> HashMap<naga::Handle<naga::Constant>, naga::Literal> {
+) -> FxHashMap<naga::Handle<naga::Constant>, naga::Literal> {
     module
         .constants
         .iter()
@@ -1933,8 +1934,8 @@ fn build_const_literal_cache(
 fn init_known_values(
     locals: &naga::Arena<naga::LocalVariable>,
     expressions: &naga::Arena<naga::Expression>,
-    const_lits: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
-) -> HashMap<naga::Handle<naga::LocalVariable>, KnownValue> {
+    const_lits: &FxHashMap<naga::Handle<naga::Constant>, naga::Literal>,
+) -> FxHashMap<naga::Handle<naga::LocalVariable>, KnownValue> {
     locals
         .iter()
         .filter_map(|(lh, lv)| match lv.init {
@@ -1957,7 +1958,7 @@ fn init_known_values(
 /// Returns the change count so the caller can aggregate.
 fn eliminate_redundant_else_stores_in_function(
     function: &mut naga::Function,
-    const_lits: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
+    const_lits: &FxHashMap<naga::Handle<naga::Constant>, naga::Literal>,
 ) -> usize {
     let mut known_values = ScopedMap::new();
     for (lh, kv) in init_known_values(&function.local_variables, &function.expressions, const_lits)
@@ -1971,7 +1972,7 @@ fn eliminate_redundant_else_stores_in_function(
     // d = false; if t {...}`) reflects the value BEFORE the store, so
     // narrowing on it would clobber the correct post-store known value and
     // drop a live branch.  See `condition_load_is_fresh`.
-    let mut fresh_loads = HashMap::new();
+    let mut fresh_loads = FxHashMap::default();
     eliminate_redundant_else_stores(
         &mut function.body,
         &function.expressions,
@@ -1991,7 +1992,7 @@ fn eliminate_redundant_else_stores_in_function(
 fn condition_load_is_fresh(
     condition: &naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
-    fresh_loads: &HashMap<naga::Handle<naga::LocalVariable>, naga::Handle<naga::Expression>>,
+    fresh_loads: &FxHashMap<naga::Handle<naga::LocalVariable>, naga::Handle<naga::Expression>>,
 ) -> bool {
     match &expressions[*condition] {
         naga::Expression::Load { pointer } => {
@@ -2022,9 +2023,9 @@ fn condition_load_is_fresh(
 fn eliminate_redundant_else_stores(
     block: &mut naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    const_lits: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
+    const_lits: &FxHashMap<naga::Handle<naga::Constant>, naga::Literal>,
     known_values: &mut ScopedMap<naga::Handle<naga::LocalVariable>, KnownValue>,
-    fresh_loads: &mut HashMap<naga::Handle<naga::LocalVariable>, naga::Handle<naga::Expression>>,
+    fresh_loads: &mut FxHashMap<naga::Handle<naga::LocalVariable>, naga::Handle<naga::Expression>>,
 ) -> usize {
     let mut changed = 0usize;
 
@@ -2109,7 +2110,7 @@ fn eliminate_redundant_else_stores(
                 // modified in either branch.  Logged so outer scopes can
                 // roll back if needed.  A branch may conditionally store a
                 // local, so any prior load of it is no longer fresh.
-                let mut modified = HashSet::new();
+                let mut modified = FxHashSet::default();
                 collect_modified_locals(accept, expressions, &mut modified);
                 collect_modified_locals(reject, expressions, &mut modified);
                 for lh in modified {
@@ -2169,7 +2170,7 @@ fn eliminate_redundant_else_stores(
                     );
                     known_values.rollback_to(cp);
                 }
-                let mut modified = HashSet::new();
+                let mut modified = FxHashSet::default();
                 for case in cases.iter() {
                     collect_modified_locals(&case.body, expressions, &mut modified);
                 }
@@ -2187,7 +2188,7 @@ fn eliminate_redundant_else_stores(
                 // known-value set before recursing.  The removals are
                 // permanent (persisted past the loop); the body's interior
                 // mutations are rolled back after the loop body is done.
-                let mut modified = HashSet::new();
+                let mut modified = FxHashSet::default();
                 collect_modified_locals(body, expressions, &mut modified);
                 collect_modified_locals(continuing, expressions, &mut modified);
 
@@ -2307,8 +2308,8 @@ fn narrow_for_reject(
 fn block_only_has_redundant_known_stores(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    known_values: &HashMap<naga::Handle<naga::LocalVariable>, KnownValue>,
-    const_lits: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
+    known_values: &FxHashMap<naga::Handle<naga::LocalVariable>, KnownValue>,
+    const_lits: &FxHashMap<naga::Handle<naga::Constant>, naga::Literal>,
 ) -> bool {
     let mut has_store = false;
     for stmt in block.iter() {
@@ -2353,7 +2354,7 @@ fn expr_matches_known(
     expressions: &naga::Arena<naga::Expression>,
     handle: naga::Handle<naga::Expression>,
     known: &KnownValue,
-    const_lits: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
+    const_lits: &FxHashMap<naga::Handle<naga::Constant>, naga::Literal>,
 ) -> bool {
     match known {
         KnownValue::Zero => is_zero_value(expressions, handle, const_lits),
@@ -2395,7 +2396,7 @@ fn literal_bit_eq(a: &naga::Literal, b: &naga::Literal) -> bool {
 fn resolve_to_literal(
     expressions: &naga::Arena<naga::Expression>,
     handle: naga::Handle<naga::Expression>,
-    const_lits: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
+    const_lits: &FxHashMap<naga::Handle<naga::Constant>, naga::Literal>,
 ) -> Option<naga::Literal> {
     match &expressions[handle] {
         naga::Expression::Literal(lit) => Some(*lit),
@@ -2408,7 +2409,7 @@ fn resolve_to_literal(
 fn is_zero_value(
     expressions: &naga::Arena<naga::Expression>,
     handle: naga::Handle<naga::Expression>,
-    const_lits: &HashMap<naga::Handle<naga::Constant>, naga::Literal>,
+    const_lits: &FxHashMap<naga::Handle<naga::Constant>, naga::Literal>,
 ) -> bool {
     match &expressions[handle] {
         naga::Expression::Literal(lit) => is_zero_literal(lit),

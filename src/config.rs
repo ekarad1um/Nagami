@@ -85,8 +85,8 @@ pub enum Profile {
 /// Configuration for per-pass diagnostic tracing.
 ///
 /// Tracing is opt-in and off the hot path: when `enabled` is `false` the
-/// pipeline never emits intermediate text, validates only once per run,
-/// and skips trace directory allocation.
+/// pipeline never emits intermediate text, validates only after accepted
+/// changes, and skips trace directory allocation.
 #[derive(Debug, Clone, Default)]
 pub struct TraceConfig {
     /// Master switch for per-pass before/after dumps to disk.

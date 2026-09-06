@@ -104,7 +104,6 @@ fn fs_main() -> @location(0) vec4f {
         let config = Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
 
@@ -146,7 +145,6 @@ fn another(y: f32) -> f32 {
         let config = Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
 

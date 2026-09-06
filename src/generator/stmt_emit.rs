@@ -8,6 +8,7 @@
 //! decision itself lives in `module_emit::find_inlineable_calls`.
 
 use crate::error::Error;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::core::{FunctionCtx, Generator};
 
@@ -122,7 +123,7 @@ fn count_inline_emissions(
     root: naga::Handle<naga::Expression>,
     target: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
-    cache: &mut std::collections::HashMap<naga::Handle<naga::Expression>, usize>,
+    cache: &mut FxHashMap<naga::Handle<naga::Expression>, usize>,
 ) -> usize {
     if root == target {
         return 1;
@@ -146,14 +147,13 @@ fn count_update_stmt_emissions(
     stmt: &naga::Statement,
     target: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
-    cache: &mut std::collections::HashMap<naga::Handle<naga::Expression>, usize>,
+    cache: &mut FxHashMap<naga::Handle<naga::Expression>, usize>,
 ) -> usize {
     let mut total = 0usize;
-    let mut add =
-        |h: naga::Handle<naga::Expression>,
-         cache: &mut std::collections::HashMap<naga::Handle<naga::Expression>, usize>| {
-            total += count_inline_emissions(h, target, expressions, cache);
-        };
+    let mut add = |h: naga::Handle<naga::Expression>,
+                   cache: &mut FxHashMap<naga::Handle<naga::Expression>, usize>| {
+        total += count_inline_emissions(h, target, expressions, cache);
+    };
     match stmt {
         naga::Statement::Store { pointer, value } => {
             add(*pointer, cache);
@@ -320,7 +320,7 @@ pub(super) fn for_header_exceeds_depth_cap(
     fn depth(
         h: naga::Handle<naga::Expression>,
         expressions: &naga::Arena<naga::Expression>,
-        memo: &mut std::collections::HashMap<naga::Handle<naga::Expression>, u16>,
+        memo: &mut FxHashMap<naga::Handle<naga::Expression>, u16>,
     ) -> u16 {
         if let Some(&d) = memo.get(&h) {
             return d;
@@ -339,7 +339,7 @@ pub(super) fn for_header_exceeds_depth_cap(
         memo.insert(h, d);
         d
     }
-    let mut memo = std::collections::HashMap::new();
+    let mut memo = FxHashMap::default();
     let mut exceeded = depth(shape.condition, expressions, &mut memo) > MAX_RENDER_DEPTH;
     if let Some(stmt) = shape.update_stmt {
         crate::passes::expr_util::visit_statement_expression_handles(stmt, false, &mut |h| {
@@ -387,7 +387,7 @@ pub(super) fn for_loop_preload_inlining_is_safe(
     body: &naga::Block,
     continuing: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    must_bind_loads: &std::collections::HashSet<naga::Handle<naga::Expression>>,
+    must_bind_loads: &FxHashSet<naga::Handle<naga::Expression>>,
 ) -> bool {
     // The update clause is RELOCATED into the `for(...; ...; update)` header,
     // which is emitted BEFORE the body.  A `Load` that must be bound (its place
@@ -413,7 +413,7 @@ pub(super) fn for_loop_preload_inlining_is_safe(
     {
         let update_hazard = stmt_references_must_bind_load(stmt, must_bind_loads, expressions)
             || shape.update_preloads.iter().any(|&(pointer, _)| {
-                let mut visited = std::collections::HashSet::new();
+                let mut visited = FxHashSet::default();
                 cone_intersects_set(pointer, must_bind_loads, expressions, &mut visited)
             });
         if update_hazard {
@@ -447,7 +447,7 @@ pub(super) fn for_loop_preload_inlining_is_safe(
             &[]
         };
         let continuing_stmts: Vec<_> = continuing.iter().collect();
-        let mut cache = std::collections::HashMap::new();
+        let mut cache = FxHashMap::default();
         for &(_, result) in &shape.guard_preloads {
             if stmts_use_expr(tail, result, expressions)
                 || stmts_use_expr(&continuing_stmts, result, expressions)
@@ -473,7 +473,7 @@ pub(super) fn for_loop_preload_inlining_is_safe(
             }
         }
         Some(stmt) => {
-            let mut cache = std::collections::HashMap::new();
+            let mut cache = FxHashMap::default();
             for &(_, result) in &shape.update_preloads {
                 cache.clear();
                 if count_update_stmt_emissions(stmt, result, expressions, &mut cache) != 1 {
@@ -494,10 +494,10 @@ pub(super) fn for_loop_preload_inlining_is_safe(
 /// load which the must-bind analysis requires be `let`-bound.
 fn stmt_references_must_bind_load(
     stmt: &naga::Statement,
-    set: &std::collections::HashSet<naga::Handle<naga::Expression>>,
+    set: &FxHashSet<naga::Handle<naga::Expression>>,
     expressions: &naga::Arena<naga::Expression>,
 ) -> bool {
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = FxHashSet::default();
     let mut found = false;
     crate::passes::expr_util::visit_statement_expression_handles(stmt, false, &mut |root| {
         if !found {
@@ -512,9 +512,9 @@ fn stmt_references_must_bind_load(
 /// proven-absent nodes so a shared sub-DAG is walked once.
 fn cone_intersects_set(
     root: naga::Handle<naga::Expression>,
-    set: &std::collections::HashSet<naga::Handle<naga::Expression>>,
+    set: &FxHashSet<naga::Handle<naga::Expression>>,
     expressions: &naga::Arena<naga::Expression>,
-    visited: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+    visited: &mut FxHashSet<naga::Handle<naga::Expression>>,
 ) -> bool {
     if set.contains(&root) {
         return true;
@@ -544,7 +544,7 @@ fn expr_subtree_contains(
     // shared sub-DAG is explored once - without this the path count through a
     // diamond-shaped expression DAG is super-linear.  Mirrors the memo in the
     // sibling `count_inline_emissions`.
-    visited: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+    visited: &mut FxHashSet<naga::Handle<naga::Expression>>,
 ) -> bool {
     if root == target {
         return true;
@@ -578,7 +578,7 @@ fn stmt_uses_expr(
     expressions: &naga::Arena<naga::Expression>,
 ) -> bool {
     // One memo per (target) query, shared across this statement's operands.
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = FxHashSet::default();
     let mut found = false;
     crate::passes::expr_util::visit_statement_expression_handles(
         stmt,
@@ -725,7 +725,7 @@ fn tail_cone_has_stashed_call(tail: &Option<naga::Statement>, ctx: &FunctionCtx<
         _ => return false,
     };
     let mut stack = vec![root];
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = FxHashSet::default();
     while let Some(h) = stack.pop() {
         if !seen.insert(h) {
             continue;

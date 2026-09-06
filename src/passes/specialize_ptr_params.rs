@@ -18,7 +18,7 @@
 //!
 //! Runs once from [`crate::run`], only after validation failed.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// Parameter positions naga's validator rejects; mirrors `valid::function`
 /// so trigger and rejection cannot drift.
@@ -46,7 +46,7 @@ fn call_spec_key(
     callee: naga::Handle<naga::Function>,
     arguments: &[naga::Handle<naga::Expression>],
     caller_exprs: &naga::Arena<naga::Expression>,
-    banned: &HashMap<naga::Handle<naga::Function>, Vec<u32>>,
+    banned: &FxHashMap<naga::Handle<naga::Function>, Vec<u32>>,
 ) -> Option<SpecKey> {
     let positions = banned.get(&callee)?;
     let mut roots = Vec::with_capacity(positions.len());
@@ -63,7 +63,7 @@ fn call_spec_key(
 fn collect_keys_in_block(
     block: &naga::Block,
     caller_exprs: &naga::Arena<naga::Expression>,
-    banned: &HashMap<naga::Handle<naga::Function>, Vec<u32>>,
+    banned: &FxHashMap<naga::Handle<naga::Function>, Vec<u32>>,
     out: &mut Vec<SpecKey>,
 ) {
     super::expr_util::for_each_statement(block, &mut |stmt| {
@@ -85,8 +85,8 @@ fn collect_keys_in_block(
 fn rewrite_calls_in_block(
     block: &mut naga::Block,
     caller_exprs: &naga::Arena<naga::Expression>,
-    banned: &HashMap<naga::Handle<naga::Function>, Vec<u32>>,
-    clones: &HashMap<SpecKey, naga::Handle<naga::Function>>,
+    banned: &FxHashMap<naga::Handle<naga::Function>, Vec<u32>>,
+    clones: &FxHashMap<SpecKey, naga::Handle<naga::Function>>,
     result_retargets: &mut Vec<(naga::Handle<naga::Expression>, naga::Handle<naga::Function>)>,
 ) -> bool {
     let mut changed = false;
@@ -123,8 +123,8 @@ fn rewrite_calls_in_block(
 fn ensure_clone(
     module: &mut naga::Module,
     key: &SpecKey,
-    banned: &HashMap<naga::Handle<naga::Function>, Vec<u32>>,
-    clones: &mut HashMap<SpecKey, naga::Handle<naga::Function>>,
+    banned: &FxHashMap<naga::Handle<naga::Function>, Vec<u32>>,
+    clones: &mut FxHashMap<SpecKey, naga::Handle<naga::Function>>,
     used_names: &mut std::collections::HashSet<String>,
     depth: usize,
 ) -> Option<naga::Handle<naga::Function>> {
@@ -161,7 +161,7 @@ fn ensure_clone(
     used_names.insert(name.clone());
     clone.name = Some(name);
     let positions: Vec<usize> = key.1.iter().map(|&(p, _)| p as usize).collect();
-    let root_of: HashMap<usize, naga::Handle<naga::GlobalVariable>> =
+    let root_of: FxHashMap<usize, naga::Handle<naga::GlobalVariable>> =
         key.1.iter().map(|&(p, gv)| (p as usize, gv)).collect();
 
     // Both slots are non-emitted pointer expressions, so no Emit-range
@@ -227,7 +227,7 @@ fn restore_call_order(module: &mut naga::Module) {
     fn emit(
         h: naga::Handle<naga::Function>,
         old: &naga::Arena<naga::Function>,
-        map: &mut HashMap<naga::Handle<naga::Function>, naga::Handle<naga::Function>>,
+        map: &mut FxHashMap<naga::Handle<naga::Function>, naga::Handle<naga::Function>>,
         rebuilt: &mut naga::Arena<naga::Function>,
     ) {
         if map.contains_key(&h) {
@@ -246,11 +246,11 @@ fn restore_call_order(module: &mut naga::Module) {
 
     fn remap_calls(
         func: &mut naga::Function,
-        map: &HashMap<naga::Handle<naga::Function>, naga::Handle<naga::Function>>,
+        map: &FxHashMap<naga::Handle<naga::Function>, naga::Handle<naga::Function>>,
     ) {
         fn walk(
             block: &mut naga::Block,
-            map: &HashMap<naga::Handle<naga::Function>, naga::Handle<naga::Function>>,
+            map: &FxHashMap<naga::Handle<naga::Function>, naga::Handle<naga::Function>>,
         ) {
             for stmt in block.iter_mut() {
                 if let naga::Statement::Call { function, .. } = stmt {
@@ -270,7 +270,7 @@ fn restore_call_order(module: &mut naga::Module) {
     }
 
     let old = std::mem::replace(&mut module.functions, naga::Arena::new());
-    let mut map = HashMap::new();
+    let mut map = FxHashMap::default();
     let mut rebuilt = naga::Arena::new();
     for (h, _) in old.iter() {
         emit(h, &old, &mut map, &mut rebuilt);
@@ -293,7 +293,7 @@ pub fn specialize_ptr_params(
     if module.entry_points.is_empty() {
         return false;
     }
-    let banned: HashMap<naga::Handle<naga::Function>, Vec<u32>> = module
+    let banned: FxHashMap<naga::Handle<naga::Function>, Vec<u32>> = module
         .functions
         .iter()
         .filter_map(|(h, f)| {
@@ -338,7 +338,7 @@ pub fn specialize_ptr_params(
             .chain(crate::name_gen::type_names(module))
             .map(str::to_owned)
             .collect();
-    let mut clones: HashMap<SpecKey, naga::Handle<naga::Function>> = HashMap::new();
+    let mut clones: FxHashMap<SpecKey, naga::Handle<naga::Function>> = FxHashMap::default();
     for key in &needed {
         ensure_clone(module, key, &banned, &mut clones, &mut used_names, 0);
     }

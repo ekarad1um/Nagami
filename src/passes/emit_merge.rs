@@ -189,7 +189,6 @@ mod tests {
         let config = crate::config::Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
         let mut pass = EmitMergePass;
@@ -213,7 +212,6 @@ mod tests {
         let config = crate::config::Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
         let mut pass = EmitMergePass;
@@ -237,7 +235,6 @@ mod tests {
         let config = crate::config::Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
         let mut pass = EmitMergePass;
@@ -277,7 +274,6 @@ mod tests {
         let config = crate::config::Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
         let mut pass = EmitMergePass;
@@ -319,7 +315,6 @@ mod tests {
         let config = crate::config::Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
         let mut pass = EmitMergePass;

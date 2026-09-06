@@ -20,7 +20,8 @@
 //! extracted literals) unchanged.  So no downstream generator decision shifts,
 //! and total identifier bytes are minimised by the rearrangement inequality.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap;
+use std::collections::HashSet;
 
 use crate::error::Error;
 use crate::name_gen;
@@ -241,12 +242,12 @@ enum FuncRef {
 /// `iter_mut` per arena rather than a per-handle random-access lookup.
 #[derive(Default)]
 struct AssignedNames {
-    constant: HashMap<naga::Handle<naga::Constant>, String>,
-    over: HashMap<naga::Handle<naga::Override>, String>,
-    global: HashMap<naga::Handle<naga::GlobalVariable>, String>,
-    function: HashMap<naga::Handle<naga::Function>, String>,
-    arg: HashMap<(FuncRef, usize), String>,
-    local: HashMap<(FuncRef, naga::Handle<naga::LocalVariable>), String>,
+    constant: FxHashMap<naga::Handle<naga::Constant>, String>,
+    over: FxHashMap<naga::Handle<naga::Override>, String>,
+    global: FxHashMap<naga::Handle<naga::GlobalVariable>, String>,
+    function: FxHashMap<naga::Handle<naga::Function>, String>,
+    arg: FxHashMap<(FuncRef, usize), String>,
+    local: FxHashMap<(FuncRef, naga::Handle<naga::LocalVariable>), String>,
 }
 
 impl AssignedNames {
@@ -279,12 +280,12 @@ impl AssignedNames {
 /// missing key means a non-renameable handle and is treated as weight 1.
 #[derive(Default)]
 struct Weights {
-    global: HashMap<naga::Handle<naga::GlobalVariable>, usize>,
-    constant: HashMap<naga::Handle<naga::Constant>, usize>,
-    over: HashMap<naga::Handle<naga::Override>, usize>,
-    function: HashMap<naga::Handle<naga::Function>, usize>,
-    arg: HashMap<(FuncRef, usize), usize>,
-    local: HashMap<(FuncRef, naga::Handle<naga::LocalVariable>), usize>,
+    global: FxHashMap<naga::Handle<naga::GlobalVariable>, usize>,
+    constant: FxHashMap<naga::Handle<naga::Constant>, usize>,
+    over: FxHashMap<naga::Handle<naga::Override>, usize>,
+    function: FxHashMap<naga::Handle<naga::Function>, usize>,
+    arg: FxHashMap<(FuncRef, usize), usize>,
+    local: FxHashMap<(FuncRef, naga::Handle<naga::LocalVariable>), usize>,
 }
 
 impl Weights {
@@ -501,7 +502,7 @@ fn mark_emit_live(block: &naga::Block, live: &mut [bool]) {
 
 /// Count `Statement::Call` targets in `block` (recursing through control
 /// flow) so a frequently-called function earns a shorter name.
-fn count_calls(block: &naga::Block, calls: &mut HashMap<naga::Handle<naga::Function>, usize>) {
+fn count_calls(block: &naga::Block, calls: &mut FxHashMap<naga::Handle<naga::Function>, usize>) {
     for_each_statement(block, &mut |stmt| {
         if let naga::Statement::Call { function, .. } = stmt {
             *calls.entry(*function).or_insert(0) += 1;
@@ -672,7 +673,6 @@ mod tests {
         let config = Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
 
@@ -1065,7 +1065,6 @@ fn fs_main() -> @location(0) vec4f {
         let config = Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
         let changed2 = pass

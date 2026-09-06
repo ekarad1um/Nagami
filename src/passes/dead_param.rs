@@ -12,7 +12,7 @@
 //! 3. Drop the corresponding argument expressions at every call site
 //!    across both functions and entry points.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
@@ -32,7 +32,8 @@ impl Pass for DeadParamPass {
         // Phase 1: identify every unused parameter.  A parameter is
         // unused when its `FunctionArgument` expression handle is not
         // transitively reachable from any statement root.
-        let mut removals: HashMap<naga::Handle<naga::Function>, Vec<usize>> = HashMap::new();
+        let mut removals: FxHashMap<naga::Handle<naga::Function>, Vec<usize>> =
+            FxHashMap::default();
 
         for (fh, func) in module.functions.iter() {
             if func.arguments.is_empty() {
@@ -56,7 +57,8 @@ impl Pass for DeadParamPass {
 
             // One-pass collection so the unused-arg filter is O(1)
             // per parameter instead of O(arena) per parameter.
-            let mut live_arg_indices: HashSet<u32> = HashSet::with_capacity(func.arguments.len());
+            let mut live_arg_indices: FxHashSet<u32> =
+                FxHashSet::with_capacity_and_hasher(func.arguments.len(), Default::default());
             for (h, e) in func.expressions.iter() {
                 if let naga::Expression::FunctionArgument(idx) = e
                     && live.contains(&h)
@@ -97,7 +99,7 @@ impl Pass for DeadParamPass {
             // Snapshot types keyed by original index so the expression
             // rewrite below can resolve a removed slot's type after
             // `func.arguments` has shrunk.
-            let removed_types: HashMap<usize, naga::Handle<naga::Type>> =
+            let removed_types: FxHashMap<usize, naga::Handle<naga::Type>> =
                 indices.iter().map(|&i| (i, func.arguments[i].ty)).collect();
 
             // Reverse iteration keeps earlier indices valid.
@@ -144,7 +146,7 @@ impl Pass for DeadParamPass {
 /// positions stay valid across removals.
 fn remove_call_args_in_block(
     block: &mut naga::Block,
-    removals: &HashMap<naga::Handle<naga::Function>, Vec<usize>>,
+    removals: &FxHashMap<naga::Handle<naga::Function>, Vec<usize>>,
 ) -> Result<(), Error> {
     for stmt in block.iter_mut() {
         if let naga::Statement::Call {
@@ -182,8 +184,8 @@ fn remove_call_args_in_block(
 /// any statement root.  A parameter whose `FunctionArgument` handle
 /// is absent from this set has no live read and is eligible for
 /// removal.
-fn compute_live_expr_set(func: &naga::Function) -> HashSet<naga::Handle<naga::Expression>> {
-    let mut live = HashSet::new();
+fn compute_live_expr_set(func: &naga::Function) -> FxHashSet<naga::Handle<naga::Expression>> {
+    let mut live = FxHashSet::default();
     let mut worklist: Vec<naga::Handle<naga::Expression>> = Vec::new();
 
     // Seed the worklist with every handle reached directly from a
@@ -256,7 +258,6 @@ mod tests {
         let config = Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
         let changed = pass.run(&mut module, &ctx).expect("pass should run");

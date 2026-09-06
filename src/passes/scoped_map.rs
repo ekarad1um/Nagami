@@ -17,14 +17,14 @@
 //! a checkpoint yields a map that is observationally equal to the one
 //! present when the checkpoint was taken.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::hash::Hash;
 
 /// A `HashMap<K, V>` augmented with an append-only undo log that enables
 /// O(in-scope writes) restoration via checkpoints.
 #[derive(Debug)]
 pub(crate) struct ScopedMap<K: Eq + Hash + Clone, V: Clone> {
-    map: HashMap<K, V>,
+    map: FxHashMap<K, V>,
     /// Each entry records a key plus the value previously held under
     /// that key (or `None` if the key was absent).  Appended on every
     /// write; popped in reverse on rollback.
@@ -34,7 +34,7 @@ pub(crate) struct ScopedMap<K: Eq + Hash + Clone, V: Clone> {
 impl<K: Eq + Hash + Clone, V: Clone> ScopedMap<K, V> {
     pub(crate) fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: FxHashMap::default(),
             undo: Vec::new(),
         }
     }
@@ -99,7 +99,7 @@ impl<K: Eq + Hash + Clone, V: Clone> ScopedMap<K, V> {
 
     /// Read-only view of the underlying map; iterators should prefer
     /// this accessor over direct field access and never mutate through it.
-    pub(crate) fn as_map(&self) -> &HashMap<K, V> {
+    pub(crate) fn as_map(&self) -> &FxHashMap<K, V> {
         &self.map
     }
 

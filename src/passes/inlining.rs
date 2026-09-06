@@ -16,7 +16,7 @@
 //! exceed `MAX_MULTI_SITE_EXPANSION` net added nodes, the function
 //! is left alone.
 
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
@@ -139,7 +139,7 @@ impl Pass for InliningPass {
 /// `return;`).  Such calls have no observable effect; deleting them lets the
 /// next compaction drop the callee itself.  Returns whether anything changed.
 fn delete_calls_to_empty_functions(module: &mut naga::Module, preserve: &[String]) -> bool {
-    let empty: std::collections::HashSet<naga::Handle<naga::Function>> = module
+    let empty: FxHashSet<naga::Handle<naga::Function>> = module
         .functions
         .iter()
         .filter(|(_, f)| {
@@ -173,7 +173,7 @@ fn delete_calls_to_empty_functions(module: &mut naga::Module, preserve: &[String
 /// Recursively drop `Call`s to `empty` functions from `block`.
 fn drop_empty_calls_in_block(
     block: &mut naga::Block,
-    empty: &std::collections::HashSet<naga::Handle<naga::Function>>,
+    empty: &FxHashSet<naga::Handle<naga::Function>>,
 ) -> bool {
     let original = std::mem::take(block);
     let mut rebuilt = naga::Block::with_capacity(original.len());
@@ -215,9 +215,9 @@ fn collect_inline_templates(
     max_node_count: usize,
     max_call_sites: usize,
     preserve: &[String],
-) -> HashMap<naga::Handle<naga::Function>, InlineTemplate> {
+) -> FxHashMap<naga::Handle<naga::Function>, InlineTemplate> {
     let call_counts = collect_call_counts(module);
-    let mut templates = HashMap::new();
+    let mut templates = FxHashMap::default();
 
     for (function_handle, function) in module.functions.iter() {
         // Preserved functions are an external contract, never templates: a
@@ -312,8 +312,8 @@ fn collect_inline_templates(
 
 /// Count call-site references to each function across every function
 /// body and entry point; used to gate the `max_call_sites` budget.
-fn collect_call_counts(module: &naga::Module) -> HashMap<naga::Handle<naga::Function>, usize> {
-    let mut counts = HashMap::new();
+fn collect_call_counts(module: &naga::Module) -> FxHashMap<naga::Handle<naga::Function>, usize> {
+    let mut counts = FxHashMap::default();
 
     for (_, function) in module.functions.iter() {
         collect_call_counts_in_block(&function.body, &mut counts);
@@ -327,7 +327,7 @@ fn collect_call_counts(module: &naga::Module) -> HashMap<naga::Handle<naga::Func
 
 fn collect_call_counts_in_block(
     block: &naga::Block,
-    counts: &mut HashMap<naga::Handle<naga::Function>, usize>,
+    counts: &mut FxHashMap<naga::Handle<naga::Function>, usize>,
 ) {
     super::expr_util::for_each_statement(block, &mut |statement| {
         if let naga::Statement::Call { function, .. } = statement {
@@ -411,23 +411,41 @@ fn analyze_inline_expression(
 /// `templates` map so every caller sees the same inlinable set.
 fn inline_in_function(
     function: &mut naga::Function,
-    templates: &HashMap<naga::Handle<naga::Function>, InlineTemplate>,
+    templates: &FxHashMap<naga::Handle<naga::Function>, InlineTemplate>,
     types: &naga::UniqueArena<naga::Type>,
 ) -> usize {
+    let arena_len = function.expressions.len();
     let (changed, _) = inline_in_block(
         &mut function.body,
         &mut function.expressions,
         templates,
         types,
-        &HashMap::new(),
+        &FxHashMap::default(),
     );
 
     if changed > 0 {
         rebuild_function_expressions(function);
         function.named_expressions.clear();
+    } else if function.expressions.len() > arena_len {
+        // Only declined clones appended anything: a pass that changes nothing
+        // must leave the arena as it found it (the driver replays on that).
+        truncate_expressions(&mut function.expressions, arena_len);
     }
 
     changed
+}
+
+/// `naga::Arena` has no truncate; drain and re-append the prefix (handles
+/// are positional, so they survive unchanged).
+fn truncate_expressions(arena: &mut naga::Arena<naga::Expression>, len: usize) {
+    let kept: Vec<_> = arena
+        .drain()
+        .take(len)
+        .map(|(_, expression, span)| (expression, span))
+        .collect();
+    for (expression, span) in kept {
+        arena.append(expression, span);
+    }
 }
 
 /// Inline eligible calls in `block`, returning the change count AND the
@@ -441,15 +459,15 @@ fn inline_in_function(
 fn inline_in_block(
     block: &mut naga::Block,
     expressions: &mut naga::Arena<naga::Expression>,
-    templates: &HashMap<naga::Handle<naga::Function>, InlineTemplate>,
+    templates: &FxHashMap<naga::Handle<naga::Function>, InlineTemplate>,
     types: &naga::UniqueArena<naga::Type>,
-    inherited_replacements: &HashMap<
+    inherited_replacements: &FxHashMap<
         naga::Handle<naga::Expression>,
         naga::Handle<naga::Expression>,
     >,
 ) -> (
     usize,
-    HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
 ) {
     let mut changed = 0usize;
     let mut replacements = inherited_replacements.clone();
@@ -667,9 +685,9 @@ fn clone_inline_expression(
                 clone_inline_expression(child, template, arguments, caller_expressions, types, memo)
             })?;
             // Backstop for composed shapes the pre-clone gate cannot size
-            // (base or index produced by nested template expressions).
-            // Declining here strands the already-cloned children -
-            // unreferenced and individually valid; compact culls them.
+            // (base or index produced by nested template expressions).  The
+            // already-cloned children stay behind as dead entries; the
+            // function-level rebuild / truncation removes them.
             if let naga::Expression::Access { base, index } = cloned
                 && let Some(i) = const_index_value(index, caller_expressions)
                 && (i < 0
@@ -782,7 +800,7 @@ fn const_index_value(
 fn apply_replacements_to_statement(
     statement: &mut naga::Statement,
     expressions: &mut naga::Arena<naga::Expression>,
-    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
 ) {
     let mut remap =
         |handle: naga::Handle<naga::Expression>| resolve_replacement(handle, replacements);
@@ -801,7 +819,7 @@ fn apply_replacements_to_statement(
 /// acyclic by construction, so a well-formed map always halts.
 fn resolve_replacement(
     mut handle: naga::Handle<naga::Expression>,
-    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
 ) -> naga::Handle<naga::Expression> {
     while let Some(next) = replacements.get(&handle).copied() {
         if next == handle {
@@ -821,7 +839,7 @@ fn resolve_replacement(
 fn rebuild_function_expressions(function: &mut naga::Function) {
     let old_expressions = std::mem::take(&mut function.expressions);
     let mut new_expressions = naga::Arena::new();
-    let mut handle_map = HashMap::new();
+    let mut handle_map = FxHashMap::default();
 
     rebuild_block_expressions(
         &mut function.body,
@@ -849,7 +867,7 @@ fn rebuild_block_expressions(
     block: &mut naga::Block,
     old_expressions: &naga::Arena<naga::Expression>,
     new_expressions: &mut naga::Arena<naga::Expression>,
-    handle_map: &mut HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    handle_map: &mut FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
 ) {
     let original = std::mem::take(block);
     let mut rebuilt = naga::Block::with_capacity(original.len());
@@ -948,7 +966,7 @@ fn clone_expression_handle(
     handle: naga::Handle<naga::Expression>,
     old_expressions: &naga::Arena<naga::Expression>,
     new_expressions: &mut naga::Arena<naga::Expression>,
-    handle_map: &mut HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    handle_map: &mut FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
 ) -> naga::Handle<naga::Expression> {
     if let Some(mapped) = handle_map.get(&handle).copied() {
         return mapped;
@@ -982,7 +1000,6 @@ mod tests {
         let config = Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
 
@@ -1230,7 +1247,6 @@ fn fs_main() -> @location(0) vec4f {
         let config = Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
         let changed = pass.run(&mut module, &ctx).expect("inlining should run");

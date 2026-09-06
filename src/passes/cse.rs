@@ -13,7 +13,7 @@
 
 use super::scoped_map::ScopedMap;
 use crate::pipeline::{Pass, PassContext};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::hash::{Hash, Hasher};
 
 use crate::error::Error;
@@ -198,7 +198,7 @@ impl Hash for CseKey {
 #[inline]
 fn resolve(
     handle: naga::Handle<naga::Expression>,
-    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
 ) -> naga::Handle<naga::Expression> {
     replacements.get(&handle).copied().unwrap_or(handle)
 }
@@ -208,7 +208,7 @@ fn resolve(
 /// duplicates that already reference a canonical operand hash equal.
 fn build_cse_key(
     expr: &naga::Expression,
-    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
 ) -> Option<CseKey> {
     let r = |h: naga::Handle<naga::Expression>| resolve(h, replacements);
     let ro = |h: &Option<naga::Handle<naga::Expression>>| h.map(|h| resolve(h, replacements));
@@ -307,8 +307,10 @@ fn build_cse_key(
 /// remapping in a single traversal.  Returns `true` when at least one
 /// replacement fired.
 fn cse_function(function: &mut naga::Function) -> bool {
-    let mut replacements: HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>> =
-        HashMap::new();
+    let mut replacements: FxHashMap<
+        naga::Handle<naga::Expression>,
+        naga::Handle<naga::Expression>,
+    > = FxHashMap::default();
 
     let mut cse_map: ScopedMap<CseKey, naga::Handle<naga::Expression>> = ScopedMap::new();
 
@@ -365,7 +367,7 @@ fn collect_cse_replacements(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
     cse_map: &mut ScopedMap<CseKey, naga::Handle<naga::Expression>>,
-    replacements: &mut HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &mut FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
 ) {
     for statement in block {
         match statement {
@@ -426,7 +428,7 @@ fn collect_cse_replacements(
 /// `apply_to_block`.
 fn apply_and_rebuild(
     block: &mut naga::Block,
-    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
 ) {
     let original = std::mem::take(block);
     for (mut statement, span) in original.span_into_iter() {
@@ -487,7 +489,6 @@ mod tests {
         let config = Config::default();
         let ctx = PassContext {
             config: &config,
-            trace_run_dir: None,
             name_log: None,
         };
         let changed = pass.run(&mut module, &ctx).expect("pass should succeed");

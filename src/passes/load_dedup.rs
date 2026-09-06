@@ -23,7 +23,7 @@
 //! influence a downstream read, and dead-init removal relies on the
 //! forwarded-and-dropped emits the dedup phase leaves behind.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::marker::PhantomData;
 
 use crate::error::Error;
@@ -190,8 +190,8 @@ enum PointerKey {
 /// The PhantomData lifetime prevents that statically.
 struct ExpressionScopeIndex<'body> {
     handle_pos: Vec<Option<u32>>,
-    store_pos: HashMap<StoreId, u32>,
-    block_interval: HashMap<*const naga::Block, (u32, u32)>,
+    store_pos: FxHashMap<StoreId, u32>,
+    block_interval: FxHashMap<*const naga::Block, (u32, u32)>,
     _phantom: PhantomData<&'body naga::Block>,
 }
 
@@ -202,8 +202,8 @@ impl<'body> ExpressionScopeIndex<'body> {
     fn build(body: &'body naga::Block, expressions: &naga::Arena<naga::Expression>) -> Self {
         let mut idx = ExpressionScopeIndex {
             handle_pos: vec![None; expressions.len()],
-            store_pos: HashMap::new(),
-            block_interval: HashMap::new(),
+            store_pos: FxHashMap::default(),
+            block_interval: FxHashMap::default(),
             _phantom: PhantomData,
         };
         let mut pos = 0u32;
@@ -430,18 +430,18 @@ fn find_dead_inits(
     body: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
     local_variables: &naga::Arena<naga::LocalVariable>,
-) -> HashSet<naga::Handle<naga::LocalVariable>> {
-    let mut pending: HashSet<naga::Handle<naga::LocalVariable>> = local_variables
+) -> FxHashSet<naga::Handle<naga::LocalVariable>> {
+    let mut pending: FxHashSet<naga::Handle<naga::LocalVariable>> = local_variables
         .iter()
         .filter(|(_, lvar)| lvar.init.is_some())
         .map(|(h, _)| h)
         .collect();
 
     if pending.is_empty() {
-        return HashSet::new();
+        return FxHashSet::default();
     }
 
-    let mut dead = HashSet::new();
+    let mut dead = FxHashSet::default();
 
     for stmt in body.iter() {
         if pending.is_empty() {
@@ -490,9 +490,9 @@ fn find_dead_inits(
 fn invalidate_involved(
     stmt: &naga::Statement,
     expressions: &naga::Arena<naga::Expression>,
-    pending: &mut HashSet<naga::Handle<naga::LocalVariable>>,
+    pending: &mut FxHashSet<naga::Handle<naga::LocalVariable>>,
 ) {
-    let mut involved = HashSet::new();
+    let mut involved = FxHashSet::default();
     for block in nested_blocks(stmt) {
         collect_touched_locals(block, expressions, &mut involved);
     }
@@ -510,7 +510,7 @@ fn invalidate_involved(
 fn collect_touched_locals(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    touched: &mut HashSet<naga::Handle<naga::LocalVariable>>,
+    touched: &mut FxHashSet<naga::Handle<naga::LocalVariable>>,
 ) {
     for_each_statement(block, &mut |stmt| {
         if let naga::Statement::Emit(range) = stmt {
@@ -558,7 +558,7 @@ fn remove_dead_stores_in_function(function: &mut naga::Function) -> bool {
 /// (those are separate statements); only the dead write disappears.
 fn eliminate_write_only_locals(function: &mut naga::Function) -> bool {
     let exprs = &function.expressions;
-    let mut used: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
+    let mut used: FxHashSet<naga::Handle<naga::LocalVariable>> = FxHashSet::default();
 
     // Reads: an expression that reads memory through a pointer rooting at a
     // local marks it used.  `Load` and `CooperativeLoad` are the only such
@@ -582,7 +582,7 @@ fn eliminate_write_only_locals(function: &mut naga::Function) -> bool {
     // intentionally unused here: a local with zero `Load`s and zero escapes is
     // dead whether its stores are whole or partial, so every store is removed
     // regardless.  (The set is consumed only by the load-forwarding path.)
-    let mut partially_stored_unused = HashSet::new();
+    let mut partially_stored_unused = FxHashSet::default();
     collect_escaped_and_partially_stored(
         &function.body,
         exprs,
@@ -606,7 +606,7 @@ fn eliminate_write_only_locals(function: &mut naga::Function) -> bool {
 fn collect_nonstore_pointer_locals(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    used: &mut HashSet<naga::Handle<naga::LocalVariable>>,
+    used: &mut FxHashSet<naga::Handle<naga::LocalVariable>>,
 ) {
     for_each_statement(block, &mut |stmt| {
         let pointer = match stmt {
@@ -649,7 +649,7 @@ fn collect_nonstore_pointer_locals(
 fn remove_stores_to_dead_locals(
     block: &mut naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    used: &HashSet<naga::Handle<naga::LocalVariable>>,
+    used: &FxHashSet<naga::Handle<naga::LocalVariable>>,
 ) -> bool {
     let mut changed = false;
     let original = std::mem::replace(block, naga::Block::new());
@@ -686,7 +686,8 @@ fn remove_dead_stores_in_block(
 
     // For each local, track the index of the most recent whole-variable Store
     // that has NOT been followed by any Load of that local.
-    let mut pending_store: HashMap<naga::Handle<naga::LocalVariable>, usize> = HashMap::new();
+    let mut pending_store: FxHashMap<naga::Handle<naga::LocalVariable>, usize> =
+        FxHashMap::default();
     let mut dead_indices: Vec<usize> = Vec::new();
 
     for (idx, stmt) in block.iter().enumerate() {
@@ -814,7 +815,7 @@ fn shift_amount_is_static_error(lit: &naga::Literal) -> bool {
 /// construction, so it is a safety net, not an expected path).
 fn resolve_forward_literal(
     expressions: &naga::Arena<naga::Expression>,
-    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
     start: naga::Handle<naga::Expression>,
 ) -> Option<naga::Literal> {
     let mut handle = start;
@@ -847,7 +848,7 @@ fn resolve_forward_literal(
 /// the safe direction (a declined forward only ever keeps more state live).
 fn decline_static_error_forwards(
     expressions: &naga::Arena<naga::Expression>,
-    replacements: &mut HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &mut FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
 ) {
     let mut to_decline: Vec<naga::Handle<naga::Expression>> = Vec::new();
     for (_, expr) in expressions.iter() {
@@ -894,7 +895,7 @@ fn decline_static_error_forwards(
 /// constant already present in the input is naga's to reject, not ours.
 fn collect_static_error_leaves<F: Fn(&naga::Literal) -> bool>(
     expressions: &naga::Arena<naga::Expression>,
-    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
     handle: naga::Handle<naga::Expression>,
     is_dangerous: &F,
     out: &mut Vec<naga::Handle<naga::Expression>>,
@@ -932,13 +933,14 @@ fn collect_static_error_leaves<F: Fn(&naga::Literal) -> bool>(
 /// [`ScopedMap`] to track per-pointer-key cache state across control
 /// flow.  Returns `true` when at least one replacement fired.
 fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
-    let mut replacements = HashMap::new();
+    let mut replacements = FxHashMap::default();
     let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
-    let mut all_loads: HashMap<
+    let mut all_loads: FxHashMap<
         naga::Handle<naga::LocalVariable>,
         Vec<naga::Handle<naga::Expression>>,
-    > = HashMap::new();
-    let mut seeded_by_store: HashMap<naga::Handle<naga::Expression>, StoreInfo> = HashMap::new();
+    > = FxHashMap::default();
+    let mut seeded_by_store: FxHashMap<naga::Handle<naga::Expression>, StoreInfo> =
+        FxHashMap::default();
 
     // Seed cache with local variable initializers so that loads
     // following `var x = <const_expr>` can be forwarded to the
@@ -973,7 +975,7 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         &mut all_loads,
         &mut seeded_by_store,
         false,
-        &mut HashSet::new(),
+        &mut FxHashSet::default(),
     );
 
     if replacements.is_empty() {
@@ -1003,8 +1005,8 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
     // We also need the partially-stored-local set a bit further down;
     // computing both in a single traversal halves the tail-end scan
     // cost on large functions.
-    let mut escaped: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
-    let mut partially_stored: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
+    let mut escaped: FxHashSet<naga::Handle<naga::LocalVariable>> = FxHashSet::default();
+    let mut partially_stored: FxHashSet<naga::Handle<naga::LocalVariable>> = FxHashSet::default();
     collect_escaped_and_partially_stored(
         &function.body,
         &function.expressions,
@@ -1019,7 +1021,7 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
     // time); `partially_stored` does NOT need exclusion because the
     // all-loads-replaced gate already covers every partial Load - any
     // un-forwarded partial Load would block the entry here.
-    let dead_locals: HashSet<naga::Handle<naga::LocalVariable>> = all_loads
+    let dead_locals: FxHashSet<naga::Handle<naga::LocalVariable>> = all_loads
         .iter()
         .filter(|(lh, loads)| {
             !escaped.contains(lh)
@@ -1047,7 +1049,8 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
 
     // Group store-seeded loads by their source Store identity (pointer, value).
     // Skip stores inside loops - loop back-edges make it unsafe to remove them.
-    let mut loads_per_store: HashMap<StoreId, Vec<naga::Handle<naga::Expression>>> = HashMap::new();
+    let mut loads_per_store: FxHashMap<StoreId, Vec<naga::Handle<naga::Expression>>> =
+        FxHashMap::default();
     for (&load_h, &(ptr, val, store_in_loop)) in &seeded_by_store {
         if store_in_loop {
             continue; // Never consider loop-internal Stores for removal
@@ -1082,7 +1085,7 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
     // and `escaped` were populated by the combined walk above.)
 
     let max_live_load_pos = build_max_live_load_positions(&all_loads, &replacements, &scope_idx);
-    let mut dead_store_ids: HashSet<StoreId> = HashSet::new();
+    let mut dead_store_ids: FxHashSet<StoreId> = FxHashSet::default();
     for (&store_id, seeded_loads) in &loads_per_store {
         let (store_ptr, _) = store_id;
         // The store must be a whole-variable store (LocalVariable pointer).
@@ -1296,11 +1299,11 @@ fn get_pointer_key(
 /// references).  Positions missing from the index contribute nothing,
 /// matching the old scan's `is_some_and`.
 fn build_max_live_load_positions(
-    all_loads: &HashMap<naga::Handle<naga::LocalVariable>, Vec<naga::Handle<naga::Expression>>>,
-    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    all_loads: &FxHashMap<naga::Handle<naga::LocalVariable>, Vec<naga::Handle<naga::Expression>>>,
+    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
     scope_idx: &ExpressionScopeIndex<'_>,
-) -> HashMap<naga::Handle<naga::LocalVariable>, u32> {
-    let mut max_pos = HashMap::with_capacity(all_loads.len());
+) -> FxHashMap<naga::Handle<naga::LocalVariable>, u32> {
+    let mut max_pos = FxHashMap::with_capacity_and_hasher(all_loads.len(), Default::default());
     for (&local, loads) in all_loads {
         for &load_h in loads {
             let live = replacements.get(&load_h).is_none_or(|&r| r >= load_h);
@@ -1390,12 +1393,12 @@ const SUBSTITUTION_DEPTH_CAP: u32 = 128;
 fn effective_forwarded_depth(
     value: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
-    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
     cap: u32,
 ) -> u32 {
     let mut frontier = vec![value];
     let mut next = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     let mut budget = 8192usize;
     let mut depth = 0u32;
     while !frontier.is_empty() {
@@ -1435,8 +1438,8 @@ fn effective_forwarded_depth(
 fn collect_escaped_and_partially_stored(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    escaped: &mut HashSet<naga::Handle<naga::LocalVariable>>,
-    partially_stored: &mut HashSet<naga::Handle<naga::LocalVariable>>,
+    escaped: &mut FxHashSet<naga::Handle<naga::LocalVariable>>,
+    partially_stored: &mut FxHashSet<naga::Handle<naga::LocalVariable>>,
 ) {
     for_each_statement(block, &mut |stmt| match stmt {
         naga::Statement::Store { pointer, .. } => {
@@ -1475,8 +1478,8 @@ fn collect_escaped_and_partially_stored(
 fn count_local_stores(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-) -> HashMap<naga::Handle<naga::LocalVariable>, usize> {
-    let mut counts = HashMap::new();
+) -> FxHashMap<naga::Handle<naga::LocalVariable>, usize> {
+    let mut counts = FxHashMap::default();
     count_stores_recursive(block, expressions, &mut counts);
     counts
 }
@@ -1485,7 +1488,7 @@ fn count_local_stores(
 fn count_stores_recursive(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    counts: &mut HashMap<naga::Handle<naga::LocalVariable>, usize>,
+    counts: &mut FxHashMap<naga::Handle<naga::LocalVariable>, usize>,
 ) {
     for stmt in block {
         match stmt {
@@ -1574,17 +1577,20 @@ fn collect_redundant_loads<'body>(
     expressions: &naga::Arena<naga::Expression>,
     scope_idx: &ExpressionScopeIndex<'body>,
     cache: &mut ScopedMap<PointerKey, naga::Handle<naga::Expression>>,
-    replacements: &mut HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
-    all_loads: &mut HashMap<naga::Handle<naga::LocalVariable>, Vec<naga::Handle<naga::Expression>>>,
-    seeded_by_store: &mut HashMap<naga::Handle<naga::Expression>, StoreInfo>,
+    replacements: &mut FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    all_loads: &mut FxHashMap<
+        naga::Handle<naga::LocalVariable>,
+        Vec<naga::Handle<naga::Expression>>,
+    >,
+    seeded_by_store: &mut FxHashMap<naga::Handle<naga::Expression>, StoreInfo>,
     in_loop: bool,
-    modified_out: &mut HashSet<naga::Handle<naga::LocalVariable>>,
+    modified_out: &mut FxHashSet<naga::Handle<naga::LocalVariable>>,
 ) {
     // Track which cache entries were seeded by a Store (not by a Load or init).
     // Maps PointerKey -> Store's (pointer, value, in_loop) identity.  This is
     // block-local scratch - it is reset on every `collect_redundant_loads`
     // call and never crosses branch boundaries, so it stays a plain HashMap.
-    let mut store_source: HashMap<PointerKey, StoreInfo> = HashMap::new();
+    let mut store_source: FxHashMap<PointerKey, StoreInfo> = FxHashMap::default();
     for statement in block {
         match statement {
             naga::Statement::Emit(range) => {
@@ -1722,7 +1728,7 @@ fn collect_redundant_loads<'body>(
                 // only drops cache entries written inside the block
                 // (not entries written by sibling statements that
                 // share `modified_out` with us).
-                let mut block_modified = HashSet::new();
+                let mut block_modified = FxHashSet::default();
                 collect_redundant_loads(
                     inner,
                     expressions,
@@ -1788,7 +1794,7 @@ fn collect_redundant_loads<'body>(
                 // walks would cost an extra full traversal per branch; the
                 // inline collection lets the meet capture / invalidation
                 // share the same single walk.
-                let mut accept_modified = HashSet::new();
+                let mut accept_modified = FxHashSet::default();
                 collect_redundant_loads(
                     accept,
                     expressions,
@@ -1813,7 +1819,7 @@ fn collect_redundant_loads<'body>(
                 // loads cache-miss instead of being forwarded.  The
                 // size win from skipping a full-tree walk per branch
                 // is judged worth the trade.
-                let mut meet: HashMap<PointerKey, naga::Handle<naga::Expression>> = cache
+                let mut meet: FxHashMap<PointerKey, naga::Handle<naga::Expression>> = cache
                     .as_map()
                     .iter()
                     .filter(|(k, _)| pointer_key_involves_any_local(k, &accept_modified))
@@ -1822,7 +1828,7 @@ fn collect_redundant_loads<'body>(
                     .collect();
                 cache.rollback_to(cp_pre_if);
 
-                let mut reject_modified = HashSet::new();
+                let mut reject_modified = FxHashSet::default();
                 collect_redundant_loads(
                     reject,
                     expressions,
@@ -1912,10 +1918,11 @@ fn collect_redundant_loads<'body>(
                     .any(|c| crate::passes::dead_branch::contains_bare_break(&c.body));
                 let meet_applicable = has_default && !any_fallthrough && !any_switch_break;
 
-                let mut total_modified: HashSet<naga::Handle<naga::LocalVariable>> = HashSet::new();
-                let mut meet: Option<HashMap<PointerKey, naga::Handle<naga::Expression>>> = None;
+                let mut total_modified: FxHashSet<naga::Handle<naga::LocalVariable>> =
+                    FxHashSet::default();
+                let mut meet: Option<FxHashMap<PointerKey, naga::Handle<naga::Expression>>> = None;
                 for case in cases {
-                    let mut case_modified = HashSet::new();
+                    let mut case_modified = FxHashSet::default();
                     collect_redundant_loads(
                         &case.body,
                         expressions,
@@ -1938,7 +1945,7 @@ fn collect_redundant_loads<'body>(
                                 // the in-cases scope + `needs_pre_emit`
                                 // gate so the meet only carries values
                                 // reachable on every post-switch path.
-                                let initial: HashMap<_, _> = cache
+                                let initial: FxHashMap<_, _> = cache
                                     .as_map()
                                     .iter()
                                     .filter(|(k, _)| {
@@ -1999,7 +2006,7 @@ fn collect_redundant_loads<'body>(
                 cache.drain_logged();
                 let cp_empty = cache.checkpoint();
 
-                let mut loop_modified = HashSet::new();
+                let mut loop_modified = FxHashSet::default();
                 collect_redundant_loads(
                     body,
                     expressions,
@@ -2071,7 +2078,7 @@ fn invalidate_cache_for_local(
 /// `pointer_key_involves_any_local`) breaks the build, forcing every
 /// site to be updated in lockstep.
 fn invalidate_store_source_for_local(
-    store_source: &mut HashMap<PointerKey, StoreInfo>,
+    store_source: &mut FxHashMap<PointerKey, StoreInfo>,
     local: naga::Handle<naga::LocalVariable>,
 ) {
     store_source.retain(|key, _| match key {
@@ -2084,7 +2091,7 @@ fn invalidate_store_source_for_local(
 /// Return `true` when a cache key names any local in `locals`.
 fn pointer_key_involves_any_local(
     key: &PointerKey,
-    locals: &HashSet<naga::Handle<naga::LocalVariable>>,
+    locals: &FxHashSet<naga::Handle<naga::LocalVariable>>,
 ) -> bool {
     match key {
         PointerKey::Local(l) | PointerKey::LocalField(l, _) | PointerKey::LocalDynamic(l, _) => {
@@ -2105,8 +2112,8 @@ fn pointer_key_involves_any_local(
 fn locals_passed_by_pointer(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-) -> HashSet<naga::Handle<naga::LocalVariable>> {
-    let mut escaped = HashSet::new();
+) -> FxHashSet<naga::Handle<naga::LocalVariable>> {
+    let mut escaped = FxHashSet::default();
     collect_escaped_locals(block, expressions, &mut escaped);
     escaped
 }
@@ -2115,7 +2122,7 @@ fn locals_passed_by_pointer(
 fn collect_escaped_locals(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    escaped: &mut HashSet<naga::Handle<naga::LocalVariable>>,
+    escaped: &mut FxHashSet<naga::Handle<naga::LocalVariable>>,
 ) {
     for stmt in block {
         match stmt {
@@ -2160,7 +2167,7 @@ fn collect_escaped_locals(
 pub(crate) fn collect_modified_locals(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    modified: &mut HashSet<naga::Handle<naga::LocalVariable>>,
+    modified: &mut FxHashSet<naga::Handle<naga::LocalVariable>>,
 ) {
     for_each_statement(block, &mut |stmt| {
         visit_statement_write_pointers(stmt, &mut |p| {
@@ -2181,9 +2188,9 @@ pub(crate) fn collect_modified_locals(
 /// `cse::apply_and_rebuild`.
 fn apply_to_block(
     block: &mut naga::Block,
-    replacements: &HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
-    dead_locals: &HashSet<naga::Handle<naga::LocalVariable>>,
-    dead_store_ids: &HashSet<StoreId>,
+    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    dead_locals: &FxHashSet<naga::Handle<naga::LocalVariable>>,
+    dead_store_ids: &FxHashSet<StoreId>,
     expressions: &naga::Arena<naga::Expression>,
     // `true` once recursion has entered a `Loop` body/continuing.  `dead_store_ids`
     // keys a dead Store by `(pointer, value)` identity alone, and a loop-internal

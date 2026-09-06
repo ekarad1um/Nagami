@@ -35,7 +35,7 @@
 //! no-op), so a gate that wrongly admits an unsafe build yields valid-but-wrong
 //! IR that slips straight through.
 
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::Error;
 use crate::passes::load_dedup::get_stored_local;
@@ -53,7 +53,7 @@ fn expr_loads_local(
     g: naga::Handle<naga::LocalVariable>,
     arena: &naga::Arena<naga::Expression>,
 ) -> bool {
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = FxHashSet::default();
     expr_loads_local_memo(h, g, arena, &mut visited)
 }
 
@@ -61,7 +61,7 @@ fn expr_loads_local_memo(
     h: naga::Handle<naga::Expression>,
     g: naga::Handle<naga::LocalVariable>,
     arena: &naga::Arena<naga::Expression>,
-    visited: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+    visited: &mut FxHashSet<naga::Handle<naga::Expression>>,
 ) -> bool {
     // A shared sub-expression forms a diamond in the DAG; without a visited set
     // each incoming edge re-walks it, making this exponential (2^depth) on wide
@@ -162,7 +162,7 @@ fn plan_local(
     let arena = &func.expressions;
 
     // 1. Scan the top-level body once for member stores, escapes, and reads.
-    let mut members: HashMap<u32, (usize, naga::Handle<naga::Expression>)> = HashMap::new();
+    let mut members: FxHashMap<u32, (usize, naga::Handle<naga::Expression>)> = FxHashMap::default();
     let mut ptr: Option<naga::Handle<naga::Expression>> = None;
     let mut last_store_idx: Option<usize> = None;
     let mut first_read_idx: Option<usize> = None;
@@ -269,14 +269,14 @@ fn apply_plans(
     plans: Vec<BuildPlan>,
 ) {
     // member-store indices to drop, and `insert_at` -> (compose, struct ptr).
-    let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut splice: HashMap<
+    let mut drop: FxHashSet<usize> = FxHashSet::default();
+    let mut splice: FxHashMap<
         usize,
         (
             naga::Handle<naga::Expression>,
             naga::Handle<naga::Expression>,
         ),
-    > = HashMap::new();
+    > = FxHashMap::default();
     for plan in plans {
         let struct_ty = func.local_variables[plan.local].ty;
         // Sanity: the local's type must still be the struct we planned for.
@@ -387,7 +387,7 @@ fn expr_mentions_local(
     local: naga::Handle<naga::LocalVariable>,
     arena: &naga::Arena<naga::Expression>,
 ) -> bool {
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = FxHashSet::default();
     expr_mentions_local_memo(h, local, arena, &mut visited)
 }
 
@@ -395,7 +395,7 @@ fn expr_mentions_local_memo(
     h: naga::Handle<naga::Expression>,
     local: naga::Handle<naga::LocalVariable>,
     arena: &naga::Arena<naga::Expression>,
-    visited: &mut std::collections::HashSet<naga::Handle<naga::Expression>>,
+    visited: &mut FxHashSet<naga::Handle<naga::Expression>>,
 ) -> bool {
     // Memoised for the same reason as `expr_loads_local_memo`: without a visited
     // set, shared sub-expressions make this exponential on the DAG.

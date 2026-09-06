@@ -10,7 +10,8 @@
 //! name bindings, deferred-variable flags, and inline-eligibility
 //! decisions stay coherent inside a single function.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashSet;
 
 use crate::config::FloatPrecision;
 
@@ -96,13 +97,13 @@ pub(super) struct Generator<'a> {
     pub(super) options: GenerateOptions,
     pub(super) out: String,
     pub(super) indent_depth: u32,
-    pub(super) type_names: HashMap<naga::Handle<naga::Type>, String>,
-    pub(super) member_names: HashMap<(naga::Handle<naga::Type>, u32), String>,
+    pub(super) type_names: FxHashMap<naga::Handle<naga::Type>, String>,
+    pub(super) member_names: FxHashMap<(naga::Handle<naga::Type>, u32), String>,
     pub(super) constant_names: Vec<String>,
     pub(super) override_names: Vec<String>,
     pub(super) global_names: Vec<String>,
     pub(super) function_names: Vec<String>,
-    pub(super) extracted_literals: HashMap<LiteralExtractKey, String>,
+    pub(super) extracted_literals: FxHashMap<LiteralExtractKey, String>,
     /// Alias declarations awaiting emission, stored as
     /// `(alias_name, type_string)`.
     pub(super) type_alias_decls: Vec<(String, String)>,
@@ -110,17 +111,18 @@ pub(super) struct Generator<'a> {
     /// `init` is that handle.  Populated incrementally during constant
     /// emission so later constants can reference earlier ones by name
     /// instead of re-inlining the entire expression tree.
-    pub(super) expr_to_const: HashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Constant>>,
+    pub(super) expr_to_const:
+        FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Constant>>,
     /// Constants reachable from live code (functions, entry points,
     /// global-variable initialisers).  Dead constants are skipped
     /// during emission.
-    pub(super) live_constants: HashSet<naga::Handle<naga::Constant>>,
+    pub(super) live_constants: FxHashSet<naga::Handle<naga::Constant>>,
     /// Types reachable from live code.  Dead struct declarations are
     /// skipped during emission.
-    pub(super) live_types: HashSet<naga::Handle<naga::Type>>,
+    pub(super) live_types: FxHashSet<naga::Handle<naga::Type>>,
     /// Struct types a host can address: live, not naga-predeclared,
     /// preamble-owned included (declared in the consumer's preamble text).
-    pub(super) map_visible_structs: HashSet<naga::Handle<naga::Type>>,
+    pub(super) map_visible_structs: FxHashSet<naga::Handle<naga::Type>>,
     /// Pre-computed type layouts used when reconstructing `@size` and
     /// `@align` attributes on struct members.
     pub(super) layouter: naga::proc::Layouter,
@@ -175,8 +177,8 @@ pub(super) struct FunctionCtx<'a, 'm> {
     pub(super) func: &'a naga::Function,
     pub(super) info: &'a naga::valid::FunctionInfo,
     pub(super) argument_names: Vec<String>,
-    pub(super) local_names: HashMap<naga::Handle<naga::LocalVariable>, String>,
-    pub(super) expr_names: HashMap<naga::Handle<naga::Expression>, String>,
+    pub(super) local_names: FxHashMap<naga::Handle<naga::LocalVariable>, String>,
+    pub(super) expr_names: FxHashMap<naga::Handle<naga::Expression>, String>,
     pub(super) ref_counts: Vec<usize>,
     pub(super) deferred_vars: Vec<bool>,
     pub(super) dead_vars: Vec<bool>,
@@ -192,14 +194,14 @@ pub(super) struct FunctionCtx<'a, 'm> {
     /// Call results that can safely be inlined at their use site:
     /// `ref_count == 1`, no side-effecting statement between the
     /// `Call` and its use.
-    pub(super) inlineable_calls: std::collections::HashSet<naga::Handle<naga::Expression>>,
+    pub(super) inlineable_calls: FxHashSet<naga::Handle<naga::Expression>>,
     /// `Load` expressions that MUST be `let`-bound rather than inlined,
     /// because the place they read is written between the `Load`'s
     /// `Emit` and a use.  Inlining such a load relocates its memory read
     /// past the write, yielding the post-write value - a silent
     /// miscompile (e.g. the classic swap `let t=x;x=y;y=t`).  Computed
     /// once per function by `module_emit::compute_must_bind_loads`.
-    pub(super) must_bind_loads: std::collections::HashSet<naga::Handle<naga::Expression>>,
+    pub(super) must_bind_loads: FxHashSet<naga::Handle<naga::Expression>>,
     /// Memo for `stmt_emit`'s rendered-nesting-depth cap, indexed by
     /// expression handle (`0` = not yet computed).  Depths are queried
     /// child-first in arena order, so a child bound after its entry was
@@ -212,7 +214,7 @@ pub(super) struct FunctionCtx<'a, 'm> {
     /// statement - so without this record a chain of stashed calls prices
     /// as nested leaves and escapes the depth cap entirely (tint's parser
     /// recursion limit then rejects text naga's self-check accepts).
-    pub(super) stashed_call_depth: std::collections::HashMap<naga::Handle<naga::Expression>, u16>,
+    pub(super) stashed_call_depth: FxHashMap<naga::Handle<naga::Expression>, u16>,
     /// Operands `let`-bound by the hazard guard (`const_hazard`), in
     /// emission order: pre-emitted expressions usable from any block, so
     /// each name must leave `expr_names` when its block closes.
@@ -245,11 +247,11 @@ impl<'a, 'm> FunctionCtx<'a, 'm> {
 /// reflects what will actually appear in the emitted output.
 fn count_type_handle_refs(
     module: &naga::Module,
-    live_constants: &HashSet<naga::Handle<naga::Constant>>,
-    live_types: &HashSet<naga::Handle<naga::Type>>,
+    live_constants: &FxHashSet<naga::Handle<naga::Constant>>,
+    live_types: &FxHashSet<naga::Handle<naga::Type>>,
     defer_cache: &[(Vec<bool>, Vec<bool>)],
-) -> HashMap<naga::Handle<naga::Type>, usize> {
-    let mut counts: HashMap<naga::Handle<naga::Type>, usize> = HashMap::new();
+) -> FxHashMap<naga::Handle<naga::Type>, usize> {
+    let mut counts: FxHashMap<naga::Handle<naga::Type>, usize> = FxHashMap::default();
     let mut inc = |h: naga::Handle<naga::Type>| {
         *counts.entry(h).or_default() += 1;
     };
@@ -361,8 +363,8 @@ pub(super) fn all_functions(module: &naga::Module) -> impl Iterator<Item = &naga
 fn compute_live_constants(
     module: &naga::Module,
     preserve_names: &HashSet<String>,
-) -> HashSet<naga::Handle<naga::Constant>> {
-    let mut live: HashSet<naga::Handle<naga::Constant>> = HashSet::new();
+) -> FxHashSet<naga::Handle<naga::Constant>> {
+    let mut live: FxHashSet<naga::Handle<naga::Constant>> = FxHashSet::default();
 
     // Library module (no entry points): keep everything, just like the compact
     // pass does with KeepUnused::Yes.
@@ -433,7 +435,7 @@ fn compute_live_constants(
 fn collect_const_refs_in_global_expr(
     expr_h: naga::Handle<naga::Expression>,
     module: &naga::Module,
-    live: &mut HashSet<naga::Handle<naga::Constant>>,
+    live: &mut FxHashSet<naga::Handle<naga::Constant>>,
 ) {
     use naga::Expression as E;
     match &module.global_expressions[expr_h] {
@@ -501,10 +503,10 @@ fn collect_const_refs_in_global_expr(
 /// [`compute_live_constants`] with a different set of seed roots.
 fn compute_live_types(
     module: &naga::Module,
-    live_constants: &HashSet<naga::Handle<naga::Constant>>,
+    live_constants: &FxHashSet<naga::Handle<naga::Constant>>,
     defer_cache: &[(Vec<bool>, Vec<bool>)],
-) -> HashSet<naga::Handle<naga::Type>> {
-    let mut live: HashSet<naga::Handle<naga::Type>> = HashSet::new();
+) -> FxHashSet<naga::Handle<naga::Type>> {
+    let mut live: FxHashSet<naga::Handle<naga::Type>> = FxHashSet::default();
 
     // Library module: keep everything.
     if module.entry_points.is_empty() {
@@ -596,7 +598,7 @@ fn compute_live_types(
 fn collect_inner_types(
     ty_h: naga::Handle<naga::Type>,
     module: &naga::Module,
-    live: &mut HashSet<naga::Handle<naga::Type>>,
+    live: &mut FxHashSet<naga::Handle<naga::Type>>,
 ) {
     match &module.types[ty_h].inner {
         naga::TypeInner::Struct { members, .. } => {
@@ -622,7 +624,7 @@ fn collect_inner_types(
 fn collect_types_in_global_expr(
     expr_h: naga::Handle<naga::Expression>,
     module: &naga::Module,
-    live: &mut HashSet<naga::Handle<naga::Type>>,
+    live: &mut FxHashSet<naga::Handle<naga::Type>>,
 ) {
     use naga::Expression as E;
     match &module.global_expressions[expr_h] {
@@ -697,7 +699,7 @@ impl<'a> Generator<'a> {
         info: &'a naga::valid::ModuleInfo,
         options: GenerateOptions,
     ) -> Self {
-        use std::collections::HashSet;
+        use rustc_hash::FxHashSet;
 
         let mangle = options.mangle;
 
@@ -718,8 +720,8 @@ impl<'a> Generator<'a> {
         let mut mangle_counter = 0usize;
 
         let preserve = &options.preserve_symbols;
-        let mut type_names = HashMap::new();
-        let mut member_names = HashMap::new();
+        let mut type_names = FxHashMap::default();
+        let mut member_names = FxHashMap::default();
 
         // naga predeclared / special types must never have their struct or
         // member names mangled: their members are accessed through canonical
@@ -949,16 +951,16 @@ impl<'a> Generator<'a> {
             // is O(N) instead of O(N^2):
             //   * `canonical[h]`           = arena-first handle in h's group.
             //   * `group_ref_count[head]`  = sum of `ref_counts` over the group.
-            let mut canonical: HashMap<naga::Handle<naga::Type>, naga::Handle<naga::Type>> =
-                HashMap::with_capacity(module.types.len());
-            let mut inner_to_first: HashMap<&naga::TypeInner, naga::Handle<naga::Type>> =
-                HashMap::with_capacity(module.types.len());
+            let mut canonical: FxHashMap<naga::Handle<naga::Type>, naga::Handle<naga::Type>> =
+                FxHashMap::with_capacity_and_hasher(module.types.len(), Default::default());
+            let mut inner_to_first: FxHashMap<&naga::TypeInner, naga::Handle<naga::Type>> =
+                FxHashMap::with_capacity_and_hasher(module.types.len(), Default::default());
             for (h, ty) in module.types.iter() {
                 let first = *inner_to_first.entry(&ty.inner).or_insert(h);
                 canonical.insert(h, first);
             }
-            let mut group_ref_count: HashMap<naga::Handle<naga::Type>, usize> =
-                HashMap::with_capacity(inner_to_first.len());
+            let mut group_ref_count: FxHashMap<naga::Handle<naga::Type>, usize> =
+                FxHashMap::with_capacity_and_hasher(inner_to_first.len(), Default::default());
             for (h, _) in module.types.iter() {
                 let first = canonical[&h];
                 *group_ref_count.entry(first).or_insert(0) +=
@@ -1030,12 +1032,12 @@ impl<'a> Generator<'a> {
             override_names,
             global_names,
             function_names,
-            extracted_literals: HashMap::new(),
+            extracted_literals: FxHashMap::default(),
             type_alias_decls,
-            expr_to_const: HashMap::new(),
+            expr_to_const: FxHashMap::default(),
             live_constants,
             live_types,
-            map_visible_structs: HashSet::new(),
+            map_visible_structs: FxHashSet::default(),
             layouter,
             layouter_complete,
             ref_count_cache: Vec::new(),

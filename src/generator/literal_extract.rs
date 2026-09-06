@@ -11,7 +11,7 @@
 //! documents each emission bypass path in detail; keep those notes in
 //! sync with `expr_emit` if new collapse rules are added there.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::name_gen::next_name_unique;
 
@@ -71,7 +71,7 @@ impl<'a> Generator<'a> {
              ref_counts: &[usize],
              live: &[bool],
              deferrable: &[bool],
-             literal_counts: &mut HashMap<LiteralExtractKey, (usize, bool)>| {
+             literal_counts: &mut FxHashMap<LiteralExtractKey, (usize, bool)>| {
                 // Predicate: is this handle a literal-like that we would tally
                 // (a `Literal`, or an unnamed `Constant` whose init is a literal)?
                 let literal_lit = |h: naga::Handle<naga::Expression>| -> Option<naga::Literal> {
@@ -158,8 +158,8 @@ impl<'a> Generator<'a> {
                 // let-bound" gate; over-matching only forgoes an extraction
                 // (never a miscompile), so the approximation is safe.
                 let is_width8_lit = |h: naga::Handle<naga::Expression>| matches!(func.expressions[h], naga::Expression::Literal(l) if literal_is_width8(l));
-                let mut narrow_folded: std::collections::HashSet<naga::Handle<naga::Expression>> =
-                    std::collections::HashSet::new();
+                let mut narrow_folded: FxHashSet<naga::Handle<naga::Expression>> =
+                    FxHashSet::default();
                 for (ch, expr) in func.expressions.iter() {
                     if !live[ch.index()] {
                         continue;
@@ -490,7 +490,7 @@ impl<'a> Generator<'a> {
         //    pattern) lets each branch index `self.info` naturally
         //    (`self.info[handle]` vs. `self.info.get_entry_point(idx)`)
         //    without an O(N) `.nth(cache_idx)` walk.
-        let mut literal_counts: HashMap<LiteralExtractKey, (usize, bool)> = HashMap::new();
+        let mut literal_counts: FxHashMap<LiteralExtractKey, (usize, bool)> = FxHashMap::default();
         let mut cache_idx: usize = 0;
         for (handle, func) in self.module.functions.iter() {
             let live = std::mem::take(&mut self.ref_count_cache[cache_idx].live);
@@ -521,7 +521,7 @@ impl<'a> Generator<'a> {
         // 2. Build forbidden name set: module-scope + all function-scope names.
         //    This prevents the extracted const name from being shadowed by
         //    any argument or local variable in any function.
-        let mut forbidden = HashSet::new();
+        let mut forbidden = std::collections::HashSet::new();
         for name in self.type_names.values() {
             forbidden.insert(name.clone());
         }
@@ -580,12 +580,9 @@ impl<'a> Generator<'a> {
                 }
             })
             .collect();
-        // Sort descending by estimated savings.  HashMap iteration order
-        // is randomised per process (`std::collections::HashMap` uses a
-        // per-instance `RandomState`), so ties on the savings estimate
-        // would otherwise produce non-reproducible output across runs.
-        // Tie-break first on `expr_text`, then on `decl_text` - together
-        // they form the full `LiteralExtractKey`, giving a total order.
+        // Descending by estimated savings; ties break on the full key
+        // (`expr_text`, then `decl_text`) for a total order independent of
+        // map iteration order.
         candidates.sort_by(|a, b| {
             b.0.cmp(&a.0)
                 .then_with(|| a.1.expr_text.cmp(&b.1.expr_text))

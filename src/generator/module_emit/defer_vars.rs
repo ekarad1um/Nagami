@@ -4,6 +4,7 @@
 //! into a `for` header.
 
 use super::local_resolve::resolve_local_var;
+use rustc_hash::FxHashSet;
 
 /// Mark in `seen` (a bitmap indexed by local handle) every local that
 /// `block` references anywhere in its subtree.  The deferral and
@@ -267,7 +268,7 @@ fn scan_block_deferrable_vars(
 /// that loop's `for (var ...; ...; ...)` header.
 pub(super) fn find_for_loop_vars(
     func: &naga::Function,
-    must_bind_loads: &std::collections::HashSet<naga::Handle<naga::Expression>>,
+    must_bind_loads: &FxHashSet<naga::Handle<naga::Expression>>,
 ) -> Vec<bool> {
     use naga::Expression as E;
 
@@ -377,7 +378,7 @@ fn is_for_loop_candidate(
     continuing: &naga::Block,
     break_if: &Option<naga::Handle<naga::Expression>>,
     expressions: &naga::Arena<naga::Expression>,
-    must_bind_loads: &std::collections::HashSet<naga::Handle<naga::Expression>>,
+    must_bind_loads: &FxHashSet<naga::Handle<naga::Expression>>,
 ) -> bool {
     // Parse via the SHARED parser so this var-suppression decision and
     // `try_emit_for_loop`'s emission decision can never drift.  `None` => not
@@ -425,7 +426,7 @@ fn scan_block_for_loop_vars(
     expr_reads: &[Option<naga::Handle<naga::LocalVariable>>],
     candidates: &[bool],
     result: &mut Vec<bool>,
-    must_bind_loads: &std::collections::HashSet<naga::Handle<naga::Expression>>,
+    must_bind_loads: &FxHashSet<naga::Handle<naga::Expression>>,
     // `true` once the walk has descended through a `Loop`.  A counter absorbed
     // into a for-init via its declaration/zero-init (not an explicit pre-loop
     // re-init `Store`) is sound only at top level: nested in another loop that
