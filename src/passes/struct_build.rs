@@ -339,7 +339,7 @@ fn statement_references_local(
             found = true;
         }
     };
-    visit_statement_expressions(stmt, arena, &mut check);
+    crate::passes::expr_util::visit_statement_operands(stmt, true, &mut check);
     found
 }
 
@@ -357,7 +357,7 @@ fn statement_value_reads_local(
             found = true;
         }
     };
-    visit_statement_expressions(stmt, arena, &mut check);
+    crate::passes::expr_util::visit_statement_operands(stmt, true, &mut check);
     found
 }
 
@@ -414,92 +414,13 @@ fn expr_mentions_local_memo(
     found
 }
 
-/// Visit every expression handle a statement reads (NOT recursing into nested
-/// blocks; the caller drives block recursion).  Store pointers are included so
-/// member-store targets count as references for the nested-ref guard.
-fn visit_statement_expressions(
-    stmt: &naga::Statement,
-    arena: &naga::Arena<naga::Expression>,
-    f: &mut impl FnMut(naga::Handle<naga::Expression>),
-) {
-    use naga::Statement as S;
-    match stmt {
-        S::Emit(range) => {
-            for h in range.clone() {
-                f(h);
-            }
-        }
-        S::Store { pointer, value } => {
-            f(*pointer);
-            f(*value);
-        }
-        S::Return { value: Some(v) } => f(*v),
-        S::If { condition, .. } => f(*condition),
-        S::Switch { selector, .. } => f(*selector),
-        S::Loop {
-            break_if: Some(b), ..
-        } => f(*b),
-        S::Call {
-            arguments, result, ..
-        } => {
-            for &a in arguments {
-                f(a);
-            }
-            if let Some(r) = result {
-                f(*r);
-            }
-        }
-        S::Atomic { pointer, value, .. } => {
-            f(*pointer);
-            f(*value);
-        }
-        S::ImageStore {
-            image,
-            coordinate,
-            array_index,
-            value,
-        } => {
-            f(*image);
-            f(*coordinate);
-            if let Some(a) = array_index {
-                f(*a);
-            }
-            f(*value);
-        }
-        S::WorkGroupUniformLoad { pointer, result } => {
-            f(*pointer);
-            f(*result);
-        }
-        // The catch-all is sound for the local-mention consumers because
-        // every COMPUTED expression is rooted through the `Emit` arm; a
-        // variant may be skipped here iff its own handle fields are all
-        // Emit'd computations, childless result expressions (which cannot
-        // mention a local), or pointers that can never root at a
-        // struct-typed function local (`RayQuery::query`,
-        // `WorkGroupUniformLoad::pointer`).  Bare-`LocalVariable` fields
-        // that CAN root at one - `Store::pointer`, `Call::arguments` -
-        // must have explicit arms above.
-        _ => {}
-    }
-    let _ = arena;
-}
-
 /// Run `f` on every statement that lives inside a NESTED block of `body` (i.e.
 /// every statement reachable through a block-bearing statement, NOT the
 /// top-level statements themselves).
 fn walk_nested(body: &naga::Block, f: &mut impl FnMut(&naga::Statement)) {
     for stmt in body.iter() {
         for nested in crate::passes::expr_util::nested_blocks(stmt) {
-            walk_block_all(nested, f);
-        }
-    }
-}
-
-fn walk_block_all(body: &naga::Block, f: &mut impl FnMut(&naga::Statement)) {
-    for stmt in body.iter() {
-        f(stmt);
-        for nested in crate::passes::expr_util::nested_blocks(stmt) {
-            walk_block_all(nested, f);
+            crate::passes::expr_util::for_each_statement(nested, f);
         }
     }
 }

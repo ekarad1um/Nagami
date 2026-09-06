@@ -566,6 +566,66 @@ const WGSL_PREDECLARED: &[&str] = &[
     "RayIntersection",
 ];
 
+// MARK: Module name census
+
+/// Every named module-scope declaration the rename pass owns: constants,
+/// overrides, globals, functions, and entry points.  Types and struct
+/// members are the generator's namespace; see [`type_names`] and
+/// [`struct_member_names`].
+pub(crate) fn module_scope_names(module: &naga::Module) -> impl Iterator<Item = &str> {
+    module
+        .constants
+        .iter()
+        .filter_map(|(_, c)| c.name.as_deref())
+        .chain(
+            module
+                .overrides
+                .iter()
+                .filter_map(|(_, o)| o.name.as_deref()),
+        )
+        .chain(
+            module
+                .global_variables
+                .iter()
+                .filter_map(|(_, g)| g.name.as_deref()),
+        )
+        .chain(
+            module
+                .functions
+                .iter()
+                .filter_map(|(_, f)| f.name.as_deref()),
+        )
+        .chain(module.entry_points.iter().map(|ep| ep.name.as_str()))
+}
+
+pub(crate) fn type_names(module: &naga::Module) -> impl Iterator<Item = &str> {
+    module.types.iter().filter_map(|(_, ty)| ty.name.as_deref())
+}
+
+pub(crate) fn struct_member_names(module: &naga::Module) -> impl Iterator<Item = &str> {
+    module
+        .types
+        .iter()
+        .flat_map(|(_, ty)| match &ty.inner {
+            naga::TypeInner::Struct { members, .. } => members.as_slice(),
+            _ => &[],
+        })
+        .filter_map(|m| m.name.as_deref())
+}
+
+/// Argument and local-variable names of one function body; a module-scope
+/// name minted equal to one would be shadowed inside that function.
+pub(crate) fn function_local_names(func: &naga::Function) -> impl Iterator<Item = &str> {
+    func.arguments
+        .iter()
+        .filter_map(|a| a.name.as_deref())
+        .chain(
+            func.local_variables
+                .iter()
+                .filter_map(|(_, l)| l.name.as_deref()),
+        )
+}
+
 // MARK: Name generation
 
 /// Encode `counter` as a short identifier via bijective numeration.

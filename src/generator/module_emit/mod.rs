@@ -7,7 +7,7 @@
 //! entry points.  Each section is gated on liveness and on the alias
 //! plan computed up front in [`super::core::Generator::new`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::error::Error;
 
@@ -27,6 +27,228 @@ use call_inline::{compute_pure_functions, find_inlineable_calls};
 use defer_vars::find_for_loop_vars;
 use must_bind::compute_must_bind_loads;
 use ref_counts::compute_expression_ref_counts;
+
+/// The `enable` directives the emitted text needs.  Mirrors naga's own
+/// writer scan except where noted: a liveness gate on 16-bit scalars, the
+/// expression scans for 16-bit values that register no standalone type, and
+/// `ray_query` (naga's writer has no ray-query arm at all).
+#[derive(Default)]
+struct Enables {
+    f16: bool,
+    int16: bool,
+    dual_source_blending: bool,
+    clip_distances: bool,
+    mesh_shaders: bool,
+    binding_array: bool,
+    draw_index: bool,
+    primitive_index: bool,
+    cooperative_matrix: bool,
+    ray_tracing: bool,
+    ray_query: bool,
+    ray_query_vertex_return: bool,
+}
+
+impl Enables {
+    fn note_binding(&mut self, binding: &naga::Binding) {
+        match *binding {
+            naga::Binding::Location {
+                blend_src: Some(_), ..
+            } => self.dual_source_blending = true,
+            naga::Binding::BuiltIn(naga::BuiltIn::ClipDistances) => self.clip_distances = true,
+            naga::Binding::BuiltIn(naga::BuiltIn::PrimitiveIndex) => self.primitive_index = true,
+            naga::Binding::BuiltIn(naga::BuiltIn::DrawIndex) => self.draw_index = true,
+            naga::Binding::Location {
+                per_primitive: true,
+                ..
+            } => self.mesh_shaders = true,
+            naga::Binding::BuiltIn(
+                naga::BuiltIn::RayInvocationId
+                | naga::BuiltIn::NumRayInvocations
+                | naga::BuiltIn::InstanceCustomData
+                | naga::BuiltIn::GeometryIndex
+                | naga::BuiltIn::WorldRayOrigin
+                | naga::BuiltIn::WorldRayDirection
+                | naga::BuiltIn::ObjectRayOrigin
+                | naga::BuiltIn::ObjectRayDirection
+                | naga::BuiltIn::RayTmin
+                | naga::BuiltIn::RayTCurrentMax
+                | naga::BuiltIn::ObjectToWorld
+                | naga::BuiltIn::WorldToObject,
+            ) => self.ray_tracing = true,
+            _ => {}
+        }
+    }
+
+    fn scan(module: &naga::Module, live_types: &HashSet<naga::Handle<naga::Type>>) -> Self {
+        let mut e = Enables {
+            mesh_shaders: module.uses_mesh_shaders(),
+            ..Default::default()
+        };
+        let mut has_acceleration_structure = false;
+        for (h, ty) in module.types.iter() {
+            match ty.inner {
+                // Liveness-gated, unlike naga's raw scan: the compactor roots
+                // `special_types`, so a dead `__frexp_result_f16` would keep
+                // `enable f16;` on text with no f16 token (non-idempotent,
+                // over-declares a device feature).  Under-detection is
+                // fail-safe: the re-parse self-check rejects f16 text
+                // without the enable.
+                naga::TypeInner::Scalar(s)
+                | naga::TypeInner::Vector { scalar: s, .. }
+                | naga::TypeInner::Matrix { scalar: s, .. }
+                    if live_types.contains(&h) =>
+                {
+                    e.f16 |= s == naga::Scalar::F16;
+                    e.int16 |= s == naga::Scalar::I16 || s == naga::Scalar::U16;
+                }
+                naga::TypeInner::Struct { ref members, .. } => {
+                    for binding in members.iter().filter_map(|m| m.binding.as_ref()) {
+                        e.note_binding(binding);
+                    }
+                }
+                naga::TypeInner::CooperativeMatrix { .. } => e.cooperative_matrix = true,
+                // `acceleration_structure` parses under EITHER
+                // `wgpu_ray_query` or `wgpu_ray_tracing_pipeline`, so it is
+                // resolved below, after every pipeline signal is known.
+                naga::TypeInner::AccelerationStructure { vertex_return } => {
+                    has_acceleration_structure = true;
+                    e.ray_query_vertex_return |= vertex_return;
+                }
+                naga::TypeInner::RayQuery { vertex_return } => {
+                    e.ray_query = true;
+                    e.ray_query_vertex_return |= vertex_return;
+                }
+                // naga 30 requires this to parse a `binding_array<...>`; it is
+                // naga-only and `run` strips it from the shipped text.
+                naga::TypeInner::BindingArray { .. } => e.binding_array = true,
+                _ => {}
+            }
+        }
+        // A bare 16-bit literal or a value-changing cast to a 16-bit scalar
+        // that survives folding (a runtime operand) registers no standalone
+        // type yet still emits text the enable must cover.
+        if !e.f16 {
+            e.f16 = any_expression(module, |expr| {
+                matches!(
+                    expr,
+                    naga::Expression::Literal(naga::Literal::F16(_))
+                        | naga::Expression::As {
+                            kind: naga::ScalarKind::Float,
+                            convert: Some(2),
+                            ..
+                        }
+                )
+            });
+        }
+        if !e.int16 {
+            e.int16 = any_expression(module, |expr| {
+                matches!(
+                    expr,
+                    naga::Expression::Literal(naga::Literal::I16(_) | naga::Literal::U16(_))
+                        | naga::Expression::As {
+                            kind: naga::ScalarKind::Sint | naga::ScalarKind::Uint,
+                            convert: Some(2),
+                            ..
+                        }
+                )
+            });
+        }
+        for ep in &module.entry_points {
+            if let Some(res) = ep.function.result.as_ref().and_then(|r| r.binding.as_ref()) {
+                e.note_binding(res);
+            }
+            for binding in ep
+                .function
+                .arguments
+                .iter()
+                .filter_map(|a| a.binding.as_ref())
+            {
+                e.note_binding(binding);
+            }
+        }
+        if module.global_variables.iter().any(|(_, gv)| {
+            matches!(
+                gv.space,
+                naga::AddressSpace::RayPayload | naga::AddressSpace::IncomingRayPayload
+            )
+        }) || module.entry_points.iter().any(|ep| {
+            matches!(
+                ep.stage,
+                naga::ShaderStage::RayGeneration
+                    | naga::ShaderStage::AnyHit
+                    | naga::ShaderStage::ClosestHit
+                    | naga::ShaderStage::Miss
+            )
+        }) {
+            e.ray_tracing = true;
+        }
+        // With a pipeline signal the pipeline enable covers the type; the IR
+        // records no other admitting directive, so a signal-free module is
+        // deliberately rewritten to the query enable.
+        if has_acceleration_structure && !e.ray_tracing {
+            e.ray_query = true;
+        }
+        // No `enable subgroups;` is ever synthesised: naga's text front-end
+        // cannot parse it, and tiny subgroup-only shaders would only grow.
+        e
+    }
+
+    /// Directive lines in naga's writer order, so the block matches the naga
+    /// baseline.
+    fn directives(&self) -> impl Iterator<Item = &'static str> {
+        [
+            (self.f16, "enable f16;"),
+            (self.int16, "enable wgpu_int16;"),
+            (self.dual_source_blending, "enable dual_source_blending;"),
+            (self.clip_distances, "enable clip_distances;"),
+            (self.mesh_shaders, "enable wgpu_mesh_shader;"),
+            (self.binding_array, "enable wgpu_binding_array;"),
+            (self.draw_index, "enable draw_index;"),
+            (self.primitive_index, "enable primitive_index;"),
+            (self.cooperative_matrix, "enable wgpu_cooperative_matrix;"),
+            (self.ray_tracing, "enable wgpu_ray_tracing_pipeline;"),
+            (self.ray_query, "enable wgpu_ray_query;"),
+            (
+                self.ray_query_vertex_return,
+                "enable wgpu_ray_query_vertex_return;",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(on, text)| on.then_some(text))
+    }
+}
+
+/// `true` when any expression in any arena (const-init, function, entry
+/// point) satisfies `pred`.
+fn any_expression(module: &naga::Module, pred: impl Fn(&naga::Expression) -> bool) -> bool {
+    module
+        .global_expressions
+        .iter()
+        .chain(super::core::all_functions(module).flat_map(|f| f.expressions.iter()))
+        .any(|(_, e)| pred(e))
+}
+
+/// Handles of naga's special / predeclared struct types (`RayDesc`,
+/// `RayIntersection`, `__modf_result_*`, `__atomic_compare_exchange_result`,
+/// ...); mirrors naga's own `is_builtin_wgsl_struct`.  Neither declared nor
+/// renamed by the emitter.
+pub(super) fn special_struct_handles(
+    module: &naga::Module,
+) -> std::collections::HashSet<naga::Handle<naga::Type>> {
+    let st = &module.special_types;
+    let mut set: std::collections::HashSet<_> = [
+        st.ray_desc,
+        st.ray_intersection,
+        st.ray_vertex_return,
+        st.external_texture_params,
+        st.external_texture_transfer_function,
+    ]
+    .iter()
+    .filter_map(|h| *h)
+    .collect();
+    set.extend(st.predeclared_types.values().copied());
+    set
+}
 
 /// `true` when a constant's init expression already renders its own
 /// concrete WGSL type, making a `const NAME: T = ...` annotation
@@ -91,326 +313,10 @@ impl<'a> Generator<'a> {
             };
         }
 
-        // Emit `enable` directives for features the module actually uses.
-        // Mirrors naga's own `enable`-directive detection.
-        let mut needs_f16 = false;
-        let mut needs_int16 = false;
-        let mut needs_dual_source_blending = false;
-        let mut needs_clip_distances = false;
-        let mut needs_primitive_index = false;
-        let mut needs_draw_index = false;
-        let mut needs_mesh_shaders = self.module.uses_mesh_shaders();
-        let mut needs_cooperative_matrix = false;
-        let mut needs_ray_tracing = false;
-        let mut needs_binding_array = false;
-        let mut needs_ray_query = false;
-        let mut needs_ray_query_vertex_return = false;
-        let mut has_acceleration_structure = false;
-
-        let check_binding = |binding: &naga::Binding,
-                             needs_dual: &mut bool,
-                             needs_clip: &mut bool,
-                             needs_prim: &mut bool,
-                             needs_draw: &mut bool,
-                             needs_mesh: &mut bool,
-                             needs_rt: &mut bool| {
-            match *binding {
-                naga::Binding::Location {
-                    blend_src: Some(_), ..
-                } => *needs_dual = true,
-                naga::Binding::BuiltIn(naga::BuiltIn::ClipDistances) => *needs_clip = true,
-                naga::Binding::BuiltIn(naga::BuiltIn::PrimitiveIndex) => *needs_prim = true,
-                naga::Binding::BuiltIn(naga::BuiltIn::DrawIndex) => *needs_draw = true,
-                naga::Binding::Location {
-                    per_primitive: true,
-                    ..
-                } => *needs_mesh = true,
-                naga::Binding::BuiltIn(
-                    naga::BuiltIn::RayInvocationId
-                    | naga::BuiltIn::NumRayInvocations
-                    | naga::BuiltIn::InstanceCustomData
-                    | naga::BuiltIn::GeometryIndex
-                    | naga::BuiltIn::WorldRayOrigin
-                    | naga::BuiltIn::WorldRayDirection
-                    | naga::BuiltIn::ObjectRayOrigin
-                    | naga::BuiltIn::ObjectRayDirection
-                    | naga::BuiltIn::RayTmin
-                    | naga::BuiltIn::RayTCurrentMax
-                    | naga::BuiltIn::ObjectToWorld
-                    | naga::BuiltIn::WorldToObject,
-                ) => *needs_rt = true,
-                _ => {}
-            }
-        };
-
-        // Scan types: f16, cooperative matrix, acceleration structure, struct
-        // member bindings (clip_distances, mesh, dual_source_blending, etc.).
-        for (h, ty) in self.module.types.iter() {
-            match ty.inner {
-                // Gated on liveness, unlike naga's writer scan of the raw
-                // arena: naga's compactor roots `special_types` (e.g. a dead
-                // `__frexp_result_f16` and its f16/i16 member scalars survive
-                // every DCE), so a raw scan emits `enable f16;` for a shader
-                // whose emitted text has no f16 token at all - the enable
-                // then drops on re-minify (non-idempotent) and retains a
-                // device-feature requirement the output no longer needs.
-                // Under-detection stays fail-safe, not silent-invalid:
-                // output using f16 without the enable fails the run()
-                // re-parse self-check and ships via the naga fallback.
-                naga::TypeInner::Scalar(s)
-                | naga::TypeInner::Vector { scalar: s, .. }
-                | naga::TypeInner::Matrix { scalar: s, .. }
-                    if self.live_types.contains(&h) =>
-                {
-                    needs_f16 |= s == naga::Scalar::F16;
-                    needs_int16 |= s == naga::Scalar::I16 || s == naga::Scalar::U16;
-                }
-                naga::TypeInner::Struct { ref members, .. } => {
-                    for binding in members.iter().filter_map(|m| m.binding.as_ref()) {
-                        check_binding(
-                            binding,
-                            &mut needs_dual_source_blending,
-                            &mut needs_clip_distances,
-                            &mut needs_primitive_index,
-                            &mut needs_draw_index,
-                            &mut needs_mesh_shaders,
-                            &mut needs_ray_tracing,
-                        );
-                    }
-                }
-                naga::TypeInner::CooperativeMatrix { .. } => {
-                    needs_cooperative_matrix = true;
-                }
-                // `acceleration_structure` / `ray_query` parse under EITHER
-                // `wgpu_ray_query` OR `wgpu_ray_tracing_pipeline` (naga's
-                // front lists both as satisfying), so an acceleration
-                // structure resolves to an enable only after every pipeline
-                // signal (stage, payload, builtin) has been scanned - see the
-                // resolution below the stage scan.  The `vertex_return` type
-                // flag additionally requires `enable
-                // wgpu_ray_query_vertex_return;` to spell.
-                naga::TypeInner::AccelerationStructure { vertex_return } => {
-                    has_acceleration_structure = true;
-                    needs_ray_query_vertex_return |= vertex_return;
-                }
-                // naga's own writer has no `ray_query` detection (it cannot
-                // write `Statement::RayQuery` at all - `unreachable!()` in
-                // its statement arm), so this goes beyond mirroring naga:
-                // without the enable, emitted `ray_query` locals and
-                // `rayQuery*` builtins fail the naga re-parse self-check.
-                naga::TypeInner::RayQuery { vertex_return } => {
-                    needs_ray_query = true;
-                    needs_ray_query_vertex_return |= vertex_return;
-                }
-                // naga 30 requires `enable wgpu_binding_array;` for a
-                // `binding_array<...>` type; mirror its backend's detection.
-                naga::TypeInner::BindingArray { .. } => {
-                    needs_binding_array = true;
-                }
-                _ => {}
-            }
-        }
-
-        // The type scan above (mirroring naga's own writer) misses an f16
-        // value that registers no standalone f16 `TypeInner`: a bare `F16`
-        // literal or a value-changing cast to f16 that survives folding
-        // because it has a runtime operand (e.g. `f32(f16(x) + 2h)` keeps a
-        // `2h` literal and an `f16(..)` cast).  Both still emit text that
-        // requires `enable f16;`, so also scan every expression arena -
-        // const-init, per-function, and entry-point - for them; omitting
-        // the directive there yields invalid, naga-rejected output.
-        if !needs_f16 {
-            let scan = |arena: &naga::Arena<naga::Expression>| {
-                arena.iter().any(|(_, e)| {
-                    matches!(
-                        e,
-                        naga::Expression::Literal(naga::Literal::F16(_))
-                            | naga::Expression::As {
-                                kind: naga::ScalarKind::Float,
-                                convert: Some(2),
-                                ..
-                            }
-                    )
-                })
-            };
-            needs_f16 = scan(&self.module.global_expressions)
-                || self
-                    .module
-                    .functions
-                    .iter()
-                    .any(|(_, f)| scan(&f.expressions))
-                || self
-                    .module
-                    .entry_points
-                    .iter()
-                    .any(|ep| scan(&ep.function.expressions));
-        }
-
-        // Same edge case for `wgpu_int16`: a bare `i16`/`u16` literal (emitted
-        // as `i16(N)` / `u16(N)`) or a cast to a 16-bit integer may not register
-        // a standalone `TypeInner`, yet the emitted text still needs the enable.
-        if !needs_int16 {
-            let scan = |arena: &naga::Arena<naga::Expression>| {
-                arena.iter().any(|(_, e)| {
-                    matches!(
-                        e,
-                        naga::Expression::Literal(naga::Literal::I16(_) | naga::Literal::U16(_))
-                            | naga::Expression::As {
-                                kind: naga::ScalarKind::Sint | naga::ScalarKind::Uint,
-                                convert: Some(2),
-                                ..
-                            }
-                    )
-                })
-            };
-            needs_int16 = scan(&self.module.global_expressions)
-                || self
-                    .module
-                    .functions
-                    .iter()
-                    .any(|(_, f)| scan(&f.expressions))
-                || self
-                    .module
-                    .entry_points
-                    .iter()
-                    .any(|ep| scan(&ep.function.expressions));
-        }
-
-        // Scan entry point bindings (arguments and result).
-        for ep in &self.module.entry_points {
-            if let Some(res) = ep.function.result.as_ref().and_then(|r| r.binding.as_ref()) {
-                check_binding(
-                    res,
-                    &mut needs_dual_source_blending,
-                    &mut needs_clip_distances,
-                    &mut needs_primitive_index,
-                    &mut needs_draw_index,
-                    &mut needs_mesh_shaders,
-                    &mut needs_ray_tracing,
-                );
-            }
-            for arg_binding in ep
-                .function
-                .arguments
-                .iter()
-                .filter_map(|a| a.binding.as_ref())
-            {
-                check_binding(
-                    arg_binding,
-                    &mut needs_dual_source_blending,
-                    &mut needs_clip_distances,
-                    &mut needs_primitive_index,
-                    &mut needs_draw_index,
-                    &mut needs_mesh_shaders,
-                    &mut needs_ray_tracing,
-                );
-            }
-        }
-
-        // RayPayload / IncomingRayPayload address spaces -> ray tracing.
-        if self.module.global_variables.iter().any(|gv| {
-            matches!(
-                gv.1.space,
-                naga::AddressSpace::RayPayload | naga::AddressSpace::IncomingRayPayload
-            )
-        }) {
-            needs_ray_tracing = true;
-        }
-
-        // Ray tracing shader stages -> ray tracing.
-        if self.module.entry_points.iter().any(|ep| {
-            matches!(
-                ep.stage,
-                naga::ShaderStage::RayGeneration
-                    | naga::ShaderStage::AnyHit
-                    | naga::ShaderStage::ClosestHit
-                    | naga::ShaderStage::Miss
-            )
-        }) {
-            needs_ray_tracing = true;
-        }
-
-        // Resolve acceleration structures now that every pipeline signal has
-        // been scanned: with a pipeline signal present, the pipeline enable
-        // already covers the type; otherwise emit `enable wgpu_ray_query;`
-        // (naga parses the type under either directive and the IR carries no
-        // record of which enable admitted it, so a pipeline-enabled but
-        // signal-free input is deliberately rewritten to the query enable).
-        if has_acceleration_structure && !needs_ray_tracing {
-            needs_ray_query = true;
-        }
-
-        // Note: we intentionally do NOT synthesize `enable subgroups;`.
-        // This avoids known naga subgroup-directive text-parse limitations
-        // and prevents non-profitable growth for tiny subgroup-only shaders.
-
-        // Emit.  Ordering follows naga's own WGSL backend (f16, int16, ...,
-        // binding_array, ...) so the directive block matches the naga baseline.
-        let any_enable = needs_f16
-            || needs_int16
-            || needs_dual_source_blending
-            || needs_clip_distances
-            || needs_mesh_shaders
-            || needs_binding_array
-            || needs_draw_index
-            || needs_primitive_index
-            || needs_cooperative_matrix
-            || needs_ray_tracing
-            || needs_ray_query
-            || needs_ray_query_vertex_return;
-        if any_enable {
-            if needs_f16 {
-                self.out.push_str("enable f16;");
-                self.push_newline();
-            }
-            if needs_int16 {
-                self.out.push_str("enable wgpu_int16;");
-                self.push_newline();
-            }
-            if needs_dual_source_blending {
-                self.out.push_str("enable dual_source_blending;");
-                self.push_newline();
-            }
-            if needs_clip_distances {
-                self.out.push_str("enable clip_distances;");
-                self.push_newline();
-            }
-            if needs_mesh_shaders {
-                self.out.push_str("enable wgpu_mesh_shader;");
-                self.push_newline();
-            }
-            // naga 30 requires this to parse a `binding_array<...>`; the naga
-            // self-check and re-parse depend on it.  It is a naga-only directive
-            // tint rejects, so `run` strips it from the final tint-facing output
-            // (tint supports binding arrays natively without an enable).
-            if needs_binding_array {
-                self.out.push_str("enable wgpu_binding_array;");
-                self.push_newline();
-            }
-            if needs_draw_index {
-                self.out.push_str("enable draw_index;");
-                self.push_newline();
-            }
-            if needs_primitive_index {
-                self.out.push_str("enable primitive_index;");
-                self.push_newline();
-            }
-            if needs_cooperative_matrix {
-                self.out.push_str("enable wgpu_cooperative_matrix;");
-                self.push_newline();
-            }
-            if needs_ray_tracing {
-                self.out.push_str("enable wgpu_ray_tracing_pipeline;");
-                self.push_newline();
-            }
-            if needs_ray_query {
-                self.out.push_str("enable wgpu_ray_query;");
-                self.push_newline();
-            }
-            if needs_ray_query_vertex_return {
-                self.out.push_str("enable wgpu_ray_query_vertex_return;");
-                self.push_newline();
-            }
+        let enables = Enables::scan(self.module, &self.live_types);
+        for directive in enables.directives() {
+            self.out.push_str(directive);
+            self.push_newline();
             has_prev_section = true;
         }
 
@@ -456,33 +362,10 @@ impl<'a> Generator<'a> {
         }
 
         let preamble = self.options.preamble_names.clone();
-        // Collect handles of naga's special/predeclared struct types so we
-        // don't re-emit them as user-defined struct declarations.  In WGSL
-        // these are predeclared types (e.g. `RayDesc`, `RayIntersection`,
-        // `__modf_result_f32`, `__atomic_compare_exchange_result`, ...) and
-        // declaring them again as a struct makes the validator reject
-        // constructor expressions because the user struct and the predeclared
-        // type end up with different type-arena handles.
-        //
-        // Mirrors naga's own `is_builtin_wgsl_struct` test exactly.
-        let special_type_handles: std::collections::HashSet<naga::Handle<naga::Type>> = {
-            let st = &self.module.special_types;
-            // Named singleton special types.
-            let mut set: std::collections::HashSet<_> = [
-                st.ray_desc,
-                st.ray_intersection,
-                st.ray_vertex_return,
-                st.external_texture_params,
-                st.external_texture_transfer_function,
-            ]
-            .iter()
-            .filter_map(|h| *h)
-            .collect();
-            // All predeclared result types: AtomicCompareExchangeWeakResult,
-            // ModfResult, FrexpResult (and any future variants naga adds).
-            set.extend(st.predeclared_types.values().copied());
-            set
-        };
+        // naga's predeclared struct types are not declarable WGSL: declaring
+        // them again gives the user struct and the predeclared type different
+        // type-arena handles, so constructor expressions fail validation.
+        let special_type_handles = special_struct_handles(self.module);
         for (h, ty) in self.module.types.iter() {
             if let naga::TypeInner::Struct { members, span } = &ty.inner {
                 if !self.live_types.contains(&h) {
@@ -1067,7 +950,7 @@ impl<'a> Generator<'a> {
         cache_idx: usize,
     ) -> Result<(), Error> {
         let ref_counts = std::mem::take(&mut self.ref_count_cache[cache_idx].ref_counts);
-        let (deferred_vars, dead_vars) = find_deferrable_vars(func);
+        let (deferred_vars, dead_vars) = std::mem::take(&mut self.defer_cache[cache_idx]);
         // Compute the must-bind loads first: `find_for_loop_vars` consults them
         // so its counter-var suppression stays in lockstep with
         // `try_emit_for_loop`'s for-conversion decision (both reject a loop

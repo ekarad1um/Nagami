@@ -1,18 +1,11 @@
-//! Pipeline driver: owns the [`Pass`] trait, the convergence loop, and
-//! all per-pass bookkeeping (validation, rollback, trace dumps).
-//!
-//! Passes are pure IR-to-IR transforms; the driver wraps them with
-//! validation, optional text round-tripping, optional rollback, and a
-//! per-pass [`PassReport`] that downstream consumers (CLI, wasm
-//! bindings, tests) surface verbatim.
+//! Pipeline driver: the [`Pass`] trait, the convergence loop, and the
+//! per-pass bookkeeping (validation, rollback, trace dumps, [`PassReport`]).
 
 use std::path::PathBuf;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::config::TraceDumpFormat;
 use crate::error::Error;
 use crate::io;
 
@@ -22,89 +15,62 @@ mod report;
 pub use context::PassContext;
 pub use report::{PassReport, Report};
 
-/// Hard cap on driver iterations.  Prevents pathological pass
-/// interactions from looping forever; real pipelines converge in
-/// well under this many sweeps.
+/// Hard cap on sweeps; real pipelines converge well under it.
 const MAX_PIPELINE_SWEEPS: usize = 16;
 
 /// An IR optimization pass that mutates a naga module in place.
 pub trait Pass {
     /// Short, unique identifier for reports and trace filenames.
     fn name(&self) -> &'static str;
-    /// Execute the pass against `module`.
-    ///
-    /// Returns `Ok(true)` when the module was modified and `Ok(false)`
-    /// when the pass made no change.  The driver validates after every
-    /// run, so passes may produce intermediate invalid IR only if they
-    /// restore validity before returning.
+    /// Run against `module`; `Ok(true)` iff it was modified.  The driver
+    /// validates only after a declared change, skips a pass whose input is
+    /// unchanged since it last contributed none, and re-runs accepted
+    /// passes to rebuild the pre-failure state after a rollback: a pass
+    /// must be a deterministic function of the module and must not touch
+    /// it (or the name log) while returning `Ok(false)`.
     ///
     /// # Errors
     ///
-    /// Returns [`Error`] if the pass encounters an unrecoverable failure.
+    /// Returns [`Error`] on an unrecoverable failure.
     fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error>;
 }
 
-/// Emit WGSL text for `module` using naga's backend and the supplied
-/// `ModuleInfo`.  Skips validation, so callers MUST ensure `info`
-/// matches the current IR state; a stale `ModuleInfo` can panic deep
-/// inside the backend through out-of-bounds type or expression indexing.
-///
-/// The pipeline threads a single `ModuleInfo` across pass boundaries
-/// precisely so this helper avoids re-validating for the before/after
-/// text emission paths; without it, trace and `validate_each_pass`
-/// builds would pay the validator cost twice per pass.
-///
-/// In `cfg(debug_assertions)` builds (which include `cargo test`),
-/// the helper re-validates `module` anyway as a drift guard - so
-/// debug-build emission costs the same as the redundant path that
-/// release intentionally avoids.  Release builds (where the perf
-/// gain matters) skip the check entirely.
+/// naga's WGSL text for `module` under an already computed `info`, so the
+/// trace / `validate_each_pass` emissions never pay the validator twice
+/// per pass.  A stale `info` panics inside the backend through
+/// out-of-bounds arena indexing; debug builds re-validate as a drift guard.
 fn emit_wgsl_with_info(
     module: &naga::Module,
     info: &naga::valid::ModuleInfo,
 ) -> Result<String, Error> {
-    // naga's WGSL backend hits `unreachable!()` on certain inputs (override-
-    // sized array sizes, non-const override/global initializers), which aborts
-    // the process under release `panic = "abort"`.  `--trace` and
-    // `--validate-each-pass` run this on every intermediate IR, so return a
-    // placeholder rather than the panicking backend.  The placeholder is
-    // comment-only WGSL that re-parses as an empty module, so the
-    // `validate_each_pass` text check below MUST skip these modules or it would
-    // record a spurious clean round-trip.
+    // The backend hits `unreachable!()` (an abort under `panic = "abort"`) on
+    // override-sized arrays and non-const global initializers; the
+    // comment-only placeholder re-parses as an empty module, which is why the
+    // text round-trip check skips these modules.
     if crate::module_needs_naga_baseline_skip(module) {
         return Ok("// (naga WGSL backend skipped: unsupported emit)\n".to_string());
     }
-    // Debug-only drift guard: re-validate so a mutation that left `module`
-    // INVALID surfaces as a clean panic here rather than a cryptic crash in
-    // the backend.  It does NOT verify `info` still matches the module's
-    // arena, so a valid-but-stale `info` (e.g. after the arena grew) can still
-    // fault inside `write_string`.  Release builds skip the check entirely;
-    // see the doc-comment above for the debug-vs-release cost trade-off.
-    #[cfg(debug_assertions)]
-    {
-        debug_assert!(
-            io::validate_module(module).is_ok(),
-            "emit_wgsl_with_info called with a stale ModuleInfo: module no longer validates"
-        );
-    }
+    // Catches a module left invalid, not an `info` whose arena view is stale.
+    debug_assert!(
+        io::validate_module(module).is_ok(),
+        "emit_wgsl_with_info called with a stale ModuleInfo: module no longer validates"
+    );
     naga::back::wgsl::write_string(module, info, naga::back::wgsl::WriterFlags::empty())
         .map_err(|e| Error::Emit(e.to_string()))
 }
 
 // MARK: Driver
 
-/// Run the IR optimization pipeline to a fixed point.
-///
-/// Passes from [`crate::passes::build_ir_passes`] execute in order and
-/// the whole sequence repeats until no pass reports a change, capped
-/// at `MAX_PIPELINE_SWEEPS` sweeps.  Every pass is validated; failures
-/// either roll back or escalate to [`Error::Validation`] depending on
+/// Run the IR pipeline to a fixed point: [`crate::passes::build_ir_passes`]
+/// in order, repeated until no pass reports a change, capped at
+/// `MAX_PIPELINE_SWEEPS`.  Every declared change is validated; a failure
+/// rolls back, or escalates under
 /// [`crate::config::TraceConfig::validate_each_pass`].
 ///
 /// # Errors
 ///
-/// Returns [`Error`] if any pass fails with an unrecoverable error or
-/// if the module fails validation and rollback is disabled.
+/// Returns [`Error`] on an unrecoverable pass failure, or on a validation
+/// failure when rollback is disabled.
 pub fn run_ir_passes(
     module: &mut naga::Module,
     config: &Config,
@@ -114,9 +80,7 @@ pub fn run_ir_passes(
     run_ir_passes_with(module, config, report, passes)
 }
 
-/// Internal driver parameterised on the pass list so tests can inject
-/// synthetic passes (e.g. an IR-corrupting pass for rollback / hard-fail
-/// coverage) without rebuilding the full pipeline.
+/// Driver parameterised on the pass list so tests can inject synthetic passes.
 fn run_ir_passes_with(
     module: &mut naga::Module,
     config: &Config,
@@ -127,28 +91,48 @@ fn run_ir_passes_with(
     let mut sweeps = 0usize;
     // Module-scope renames across sweeps, for the name map.
     let name_log = std::cell::RefCell::new(crate::name_map::NameLog::default());
+    let trace_enabled = config.trace.enabled;
+    let needs_text_validation = config.trace.validate_each_pass;
+    // Trace / CI runs report every pass; the plain path skips idle ones.
+    let full_fidelity = trace_enabled || needs_text_validation;
 
-    // Thread a `ModuleInfo` across pass boundaries so neither text
-    // emission nor per-pass validation ever re-runs the validator
-    // redundantly.  Seeding is lazy: without tracing or
-    // `validate_each_pass`, emission helpers are never called and the
-    // common hot path (plain minification) avoids paying for an upfront
-    // `validate_module`.  Every successful pass refreshes `current_info`
-    // from its post-validation result, so the initial seed matters only
-    // for the very first `before_text`.
-    let needs_info_upfront = config.trace.enabled || config.trace.validate_each_pass;
-    let mut current_info: Option<naga::valid::ModuleInfo> = if needs_info_upfront {
+    // Validator info reused by the trace / CI text emissions; plain
+    // minification emits no intermediate text and leaves it unseeded.
+    let mut current_info: Option<naga::valid::ModuleInfo> = if full_fidelity {
         Some(io::validate_module(module)?)
     } else {
         None
     };
 
+    // `version` counts accepted changes; `clean_at[i]` is the version at
+    // which pass `i` last contributed none (no change, or rejected).  Passes
+    // are deterministic in the module, so a pass clean at the current
+    // version is skipped: it would contribute none again.  Output and
+    // convergence are unaffected; only the report omits the idle runs.
+    let mut version = 0u64;
+    let mut clean_at: Vec<Option<u64>> = vec![None; passes.len()];
+
     loop {
         let mut any_changed = false;
 
-        for pass in passes.iter_mut() {
-            let trace_enabled = config.trace.enabled;
-            let needs_text_validation = config.trace.validate_each_pass;
+        // Rollback state: module + name log (a stale log would report renames
+        // the shipped names lack) as of the sweep start, and the passes whose
+        // accepted changes it lacks.  A validation failure restores it and
+        // replays exactly those passes: determinism reproduces the pre-pass
+        // state, and a rejected pass never joins the list, so a second
+        // failure cannot resurrect the first one's output.  Taken before the
+        // first pass that runs (an all-idle sweep clones nothing); never
+        // under `validate_each_pass`, where every failure is an `Err`.
+        let mut backup: Option<(naga::Module, crate::name_map::NameLog)> = None;
+        let mut accepted: Vec<usize> = Vec::new();
+
+        for i in 0..passes.len() {
+            if !full_fidelity && clean_at[i] == Some(version) {
+                continue;
+            }
+            if backup.is_none() && !needs_text_validation {
+                backup = Some((module.clone(), name_log.borrow().clone()));
+            }
 
             let before_text = if trace_enabled {
                 let info = current_info
@@ -160,27 +144,6 @@ fn run_ir_passes_with(
             };
             let before_bytes = before_text.as_ref().map(|text| text.len());
 
-            // Pre-pass backup used to roll back invalid IR.
-            //
-            // naga's arenas derive `Clone` without a custom `clone_from`,
-            // so the default impl allocates a fresh copy anyway; reusing
-            // a long-lived backup via `clone_from + mem::swap` would
-            // bring no capacity reuse until naga ships its own impl.
-            //
-            // Under `validate_each_pass` every failure path escalates
-            // to `Err` without ever consuming the backup, so we skip
-            // the clone entirely on that CI-oriented path where
-            // `module.clone()` is otherwise the hottest call.  Taking
-            // the backup below in that mode would indicate a logic bug.
-            let mut backup: Option<naga::Module> = if needs_text_validation {
-                None
-            } else {
-                Some(module.clone())
-            };
-            // Snapshot the log with the module: a rollback that kept the
-            // log would report renames the shipped names do not carry.
-            let log_backup = backup.as_ref().map(|_| name_log.borrow().clone());
-
             #[cfg(not(target_arch = "wasm32"))]
             let start = Instant::now();
             let ctx = PassContext {
@@ -189,7 +152,7 @@ fn run_ir_passes_with(
                 name_log: Some(&name_log),
             };
 
-            let declared_changed = pass.run(module, &ctx)?;
+            let declared_changed = passes[i].run(module, &ctx)?;
             #[cfg(not(target_arch = "wasm32"))]
             let duration_us = start.elapsed().as_micros() as u64;
             #[cfg(target_arch = "wasm32")]
@@ -198,77 +161,59 @@ fn run_ir_passes_with(
             let mut rolled_back = false;
             let mut text_validation_ok = None;
 
-            // A pass declaring "no change" leaves the module byte-identical
-            // to the state the previous validation already blessed, so
-            // re-validating is pure redundancy - a converged sweep otherwise
-            // pays one full validator run per pass for nothing (~40% of wall
-            // time on statement-dense shaders).  The declaration is a
-            // load-bearing contract either way (it alone drives convergence);
-            // an under-reporting pass is caught by the traced debug_assert
-            // below, and `validate_each_pass` (the CI mode) still validates
-            // after every pass, changed or not.
+            // No declared change -> the module is still the state the last
+            // validation blessed, so only CI mode re-validates; an
+            // under-reporting pass trips the traced debug_assert below.
             if declared_changed || needs_text_validation {
                 match io::validate_module(module) {
                     Ok(info) => {
-                        // Adopt the fresh info unconditionally.  Even when
-                        // this iteration did not consume `current_info`
-                        // (only the trace / validate_each_pass emission
-                        // paths do), caching it here means the next pass
-                        // whose `before_text` is needed already has a
-                        // current snapshot and avoids a redundant validation.
                         current_info = Some(info);
+                        if declared_changed {
+                            version += 1;
+                            accepted.push(i);
+                        }
                     }
                     Err(e) => {
                         if needs_text_validation {
-                            // `validate_each_pass` escalates IR failures to
-                            // a hard `Err` so CI surfaces a regressing pass
-                            // instead of burying a warning in stderr.  The
-                            // text-validation branch further down applies
-                            // the same policy for symmetry.
+                            // CI mode: a regressing pass is an error, not a warning.
                             return Err(Error::Validation(format!(
                                 "pass '{}' produced invalid IR: {}",
-                                pass.name(),
+                                passes[i].name(),
                                 e
                             )));
                         }
-                        // We took the !needs_text_validation branch above
-                        // when seeding `backup`, so it is always `Some` on
-                        // this branch.  The `expect` documents the
-                        // invariant rather than introducing a runtime
-                        // fallback that would also have to return an Err.
-                        let b = backup.take().expect(
-                            "backup must be Some when validate_each_pass is off; \
-                         see pre-pass backup gate above",
-                        );
                         eprintln!(
                             "warning: validation failed after pass '{}', rolling back: {}",
-                            pass.name(),
+                            passes[i].name(),
                             e
                         );
-                        *module = b;
-                        if let Some(lb) = log_backup {
-                            *name_log.borrow_mut() = lb;
+                        // Pre-pass state again, which `current_info` (if
+                        // seeded) already describes.
+                        let (saved_module, saved_log) = backup
+                            .as_ref()
+                            .expect("backup is taken whenever validate_each_pass is off");
+                        *module = saved_module.clone();
+                        *name_log.borrow_mut() = saved_log.clone();
+                        for &earlier in &accepted {
+                            passes[earlier].run(module, &ctx)?;
                         }
-                        // `current_info` (if seeded) still matches the
-                        // restored backup since it was last refreshed
-                        // against the pre-pass state, so re-validation
-                        // is unnecessary.
                         validation_ok = false;
                         rolled_back = true;
                     }
                 }
             }
+            if !declared_changed || rolled_back {
+                clean_at[i] = Some(version);
+            }
 
             let after_text = if rolled_back {
-                // Module is back to its pre-pass state, so reuse
-                // `before_text` when tracing rather than emitting the
-                // identical string a second time.
+                // Pre-pass state again: the before text is the after text.
                 if trace_enabled {
                     before_text.clone()
                 } else {
                     None
                 }
-            } else if trace_enabled || needs_text_validation {
+            } else if full_fidelity {
                 let info = current_info
                     .as_ref()
                     .expect("current_info is refreshed after every successful pass");
@@ -278,10 +223,8 @@ fn run_ir_passes_with(
             };
             let after_bytes = after_text.as_ref().map(|text| text.len());
 
-            // naga-baseline-skipped modules emit a comment-only placeholder
-            // (the backend would abort), which re-parses as a valid empty
-            // module; skip the check so a spurious clean round-trip is not
-            // recorded, leaving `text_validation_ok` as `None`.
+            // A baseline-skipped module's placeholder text re-parses as an
+            // empty module: no verdict rather than a spurious clean round-trip.
             if !rolled_back
                 && needs_text_validation
                 && !crate::module_needs_naga_baseline_skip(module)
@@ -294,12 +237,9 @@ fn run_ir_passes_with(
                 .is_ok();
                 text_validation_ok = Some(ok);
                 if !ok {
-                    // Mirror the IR-validation policy above: under
-                    // `validate_each_pass`, a failed text round-trip
-                    // escalates to a structured error.
                     return Err(Error::Validation(format!(
                         "pass '{}' produced IR that round-trips to invalid WGSL text",
-                        pass.name()
+                        passes[i].name()
                     )));
                 }
             }
@@ -308,30 +248,24 @@ fn run_ir_passes_with(
                 (Some(before), Some(after)) => before != after,
                 _ => false,
             };
-            // Convergence is driven SOLELY by each pass's own `declared_changed`
-            // return.  `changed_by_text` requires `before_text`, which exists
-            // only under `--trace`, so folding it into the loop signal would
-            // make a deterministic minifier's convergence depth depend on a
-            // debug flag (an under-reporting pass would sweep one extra time
-            // only when traced).  It is kept solely to enrich the per-pass
-            // report below.
+            // Convergence follows the declarations alone: `changed_by_text`
+            // exists only under `--trace`, and letting it drive the loop
+            // would make convergence depth depend on a debug flag.  It only
+            // enriches the report and, in debug builds, exposes an
+            // under-reporting pass.
             any_changed |= !rolled_back && declared_changed;
-            // Debug guard: a pass that mutated the IR yet returned `Ok(false)`
-            // is an under-reporter - its emitted text differs here while
-            // `declared_changed` is false.  Catch it loudly in tests rather
-            // than letting traced and production convergence silently fork.
             #[cfg(debug_assertions)]
             if trace_enabled && !rolled_back && !declared_changed {
                 debug_assert!(
                     !changed_by_text,
                     "pass '{}' under-reports: emitted text changed but it returned Ok(false)",
-                    pass.name()
+                    passes[i].name()
                 );
             }
             let changed = !rolled_back && (declared_changed || changed_by_text);
 
             let pass_report = PassReport {
-                pass_name: pass.name().to_string(),
+                pass_name: passes[i].name().to_string(),
                 before_bytes,
                 after_bytes,
                 changed,
@@ -362,20 +296,10 @@ fn run_ir_passes_with(
         if !any_changed || sweeps >= MAX_PIPELINE_SWEEPS {
             if sweeps >= MAX_PIPELINE_SWEEPS && any_changed {
                 report.converged = false;
-                // Persist the sweep count BEFORE the early-Err return
-                // so callers inspecting the report after the error
-                // (we take `&mut report`, the report state is
-                // observable on the Err path) see the actual
-                // sweep-count we ran for, not the `Report::new`
-                // default of 0.
+                // The report is observable on the `Err` path too, so the
+                // sweep count lands before the CI-mode escalation (a
+                // warning otherwise).
                 report.sweeps = sweeps;
-                // Under `validate_each_pass` (CI mode) a non-converged
-                // pipeline is a regression to surface, not a warning to
-                // bury in stderr.  Escalate to a structured error so
-                // CI assertions catch it.  In the default (non-CI)
-                // mode keep the existing warning + partial-output
-                // behaviour - callers can inspect `report.converged`
-                // explicitly.
                 if config.trace.validate_each_pass {
                     return Err(Error::Validation(format!(
                         "pipeline did not converge after {MAX_PIPELINE_SWEEPS} sweeps; \
@@ -457,10 +381,9 @@ pub(crate) fn allocate_trace_run_dir(
     )))
 }
 
-/// Write one `step-NNN-<pass>/` directory under the run's trace folder.
-/// Silently returns `Ok(())` on wasm, when tracing is disabled, or when
-/// the configured dump format is anything other than
-/// [`TraceDumpFormat::WGSL`].
+/// Write one `step-NNN-<pass>/` directory (`before.wgsl`, `after.wgsl`,
+/// `meta.txt`) under the run's trace folder; a no-op on wasm or with
+/// tracing off.
 fn dump_trace_step(
     ctx: &PassContext<'_>,
     step_index: usize,
@@ -480,18 +403,12 @@ fn dump_trace_step(
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if !matches!(ctx.config.trace.dump_format, TraceDumpFormat::WGSL) {
-            return Ok(());
-        }
         let Some(run_dir) = ctx.trace_run_dir else {
             return Ok(());
         };
         let step_dir = run_dir.join(format!("step-{step_index:03}-{}", report.pass_name));
         std::fs::create_dir_all(&step_dir)?;
-
-        if ctx.config.trace.dump_before_after {
-            std::fs::write(step_dir.join("before.wgsl"), before_text)?;
-        }
+        std::fs::write(step_dir.join("before.wgsl"), before_text)?;
         std::fs::write(step_dir.join("after.wgsl"), after_text)?;
         std::fs::write(
             step_dir.join("meta.txt"),
@@ -597,36 +514,39 @@ mod trace_dir_tests {
     }
 }
 
-// MARK: Hard-fail escalation tests
+// MARK: Driver tests
 
 #[cfg(test)]
-mod hard_fail_tests {
-    //! Coverage for the `validate_each_pass` hard-fail escalation paths.
-    //!
-    //! Two symmetric behaviours are locked in:
-    //!
-    //! * With `trace.validate_each_pass = true`, any pass that produces
-    //!   invalid IR must return `Err(Error::Validation)` instead of
-    //!   silently rolling back.  Rollback-and-warn is reserved for the
-    //!   default non-CI configuration.
-    //! * Without the flag, the same corruption must be rolled back and
-    //!   the pipeline must finish successfully with the pre-pass IR
-    //!   state fully restored.
-    //!
-    //! The synthetic `CorruptingPass` below appends a structurally
-    //! invalid `Store` (pointer operand is a scalar literal) to the
-    //! first function or entry point it sees.  The validator rejects
-    //! such a store because the pointer operand matches neither the
-    //! value-pointer nor module-pointer shape.
+mod driver_tests {
+    //! Rollback, hard-fail escalation, and idle-skip coverage on synthetic
+    //! passes; each is a deterministic function of the module, as
+    //! `Pass::run` demands.
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use super::{Pass, PassContext, run_ir_passes_with};
     use crate::config::Config;
     use crate::error::Error;
     use crate::io;
     use crate::pipeline::report::Report;
 
-    struct CorruptingPass {
-        ran: bool,
+    fn first_function(module: &mut naga::Module) -> &mut naga::Function {
+        match module.entry_points.first_mut() {
+            Some(ep) => &mut ep.function,
+            None => {
+                let (_, f) = module
+                    .functions
+                    .iter_mut()
+                    .next()
+                    .expect("test module must have a function or entry point");
+                f
+            }
+        }
     }
+
+    /// Corrupts on EVERY run: the driver's bookkeeping, not pass-side
+    /// memory, must keep a rejected pass out of the replayed state.
+    struct CorruptingPass;
 
     impl Pass for CorruptingPass {
         fn name(&self) -> &'static str {
@@ -637,32 +557,12 @@ mod hard_fail_tests {
             module: &mut naga::Module,
             _ctx: &PassContext<'_>,
         ) -> Result<bool, Error> {
-            // Idempotent: corrupt only on the first invocation so the
-            // convergence loop terminates in the no-escalate scenario
-            // where rollback restores the valid state.
-            if self.ran {
-                return Ok(false);
-            }
-            self.ran = true;
-            let function = match module.entry_points.first_mut() {
-                Some(ep) => &mut ep.function,
-                None => {
-                    let (_, f) = module
-                        .functions
-                        .iter_mut()
-                        .next()
-                        .expect("test module must have a function or entry point");
-                    f
-                }
-            };
+            let function = first_function(module);
             let lit = function.expressions.append(
                 naga::Expression::Literal(naga::Literal::I32(0)),
                 naga::Span::UNDEFINED,
             );
-            // A Store whose pointer is a scalar literal is structurally
-            // invalid; the pointer operand must resolve to a pointer or
-            // value-pointer type.  Validator rejects this before ever
-            // inspecting the value side.
+            // Store through a scalar literal: structurally invalid.
             function.body.push(
                 naga::Statement::Store {
                     pointer: lit,
@@ -674,9 +574,56 @@ mod hard_fail_tests {
         }
     }
 
-    /// Tiny compute shader used as the corruption substrate.  Chosen
-    /// so the built-in pass pipeline (which these tests bypass) is
-    /// irrelevant to the outcome.
+    /// Adds `var t: u32;` once: a valid, idempotent change the rollback
+    /// tests can watch survive.
+    struct AddLocalPass;
+
+    impl Pass for AddLocalPass {
+        fn name(&self) -> &'static str {
+            "synthetic_add_local"
+        }
+        fn run(
+            &mut self,
+            module: &mut naga::Module,
+            _ctx: &PassContext<'_>,
+        ) -> Result<bool, Error> {
+            let ty = module.types.insert(
+                naga::Type {
+                    name: None,
+                    inner: naga::TypeInner::Scalar(naga::Scalar::U32),
+                },
+                naga::Span::UNDEFINED,
+            );
+            let function = first_function(module);
+            if !function.local_variables.is_empty() {
+                return Ok(false);
+            }
+            function.local_variables.append(
+                naga::LocalVariable {
+                    name: Some("t".to_owned()),
+                    ty,
+                    init: None,
+                },
+                naga::Span::UNDEFINED,
+            );
+            Ok(true)
+        }
+    }
+
+    /// Counts the driver's invocations; never changes anything.
+    struct CountingPass(Rc<Cell<usize>>);
+
+    impl Pass for CountingPass {
+        fn name(&self) -> &'static str {
+            "synthetic_count"
+        }
+        fn run(&mut self, _: &mut naga::Module, _: &PassContext<'_>) -> Result<bool, Error> {
+            self.0.set(self.0.get() + 1);
+            Ok(false)
+        }
+    }
+
+    /// Substrate for every synthetic pass.
     const TINY_WGSL: &str = "@compute @workgroup_size(1) fn main() { }\n";
 
     fn parsed_module() -> naga::Module {
@@ -694,7 +641,7 @@ mod hard_fail_tests {
         let mut module = parsed_module();
         let cfg = baseline_config(/*validate_each_pass=*/ true);
         let mut report = Report::new(0);
-        let passes: Vec<Box<dyn Pass>> = vec![Box::new(CorruptingPass { ran: false })];
+        let passes: Vec<Box<dyn Pass>> = vec![Box::new(CorruptingPass)];
         let result = run_ir_passes_with(&mut module, &cfg, &mut report, passes);
         match result {
             Err(Error::Validation(msg)) => {
@@ -702,14 +649,9 @@ mod hard_fail_tests {
                     msg.contains("synthetic_corrupt"),
                     "validation error should name the offending pass; got: {msg}"
                 );
-                // Module must still reflect the corrupting pass output:
-                // the escalation path intentionally does NOT roll back,
-                // and a future refactor that starts rolling back on
-                // escalation would silently break this contract.
                 assert!(
                     io::validate_module(&module).is_err(),
-                    "expected module to still reflect the corrupting pass output \
-                     (escalation path intentionally does not roll back)"
+                    "escalation must not roll back"
                 );
             }
             other => panic!("expected Err(Error::Validation(..)), got {other:?}"),
@@ -721,14 +663,12 @@ mod hard_fail_tests {
         let mut module = parsed_module();
         let cfg = baseline_config(/*validate_each_pass=*/ false);
         let mut report = Report::new(0);
-        let passes: Vec<Box<dyn Pass>> = vec![Box::new(CorruptingPass { ran: false })];
+        let passes: Vec<Box<dyn Pass>> = vec![Box::new(CorruptingPass)];
         let result = run_ir_passes_with(&mut module, &cfg, &mut report, passes);
         assert!(
             result.is_ok(),
             "without the flag, rollback must keep the pipeline on the happy path; got {result:?}"
         );
-        // The corruption must have been reverted: the restored module
-        // validates again and the step report flags the rollback.
         io::validate_module(&module)
             .expect("module must be restored to a valid state after rollback");
         let step = report
@@ -741,5 +681,81 @@ mod hard_fail_tests {
             !step.validation_ok,
             "step must be flagged as validation_ok=false"
         );
+    }
+
+    /// Two failures in one sweep: the second rollback must rebuild from the
+    /// accepted pass only; replaying every earlier pass would ship the first
+    /// corruption unvalidated.
+    #[test]
+    fn rollback_replays_only_accepted_passes() {
+        let mut module = parsed_module();
+        let cfg = baseline_config(/*validate_each_pass=*/ false);
+        let mut report = Report::new(0);
+        let passes: Vec<Box<dyn Pass>> = vec![
+            Box::new(CorruptingPass),
+            Box::new(AddLocalPass),
+            Box::new(CorruptingPass),
+        ];
+        run_ir_passes_with(&mut module, &cfg, &mut report, passes)
+            .expect("rollbacks keep the pipeline on the happy path");
+        io::validate_module(&module).expect("both corruptions must be rolled back");
+        let function = first_function(&mut module);
+        assert_eq!(
+            function.local_variables.len(),
+            1,
+            "the accepted pass's change must survive the later rollback"
+        );
+        assert!(
+            function
+                .body
+                .iter()
+                .all(|s| !matches!(s, naga::Statement::Store { .. })),
+            "no corrupting store may survive"
+        );
+        assert!(
+            report
+                .pass_reports
+                .iter()
+                .filter(|p| p.pass_name == "synthetic_corrupt")
+                .all(|p| p.rolled_back && !p.validation_ok)
+        );
+        assert_eq!(
+            report
+                .pass_reports
+                .iter()
+                .filter(|p| p.pass_name == "synthetic_add_local" && p.changed)
+                .count(),
+            1
+        );
+    }
+
+    /// An idle pass is not re-run until the module changes; trace / CI
+    /// modes keep every run.
+    #[test]
+    fn idle_passes_are_skipped_until_the_module_changes() {
+        for (validate_each_pass, expected_runs, expected_reports) in [(false, 1, 3), (true, 2, 4)] {
+            let runs = Rc::new(Cell::new(0usize));
+            let mut module = parsed_module();
+            let cfg = baseline_config(validate_each_pass);
+            let mut report = Report::new(0);
+            let passes: Vec<Box<dyn Pass>> = vec![
+                Box::new(AddLocalPass),
+                Box::new(CountingPass(Rc::clone(&runs))),
+            ];
+            run_ir_passes_with(&mut module, &cfg, &mut report, passes).expect("converges");
+            // Sweep 2 re-runs only the pass that changed (now idle) and
+            // skips the one already clean at that version.
+            assert_eq!(report.sweeps, 2, "validate_each_pass={validate_each_pass}");
+            assert_eq!(
+                runs.get(),
+                expected_runs,
+                "validate_each_pass={validate_each_pass}"
+            );
+            assert_eq!(
+                report.pass_reports.len(),
+                expected_reports,
+                "validate_each_pass={validate_each_pass}"
+            );
+        }
     }
 }

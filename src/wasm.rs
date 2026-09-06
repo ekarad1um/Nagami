@@ -123,33 +123,21 @@ fn require_u8(v: f64, key: &str) -> Result<u8, JsError> {
     Ok(v as u8)
 }
 
-/// Decode a JS number as a `usize`, capped at `min(2^53, usize::MAX)`.
-///
-/// JavaScript numbers are IEEE-754 doubles and can represent integers
-/// exactly only up to 2^53; values past that threshold silently lose
-/// precision when cast to `usize`.  On wasm32 the platform `usize` is
-/// `u32`, so an additional cap at `usize::MAX` is required - without
-/// it, `v as usize` performs a saturating cast (Rust 1.45+) and any
-/// `u32::MAX < v <= 2^53` silently clamps to `u32::MAX` rather than
-/// erroring.  The cap chosen below picks whichever bound is tighter
-/// for the build target so callers always see a crisp error instead
-/// of a latent wrap or silent clamp.
+/// Decode a JS number as a `usize`.  A double is exact only up to 2^53, and
+/// wasm32's `usize` is narrower still, so anything else is an error rather
+/// than a silent clamp or precision loss.
 fn require_usize(v: f64, key: &str) -> Result<usize, JsError> {
-    const MAX_SAFE_F64: f64 = (1u64 << 53) as f64; // 9_007_199_254_740_992
-    // Compare in `u128` so the bound choice is exact: `usize::MAX as f64`
-    // rounds on native 64-bit (u64::MAX has no exact f64 representation),
-    // which would skew a direct f64 comparison.
-    let max = if (usize::MAX as u128) < (1u128 << 53) {
-        usize::MAX as f64
-    } else {
-        MAX_SAFE_F64
-    };
-    if v.is_nan() || !(0.0..=max).contains(&v) || v.fract() != 0.0 {
+    const MAX_SAFE_F64: f64 = (1u64 << 53) as f64;
+    if v.is_nan() || v.fract() != 0.0 || !(0.0..=MAX_SAFE_F64).contains(&v) {
         return Err(JsError::new(&format!(
-            "\"{key}\" must be a non-negative integer in 0..={max}, got {v}"
+            "\"{key}\" must be a non-negative integer in 0..=2^53, got {v}"
         )));
     }
-    Ok(v as usize)
+    usize::try_from(v as u64).map_err(|_| {
+        JsError::new(&format!(
+            "\"{key}\" must fit the platform address range, got {v}"
+        ))
+    })
 }
 
 // MARK: Precision decoding

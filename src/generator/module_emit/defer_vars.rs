@@ -9,157 +9,30 @@ use super::local_resolve::resolve_local_var;
 /// `block` references anywhere in its subtree.  The deferral and
 /// for-loop analyses use per-sub-block runs of this census to decide
 /// which single sub-block, if any, owns all of a candidate's uses.
+///
+/// A value read is a `Load` in an `Emit` range (`expr_reads`); every other
+/// reference is a pointer chain in a statement operand, which
+/// `resolve_local_var` roots (value operands root nothing).
 fn collect_block_local_refs(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
     expr_reads: &[Option<naga::Handle<naga::LocalVariable>>],
-    seen: &mut Vec<bool>,
+    seen: &mut [bool],
 ) {
-    for stmt in block {
-        match stmt {
-            naga::Statement::Emit(range) => {
-                for h in range.clone() {
-                    if let Some(lh) = expr_reads[h.index()] {
-                        seen[lh.index()] = true;
-                    }
-                }
-            }
-            naga::Statement::Store { pointer, .. }
-            | naga::Statement::WorkGroupUniformLoad { pointer, .. } => {
-                if let Some(lh) = resolve_local_var(*pointer, expressions) {
+    crate::passes::expr_util::for_each_statement(block, &mut |stmt| match stmt {
+        naga::Statement::Emit(range) => {
+            for h in range.clone() {
+                if let Some(lh) = expr_reads[h.index()] {
                     seen[lh.index()] = true;
                 }
             }
-            naga::Statement::Atomic { pointer, .. } => {
-                if let Some(lh) = resolve_local_var(*pointer, expressions) {
-                    seen[lh.index()] = true;
-                }
-            }
-            naga::Statement::ImageStore {
-                image,
-                coordinate,
-                array_index,
-                value,
-            } => {
-                for e in [Some(*image), Some(*coordinate), *array_index, Some(*value)]
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some(lh) = resolve_local_var(e, expressions) {
-                        seen[lh.index()] = true;
-                    }
-                }
-            }
-            naga::Statement::ImageAtomic {
-                image,
-                coordinate,
-                array_index,
-                value,
-                ..
-            } => {
-                for e in [Some(*image), Some(*coordinate), *array_index, Some(*value)]
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some(lh) = resolve_local_var(e, expressions) {
-                        seen[lh.index()] = true;
-                    }
-                }
-            }
-            naga::Statement::Return { value: Some(v) } => {
-                if let Some(lh) = resolve_local_var(*v, expressions) {
-                    seen[lh.index()] = true;
-                }
-            }
-            naga::Statement::SubgroupBallot {
-                predicate: Some(p), ..
-            } => {
-                if let Some(lh) = resolve_local_var(*p, expressions) {
-                    seen[lh.index()] = true;
-                }
-            }
-            naga::Statement::SubgroupGather { mode, argument, .. } => {
-                if let Some(lh) = resolve_local_var(*argument, expressions) {
-                    seen[lh.index()] = true;
-                }
-                let index = match mode {
-                    naga::GatherMode::Broadcast(h)
-                    | naga::GatherMode::Shuffle(h)
-                    | naga::GatherMode::ShuffleDown(h)
-                    | naga::GatherMode::ShuffleUp(h)
-                    | naga::GatherMode::ShuffleXor(h)
-                    | naga::GatherMode::QuadBroadcast(h) => Some(*h),
-                    _ => None,
-                };
-                if let Some(idx) = index
-                    && let Some(lh) = resolve_local_var(idx, expressions)
-                {
-                    seen[lh.index()] = true;
-                }
-            }
-            naga::Statement::SubgroupCollectiveOperation { argument, .. } => {
-                if let Some(lh) = resolve_local_var(*argument, expressions) {
-                    seen[lh.index()] = true;
-                }
-            }
-            naga::Statement::Call { arguments, .. } => {
-                for &arg in arguments {
-                    if let Some(lh) = resolve_local_var(arg, expressions) {
-                        seen[lh.index()] = true;
-                    }
-                }
-            }
-            naga::Statement::RayPipelineFunction(fun) => match fun {
-                naga::RayPipelineFunction::TraceRay {
-                    acceleration_structure,
-                    descriptor,
-                    payload,
-                } => {
-                    for e in [*acceleration_structure, *descriptor, *payload] {
-                        if let Some(lh) = resolve_local_var(e, expressions) {
-                            seen[lh.index()] = true;
-                        }
-                    }
-                }
-            },
-            naga::Statement::CooperativeStore { target, data } => {
-                for e in [*target, data.pointer, data.stride] {
-                    if let Some(lh) = resolve_local_var(e, expressions) {
-                        seen[lh.index()] = true;
-                    }
-                }
-            }
-            naga::Statement::RayQuery { query, fun } => {
-                if let Some(lh) = resolve_local_var(*query, expressions) {
-                    seen[lh.index()] = true;
-                }
-                match fun {
-                    naga::RayQueryFunction::Initialize {
-                        acceleration_structure,
-                        descriptor,
-                    } => {
-                        for e in [*acceleration_structure, *descriptor] {
-                            if let Some(lh) = resolve_local_var(e, expressions) {
-                                seen[lh.index()] = true;
-                            }
-                        }
-                    }
-                    naga::RayQueryFunction::GenerateIntersection { hit_t } => {
-                        if let Some(lh) = resolve_local_var(*hit_t, expressions) {
-                            seen[lh.index()] = true;
-                        }
-                    }
-                    naga::RayQueryFunction::Proceed { .. }
-                    | naga::RayQueryFunction::ConfirmIntersection
-                    | naga::RayQueryFunction::Terminate => {}
-                }
-            }
-            _ => {}
         }
-        for nested in crate::passes::expr_util::nested_blocks(stmt) {
-            collect_block_local_refs(nested, expressions, expr_reads, seen);
-        }
-    }
+        other => crate::passes::expr_util::visit_statement_operands(other, false, &mut |h| {
+            if let Some(lh) = resolve_local_var(h, expressions) {
+                seen[lh.index()] = true;
+            }
+        }),
+    });
 }
 
 /// Identify locals whose declaration can be deferred to the site of
@@ -280,162 +153,17 @@ fn scan_block_deferrable_vars(
                     }
                 }
             }
-            naga::Statement::Call { arguments, .. } => {
-                for &arg in arguments {
-                    if let Some(lh) = resolve_local_var(arg, expressions)
+            other => {
+                crate::passes::expr_util::visit_statement_operands(other, false, &mut |h| {
+                    if let Some(lh) = resolve_local_var(h, expressions)
                         && candidates[lh.index()]
                     {
                         seen[lh.index()] = true;
                     }
-                }
-            }
-            naga::Statement::Atomic { pointer, .. }
-            | naga::Statement::WorkGroupUniformLoad { pointer, .. } => {
-                if let Some(lh) = resolve_local_var(*pointer, expressions)
-                    && candidates[lh.index()]
-                {
-                    seen[lh.index()] = true;
-                }
-            }
-            naga::Statement::ImageStore {
-                image,
-                coordinate,
-                array_index,
-                value,
-            } => {
-                for e in [Some(*image), Some(*coordinate), *array_index, Some(*value)]
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some(lh) = resolve_local_var(e, expressions)
-                        && candidates[lh.index()]
-                    {
-                        seen[lh.index()] = true;
-                    }
-                }
-            }
-            naga::Statement::ImageAtomic {
-                image,
-                coordinate,
-                array_index,
-                value,
-                ..
-            } => {
-                for e in [Some(*image), Some(*coordinate), *array_index, Some(*value)]
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some(lh) = resolve_local_var(e, expressions)
-                        && candidates[lh.index()]
-                    {
-                        seen[lh.index()] = true;
-                    }
-                }
-            }
-            naga::Statement::Return { value: Some(v) } => {
-                if let Some(lh) = resolve_local_var(*v, expressions)
-                    && candidates[lh.index()]
-                {
-                    seen[lh.index()] = true;
-                }
-            }
-            naga::Statement::SubgroupBallot {
-                predicate: Some(p), ..
-            } => {
-                if let Some(lh) = resolve_local_var(*p, expressions)
-                    && candidates[lh.index()]
-                {
-                    seen[lh.index()] = true;
-                }
-            }
-            naga::Statement::SubgroupGather { mode, argument, .. } => {
-                if let Some(lh) = resolve_local_var(*argument, expressions)
-                    && candidates[lh.index()]
-                {
-                    seen[lh.index()] = true;
-                }
-                let index = match mode {
-                    naga::GatherMode::Broadcast(h)
-                    | naga::GatherMode::Shuffle(h)
-                    | naga::GatherMode::ShuffleDown(h)
-                    | naga::GatherMode::ShuffleUp(h)
-                    | naga::GatherMode::ShuffleXor(h)
-                    | naga::GatherMode::QuadBroadcast(h) => Some(*h),
-                    _ => None,
-                };
-                if let Some(idx) = index
-                    && let Some(lh) = resolve_local_var(idx, expressions)
-                    && candidates[lh.index()]
-                {
-                    seen[lh.index()] = true;
-                }
-            }
-            naga::Statement::SubgroupCollectiveOperation { argument, .. } => {
-                if let Some(lh) = resolve_local_var(*argument, expressions)
-                    && candidates[lh.index()]
-                {
-                    seen[lh.index()] = true;
-                }
-            }
-            naga::Statement::RayPipelineFunction(fun) => match fun {
-                naga::RayPipelineFunction::TraceRay {
-                    acceleration_structure,
-                    descriptor,
-                    payload,
-                } => {
-                    for e in [*acceleration_structure, *descriptor, *payload] {
-                        if let Some(lh) = resolve_local_var(e, expressions)
-                            && candidates[lh.index()]
-                        {
-                            seen[lh.index()] = true;
-                        }
-                    }
-                }
-            },
-            naga::Statement::CooperativeStore { target, data } => {
-                for e in [*target, data.pointer, data.stride] {
-                    if let Some(lh) = resolve_local_var(e, expressions)
-                        && candidates[lh.index()]
-                    {
-                        seen[lh.index()] = true;
-                    }
-                }
-            }
-            naga::Statement::RayQuery { query, fun } => {
-                if let Some(lh) = resolve_local_var(*query, expressions)
-                    && candidates[lh.index()]
-                {
-                    seen[lh.index()] = true;
-                }
-                match fun {
-                    naga::RayQueryFunction::Initialize {
-                        acceleration_structure,
-                        descriptor,
-                    } => {
-                        for e in [*acceleration_structure, *descriptor] {
-                            if let Some(lh) = resolve_local_var(e, expressions)
-                                && candidates[lh.index()]
-                            {
-                                seen[lh.index()] = true;
-                            }
-                        }
-                    }
-                    naga::RayQueryFunction::GenerateIntersection { hit_t } => {
-                        if let Some(lh) = resolve_local_var(*hit_t, expressions)
-                            && candidates[lh.index()]
-                        {
-                            seen[lh.index()] = true;
-                        }
-                    }
-                    naga::RayQueryFunction::Proceed { .. }
-                    | naga::RayQueryFunction::ConfirmIntersection
-                    | naga::RayQueryFunction::Terminate => {}
-                }
-            }
-            _ => {
-                // For control-flow and other compound statements, conservatively
-                // mark every candidate local referenced in sub-blocks as seen.
-                for nested in crate::passes::expr_util::nested_blocks(stmt) {
+                });
+                // A compound statement's sub-blocks conservatively mark every
+                // candidate they reference as seen.
+                for nested in crate::passes::expr_util::nested_blocks(other) {
                     collect_block_local_refs(nested, expressions, expr_reads, &mut seen);
                 }
             }
@@ -612,137 +340,11 @@ fn compute_block_ownership(
                     }
                 }
             }
-            naga::Statement::Store { pointer, .. } => {
-                if let Some(lh) = resolve_local_var(*pointer, expressions) {
+            other => crate::passes::expr_util::visit_statement_operands(other, false, &mut |h| {
+                if let Some(lh) = resolve_local_var(h, expressions) {
                     mark_owner(&mut ref_owner, lh.index(), idx);
                 }
-            }
-            naga::Statement::Call { arguments, .. } => {
-                for &arg in arguments {
-                    if let Some(lh) = resolve_local_var(arg, expressions) {
-                        mark_owner(&mut ref_owner, lh.index(), idx);
-                    }
-                }
-            }
-            naga::Statement::Return { value: Some(v) } => {
-                if let Some(lh) = resolve_local_var(*v, expressions) {
-                    mark_owner(&mut ref_owner, lh.index(), idx);
-                }
-            }
-            naga::Statement::Atomic { pointer, .. }
-            | naga::Statement::WorkGroupUniformLoad { pointer, .. } => {
-                if let Some(lh) = resolve_local_var(*pointer, expressions) {
-                    mark_owner(&mut ref_owner, lh.index(), idx);
-                }
-            }
-            naga::Statement::ImageStore {
-                image,
-                coordinate,
-                array_index,
-                value,
-            } => {
-                for e in [Some(*image), Some(*coordinate), *array_index, Some(*value)]
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some(lh) = resolve_local_var(e, expressions) {
-                        mark_owner(&mut ref_owner, lh.index(), idx);
-                    }
-                }
-            }
-            naga::Statement::ImageAtomic {
-                image,
-                coordinate,
-                array_index,
-                value,
-                ..
-            } => {
-                for e in [Some(*image), Some(*coordinate), *array_index, Some(*value)]
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some(lh) = resolve_local_var(e, expressions) {
-                        mark_owner(&mut ref_owner, lh.index(), idx);
-                    }
-                }
-            }
-            naga::Statement::SubgroupBallot {
-                predicate: Some(p), ..
-            } => {
-                if let Some(lh) = resolve_local_var(*p, expressions) {
-                    mark_owner(&mut ref_owner, lh.index(), idx);
-                }
-            }
-            naga::Statement::SubgroupGather { mode, argument, .. } => {
-                if let Some(lh) = resolve_local_var(*argument, expressions) {
-                    mark_owner(&mut ref_owner, lh.index(), idx);
-                }
-                let index = match mode {
-                    naga::GatherMode::Broadcast(h)
-                    | naga::GatherMode::Shuffle(h)
-                    | naga::GatherMode::ShuffleDown(h)
-                    | naga::GatherMode::ShuffleUp(h)
-                    | naga::GatherMode::ShuffleXor(h)
-                    | naga::GatherMode::QuadBroadcast(h) => Some(*h),
-                    _ => None,
-                };
-                if let Some(idx_h) = index
-                    && let Some(lh) = resolve_local_var(idx_h, expressions)
-                {
-                    mark_owner(&mut ref_owner, lh.index(), idx);
-                }
-            }
-            naga::Statement::SubgroupCollectiveOperation { argument, .. } => {
-                if let Some(lh) = resolve_local_var(*argument, expressions) {
-                    mark_owner(&mut ref_owner, lh.index(), idx);
-                }
-            }
-            naga::Statement::RayPipelineFunction(fun) => match fun {
-                naga::RayPipelineFunction::TraceRay {
-                    acceleration_structure,
-                    descriptor,
-                    payload,
-                } => {
-                    for e in [*acceleration_structure, *descriptor, *payload] {
-                        if let Some(lh) = resolve_local_var(e, expressions) {
-                            mark_owner(&mut ref_owner, lh.index(), idx);
-                        }
-                    }
-                }
-            },
-            naga::Statement::CooperativeStore { target, data } => {
-                for e in [*target, data.pointer, data.stride] {
-                    if let Some(lh) = resolve_local_var(e, expressions) {
-                        mark_owner(&mut ref_owner, lh.index(), idx);
-                    }
-                }
-            }
-            naga::Statement::RayQuery { query, fun } => {
-                if let Some(lh) = resolve_local_var(*query, expressions) {
-                    mark_owner(&mut ref_owner, lh.index(), idx);
-                }
-                match fun {
-                    naga::RayQueryFunction::Initialize {
-                        acceleration_structure,
-                        descriptor,
-                    } => {
-                        for e in [*acceleration_structure, *descriptor] {
-                            if let Some(lh) = resolve_local_var(e, expressions) {
-                                mark_owner(&mut ref_owner, lh.index(), idx);
-                            }
-                        }
-                    }
-                    naga::RayQueryFunction::GenerateIntersection { hit_t } => {
-                        if let Some(lh) = resolve_local_var(*hit_t, expressions) {
-                            mark_owner(&mut ref_owner, lh.index(), idx);
-                        }
-                    }
-                    naga::RayQueryFunction::Proceed { .. }
-                    | naga::RayQueryFunction::ConfirmIntersection
-                    | naga::RayQueryFunction::Terminate => {}
-                }
-            }
-            _ => {}
+            }),
         }
         // For compound statements, scan sub-blocks and attribute to `idx`.
         let mut nested = crate::passes::expr_util::nested_blocks(stmt).peekable();

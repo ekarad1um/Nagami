@@ -22,7 +22,6 @@ use std::fmt::{Display, Formatter};
 /// | `Validation` | `{msg}` (no prefix)                    |
 /// | `Emit`       | `emit error: {msg}`                    |
 /// | `Io`         | `I/O error: {msg}`                     |
-/// | `Config`     | `configuration error: {msg}`           |
 ///
 /// `Parse` and `Validation` messages already begin with `error: ` and
 /// embed source context, so adding a category prefix would produce
@@ -43,31 +42,24 @@ pub enum Error {
     Emit(String),
     /// A filesystem or I/O operation failed.
     Io(String),
-    /// An invalid configuration was provided.
-    Config(String),
 }
 
 impl Error {
     /// Short, stable category label suitable for log scraping.
-    /// One of `"parse"`, `"validation"`, `"emit"`, `"io"`, `"config"`.
+    /// One of `"parse"`, `"validation"`, `"emit"`, `"io"`.
     pub fn kind(&self) -> &'static str {
         match self {
             Error::Parse(_) => "parse",
             Error::Validation(_) => "validation",
             Error::Emit(_) => "emit",
             Error::Io(_) => "io",
-            Error::Config(_) => "config",
         }
     }
 
     /// Inner message without the category prefix that [`Display`] may add.
     pub fn message(&self) -> &str {
         match self {
-            Error::Parse(m)
-            | Error::Validation(m)
-            | Error::Emit(m)
-            | Error::Io(m)
-            | Error::Config(m) => m,
+            Error::Parse(m) | Error::Validation(m) | Error::Emit(m) | Error::Io(m) => m,
         }
     }
 }
@@ -82,7 +74,6 @@ impl Display for Error {
             Error::Parse(msg) | Error::Validation(msg) => f.write_str(msg),
             Error::Emit(msg) => write!(f, "emit error: {msg}"),
             Error::Io(msg) => write!(f, "I/O error: {msg}"),
-            Error::Config(msg) => write!(f, "configuration error: {msg}"),
         }
     }
 }
@@ -99,92 +90,28 @@ impl From<std::io::Error> for Error {
 mod tests {
     use super::*;
 
+    /// Snapshot lock for every `Display` format and `kind` label: drift is a
+    /// breaking change to the public surface described on [`Error`].
     #[test]
-    fn kind_returns_correct_label() {
-        assert_eq!(Error::Parse("x".into()).kind(), "parse");
-        assert_eq!(Error::Validation("x".into()).kind(), "validation");
-        assert_eq!(Error::Emit("x".into()).kind(), "emit");
-        assert_eq!(Error::Io("x".into()).kind(), "io");
-        assert_eq!(Error::Config("x".into()).kind(), "config");
-    }
-
-    #[test]
-    fn message_returns_inner_string() {
-        let e = Error::Parse("hello".into());
-        assert_eq!(e.message(), "hello");
-    }
-
-    #[test]
-    fn display_parse_is_self_describing() {
-        // Parse errors carry codespan output that already starts with
-        // "error: "; Display must not prepend another category prefix.
-        let e = Error::Parse("error: bad token\n  ┌─ wgsl:1:1".into());
-        let s = e.to_string();
-        assert!(
-            !s.starts_with("parse"),
-            "Parse Display must not double-prefix: {s}"
-        );
-        assert!(s.contains("bad token"));
-    }
-
-    #[test]
-    fn display_validation_is_self_describing() {
-        // Validation errors, like Parse, are self-describing codespan
-        // diagnostics.  Display must not add a category prefix.
-        let e = Error::Validation("error: invalid type\n  ┌─ wgsl:3:5".into());
-        let s = e.to_string();
-        assert!(
-            !s.starts_with("validation"),
-            "Validation Display must not double-prefix: {s}"
-        );
-        assert!(s.contains("invalid type"));
-    }
-
-    #[test]
-    fn display_emit_has_prefix() {
-        let e = Error::Emit("something broke".into());
-        assert_eq!(e.to_string(), "emit error: something broke");
-    }
-
-    #[test]
-    fn display_io_has_prefix() {
-        let e = Error::Io("not found".into());
-        assert_eq!(e.to_string(), "I/O error: not found");
-    }
-
-    #[test]
-    fn display_config_has_prefix() {
-        let e = Error::Config("bad value".into());
-        assert_eq!(e.to_string(), "configuration error: bad value");
-    }
-
-    /// Snapshot lock for every `Display` format.  Any drift here is a
-    /// breaking change to the public surface described on [`Error`];
-    /// update both the format table and downstream consumers before
-    /// touching these strings.
-    #[test]
-    fn display_format_snapshot() {
-        assert_eq!(Error::Parse("X".into()).to_string(), "X");
-        assert_eq!(Error::Validation("X".into()).to_string(), "X");
-        assert_eq!(Error::Emit("X".into()).to_string(), "emit error: X");
-        assert_eq!(Error::Io("X".into()).to_string(), "I/O error: X");
-        assert_eq!(
-            Error::Config("X".into()).to_string(),
-            "configuration error: X"
-        );
+    fn display_and_kind_snapshot() {
+        let cases = [
+            (Error::Parse("X".into()), "X", "parse"),
+            (Error::Validation("X".into()), "X", "validation"),
+            (Error::Emit("X".into()), "emit error: X", "emit"),
+            (Error::Io("X".into()), "I/O error: X", "io"),
+        ];
+        for (err, display, kind) in cases {
+            assert_eq!(err.to_string(), display);
+            assert_eq!(err.kind(), kind);
+            assert_eq!(err.message(), "X");
+        }
     }
 
     #[test]
     fn from_io_error() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
-        let e = Error::from(io_err);
+        let e = Error::from(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"));
         assert_eq!(e.kind(), "io");
         assert!(e.message().contains("gone"));
-    }
-
-    #[test]
-    fn implements_std_error() {
-        let e = Error::Parse("test".into());
         let _: &dyn std::error::Error = &e;
     }
 }

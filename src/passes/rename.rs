@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use crate::error::Error;
 use crate::name_gen;
 use crate::passes::expr_util::{
-    nested_blocks, visit_block_expression_handles, visit_expression_children,
+    for_each_statement, visit_block_expression_handles, visit_expression_children,
 };
 use crate::pipeline::{Pass, PassContext};
 
@@ -490,29 +490,23 @@ fn function_ref_counts(function: &naga::Function) -> Vec<usize> {
 /// `block`, recursing through control flow.  Emission-range membership is the
 /// liveness signal `function_ref_counts` filters on.
 fn mark_emit_live(block: &naga::Block, live: &mut [bool]) {
-    for stmt in block.iter() {
+    for_each_statement(block, &mut |stmt| {
         if let naga::Statement::Emit(range) = stmt {
             for h in range.clone() {
                 live[h.index()] = true;
             }
         }
-        for nested in nested_blocks(stmt) {
-            mark_emit_live(nested, live);
-        }
-    }
+    });
 }
 
 /// Count `Statement::Call` targets in `block` (recursing through control
 /// flow) so a frequently-called function earns a shorter name.
 fn count_calls(block: &naga::Block, calls: &mut HashMap<naga::Handle<naga::Function>, usize>) {
-    for stmt in block.iter() {
+    for_each_statement(block, &mut |stmt| {
         if let naga::Statement::Call { function, .. } = stmt {
             *calls.entry(*function).or_insert(0) += 1;
         }
-        for nested in nested_blocks(stmt) {
-            count_calls(nested, calls);
-        }
-    }
+    });
 }
 
 /// Build the starting `used_names` set for one rename sweep.

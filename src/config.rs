@@ -1,10 +1,9 @@
 //! Public configuration surface for the minification pipeline.
 //!
-//! Five types form the knobs callers tune before invoking [`crate::run`]
-//! or [`crate::run_module`]: [`Profile`] selects the pass bundle,
-//! [`TraceConfig`] gates diagnostic instrumentation, [`PrecisionMode`]
-//! and [`FloatPrecision`] control float-literal trimming, and [`Config`]
-//! composes them all with the user-visible output options.
+//! [`Profile`] selects the pass bundle, [`TraceConfig`] gates diagnostic
+//! instrumentation, [`PrecisionMode`] and [`FloatPrecision`] control
+//! float-literal trimming, and [`Config`] composes them with the
+//! user-visible output options for [`crate::run`] / [`crate::run_module`].
 
 use std::path::PathBuf;
 
@@ -83,52 +82,21 @@ pub enum Profile {
     Max,
 }
 
-/// Format used when dumping per-pass trace output.
-///
-/// Currently single-variant.  Kept as an enum (rather than collapsed
-/// to a unit-typed marker) so additional formats - JSON, naga-IR
-/// debug print, statistics CSV - can be added without breaking the
-/// public surface of [`TraceConfig`].  Consumers should always
-/// `match` on this exhaustively.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TraceDumpFormat {
-    /// Emit each per-pass dump as a `.wgsl` source file.
-    #[default]
-    WGSL,
-}
-
 /// Configuration for per-pass diagnostic tracing.
 ///
 /// Tracing is opt-in and off the hot path: when `enabled` is `false` the
 /// pipeline never emits intermediate text, validates only once per run,
 /// and skips trace directory allocation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TraceConfig {
     /// Master switch for per-pass before/after dumps to disk.
     pub enabled: bool,
     /// Base directory for trace output; defaults to `./trace` when `None`.
     pub dump_dir: Option<PathBuf>,
-    /// Output format for trace dumps.
-    pub dump_format: TraceDumpFormat,
     /// Re-validate the WGSL text after every pass and escalate any
     /// failure to a hard error instead of silently rolling back.  Intended
     /// for CI regressions, not day-to-day minification.
     pub validate_each_pass: bool,
-    /// Emit a `before.wgsl` alongside each step's `after.wgsl`.  Disable
-    /// to roughly halve trace volume when only the final state matters.
-    pub dump_before_after: bool,
-}
-
-impl Default for TraceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            dump_dir: None,
-            dump_format: TraceDumpFormat::WGSL,
-            validate_each_pass: false,
-            dump_before_after: true,
-        }
-    }
 }
 
 /// Top-level minification configuration.

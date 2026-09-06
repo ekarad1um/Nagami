@@ -366,28 +366,17 @@ fn count_handle_refs(function: &naga::Function) -> Vec<u32> {
 /// of one fold pass (the body's `Emit` ranges are rebuilt only
 /// afterwards by `rebuild_emit_ranges_after_removal`).
 fn build_emit_range_map(body: &naga::Block) -> HashMap<naga::Handle<naga::Expression>, usize> {
-    fn walk(
-        block: &naga::Block,
-        map: &mut HashMap<naga::Handle<naga::Expression>, usize>,
-        next_id: &mut usize,
-    ) {
-        for stmt in block.iter() {
-            if let naga::Statement::Emit(range) = stmt {
-                let id = *next_id;
-                *next_id += 1;
-                for h in range.clone() {
-                    map.insert(h, id);
-                }
-            }
-            for nested in crate::passes::expr_util::nested_blocks(stmt) {
-                walk(nested, map, next_id);
-            }
-        }
-    }
-
     let mut map = HashMap::new();
     let mut next_id = 0usize;
-    walk(body, &mut map, &mut next_id);
+    crate::passes::expr_util::for_each_statement(body, &mut |stmt| {
+        if let naga::Statement::Emit(range) = stmt {
+            let id = next_id;
+            next_id += 1;
+            for h in range.clone() {
+                map.insert(h, id);
+            }
+        }
+    });
     map
 }
 
@@ -482,7 +471,7 @@ fn fold_local_expressions(
                 // already emittable.  Replacing a non-emittable expression
                 // (ZeroValue, Constant, etc.) with an emittable Compose would
                 // produce invalid IR because the handle isn't in any Emit range.
-                if needs_emit(&arena[handle])
+                if crate::passes::expr_util::expression_needs_emit(&arena[handle])
                     && let Some(new_expr) = materialize_vector(
                         handle,
                         components,
@@ -574,7 +563,7 @@ fn fold_local_expressions(
                     if other_pure || other_uniquely_owned {
                         arena[handle] = arena[other].clone();
                         simplify_count += 1;
-                        if !needs_emit(&arena[handle]) {
+                        if !crate::passes::expr_util::expression_needs_emit(&arena[handle]) {
                             folded.insert(handle);
                         }
                         if other_uniquely_owned {
@@ -618,7 +607,7 @@ fn fold_local_expressions(
                     if inner_pure || inner_uniquely_owned {
                         arena[handle] = arena[inner].clone();
                         simplify_count += 1;
-                        if !needs_emit(&arena[handle]) {
+                        if !crate::passes::expr_util::expression_needs_emit(&arena[handle]) {
                             folded.insert(handle);
                         }
                         if inner_uniquely_owned {
@@ -673,7 +662,7 @@ fn fold_local_expressions(
             {
                 arena[handle] = arena[accept].clone();
                 simplify_count += 1;
-                if !needs_emit(&arena[handle]) {
+                if !crate::passes::expr_util::expression_needs_emit(&arena[handle]) {
                     folded.insert(handle);
                 }
                 continue;
@@ -2364,56 +2353,6 @@ fn eval_const_math(
 }
 
 // MARK: Identity / absorbing operand detection
-
-/// `true` when `expr` must live inside an `Emit` range.  Inline
-/// mirror of [`crate::passes::expr_util::expression_needs_emit`]
-/// (the identity loop calls it once per arena entry per sweep, so
-/// a cross-module call would compound).
-///
-/// Exhaustive match - a new naga variant must trip the build at
-/// BOTH copies so the maintainer classifies it deliberately rather
-/// than letting `!matches!` silently default it to `needs_emit = true`
-/// (validator rejection) or `false` (silently wedged in an Emit
-/// range).  Update both lists in one commit on naga upgrade.
-fn needs_emit(expr: &naga::Expression) -> bool {
-    use naga::Expression as E;
-    match expr {
-        E::Literal(_)
-        | E::Constant(_)
-        | E::Override(_)
-        | E::ZeroValue(_)
-        | E::FunctionArgument(_)
-        | E::GlobalVariable(_)
-        | E::LocalVariable(_)
-        | E::CallResult(_)
-        | E::AtomicResult { .. }
-        | E::WorkGroupUniformLoadResult { .. }
-        | E::RayQueryProceedResult
-        | E::SubgroupBallotResult
-        | E::SubgroupOperationResult { .. } => false,
-        E::Access { .. }
-        | E::AccessIndex { .. }
-        | E::Splat { .. }
-        | E::Swizzle { .. }
-        | E::Compose { .. }
-        | E::Load { .. }
-        | E::ImageSample { .. }
-        | E::ImageLoad { .. }
-        | E::ImageQuery { .. }
-        | E::Unary { .. }
-        | E::Binary { .. }
-        | E::Select { .. }
-        | E::Derivative { .. }
-        | E::Relational { .. }
-        | E::Math { .. }
-        | E::As { .. }
-        | E::ArrayLength(_)
-        | E::RayQueryGetIntersection { .. }
-        | E::RayQueryVertexPositions { .. }
-        | E::CooperativeLoad { .. }
-        | E::CooperativeMultiplyAdd { .. } => true,
-    }
-}
 
 /// `true` when `h` is a literal zero of any scalar type.
 ///

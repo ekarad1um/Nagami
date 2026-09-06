@@ -359,7 +359,6 @@ fn run_cli() -> Result<u8, Box<dyn std::error::Error>> {
             enabled: args.trace,
             dump_dir: args.trace_dir,
             validate_each_pass: args.validate_each_pass,
-            ..Default::default()
         },
         preamble,
     };

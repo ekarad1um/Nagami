@@ -22,10 +22,8 @@ use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
 
 use super::expr_util::{
-    expression_needs_emit, is_disallowed_inline_expression, map_atomic_function_handles,
-    map_cooperative_data_handles, map_gather_mode_handles, map_ray_pipeline_function_handles,
-    map_ray_query_function_handles, nested_blocks, nested_blocks_mut, remap_statement_handles,
-    try_map_expression_handles_in_place, visit_expression_children,
+    expression_needs_emit, is_disallowed_inline_expression, nested_blocks_mut,
+    remap_statement_handles, try_map_expression_handles_in_place, visit_expression_children,
 };
 
 /// Default inlining budgets (used by [`super::Profile::Aggressive`]).
@@ -331,14 +329,11 @@ fn collect_call_counts_in_block(
     block: &naga::Block,
     counts: &mut HashMap<naga::Handle<naga::Function>, usize>,
 ) {
-    for statement in block {
+    super::expr_util::for_each_statement(block, &mut |statement| {
         if let naga::Statement::Call { function, .. } = statement {
             *counts.entry(*function).or_insert(0) += 1;
         }
-        for nested in nested_blocks(statement) {
-            collect_call_counts_in_block(nested, counts);
-        }
-    }
+    });
 }
 
 /// Return the expression handle delivered by a body of the form
@@ -781,10 +776,9 @@ fn const_index_value(
     }
 }
 
-/// Remap every expression handle referenced by `statement` through
-/// the inlining `replacements` map.  Covers every naga statement
-/// variant exhaustively so inlined call results are consistently
-/// substituted across control flow.
+/// Remap the handles `statement` references (its Emit'd expressions'
+/// operands and its own fields) through `replacements`; nested blocks are
+/// the caller's.
 fn apply_replacements_to_statement(
     statement: &mut naga::Statement,
     expressions: &mut naga::Arena<naga::Expression>,
@@ -792,107 +786,14 @@ fn apply_replacements_to_statement(
 ) {
     let mut remap =
         |handle: naga::Handle<naga::Expression>| resolve_replacement(handle, replacements);
-
-    match statement {
-        naga::Statement::Emit(range) => {
-            for handle in range.clone() {
-                let expression = expressions.get_mut(handle);
-                let _ = try_map_expression_handles_in_place(expression, &mut |h| Some(remap(h)));
-            }
+    if let naga::Statement::Emit(range) = statement {
+        for handle in range.clone() {
+            let expression = expressions.get_mut(handle);
+            let _ = try_map_expression_handles_in_place(expression, &mut |h| Some(remap(h)));
         }
-        naga::Statement::Block(_) => {}
-        naga::Statement::If { condition, .. } => {
-            *condition = remap(*condition);
-        }
-        naga::Statement::Switch { selector, .. } => {
-            *selector = remap(*selector);
-        }
-        naga::Statement::Loop { break_if, .. } => {
-            if let Some(handle) = break_if {
-                *handle = remap(*handle);
-            }
-        }
-        naga::Statement::Break | naga::Statement::Continue | naga::Statement::Kill => {}
-        naga::Statement::Return { value } => {
-            if let Some(handle) = value {
-                *handle = remap(*handle);
-            }
-        }
-        naga::Statement::ControlBarrier(_) | naga::Statement::MemoryBarrier(_) => {}
-        naga::Statement::Store { pointer, value } => {
-            *pointer = remap(*pointer);
-            *value = remap(*value);
-        }
-        naga::Statement::ImageStore {
-            image,
-            coordinate,
-            array_index,
-            value,
-        } => {
-            *image = remap(*image);
-            *coordinate = remap(*coordinate);
-            if let Some(index) = array_index {
-                *index = remap(*index);
-            }
-            *value = remap(*value);
-        }
-        naga::Statement::Atomic {
-            pointer,
-            fun,
-            value,
-            ..
-        } => {
-            *pointer = remap(*pointer);
-            map_atomic_function_handles(fun, &mut remap);
-            *value = remap(*value);
-        }
-        naga::Statement::ImageAtomic {
-            image,
-            coordinate,
-            array_index,
-            fun,
-            value,
-        } => {
-            *image = remap(*image);
-            *coordinate = remap(*coordinate);
-            if let Some(index) = array_index {
-                *index = remap(*index);
-            }
-            map_atomic_function_handles(fun, &mut remap);
-            *value = remap(*value);
-        }
-        naga::Statement::WorkGroupUniformLoad { pointer, .. } => {
-            *pointer = remap(*pointer);
-        }
-        naga::Statement::Call { arguments, .. } => {
-            for argument in arguments {
-                *argument = remap(*argument);
-            }
-        }
-        naga::Statement::RayQuery { query, fun } => {
-            *query = remap(*query);
-            map_ray_query_function_handles(fun, &mut remap);
-        }
-        naga::Statement::RayPipelineFunction(fun) => {
-            map_ray_pipeline_function_handles(fun, &mut remap);
-        }
-        naga::Statement::SubgroupBallot { predicate, .. } => {
-            if let Some(handle) = predicate {
-                *handle = remap(*handle);
-            }
-        }
-        naga::Statement::SubgroupGather { mode, argument, .. } => {
-            map_gather_mode_handles(mode, &mut remap);
-            *argument = remap(*argument);
-        }
-        naga::Statement::SubgroupCollectiveOperation { argument, .. } => {
-            *argument = remap(*argument);
-        }
-        naga::Statement::CooperativeStore { target, data } => {
-            *target = remap(*target);
-            map_cooperative_data_handles(data, &mut remap);
-        }
+        return;
     }
+    remap_statement_handles(statement, &mut remap);
 }
 
 /// Follow `replacements` transitively and return the terminal target.
@@ -1107,16 +1008,13 @@ mod tests {
 
     fn count_calls_to_function(block: &naga::Block, target: naga::Handle<naga::Function>) -> usize {
         let mut count = 0usize;
-        for statement in block {
+        super::super::expr_util::for_each_statement(block, &mut |statement| {
             if let naga::Statement::Call { function, .. } = statement
                 && *function == target
             {
                 count += 1;
             }
-            for nested in nested_blocks(statement) {
-                count += count_calls_to_function(nested, target);
-            }
-        }
+        });
         count
     }
 

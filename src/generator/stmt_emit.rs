@@ -923,18 +923,8 @@ impl<'a> Generator<'a> {
                 array_index,
                 value,
             } => {
-                self.out.push_str("textureStore(");
-                self.out.push_str(&self.emit_expr(*image, ctx)?);
-                let sep = self.comma_sep();
-                self.out.push_str(sep);
-                self.out.push_str(&self.emit_expr(*coordinate, ctx)?);
-                if let Some(index) = array_index {
-                    self.out.push_str(sep);
-                    self.out.push_str(&self.emit_expr(*index, ctx)?);
-                }
-                self.out.push_str(sep);
-                self.out.push_str(&self.emit_expr(*value, ctx)?);
-                self.out.push_str(");");
+                self.emit_image_store(*image, *coordinate, *array_index, *value, ctx)?;
+                self.out.push(';');
             }
             S::Call {
                 function,
@@ -1303,9 +1293,28 @@ impl<'a> Generator<'a> {
                 }
             }
             self.out.push(';');
-        } else if let Some((cop, other)) = self.try_compound_assign(*pointer, *value, ctx) {
-            self.out.push_str(&self.emit_lvalue(*pointer, ctx)?);
-            if let Some(inc) = self.try_increment(cop, other, *value, ctx) {
+        } else {
+            self.emit_assignment(*pointer, *value, ctx)?;
+            self.out.push(';');
+        }
+        Ok(())
+    }
+
+    /// `lvalue <op>= rhs` / `lvalue++` when `value` is `lvalue <op> rhs`,
+    /// else `lvalue = value`; no terminator, so the for-update slot can
+    /// share it with the statement form.
+    fn emit_assignment(
+        &mut self,
+        pointer: naga::Handle<naga::Expression>,
+        value: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        // Decide the form before rendering the lvalue: the decision reads the
+        // binding map, which rendering may extend.
+        let compound = self.try_compound_assign(pointer, value, ctx);
+        self.out.push_str(&self.emit_lvalue(pointer, ctx)?);
+        if let Some((cop, other)) = compound {
+            if let Some(inc) = self.try_increment(cop, other, value, ctx) {
                 self.out.push_str(inc);
             } else {
                 let sp = self.bin_op_sep();
@@ -1315,13 +1324,35 @@ impl<'a> Generator<'a> {
                 self.out
                     .push_str(&self.emit_compound_assign_rhs(cop, other, ctx)?);
             }
-            self.out.push(';');
         } else {
-            self.out.push_str(&self.emit_lvalue(*pointer, ctx)?);
             self.push_assign();
-            self.out.push_str(&self.emit_expr(*value, ctx)?);
-            self.out.push(';');
+            self.out.push_str(&self.emit_expr(value, ctx)?);
         }
+        Ok(())
+    }
+
+    /// `textureStore(image, coordinate[, layer], value)` without the
+    /// terminator.
+    fn emit_image_store(
+        &mut self,
+        image: naga::Handle<naga::Expression>,
+        coordinate: naga::Handle<naga::Expression>,
+        array_index: Option<naga::Handle<naga::Expression>>,
+        value: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        let sep = self.comma_sep();
+        self.out.push_str("textureStore(");
+        self.out.push_str(&self.emit_expr(image, ctx)?);
+        self.out.push_str(sep);
+        self.out.push_str(&self.emit_expr(coordinate, ctx)?);
+        if let Some(index) = array_index {
+            self.out.push_str(sep);
+            self.out.push_str(&self.emit_expr(index, ctx)?);
+        }
+        self.out.push_str(sep);
+        self.out.push_str(&self.emit_expr(value, ctx)?);
+        self.out.push(')');
         Ok(())
     }
 
@@ -2145,22 +2176,8 @@ impl<'a> Generator<'a> {
                     // the same way the top-level Store handler does (see the
                     // for-loop pre-validation that accepts atomic Stores).
                     self.emit_atomic_store(*pointer, *value, atomic_scalar, ctx)?;
-                } else if let Some((cop, other)) = self.try_compound_assign(*pointer, *value, ctx) {
-                    self.out.push_str(&self.emit_lvalue(*pointer, ctx)?);
-                    if let Some(inc) = self.try_increment(cop, other, *value, ctx) {
-                        self.out.push_str(inc);
-                    } else {
-                        let sp = self.bin_op_sep();
-                        self.out.push_str(sp);
-                        self.out.push_str(cop);
-                        self.out.push_str(sp);
-                        self.out
-                            .push_str(&self.emit_compound_assign_rhs(cop, other, ctx)?);
-                    }
                 } else {
-                    self.out.push_str(&self.emit_lvalue(*pointer, ctx)?);
-                    self.push_assign();
-                    self.out.push_str(&self.emit_expr(*value, ctx)?);
+                    self.emit_assignment(*pointer, *value, ctx)?;
                 }
             }
             naga::Statement::Call {
@@ -2176,20 +2193,7 @@ impl<'a> Generator<'a> {
                 coordinate,
                 array_index,
                 value,
-            } => {
-                self.out.push_str("textureStore(");
-                self.out.push_str(&self.emit_expr(*image, ctx)?);
-                let sep = self.comma_sep();
-                self.out.push_str(sep);
-                self.out.push_str(&self.emit_expr(*coordinate, ctx)?);
-                if let Some(index) = array_index {
-                    self.out.push_str(sep);
-                    self.out.push_str(&self.emit_expr(*index, ctx)?);
-                }
-                self.out.push_str(sep);
-                self.out.push_str(&self.emit_expr(*value, ctx)?);
-                self.out.push(')');
-            }
+            } => self.emit_image_store(*image, *coordinate, *array_index, *value, ctx)?,
             _ => {
                 return Err(Error::Emit(format!(
                     "unsupported statement in for-loop update clause \

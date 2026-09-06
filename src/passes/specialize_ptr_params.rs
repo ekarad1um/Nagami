@@ -66,7 +66,7 @@ fn collect_keys_in_block(
     banned: &HashMap<naga::Handle<naga::Function>, Vec<u32>>,
     out: &mut Vec<SpecKey>,
 ) {
-    for stmt in block.iter() {
+    super::expr_util::for_each_statement(block, &mut |stmt| {
         if let naga::Statement::Call {
             function,
             arguments,
@@ -76,10 +76,7 @@ fn collect_keys_in_block(
         {
             out.push(key);
         }
-        for nested in super::expr_util::nested_blocks(stmt) {
-            collect_keys_in_block(nested, caller_exprs, banned, out);
-        }
-    }
+    });
 }
 
 /// Retarget matching calls to their clones; `CallResult` expressions embed
@@ -220,17 +217,11 @@ fn ensure_clone(
 /// analyzer panics on.
 fn restore_call_order(module: &mut naga::Module) {
     fn callees_of(func: &naga::Function, out: &mut Vec<naga::Handle<naga::Function>>) {
-        fn walk(block: &naga::Block, out: &mut Vec<naga::Handle<naga::Function>>) {
-            for stmt in block.iter() {
-                if let naga::Statement::Call { function, .. } = stmt {
-                    out.push(*function);
-                }
-                for nested in crate::passes::expr_util::nested_blocks(stmt) {
-                    walk(nested, out);
-                }
+        crate::passes::expr_util::for_each_statement(&func.body, &mut |stmt| {
+            if let naga::Statement::Call { function, .. } = stmt {
+                out.push(*function);
             }
-        }
-        walk(&func.body, out);
+        });
     }
 
     fn emit(
@@ -342,21 +333,11 @@ pub fn specialize_ptr_params(
 
     // Phase B: clones, bottom-up.  The collision set holds every
     // module-scope name.
-    let mut used_names: std::collections::HashSet<String> = module
-        .functions
-        .iter()
-        .filter_map(|(_, f)| f.name.clone())
-        .chain(
-            module
-                .global_variables
-                .iter()
-                .filter_map(|(_, g)| g.name.clone()),
-        )
-        .chain(module.constants.iter().filter_map(|(_, c)| c.name.clone()))
-        .chain(module.overrides.iter().filter_map(|(_, o)| o.name.clone()))
-        .chain(module.types.iter().filter_map(|(_, t)| t.name.clone()))
-        .chain(module.entry_points.iter().map(|e| e.name.clone()))
-        .collect();
+    let mut used_names: std::collections::HashSet<String> =
+        crate::name_gen::module_scope_names(module)
+            .chain(crate::name_gen::type_names(module))
+            .map(str::to_owned)
+            .collect();
     let mut clones: HashMap<SpecKey, naga::Handle<naga::Function>> = HashMap::new();
     for key in &needed {
         ensure_clone(module, key, &banned, &mut clones, &mut used_names, 0);

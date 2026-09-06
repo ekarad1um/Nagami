@@ -1564,7 +1564,6 @@ fn unsupported_extension_patterns_only_match_parse_errors() {
         Error::Validation as fn(String) -> Error,
         Error::Emit as fn(String) -> Error,
         Error::Io as fn(String) -> Error,
-        Error::Config as fn(String) -> Error,
     ] {
         let err = ctor("error: enable extension is not enabled".to_string());
         assert!(
@@ -1584,7 +1583,6 @@ fn known_text_validation_limitation_only_matches_parse_or_validation() {
     for ctor in [
         Error::Emit as fn(String) -> Error,
         Error::Io as fn(String) -> Error,
-        Error::Config as fn(String) -> Error,
     ] {
         let err = ctor("error: `subgroups` enable-extension is not yet supported".to_string());
         assert!(

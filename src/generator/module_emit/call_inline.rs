@@ -634,8 +634,6 @@ fn consume_pending_for_statement(
                 });
             }
         }
-        naga::Statement::If { condition, .. } => check(*condition, pending, result),
-        naga::Statement::Switch { selector, .. } => check(*selector, pending, result),
         // A loop's `break_if` is re-evaluated each iteration, but a pending
         // call from the ENCLOSING block was emitted once before the loop;
         // consuming it into `break_if` would recompute it per iteration - a
@@ -646,119 +644,8 @@ fn consume_pending_for_statement(
         // calls emitted INSIDE the loop still inline via that function's
         // recursion into body/continuing with a fresh pending set.
         naga::Statement::Loop { .. } => {}
-        naga::Statement::Return { value: Some(h) } => check(*h, pending, result),
-        naga::Statement::Store { pointer, value } => {
-            check(*pointer, pending, result);
-            check(*value, pending, result);
-        }
-        naga::Statement::Call { arguments, .. } => {
-            for a in arguments {
-                check(*a, pending, result);
-            }
-        }
-        naga::Statement::ImageStore {
-            image,
-            coordinate,
-            array_index,
-            value,
-        } => {
-            check(*image, pending, result);
-            check(*coordinate, pending, result);
-            if let Some(i) = array_index {
-                check(*i, pending, result);
-            }
-            check(*value, pending, result);
-        }
-        naga::Statement::Atomic {
-            pointer,
-            value,
-            fun,
-            ..
-        } => {
-            check(*pointer, pending, result);
-            check(*value, pending, result);
-            crate::passes::expr_util::visit_atomic_function_handles(fun, &mut |h| {
-                check(h, pending, result)
-            });
-        }
-        naga::Statement::ImageAtomic {
-            image,
-            coordinate,
-            array_index,
-            value,
-            fun,
-        } => {
-            check(*image, pending, result);
-            check(*coordinate, pending, result);
-            if let Some(i) = array_index {
-                check(*i, pending, result);
-            }
-            check(*value, pending, result);
-            crate::passes::expr_util::visit_atomic_function_handles(fun, &mut |h| {
-                check(h, pending, result)
-            });
-        }
-        naga::Statement::WorkGroupUniformLoad { pointer, .. } => {
-            check(*pointer, pending, result);
-        }
-        naga::Statement::SubgroupBallot {
-            predicate: Some(p), ..
-        } => check(*p, pending, result),
-        naga::Statement::SubgroupGather { argument, mode, .. } => {
-            check(*argument, pending, result);
-            match mode {
-                naga::GatherMode::BroadcastFirst | naga::GatherMode::QuadSwap(_) => {}
-                naga::GatherMode::Broadcast(h)
-                | naga::GatherMode::Shuffle(h)
-                | naga::GatherMode::ShuffleDown(h)
-                | naga::GatherMode::ShuffleUp(h)
-                | naga::GatherMode::ShuffleXor(h)
-                | naga::GatherMode::QuadBroadcast(h) => check(*h, pending, result),
-            }
-        }
-        naga::Statement::SubgroupCollectiveOperation { argument, .. } => {
-            check(*argument, pending, result);
-        }
-        naga::Statement::RayQuery { query, fun } => {
-            check(*query, pending, result);
-            match fun {
-                naga::RayQueryFunction::Initialize {
-                    acceleration_structure,
-                    descriptor,
-                } => {
-                    check(*acceleration_structure, pending, result);
-                    check(*descriptor, pending, result);
-                }
-                naga::RayQueryFunction::GenerateIntersection { hit_t } => {
-                    check(*hit_t, pending, result);
-                }
-                _ => {}
-            }
-        }
-        naga::Statement::RayPipelineFunction(naga::RayPipelineFunction::TraceRay {
-            acceleration_structure,
-            descriptor,
-            payload,
-        }) => {
-            check(*acceleration_structure, pending, result);
-            check(*descriptor, pending, result);
-            check(*payload, pending, result);
-        }
-        naga::Statement::CooperativeStore { target, data } => {
-            check(*target, pending, result);
-            check(data.pointer, pending, result);
-            check(data.stride, pending, result);
-        }
-        // No direct expression references (or only nested blocks handled by recursion):
-        naga::Statement::Block(_)
-        | naga::Statement::Break
-        | naga::Statement::Continue
-        | naga::Statement::Kill
-        | naga::Statement::ControlBarrier(_)
-        | naga::Statement::MemoryBarrier(_)
-        | naga::Statement::Return { value: None }
-        | naga::Statement::SubgroupBallot {
-            predicate: None, ..
-        } => {}
+        other => crate::passes::expr_util::visit_statement_operands(other, false, &mut |h| {
+            check(h, pending, result)
+        }),
     }
 }

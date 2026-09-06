@@ -2517,15 +2517,27 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// Resolve a struct field name for an `AccessIndex` in a global expression.
     fn global_struct_field_name(
         &self,
         base: naga::Handle<naga::Expression>,
         index: u32,
     ) -> Option<String> {
-        use naga::proc::TypeResolution;
+        self.field_name_of(&self.info[base], index)
+    }
 
-        let resolution = &self.info[base];
+    fn global_vector_component_name(
+        &self,
+        base: naga::Handle<naga::Expression>,
+        index: u32,
+    ) -> Option<char> {
+        self.component_letter_of(&self.info[base], index)
+    }
+
+    /// The emitted member name at `index` of the struct `resolution` names
+    /// (directly or through a pointer): the mangled name when one was
+    /// assigned, else the source name, else a positional placeholder.
+    fn field_name_of(&self, resolution: &naga::proc::TypeResolution, index: u32) -> Option<String> {
+        use naga::proc::TypeResolution;
         let (ty_handle, members) = match resolution {
             TypeResolution::Handle(h) => match &self.module.types[*h].inner {
                 naga::TypeInner::Struct { members, .. } => (Some(*h), members),
@@ -2537,40 +2549,36 @@ impl<'a> Generator<'a> {
                 }
                 _ => return None,
             },
-            TypeResolution::Value(inner) => match inner {
-                naga::TypeInner::Pointer { base: bty, .. } => {
-                    match &self.module.types[*bty].inner {
-                        naga::TypeInner::Struct { members, .. } => (Some(*bty), members),
-                        _ => return None,
-                    }
+            TypeResolution::Value(naga::TypeInner::Pointer { base: bty, .. }) => {
+                match &self.module.types[*bty].inner {
+                    naga::TypeInner::Struct { members, .. } => (Some(*bty), members),
+                    _ => return None,
                 }
-                _ => return None,
-            },
+            }
+            TypeResolution::Value(_) => return None,
         };
-
         if let Some(h) = ty_handle
             && let Some(mangled) = self.member_names.get(&(h, index))
         {
             return Some(mangled.clone());
         }
-
         members
             .get(index as usize)
             .map(|m| m.name.clone().unwrap_or_else(|| format!("m{}", index)))
     }
 
-    /// If the base expression is a vector (or pointer-to-vector) and the
-    /// index is 0-3, return the corresponding WGSL component letter.
-    fn global_vector_component_name(
+    /// The WGSL component letter (`x`..`w`) for `index` when `resolution`
+    /// is a vector or a pointer to one; `.x` is one byte shorter than `[0]`.
+    fn component_letter_of(
         &self,
-        base: naga::Handle<naga::Expression>,
+        resolution: &naga::proc::TypeResolution,
         index: u32,
     ) -> Option<char> {
         const COMPONENTS: [char; 4] = ['x', 'y', 'z', 'w'];
         if index > 3 {
             return None;
         }
-        let inner = self.info[base].inner_with(&self.module.types);
+        let inner = resolution.inner_with(&self.module.types);
         let is_vec = matches!(
             inner,
             naga::TypeInner::Vector { .. } | naga::TypeInner::ValuePointer { size: Some(_), .. }
@@ -2578,88 +2586,25 @@ impl<'a> Generator<'a> {
             self.module.types[*bty].inner,
             naga::TypeInner::Vector { .. }
         ));
-        if is_vec {
-            Some(COMPONENTS[index as usize])
-        } else {
-            None
-        }
+        is_vec.then(|| COMPONENTS[index as usize])
     }
 
-    /// Return the mangled (or preserved) member name at `(base, index)`
-    /// when `base` is a struct-typed expression, or `None` when the
-    /// access is actually a vector swizzle position.
     pub(super) fn struct_field_name(
         &self,
         base: naga::Handle<naga::Expression>,
         index: u32,
         ctx: &FunctionCtx<'a, '_>,
     ) -> Option<String> {
-        use naga::proc::TypeResolution;
-
-        // Extract the struct handle and members directly from the
-        // TypeResolution, avoiding an O(n) linear scan of the type arena.
-        let resolution = &ctx.info[base].ty;
-        let (ty_handle, members) = match resolution {
-            TypeResolution::Handle(h) => match &self.module.types[*h].inner {
-                naga::TypeInner::Struct { members, .. } => (Some(*h), members),
-                naga::TypeInner::Pointer { base: bty, .. } => {
-                    match &self.module.types[*bty].inner {
-                        naga::TypeInner::Struct { members, .. } => (Some(*bty), members),
-                        _ => return None,
-                    }
-                }
-                _ => return None,
-            },
-            TypeResolution::Value(inner) => match inner {
-                naga::TypeInner::Pointer { base: bty, .. } => {
-                    match &self.module.types[*bty].inner {
-                        naga::TypeInner::Struct { members, .. } => (Some(*bty), members),
-                        _ => return None,
-                    }
-                }
-                _ => return None,
-            },
-        };
-
-        // If we have a mangled member name, use it.
-        if let Some(h) = ty_handle
-            && let Some(mangled) = self.member_names.get(&(h, index))
-        {
-            return Some(mangled.clone());
-        }
-
-        members
-            .get(index as usize)
-            .map(|m| m.name.clone().unwrap_or_else(|| format!("m{}", index)))
+        self.field_name_of(&ctx.info[base].ty, index)
     }
 
-    /// If the base expression is a vector (or pointer-to-vector) and the
-    /// index is 0-3, return the corresponding WGSL component letter
-    /// (`x`, `y`, `z`, `w`).  This produces `.x` instead of `[0]`,
-    /// saving one byte per access.
     fn vector_component_name(
         &self,
         base: naga::Handle<naga::Expression>,
         index: u32,
         ctx: &FunctionCtx<'a, '_>,
     ) -> Option<char> {
-        const COMPONENTS: [char; 4] = ['x', 'y', 'z', 'w'];
-        if index > 3 {
-            return None;
-        }
-        let inner = ctx.info[base].ty.inner_with(&self.module.types);
-        let is_vec = matches!(
-            inner,
-            naga::TypeInner::Vector { .. } | naga::TypeInner::ValuePointer { size: Some(_), .. }
-        ) || matches!(inner, naga::TypeInner::Pointer { base: bty, .. } if matches!(
-            self.module.types[*bty].inner,
-            naga::TypeInner::Vector { .. }
-        ));
-        if is_vec {
-            Some(COMPONENTS[index as usize])
-        } else {
-            None
-        }
+        self.component_letter_of(&ctx.info[base].ty, index)
     }
 
     /// WGSL component letters for swizzle patterns.

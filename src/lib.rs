@@ -169,12 +169,13 @@ fn preprocess_source_for_naga(source: &str) -> String {
     // different compiler.  Detection is whole-token on comment-stripped text so
     // a longer identifier never triggers, and the has-directive guards avoid a
     // duplicate.
+    let cleaned = strip_wgsl_comments(&normalized);
     let mut prefix = String::new();
-    if references_f16_token(&normalized) && !has_enable_f16_directive(&normalized) {
+    if cleaned_references_f16_token(&cleaned) && !cleaned_has_enable_directive(&cleaned, "f16") {
         prefix.push_str("enable f16;\n");
     }
-    if references_binding_array_token(&normalized)
-        && !has_enable_directive(&normalized, "wgpu_binding_array")
+    if cleaned_references_whole_token(&cleaned, "binding_array")
+        && !cleaned_has_enable_directive(&cleaned, "wgpu_binding_array")
     {
         prefix.push_str("enable wgpu_binding_array;\n");
     }
@@ -339,7 +340,11 @@ fn is_f16_type_token(tok: &[u8]) -> bool {
 /// `enable f16;`, and the emitter drops the directive from the output
 /// whenever the final module uses no f16 - so detection errs broad.
 fn references_f16_token(source: &str) -> bool {
-    let cleaned = strip_wgsl_comments(source);
+    cleaned_references_f16_token(&strip_wgsl_comments(source))
+}
+
+/// [`references_f16_token`] over already comment-stripped text.
+fn cleaned_references_f16_token(cleaned: &str) -> bool {
     let bytes = cleaned.as_bytes();
     let len = bytes.len();
     let mut i = 0;
@@ -400,7 +405,11 @@ fn has_enable_f16_directive(source: &str) -> bool {
 /// the preamble guard in [`run`] turns it into a hard error on valid input, so
 /// EVERY directive is scanned, not just the first on a line.
 fn has_enable_directive(source: &str, ext: &str) -> bool {
-    let cleaned = strip_wgsl_comments(source);
+    cleaned_has_enable_directive(&strip_wgsl_comments(source), ext)
+}
+
+/// [`has_enable_directive`] over already comment-stripped text.
+fn cleaned_has_enable_directive(cleaned: &str, ext: &str) -> bool {
     // Each `;`-terminated segment is one directive; a directive lists one or
     // more comma-separated extensions.  Scanning all segments handles several
     // directives on one line (`enable a; enable f16;`) - the callers include
@@ -488,11 +497,13 @@ const NAGA_ONLY_ENABLES: [&str; 2] = ["enable wgpu_binding_array;", "enable wgpu
 /// following newline, if any) from generator output.  Each is emitted at most
 /// once.
 fn strip_naga_only_enables(mut source: String) -> String {
+    let cleaned = strip_wgsl_comments(&source);
     for directive in NAGA_ONLY_ENABLES {
         // `wgpu_int16` is load-bearing when the text uses 16-bit integer
         // tokens; strip only the spurious lingering-type-arena case.
         if directive == "enable wgpu_int16;"
-            && (references_whole_token(&source, "i16") || references_whole_token(&source, "u16"))
+            && (cleaned_references_whole_token(&cleaned, "i16")
+                || cleaned_references_whole_token(&cleaned, "u16"))
         {
             continue;
         }
@@ -622,11 +633,10 @@ fn naga_only_enable_prefix(emit_source: &str) -> String {
     prefix
 }
 
-/// `true` when comment-stripped `source` uses `token` as a whole identifier
+/// `true` when comment-stripped `cleaned` uses `token` as a whole identifier
 /// token (so a longer identifier like `my_binding_array` never triggers for
 /// `binding_array`).
-fn references_whole_token(source: &str, token: &str) -> bool {
-    let cleaned = strip_wgsl_comments(source);
+fn cleaned_references_whole_token(cleaned: &str, token: &str) -> bool {
     let bytes = cleaned.as_bytes();
     let mut i = 0;
     while let Some(off) = cleaned[i..].find(token) {
@@ -640,13 +650,6 @@ fn references_whole_token(source: &str, token: &str) -> bool {
         i = start + 1;
     }
     false
-}
-
-/// naga 30 requires `enable wgpu_binding_array;` to PARSE a `binding_array`
-/// type, so the preprocessor injects the directive when the type-generator is
-/// used without one.
-fn references_binding_array_token(source: &str) -> bool {
-    references_whole_token(source, "binding_array")
 }
 
 /// If `bytes[i..]` begins a `//` line comment or a (nesting-aware) `/* */`
@@ -905,49 +908,16 @@ fn emit_module_for_report(
     }
 }
 
-/// Collect every top-level declaration name in `module`: types,
-/// struct members, constants, overrides, globals, functions, and
-/// entry points.  [`run`] uses the result to hide preamble symbols
-/// from the generator and to extend `preserve_symbols` so rename and
-/// mangle passes leave them alone.
+/// Every declaration name in `module` (types, struct members, and the
+/// module-scope declarations).  [`run`] uses the result to hide preamble
+/// symbols from the generator and to extend `preserve_symbols` so rename
+/// and mangle leave them alone.
 fn collect_module_names(module: &naga::Module) -> HashSet<String> {
-    let mut names = HashSet::new();
-    for (_, ty) in module.types.iter() {
-        if let Some(name) = &ty.name {
-            names.insert(name.clone());
-        }
-        if let naga::TypeInner::Struct { members, .. } = &ty.inner {
-            for m in members {
-                if let Some(name) = &m.name {
-                    names.insert(name.clone());
-                }
-            }
-        }
-    }
-    for (_, c) in module.constants.iter() {
-        if let Some(name) = &c.name {
-            names.insert(name.clone());
-        }
-    }
-    for (_, ov) in module.overrides.iter() {
-        if let Some(name) = &ov.name {
-            names.insert(name.clone());
-        }
-    }
-    for (_, g) in module.global_variables.iter() {
-        if let Some(name) = &g.name {
-            names.insert(name.clone());
-        }
-    }
-    for (_, f) in module.functions.iter() {
-        if let Some(name) = &f.name {
-            names.insert(name.clone());
-        }
-    }
-    for ep in &module.entry_points {
-        names.insert(ep.name.clone());
-    }
-    names
+    name_gen::module_scope_names(module)
+        .chain(name_gen::type_names(module))
+        .chain(name_gen::struct_member_names(module))
+        .map(str::to_owned)
+        .collect()
 }
 
 // MARK: Naga error-message coupling
@@ -975,64 +945,32 @@ const KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS: &[&str] = &[
     "subgroups enable-extension is not yet supported",
 ];
 
-/// `true` when `err` is a parse error whose message matches any of
-/// [`UNSUPPORTED_EXTENSION_PATTERNS`].
-///
-/// Restricted to [`Error::Parse`] on purpose: the patterns are
-/// substring matches against naga's rendered diagnostic, which can
-/// appear inside user-controlled source quoted by a validation or
-/// emit error.  Without the variant guard the caller's
-/// "extension we cannot parse -> return input unchanged" branch can
-/// silently swallow a real validation or emit failure.
-///
-/// Additionally restricted to the first line of the rendered
-/// diagnostic.  naga's codespan output places the diagnostic message
-/// on line 1 (`error: <message>`) and quotes user source on the
-/// indented lines that follow.  Matching the full message would let
-/// a user shader containing the pattern text in a comment trigger
-/// the bailout when an UNRELATED parse error happens to render that
-/// comment as nearby context.
-fn is_unsupported_extension_parse_error(err: &Error) -> bool {
-    if !matches!(err, Error::Parse(_)) {
-        return false;
-    }
+/// `true` when the FIRST line of `err`'s rendering contains one of
+/// `patterns`.  naga's codespan output puts the message on line 1 and quotes
+/// user source below it, so matching the whole rendering would let a shader
+/// comment containing the pattern text trigger on an unrelated error.
+fn first_line_matches(err: &Error, patterns: &[&str]) -> bool {
     let msg = err.to_string();
     let first_line = msg.lines().next().unwrap_or("");
-    UNSUPPORTED_EXTENSION_PATTERNS
-        .iter()
-        .any(|p| first_line.contains(p))
+    patterns.iter().any(|p| first_line.contains(p))
 }
 
-/// `true` when `err` is a `Parse` or `Validation` error whose message
-/// matches any of [`KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS`].
-///
-/// Both variants are accepted because `io::validate_wgsl_text`
-/// internally calls `parse_wgsl` (which wraps any front-end failure
-/// in `Error::Parse`) and then `validate_module_with_source` (which
-/// wraps validator failures in `Error::Validation`); naga's text
-/// front-end can report a not-yet-supported `enable` directive
-/// through either path depending on whether the failure surfaces at
-/// tokenisation or at semantic validation.
-///
-/// Scoped to `Parse | Validation` to refuse matching against unrelated
-/// `Emit`/`Io`/`Config` errors whose body happens to quote the same
-/// phrasing - otherwise the caller would silently bypass the
-/// "fall back to naga emitter" guard on a real downstream failure.
+/// `true` for a `Parse` error about an enable-extension naga cannot parse
+/// ([`UNSUPPORTED_EXTENSION_PATTERNS`]).  Restricted to `Parse`: a
+/// validation or emit error quoting the same text must stay a hard error
+/// rather than take the "ship the input compacted" bailout.
+fn is_unsupported_extension_parse_error(err: &Error) -> bool {
+    matches!(err, Error::Parse(_)) && first_line_matches(err, UNSUPPORTED_EXTENSION_PATTERNS)
+}
+
+/// `true` for a `Parse` / `Validation` error matching
+/// [`KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS`] (`validate_wgsl_text`
+/// reports the not-yet-supported `enable` through either variant depending
+/// on whether tokenisation or semantic validation trips).  Other variants
+/// never opt into the fallback bypass.
 fn is_known_text_validation_limitation(err: &Error) -> bool {
-    if !matches!(err, Error::Parse(_) | Error::Validation(_)) {
-        return false;
-    }
-    let msg = err.to_string();
-    // Same first-line restriction as `is_unsupported_extension_parse_error`:
-    // naga's diagnostic format places the message on line 1 and quotes user
-    // source on subsequent lines, so restricting the match here prevents a
-    // user shader carrying the pattern text in a comment from spuriously
-    // opting into the round-trip-validation bypass when an unrelated parse
-    // or validation error renders that comment as nearby context.
-    let first_line = msg.lines().next().unwrap_or("");
-    KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS
-        .iter()
-        .any(|p| first_line.contains(p))
+    matches!(err, Error::Parse(_) | Error::Validation(_))
+        && first_line_matches(err, KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS)
 }
 
 /// What the fallback ladder in [`resolve_generator_output`] resolved for

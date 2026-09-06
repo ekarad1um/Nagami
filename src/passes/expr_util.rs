@@ -142,9 +142,19 @@ pub fn is_disallowed_inline_expression(expression: &naga::Expression) -> bool {
 /// collector).  A missed variant would understate counts, letting
 /// the identity gate green-light an unsafe clone or dead-param
 /// elimination drop a live argument.
+#[inline]
 pub fn visit_expression_children(
     expression: &naga::Expression,
     mut visit: impl FnMut(naga::Handle<naga::Expression>),
+) {
+    visit_expression_children_dyn(expression, &mut visit)
+}
+
+/// The one compiled body behind [`visit_expression_children`]: a `dyn`
+/// callback keeps this match from being instantiated per call-site closure.
+fn visit_expression_children_dyn(
+    expression: &naga::Expression,
+    visit: &mut dyn FnMut(naga::Handle<naga::Expression>),
 ) {
     use naga::Expression as E;
     match expression {
@@ -294,7 +304,7 @@ pub fn visit_expression_children(
 /// new naga variants fail the build instead of silently short-circuiting.
 pub fn try_map_expression_handles_in_place(
     expression: &mut naga::Expression,
-    remap: &mut impl FnMut(naga::Handle<naga::Expression>) -> Option<naga::Handle<naga::Expression>>,
+    remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> Option<naga::Handle<naga::Expression>>,
 ) -> Option<()> {
     match expression {
         naga::Expression::Literal(_)
@@ -478,7 +488,7 @@ pub fn try_map_expression_handles_in_place(
 /// same exhaustiveness so all atomic-handle walkers break together.
 pub fn map_atomic_function_handles(
     fun: &mut naga::AtomicFunction,
-    remap: &mut impl FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
+    remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
 ) {
     match fun {
         naga::AtomicFunction::Exchange {
@@ -503,7 +513,7 @@ pub fn map_atomic_function_handles(
 /// walk visits exactly the operand the mutable remap would touch.
 pub fn visit_atomic_function_handles(
     fun: &naga::AtomicFunction,
-    visit: &mut impl FnMut(naga::Handle<naga::Expression>),
+    visit: &mut dyn FnMut(naga::Handle<naga::Expression>),
 ) {
     match fun {
         naga::AtomicFunction::Exchange {
@@ -524,7 +534,7 @@ pub fn visit_atomic_function_handles(
 /// `BroadcastFirst` and `QuadSwap` carry no handle and are skipped.
 pub fn map_gather_mode_handles(
     mode: &mut naga::GatherMode,
-    remap: &mut impl FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
+    remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
 ) {
     match mode {
         naga::GatherMode::BroadcastFirst | naga::GatherMode::QuadSwap(_) => {}
@@ -544,7 +554,7 @@ pub fn map_gather_mode_handles(
 /// (`ConfirmIntersection`, `Terminate`) are skipped.
 pub fn map_ray_query_function_handles(
     fun: &mut naga::RayQueryFunction,
-    remap: &mut impl FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
+    remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
 ) {
     match fun {
         naga::RayQueryFunction::Initialize {
@@ -568,7 +578,7 @@ pub fn map_ray_query_function_handles(
 /// [`naga::RayPipelineFunction`] (currently `TraceRay`).
 pub fn map_ray_pipeline_function_handles(
     fun: &mut naga::RayPipelineFunction,
-    remap: &mut impl FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
+    remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
 ) {
     match fun {
         naga::RayPipelineFunction::TraceRay {
@@ -587,7 +597,7 @@ pub fn map_ray_pipeline_function_handles(
 /// load/store descriptor.
 pub fn map_cooperative_data_handles(
     data: &mut naga::CooperativeData,
-    remap: &mut impl FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
+    remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
 ) {
     data.pointer = remap(data.pointer);
     data.stride = remap(data.stride);
@@ -614,7 +624,7 @@ pub fn map_cooperative_data_handles(
 /// handle-bearing `Statement` variant must be added to both.
 pub fn remap_statement_handles(
     statement: &mut naga::Statement,
-    remap: &mut impl FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
+    remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
 ) {
     match statement {
         naga::Statement::Emit(_) | naga::Statement::Block(_) => {}
@@ -730,48 +740,62 @@ pub fn remap_statement_handles(
     }
 }
 
-/// Visit every expression handle referenced by `block`, recursing
-/// through nested control flow.  Fires `visit` once per direct
-/// statement-field reference (`Store.value`, `If.condition`, each
-/// `Call.arguments` element, etc.).
-///
-/// `include_emit_handles` selects between two semantics:
-/// * `true` - also fires `visit` once per handle inside each
-///   `Statement::Emit` range.  Use for analyses that treat Emit'd
-///   expressions as reachable (liveness, where they are let-bound
-///   names visible to downstream consumers).
-/// * `false` - suppresses Emit visits.  Use for data-flow reference
-///   counting; Emit is sequencing, not a use, and conflating the two
-///   would push every Emit'd expression to refcount `>= 1` and defeat
-///   any unique-owner gate.
-///
-/// Exhaustive match (no `_` arm), in lockstep with
-/// [`remap_statement_handles`]; any new handle-bearing statement
-/// variant must be added to both.
-pub fn visit_block_expression_handles<F>(
+/// Every expression handle `block` references, nested blocks included:
+/// statement operands and results, plus each `Emit` range handle when
+/// `include_emit_handles` (semantics on [`visit_statement_operands`]).
+pub fn visit_block_expression_handles(
     block: &naga::Block,
     include_emit_handles: bool,
-    visit: &mut F,
-) where
-    F: FnMut(naga::Handle<naga::Expression>),
-{
+    visit: &mut dyn FnMut(naga::Handle<naga::Expression>),
+) {
     for stmt in block.iter() {
         visit_statement_expression_handles(stmt, include_emit_handles, visit);
     }
 }
 
-/// Per-statement counterpart of [`visit_block_expression_handles`]: visit
-/// every expression handle `stmt` references directly, recursing into nested
-/// blocks.  Exhaustive (no `_` arm), in lockstep with
-/// [`remap_statement_handles`] - any new handle-bearing statement variant
-/// must be added here too.
-pub fn visit_statement_expression_handles<F>(
+/// Per-statement counterpart of [`visit_block_expression_handles`]: the
+/// statement's own fields, results included, then its nested blocks.
+pub fn visit_statement_expression_handles(
     stmt: &naga::Statement,
     include_emit_handles: bool,
-    visit: &mut F,
-) where
-    F: FnMut(naga::Handle<naga::Expression>),
-{
+    visit: &mut dyn FnMut(naga::Handle<naga::Expression>),
+) {
+    visit_statement_fields(stmt, include_emit_handles, true, visit);
+    for nested in nested_blocks(stmt) {
+        visit_block_expression_handles(nested, include_emit_handles, visit);
+    }
+}
+
+/// The handles `stmt` reads directly: its operands, not the results it
+/// defines nor its nested blocks.  Every "which operands does this statement
+/// carry" question routes here, so a new handle-bearing variant is
+/// classified once.  `include_emit_handles` also visits each `Emit` range
+/// handle: right for liveness (an Emit'd expression is a reachable
+/// let-bound name), wrong for reference counting (Emit is sequencing, not
+/// a use; counting it would give every Emit'd expression a refcount >= 1
+/// and defeat unique-owner gates).
+pub fn visit_statement_operands(
+    stmt: &naga::Statement,
+    include_emit_handles: bool,
+    visit: &mut dyn FnMut(naga::Handle<naga::Expression>),
+) {
+    visit_statement_fields(stmt, include_emit_handles, false, visit);
+}
+
+/// Exhaustive field walk (no `_` arm) in lockstep with
+/// [`remap_statement_handles`]; `include_results` adds the results a
+/// statement defines, which only whole-function reference counts want.
+fn visit_statement_fields(
+    stmt: &naga::Statement,
+    include_emit_handles: bool,
+    include_results: bool,
+    visit: &mut dyn FnMut(naga::Handle<naga::Expression>),
+) {
+    let result = |h: naga::Handle<naga::Expression>, visit: &mut dyn FnMut(_)| {
+        if include_results {
+            visit(h);
+        }
+    };
     match stmt {
         naga::Statement::Emit(range) => {
             if include_emit_handles {
@@ -780,31 +804,9 @@ pub fn visit_statement_expression_handles<F>(
                 }
             }
         }
-        naga::Statement::Block(inner) => {
-            visit_block_expression_handles(inner, include_emit_handles, visit);
-        }
-        naga::Statement::If {
-            condition,
-            accept,
-            reject,
-        } => {
-            visit(*condition);
-            visit_block_expression_handles(accept, include_emit_handles, visit);
-            visit_block_expression_handles(reject, include_emit_handles, visit);
-        }
-        naga::Statement::Switch { selector, cases } => {
-            visit(*selector);
-            for case in cases {
-                visit_block_expression_handles(&case.body, include_emit_handles, visit);
-            }
-        }
-        naga::Statement::Loop {
-            body,
-            continuing,
-            break_if,
-        } => {
-            visit_block_expression_handles(body, include_emit_handles, visit);
-            visit_block_expression_handles(continuing, include_emit_handles, visit);
+        naga::Statement::If { condition, .. } => visit(*condition),
+        naga::Statement::Switch { selector, .. } => visit(*selector),
+        naga::Statement::Loop { break_if, .. } => {
             if let Some(handle) = break_if {
                 visit(*handle);
             }
@@ -835,13 +837,13 @@ pub fn visit_statement_expression_handles<F>(
             pointer,
             fun,
             value,
-            result,
+            result: res,
         } => {
             visit(*pointer);
             visit_atomic_function_handles(fun, visit);
             visit(*value);
-            if let Some(handle) = result {
-                visit(*handle);
+            if let Some(handle) = res {
+                result(*handle, visit);
             }
         }
         naga::Statement::ImageAtomic {
@@ -859,18 +861,23 @@ pub fn visit_statement_expression_handles<F>(
             visit_atomic_function_handles(fun, visit);
             visit(*value);
         }
-        naga::Statement::WorkGroupUniformLoad { pointer, result } => {
+        naga::Statement::WorkGroupUniformLoad {
+            pointer,
+            result: res,
+        } => {
             visit(*pointer);
-            visit(*result);
+            result(*res, visit);
         }
         naga::Statement::Call {
-            arguments, result, ..
+            arguments,
+            result: res,
+            ..
         } => {
             for &argument in arguments {
                 visit(argument);
             }
-            if let Some(handle) = result {
-                visit(*handle);
+            if let Some(handle) = res {
+                result(*handle, visit);
             }
         }
         naga::Statement::RayQuery { query, fun } => {
@@ -883,7 +890,7 @@ pub fn visit_statement_expression_handles<F>(
                     visit(*acceleration_structure);
                     visit(*descriptor);
                 }
-                naga::RayQueryFunction::Proceed { result } => visit(*result),
+                naga::RayQueryFunction::Proceed { result: res } => result(*res, visit),
                 naga::RayQueryFunction::GenerateIntersection { hit_t } => visit(*hit_t),
                 naga::RayQueryFunction::ConfirmIntersection | naga::RayQueryFunction::Terminate => {
                 }
@@ -899,8 +906,11 @@ pub fn visit_statement_expression_handles<F>(
             visit(*descriptor);
             visit(*payload);
         }
-        naga::Statement::SubgroupBallot { result, predicate } => {
-            visit(*result);
+        naga::Statement::SubgroupBallot {
+            result: res,
+            predicate,
+        } => {
+            result(*res, visit);
             if let Some(handle) = predicate {
                 visit(*handle);
             }
@@ -908,10 +918,10 @@ pub fn visit_statement_expression_handles<F>(
         naga::Statement::SubgroupGather {
             mode,
             argument,
-            result,
+            result: res,
         } => {
             visit(*argument);
-            visit(*result);
+            result(*res, visit);
             match mode {
                 naga::GatherMode::Broadcast(handle)
                 | naga::GatherMode::Shuffle(handle)
@@ -923,22 +933,81 @@ pub fn visit_statement_expression_handles<F>(
             }
         }
         naga::Statement::SubgroupCollectiveOperation {
-            argument, result, ..
+            argument,
+            result: res,
+            ..
         } => {
             visit(*argument);
-            visit(*result);
+            result(*res, visit);
         }
         naga::Statement::CooperativeStore { target, data } => {
             visit(*target);
             visit(data.pointer);
             visit(data.stride);
         }
-        // Terminators / barriers reference no handles.
-        naga::Statement::Break
+        // Nested blocks are the caller's; terminators / barriers carry nothing.
+        naga::Statement::Block(_)
+        | naga::Statement::Break
         | naga::Statement::Continue
         | naga::Statement::Kill
         | naga::Statement::ControlBarrier(_)
         | naga::Statement::MemoryBarrier(_) => {}
+    }
+}
+
+/// Pointer operands `stmt` may WRITE through: the `Store` / `Atomic`
+/// pointer, every `Call` argument (a `ptr<function>` parameter lets the
+/// callee write the pointee), `traceRay`'s payload, a cooperative store's
+/// destination, and the ray-query object.  Every "which locals might this
+/// statement mutate" analysis routes here; the no-op variants never write
+/// through a function-local pointer.
+pub fn visit_statement_write_pointers(
+    stmt: &naga::Statement,
+    visit: &mut dyn FnMut(naga::Handle<naga::Expression>),
+) {
+    match stmt {
+        naga::Statement::Store { pointer, .. } | naga::Statement::Atomic { pointer, .. } => {
+            visit(*pointer)
+        }
+        naga::Statement::Call { arguments, .. } => {
+            for &argument in arguments {
+                visit(argument);
+            }
+        }
+        naga::Statement::RayPipelineFunction(naga::RayPipelineFunction::TraceRay {
+            payload,
+            ..
+        }) => visit(*payload),
+        naga::Statement::CooperativeStore { data, .. } => visit(data.pointer),
+        naga::Statement::RayQuery { query, .. } => visit(*query),
+        naga::Statement::Emit(_)
+        | naga::Statement::Block(_)
+        | naga::Statement::If { .. }
+        | naga::Statement::Switch { .. }
+        | naga::Statement::Loop { .. }
+        | naga::Statement::Break
+        | naga::Statement::Continue
+        | naga::Statement::Return { .. }
+        | naga::Statement::Kill
+        | naga::Statement::ControlBarrier(_)
+        | naga::Statement::MemoryBarrier(_)
+        | naga::Statement::ImageStore { .. }
+        | naga::Statement::ImageAtomic { .. }
+        | naga::Statement::WorkGroupUniformLoad { .. }
+        | naga::Statement::SubgroupBallot { .. }
+        | naga::Statement::SubgroupGather { .. }
+        | naga::Statement::SubgroupCollectiveOperation { .. } => {}
+    }
+}
+
+/// Pre-order, syntactic-order walk of `block` and its nested blocks; the
+/// shared recursion behind every read-only whole-body scan.
+pub fn for_each_statement(block: &naga::Block, f: &mut dyn FnMut(&naga::Statement)) {
+    for stmt in block.iter() {
+        f(stmt);
+        for nested in nested_blocks(stmt) {
+            for_each_statement(nested, f);
+        }
     }
 }
 

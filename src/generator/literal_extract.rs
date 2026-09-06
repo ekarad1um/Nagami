@@ -70,6 +70,7 @@ impl<'a> Generator<'a> {
              func_info: &naga::valid::FunctionInfo,
              ref_counts: &[usize],
              live: &[bool],
+             deferrable: &[bool],
              literal_counts: &mut HashMap<LiteralExtractKey, (usize, bool)>| {
                 // Predicate: is this handle a literal-like that we would tally
                 // (a `Literal`, or an unnamed `Constant` whose init is a literal)?
@@ -353,31 +354,26 @@ impl<'a> Generator<'a> {
                     types: &naga::UniqueArena<naga::Type>,
                     visit: &mut F,
                 ) {
-                    for stmt in block {
-                        match stmt {
-                            naga::Statement::Atomic { fun, value, .. } => {
-                                crate::passes::expr_util::visit_atomic_function_handles(fun, visit);
-                                visit(*value);
-                            }
-                            // `atomicStore(&a, <int lit>)`: same typed-form force
-                            // via `emit_atomic_store`/`emit_expr_for_atomic`.
-                            naga::Statement::Store { pointer, value }
-                                if pointer_is_atomic(*pointer, func_info, types) =>
-                            {
-                                visit(*value);
-                            }
-                            // `ImageAtomic` value (and Exchange compare) route
-                            // through `emit_expr_for_atomic` too.
-                            naga::Statement::ImageAtomic { fun, value, .. } => {
-                                crate::passes::expr_util::visit_atomic_function_handles(fun, visit);
-                                visit(*value);
-                            }
-                            _ => {}
+                    crate::passes::expr_util::for_each_statement(block, &mut |stmt| match stmt {
+                        naga::Statement::Atomic { fun, value, .. } => {
+                            crate::passes::expr_util::visit_atomic_function_handles(fun, visit);
+                            visit(*value);
                         }
-                        for nested in crate::passes::expr_util::nested_blocks(stmt) {
-                            walk_block_for_atomic_lits(nested, func_info, types, visit);
+                        // `atomicStore(&a, <int lit>)`: same typed-form force
+                        // via `emit_atomic_store`/`emit_expr_for_atomic`.
+                        naga::Statement::Store { pointer, value }
+                            if pointer_is_atomic(*pointer, func_info, types) =>
+                        {
+                            visit(*value);
                         }
-                    }
+                        // `ImageAtomic` value (and Exchange compare) route
+                        // through `emit_expr_for_atomic` too.
+                        naga::Statement::ImageAtomic { fun, value, .. } => {
+                            crate::passes::expr_util::visit_atomic_function_handles(fun, visit);
+                            visit(*value);
+                        }
+                        _ => {}
+                    });
                 }
                 walk_block_for_atomic_lits(&func.body, func_info, &module.types, &mut |h| {
                     if let Some(lit) = literal_lit(h)
@@ -410,31 +406,25 @@ impl<'a> Generator<'a> {
                     consumed: &mut [bool],
                     visit: &mut F,
                 ) {
-                    for stmt in block {
-                        match stmt {
-                            naga::Statement::Store { pointer, value } => {
-                                if let naga::Expression::LocalVariable(lh) = expressions[*pointer]
-                                    && deferrable[lh.index()]
-                                    && !consumed[lh.index()]
-                                {
-                                    consumed[lh.index()] = true;
-                                    visit(*value);
-                                }
+                    crate::passes::expr_util::for_each_statement(block, &mut |stmt| match stmt {
+                        naga::Statement::Store { pointer, value } => {
+                            if let naga::Expression::LocalVariable(lh) = expressions[*pointer]
+                                && deferrable[lh.index()]
+                                && !consumed[lh.index()]
+                            {
+                                consumed[lh.index()] = true;
+                                visit(*value);
                             }
-                            naga::Statement::Switch { selector, .. } => visit(*selector),
-                            _ => {}
                         }
-                        for nested in crate::passes::expr_util::nested_blocks(stmt) {
-                            walk_typed_form_lits(nested, expressions, deferrable, consumed, visit);
-                        }
-                    }
+                        naga::Statement::Switch { selector, .. } => visit(*selector),
+                        _ => {}
+                    });
                 }
-                let (deferrable, _) = super::module_emit::find_deferrable_vars(func);
                 let mut deferred_consumed = vec![false; func.local_variables.len()];
                 walk_typed_form_lits(
                     &func.body,
                     &func.expressions,
-                    &deferrable,
+                    deferrable,
                     &mut deferred_consumed,
                     &mut |h| {
                         if matches!(func.expressions[h], naga::Expression::Literal(_)) {
@@ -492,23 +482,6 @@ impl<'a> Generator<'a> {
                 }
             };
 
-        // Gather the forbidden-name set contributed by one function.
-        // Function-scope names shadow module-scope names, so the
-        // extracted constant must avoid colliding with any argument
-        // or local of any function or entry point.
-        let collect_func_names = |func: &naga::Function, forbidden: &mut HashSet<String>| {
-            for arg in &func.arguments {
-                if let Some(n) = &arg.name {
-                    forbidden.insert(n.clone());
-                }
-            }
-            for (_, local) in func.local_variables.iter() {
-                if let Some(n) = &local.name {
-                    forbidden.insert(n.clone());
-                }
-            }
-        };
-
         // 1. Count literal strings exactly as they are emitted in general
         //    expression contexts.  Walk regular functions then entry
         //    points; the `cache_idx` counter mirrors the order in which
@@ -526,6 +499,7 @@ impl<'a> Generator<'a> {
                 &self.info[handle],
                 &self.ref_count_cache[cache_idx].ref_counts,
                 &live,
+                &self.defer_cache[cache_idx].0,
                 &mut literal_counts,
             );
             cache_idx += 1;
@@ -537,6 +511,7 @@ impl<'a> Generator<'a> {
                 self.info.get_entry_point(ep_idx),
                 &self.ref_count_cache[cache_idx].ref_counts,
                 &live,
+                &self.defer_cache[cache_idx].0,
                 &mut literal_counts,
             );
             cache_idx += 1;
@@ -565,15 +540,13 @@ impl<'a> Generator<'a> {
         for ep in self.module.entry_points.iter() {
             forbidden.insert(ep.name.clone());
         }
-        for func in self
-            .module
-            .functions
-            .iter()
-            .map(|(_, f)| f)
-            .chain(self.module.entry_points.iter().map(|ep| &ep.function))
-        {
-            collect_func_names(func, &mut forbidden);
-        }
+        // Function-scope names shadow module-scope names, so the extracted
+        // constant must also avoid every argument and local.
+        forbidden.extend(
+            super::core::all_functions(self.module)
+                .flat_map(crate::name_gen::function_local_names)
+                .map(str::to_owned),
+        );
 
         // 3. Collect profitable candidates sorted by estimated savings.
         //    `savings = K * (L - N) - (BOILERPLATE + N + D)` where `K`

@@ -319,12 +319,9 @@ fn collect_block_write_effects(
     expressions: &naga::Arena<naga::Expression>,
     out: &mut Vec<WriteEffect>,
 ) {
-    for stmt in block.iter() {
-        statement_write_effects(stmt, expressions, out);
-        for nested in crate::passes::expr_util::nested_blocks(stmt) {
-            collect_block_write_effects(nested, expressions, out);
-        }
-    }
+    crate::passes::expr_util::for_each_statement(block, &mut |stmt| {
+        statement_write_effects(stmt, expressions, out)
+    });
 }
 
 /// A `Load` that has been emitted and is still in flight: its place plus

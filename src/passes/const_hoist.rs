@@ -151,14 +151,11 @@ fn full_literal_vector(
 /// at most once, so a plain `Vec` collects the live set without deduplication
 /// and lets the caller scan only those handles rather than the whole arena.
 fn collect_emitted(block: &naga::Block, out: &mut Vec<naga::Handle<naga::Expression>>) {
-    for stmt in block.iter() {
+    super::expr_util::for_each_statement(block, &mut |stmt| {
         if let naga::Statement::Emit(range) = stmt {
             out.extend(range.clone());
         }
-        for nested in super::expr_util::nested_blocks(stmt) {
-            collect_emitted(nested, out);
-        }
-    }
+    });
 }
 
 /// Pass entry point; the algorithm and its scope limits are the
@@ -236,34 +233,11 @@ impl Pass for ConstHoistPass {
         // avoid-set once and record each minted name so repeated hoists differ.
         let mut reserved_names: std::collections::HashSet<String> =
             ctx.config.preserve_symbols.iter().cloned().collect();
-        for (_, c) in module.constants.iter() {
-            if let Some(n) = c.name.as_deref() {
-                reserved_names.insert(n.to_string());
-            }
-        }
-        for (_, g) in module.global_variables.iter() {
-            if let Some(n) = g.name.as_deref() {
-                reserved_names.insert(n.to_string());
-            }
-        }
-        for (_, ov) in module.overrides.iter() {
-            if let Some(n) = ov.name.as_deref() {
-                reserved_names.insert(n.to_string());
-            }
-        }
-        for (_, f) in module.functions.iter() {
-            if let Some(n) = f.name.as_deref() {
-                reserved_names.insert(n.to_string());
-            }
-        }
-        for ep in module.entry_points.iter() {
-            reserved_names.insert(ep.name.clone());
-        }
-        for (_, ty) in module.types.iter() {
-            if let Some(n) = ty.name.as_deref() {
-                reserved_names.insert(n.to_string());
-            }
-        }
+        reserved_names.extend(
+            crate::name_gen::module_scope_names(module)
+                .chain(crate::name_gen::type_names(module))
+                .map(str::to_owned),
+        );
 
         const NAME_LEN: usize = 2;
         let mut changed = false;

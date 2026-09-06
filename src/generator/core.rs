@@ -136,6 +136,10 @@ pub(super) struct Generator<'a> {
     /// consumers that need the live mask (e.g. `literal_extract`) do
     /// not re-walk the body.
     pub(super) ref_count_cache: Vec<FunctionExprInfo>,
+    /// Per-function `(deferrable, dead)` local bitmaps, indexed like
+    /// `ref_count_cache`; computed once so the live-type census, alias cost
+    /// model, literal extraction, and emission cannot disagree.
+    pub(super) defer_cache: Vec<(Vec<bool>, Vec<bool>)>,
     /// Per-`module.functions` purity bitmap (`true` = no side effect
     /// observable beyond the return value).  Computed once in
     /// `generate_module` and read by `find_inlineable_calls` to keep impure
@@ -243,6 +247,7 @@ fn count_type_handle_refs(
     module: &naga::Module,
     live_constants: &HashSet<naga::Handle<naga::Constant>>,
     live_types: &HashSet<naga::Handle<naga::Type>>,
+    defer_cache: &[(Vec<bool>, Vec<bool>)],
 ) -> HashMap<naga::Handle<naga::Type>, usize> {
     let mut counts: HashMap<naga::Handle<naga::Type>, usize> = HashMap::new();
     let mut inc = |h: naga::Handle<naga::Type>| {
@@ -311,19 +316,13 @@ fn count_type_handle_refs(
     // perturbing any count can flip a marginal choice; this is net-positive
     // across real shaders but not regression-free - a few shaders trade one
     // marginal alias for a slightly worse one.  All outputs stay valid.
-    let all_funcs = module
-        .functions
-        .iter()
-        .map(|(_, f)| f)
-        .chain(module.entry_points.iter().map(|ep| &ep.function));
-    for func in all_funcs {
+    for (func, (_, dead_locals)) in all_functions(module).zip(defer_cache) {
         for arg in &func.arguments {
             inc(arg.ty);
         }
         if let Some(result) = &func.result {
             inc(result.ty);
         }
-        let (_, dead_locals) = super::module_emit::find_deferrable_vars(func);
         for (h, local) in func.local_variables.iter() {
             if !dead_locals[h.index()] {
                 inc(local.ty);
@@ -339,6 +338,16 @@ fn count_type_handle_refs(
     }
 
     counts
+}
+
+/// Every function body in `ref_count_cache` / `defer_cache` order: regular
+/// functions, then entry points.
+pub(super) fn all_functions(module: &naga::Module) -> impl Iterator<Item = &naga::Function> {
+    module
+        .functions
+        .iter()
+        .map(|(_, f)| f)
+        .chain(module.entry_points.iter().map(|ep| &ep.function))
 }
 
 // MARK: Liveness analyses
@@ -493,6 +502,7 @@ fn collect_const_refs_in_global_expr(
 fn compute_live_types(
     module: &naga::Module,
     live_constants: &HashSet<naga::Handle<naga::Constant>>,
+    defer_cache: &[(Vec<bool>, Vec<bool>)],
 ) -> HashSet<naga::Handle<naga::Type>> {
     let mut live: HashSet<naga::Handle<naga::Type>> = HashSet::new();
 
@@ -523,27 +533,18 @@ fn compute_live_types(
     }
 
     // From functions and entry points.
-    let all_funcs = module
-        .functions
-        .iter()
-        .map(|(_, f)| f)
-        .chain(module.entry_points.iter().map(|ep| &ep.function));
-    for func in all_funcs {
+    for (func, (_, dead_locals)) in all_functions(module).zip(defer_cache) {
         for arg in &func.arguments {
             mark(arg.ty);
         }
         if let Some(result) = &func.result {
             mark(result.ty);
         }
-        // Dead locals (never referenced) are not declared by the emitter, so
-        // their types must not count as live either - naga's compactor roots
-        // ALL locals, so a DCE'd `var res: __frexp_result_f16;` would
-        // otherwise keep pinning its special type (and, through the f16
-        // member scalars, a spurious `enable f16;`) forever.  Uses the SAME
-        // dead-local analysis the emitter's declaration skip uses
-        // (`find_deferrable_vars`), so emitted-decl and live-type views
-        // cannot disagree.
-        let (_, dead_locals) = super::module_emit::find_deferrable_vars(func);
+        // The emitter declares no dead local, so its type is not live either:
+        // naga's compactor roots ALL locals, and a DCE'd
+        // `var res: __frexp_result_f16;` would otherwise pin its special type
+        // and, through the member scalars, a spurious `enable f16;`.
+        // `defer_cache` is the emitter's own verdict, so the two views agree.
         for (h, local) in func.local_variables.iter() {
             if !dead_locals[h.index()] {
                 mark(local.ty);
@@ -700,61 +701,18 @@ impl<'a> Generator<'a> {
 
         let mangle = options.mangle;
 
-        // When mangling, collect all names already used by constants,
-        // globals, overrides, functions, entry points, and function-local
-        // identifiers (arguments, locals) so that struct type/member
-        // mangled names don't collide.  In WGSL, function-scope names
-        // shadow module-scope type names, so a struct type named `B`
-        // becomes unusable inside any function that has a parameter `B`.
+        // Mangled struct type / member names must not collide with any name
+        // in scope where the type is referenced: every module-scope name and,
+        // because function-scope names shadow module-scope type names, every
+        // argument and local in any function.  Preserved names are reserved
+        // up front so the counter never mints one, whatever the arena order.
         let mut used_names = HashSet::new();
         if mangle {
-            for (_, c) in module.constants.iter() {
-                if let Some(name) = c.name.as_deref() {
-                    used_names.insert(name.to_string());
-                }
-            }
-            for (_, ov) in module.overrides.iter() {
-                if let Some(name) = ov.name.as_deref() {
-                    used_names.insert(name.to_string());
-                }
-            }
-            for (_, g) in module.global_variables.iter() {
-                if let Some(name) = g.name.as_deref() {
-                    used_names.insert(name.to_string());
-                }
-            }
-            for (_, f) in module.functions.iter() {
-                if let Some(name) = f.name.as_deref() {
-                    used_names.insert(name.to_string());
-                }
-                for arg in &f.arguments {
-                    if let Some(name) = arg.name.as_deref() {
-                        used_names.insert(name.to_string());
-                    }
-                }
-                for (_, local) in f.local_variables.iter() {
-                    if let Some(name) = local.name.as_deref() {
-                        used_names.insert(name.to_string());
-                    }
-                }
-            }
-            for ep in module.entry_points.iter() {
-                used_names.insert(ep.name.clone());
-                for arg in &ep.function.arguments {
-                    if let Some(name) = arg.name.as_deref() {
-                        used_names.insert(name.to_string());
-                    }
-                }
-                for (_, local) in ep.function.local_variables.iter() {
-                    if let Some(name) = local.name.as_deref() {
-                        used_names.insert(name.to_string());
-                    }
-                }
-            }
-            // Reserve all preserved symbol names upfront so that the
-            // mangle counter never generates a name that collides with
-            // a preserved struct type or member - regardless of the
-            // order types appear in the arena.
+            used_names.extend(
+                crate::name_gen::module_scope_names(module)
+                    .chain(all_functions(module).flat_map(crate::name_gen::function_local_names))
+                    .map(str::to_owned),
+            );
             used_names.extend(options.preserve_symbols.iter().cloned());
         }
         let mut mangle_counter = 0usize;
@@ -763,33 +721,12 @@ impl<'a> Generator<'a> {
         let mut type_names = HashMap::new();
         let mut member_names = HashMap::new();
 
-        // naga predeclared / special types must never have their
-        // struct or member names mangled: their members are accessed
-        // through canonical names (`.old_value`, `.exchanged`,
-        // `.fract`, `.whole`, `.exp`, `.kind`, `.t`,
-        // `.barycentrics`, ...) and `module_emit::generate_module`
-        // emits no declaration for them, so a mangled accessor
-        // produces invalid WGSL.  Mirror the exact set
-        // `module_emit::generate_module` skips at declaration time -
-        // `ray_desc`, `ray_intersection`, `ray_vertex_return`,
-        // `external_texture_params`,
-        // `external_texture_transfer_function`, plus every
-        // `predeclared_types` entry.
-        let predeclared_type_handles: std::collections::HashSet<naga::Handle<naga::Type>> = {
-            let st = &module.special_types;
-            let mut set: std::collections::HashSet<_> = [
-                st.ray_desc,
-                st.ray_intersection,
-                st.ray_vertex_return,
-                st.external_texture_params,
-                st.external_texture_transfer_function,
-            ]
-            .iter()
-            .filter_map(|h| *h)
-            .collect();
-            set.extend(st.predeclared_types.values().copied());
-            set
-        };
+        // naga predeclared / special types must never have their struct or
+        // member names mangled: their members are accessed through canonical
+        // names (`.old_value`, `.exchanged`, `.fract`, `.whole`, `.exp`,
+        // `.kind`, `.t`, `.barycentrics`, ...) and `generate_module` emits no
+        // declaration for them, so a mangled accessor produces invalid WGSL.
+        let predeclared_type_handles = super::module_emit::special_struct_handles(module);
 
         for (h, ty) in module.types.iter() {
             if let naga::TypeInner::Struct { members, .. } = &ty.inner {
@@ -966,12 +903,16 @@ impl<'a> Generator<'a> {
         // panic is still a panic.
         let layouter_complete = layouter.update(module.to_ctx()).is_ok();
 
+        let defer_cache: Vec<(Vec<bool>, Vec<bool>)> = all_functions(module)
+            .map(super::module_emit::find_deferrable_vars)
+            .collect();
         let live_constants = compute_live_constants(module, &options.preserve_symbols);
-        let live_types = compute_live_types(module, &live_constants);
+        let live_types = compute_live_types(module, &live_constants, &defer_cache);
 
         // Type aliasing: introduce `alias` declarations when they shrink output
         let type_alias_decls = if options.type_alias {
-            let ref_counts = count_type_handle_refs(module, &live_constants, &live_types);
+            let ref_counts =
+                count_type_handle_refs(module, &live_constants, &live_types, &defer_cache);
 
             // Collect every name already in use so alias names don't collide.
             // This includes function-local names (arguments, locals) because a
@@ -990,23 +931,11 @@ impl<'a> Generator<'a> {
             // cannot shadow or redeclare one.  Mirrors the mangle-counter seed at
             // the top of this function.
             alias_used.extend(options.preserve_symbols.iter().cloned());
-            let all_funcs = module
-                .functions
-                .iter()
-                .map(|(_, f)| f)
-                .chain(module.entry_points.iter().map(|ep| &ep.function));
-            for func in all_funcs {
-                for arg in &func.arguments {
-                    if let Some(name) = &arg.name {
-                        alias_used.insert(name.clone());
-                    }
-                }
-                for (_, local) in func.local_variables.iter() {
-                    if let Some(name) = &local.name {
-                        alias_used.insert(name.clone());
-                    }
-                }
-            }
+            alias_used.extend(
+                all_functions(module)
+                    .flat_map(crate::name_gen::function_local_names)
+                    .map(str::to_owned),
+            );
 
             let mut alias_counter = 0usize;
             let mut decls: Vec<(String, String)> = Vec::new();
@@ -1110,6 +1039,7 @@ impl<'a> Generator<'a> {
             layouter,
             layouter_complete,
             ref_count_cache: Vec::new(),
+            defer_cache,
             pure_functions: Vec::new(),
             tok_separator,
             tok_assign,

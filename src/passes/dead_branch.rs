@@ -261,17 +261,14 @@ fn count_whole_stores(
     whole_stores: &mut [u32],
     store_value: &mut [Option<naga::Handle<naga::Expression>>],
 ) {
-    for stmt in block.iter() {
+    super::expr_util::for_each_statement(block, &mut |stmt| {
         if let naga::Statement::Store { pointer, value } = stmt
             && let naga::Expression::LocalVariable(l) = exprs[*pointer]
         {
             whole_stores[l.index()] += 1;
             store_value[l.index()] = Some(*value);
         }
-        for nested in nested_blocks(stmt) {
-            count_whole_stores(nested, exprs, whole_stores, store_value);
-        }
-    }
+    });
 }
 
 /// Read-only census slices threaded through [`collect_forwards`].
@@ -2237,68 +2234,14 @@ fn eliminate_redundant_else_stores(
                 );
             }
 
-            naga::Statement::Call { arguments, .. } => {
-                // Pointer arguments may be written through by the callee.
-                for &arg in arguments.iter() {
-                    if let Some(lh) = get_stored_local(expressions, arg) {
-                        known_values.remove(&lh);
-                        fresh_loads.remove(&lh);
-                    }
-                }
-            }
-
-            naga::Statement::Atomic { pointer, .. } => {
-                if let Some(lh) = get_stored_local(expressions, *pointer) {
+            // A pointer write by a callee / atomic / ray / cooperative op:
+            // the local's value is unknown and no earlier load of it is fresh.
+            other => super::expr_util::visit_statement_write_pointers(other, &mut |p| {
+                if let Some(lh) = get_stored_local(expressions, p) {
                     known_values.remove(&lh);
                     fresh_loads.remove(&lh);
                 }
-            }
-
-            naga::Statement::RayQuery { query, .. } => {
-                if let Some(lh) = get_stored_local(expressions, *query) {
-                    known_values.remove(&lh);
-                    fresh_loads.remove(&lh);
-                }
-            }
-
-            naga::Statement::RayPipelineFunction(fun) => {
-                let naga::RayPipelineFunction::TraceRay { payload, .. } = fun;
-                if let Some(lh) = get_stored_local(expressions, *payload) {
-                    known_values.remove(&lh);
-                    fresh_loads.remove(&lh);
-                }
-            }
-
-            naga::Statement::CooperativeStore { data, .. } => {
-                // `CooperativeStore { target, data }`: `data.pointer` is
-                // the validator-required STORE-space write destination;
-                // `target` is the matrix value being read.  Invalidate
-                // the local rooted at the write side.
-                if let Some(lh) = get_stored_local(expressions, data.pointer) {
-                    known_values.remove(&lh);
-                    fresh_loads.remove(&lh);
-                }
-            }
-
-            // Statements that neither modify known-value tracking nor
-            // contain nested blocks - enumerated explicitly so a
-            // future naga release adding a new pointer-bearing variant
-            // breaks the build here instead of silently leaving a
-            // known_values entry stale across the new statement type.
-            // (`Emit` has its own arm above: it materialises loads that
-            // feed condition narrowing.)
-            naga::Statement::Break
-            | naga::Statement::Continue
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. } => {}
+            }),
         }
     }
 
