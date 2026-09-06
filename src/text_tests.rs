@@ -390,3 +390,44 @@ fn split_directives_does_not_capture_diagnostic_prefixed_identifier() {
     );
     assert_eq!(body, source);
 }
+
+#[test]
+fn requires_entry_spans_blank_the_directive_or_one_entry() {
+    let ext = "unrestricted_pointer_parameters";
+    let blank = |src: &str| -> String {
+        let mut out = src.to_string();
+        for span in requires_entry_spans(src, ext) {
+            out.replace_range(span.clone(), &" ".repeat(span.len()));
+        }
+        out
+    };
+    // Sole entry: the whole directive goes, `;` and a trailing comma included.
+    assert_eq!(
+        blank("requires unrestricted_pointer_parameters;\nfn f() {}\n"),
+        format!("{}\nfn f() {{}}\n", " ".repeat(41))
+    );
+    assert_eq!(
+        blank("requires unrestricted_pointer_parameters,;"),
+        " ".repeat(42)
+    );
+    // Listed with others: through to the next entry, or back to the previous
+    // one and on to the `;` (a trailing comma goes with it).
+    assert_eq!(
+        blank("requires unrestricted_pointer_parameters, pointer_composite_access;"),
+        format!("requires {}pointer_composite_access;", " ".repeat(33))
+    );
+    assert_eq!(
+        blank("requires pointer_composite_access, unrestricted_pointer_parameters;"),
+        format!("requires pointer_composite_access{};", " ".repeat(33))
+    );
+    assert_eq!(
+        blank("requires pointer_composite_access, unrestricted_pointer_parameters,;"),
+        format!("requires pointer_composite_access{};", " ".repeat(34))
+    );
+    // Longer identifiers, and directives after a declaration, are left alone.
+    assert!(requires_entry_spans("requires unrestricted_pointer_parameters_v2;", ext).is_empty());
+    assert!(
+        requires_entry_spans("fn f() {}\nrequires unrestricted_pointer_parameters;", ext)
+            .is_empty()
+    );
+}

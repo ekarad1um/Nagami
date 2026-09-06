@@ -35,7 +35,7 @@ use std::collections::HashSet;
 use text::{
     cleaned_has_enable_directive, cleaned_references_f16_token, cleaned_references_whole_token,
     compact_wgsl_text, has_enable_f16_directive, join_with_newline, normalize_line_endings,
-    references_f16_token, split_directives, strip_wgsl_comments,
+    references_f16_token, requires_entry_spans, split_directives, strip_wgsl_comments,
 };
 
 // MARK: Source preprocessing
@@ -164,12 +164,13 @@ pub(crate) fn module_needs_naga_baseline_skip(module: &naga::Module) -> bool {
 }
 
 /// Normalise `source` so naga's front-end accepts it: rewrite lone-CR endings
-/// to LF (so the per-line scans see every break), then inject the `enable`
+/// to LF (so the per-line scans see every break), inject the `enable`
 /// directives naga 30 requires to parse a feature the text uses but does not
-/// declare (`enable f16;`, `enable wgpu_binding_array;`).  naga 30 implements
-/// every `wgpu_*` extension, so nothing is stripped.  Output is re-derived from
-/// the IR, so callers of [`run`] never observe these rewrites.  Borrows the
-/// input when nothing needs rewriting.
+/// declare (`enable f16;`, `enable wgpu_binding_array;`), and blank the one
+/// `requires` entry naga refuses outright.  naga 30 implements every `wgpu_*`
+/// extension, so no `wgpu_*` directive is stripped.  Output is re-derived from the IR, so
+/// callers of [`run`] never observe these rewrites.  Borrows the input when
+/// nothing needs rewriting.
 fn preprocess_source_for_naga(source: &str) -> Cow<'_, str> {
     let normalized = normalize_line_endings(source);
 
@@ -187,11 +188,27 @@ fn preprocess_source_for_naga(source: &str) -> Cow<'_, str> {
     {
         prefix.push_str("enable wgpu_binding_array;\n");
     }
-    if prefix.is_empty() {
+    // naga parses pointer parameters in every address space yet rejects the
+    // directive announcing them (wgpu #5158), which would stop the very shaders
+    // `specialize_ptr_params` exists for at the parser.  The directive is
+    // advisory, so blanking it changes nothing the IR sees; same length with
+    // line breaks kept, because naga's diagnostics quote these offsets.
+    let blanks = requires_entry_spans(&cleaned, "unrestricted_pointer_parameters");
+    if prefix.is_empty() && blanks.is_empty() {
         return normalized;
     }
-    prefix.push_str(&normalized);
-    Cow::Owned(prefix)
+    let base = prefix.len();
+    let mut out = prefix;
+    out.push_str(&normalized);
+    for span in blanks {
+        let span = span.start + base..span.end + base;
+        let blanked: String = out.as_bytes()[span.clone()]
+            .iter()
+            .map(|&b| if b == b'\n' { '\n' } else { ' ' })
+            .collect();
+        out.replace_range(span, &blanked);
+    }
+    Cow::Owned(out)
 }
 
 /// Strip the dead `return;` naga's WGSL front-end appends after a diverging
@@ -451,28 +468,28 @@ fn collect_module_names(module: &naga::Module) -> HashSet<String> {
 
 // MARK: Naga error-message coupling
 
-/// Substrings that identify naga parse errors about enable-extensions
-/// naga does not yet support (or a shader declares but the front-end
-/// refuses).  Matched against the rendered [`Error`] message.
-///
-/// NOTE: This couples behaviour to naga's human-readable error strings.
-/// A naga upgrade that rewords these messages silently flips the
-/// "unsupported extension -> return input unchanged" code path into a
-/// hard error.  The lock-in tests at the bottom of this module pin the
-/// current phrasings so such drift fails at test time instead.
+/// First-line keys of the parse errors naga's front-end raises for a directive
+/// it declines: `unknown enable-extension`, `unknown language extension`, and
+/// the four "the `x` ... extension is not {yet supported, enabled, supported in
+/// the current environment}" forms.  Every key spans a space because naga
+/// quotes user identifiers on that same line ("no definition in scope for
+/// identifier: `extension_of_life`"); the bare word would file an invalid
+/// shader as a bailout.  Coupled to naga's wording:
+/// `unsupported_extension_patterns_track_naga_phrasings` parses real shaders
+/// so a rewording fails at test time rather than turning the bailout into a
+/// hard error in the field.
 const UNSUPPORTED_EXTENSION_PATTERNS: &[&str] = &[
-    "enable extension is not enabled",
-    "enable-extension is not yet supported",
+    "extension is not",
+    "unknown enable-extension",
+    "unknown language extension",
 ];
 
 /// Substrings flagging text-validation errors that are known naga
 /// limitations rather than real generator bugs.  Currently scoped to
 /// the `subgroups` enable-extension, which naga's text front-end
 /// rejects even though its IR emitter produces it.
-const KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS: &[&str] = &[
-    "`subgroups` enable-extension is not yet supported",
-    "subgroups enable-extension is not yet supported",
-];
+const KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS: &[&str] =
+    &["`subgroups` enable-extension is not yet supported"];
 
 /// `true` when the FIRST line of `err`'s rendering contains one of
 /// `patterns`.  naga's codespan output puts the message on line 1 and quotes
@@ -484,7 +501,7 @@ fn first_line_matches(err: &Error, patterns: &[&str]) -> bool {
     patterns.iter().any(|p| first_line.contains(p))
 }
 
-/// `true` for a `Parse` error about an enable-extension naga cannot parse
+/// `true` for a `Parse` error about a directive naga's front-end declines
 /// ([`UNSUPPORTED_EXTENSION_PATTERNS`]).  Restricted to `Parse`: a
 /// validation or emit error quoting the same text must stay a hard error
 /// rather than take the "ship the input compacted" bailout.
@@ -760,9 +777,10 @@ fn resolve_generator_output(
 /// # Errors
 ///
 /// Propagates [`Error::Parse`], [`Error::Validation`], and
-/// [`Error::Emit`] from the underlying stages.  Shaders using
-/// extensions naga cannot parse short-circuit to an unchanged input
-/// rather than erroring; see `UNSUPPORTED_EXTENSION_PATTERNS`.
+/// [`Error::Emit`] from the underlying stages.  A directive naga's
+/// front-end declines (an unknown, unimplemented, or not-enabled
+/// extension) ships the input lexically compacted with
+/// [`Report::bailout`] set instead; see `UNSUPPORTED_EXTENSION_PATTERNS`.
 pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     let normalized_source = preprocess_source_for_naga(source);
 
@@ -786,7 +804,21 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         // crash at parse time while the same text in the source body
         // would silently succeed - an asymmetry that surprised callers
         // and prevented preambles from sharing source-style content.
-        let preamble_module = io::parse_wgsl_with_path(normalized_preamble, "<preamble>")?;
+        let preamble_module = match io::parse_wgsl_with_path(normalized_preamble, "<preamble>") {
+            Ok(m) => m,
+            // Same bailout as the body's parse arm below: the consumer's own
+            // preamble carries the directive, so the compacted body still
+            // concatenates into a shader their compiler accepts.
+            Err(e) if is_unsupported_extension_parse_error(&e) => {
+                return bailout_output(
+                    format!("naga cannot parse the preamble: {e}"),
+                    source,
+                    effective_preamble,
+                    Report::new(source.len()),
+                );
+            }
+            Err(e) => return Err(e),
+        };
         preamble_names = collect_module_names(&preamble_module);
         // Directives must precede declarations (see `split_directives`),
         // so extract both sides' leading directives and prepend them
@@ -815,12 +847,12 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     let mut module = match io::parse_wgsl(&full_source) {
         Ok(m) => m,
         Err(e) if is_unsupported_extension_parse_error(&e) => {
-            // Shader uses an extension naga can't parse (e.g.
-            // `subgroups`).  Ship the source lexically compacted -
-            // comments and whitespace need no parser to remove, and
-            // this path otherwise ships fully un-minified text - so
-            // the caller still gets something runnable on backends
-            // that DO understand the extension.
+            // A directive naga's front-end declines (`enable subgroups;`,
+            // `requires texel_buffers;`).  Ship the source lexically
+            // compacted - comments and whitespace need no parser to remove,
+            // and this path otherwise ships fully un-minified text - so the
+            // caller still gets something runnable on backends that DO
+            // understand the directive.
             return bailout_output(
                 format!("naga cannot parse the input: {e}"),
                 source,

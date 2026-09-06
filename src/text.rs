@@ -3,6 +3,7 @@
 //! Byte-level and grammar-agnostic; nothing here touches naga.
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 /// Rewrite lone `\r` to `\n`; leave `\r\n` intact (`str::lines`
 /// handles it).  Borrows the input when no lone `\r` exists.
@@ -246,6 +247,54 @@ pub(crate) fn cleaned_has_enable_directive(cleaned: &str, ext: &str) -> bool {
         }
     }
     false
+}
+
+/// Byte spans to blank so `ext` disappears from every `requires` directive in
+/// comment-stripped `cleaned`: the whole directive when `ext` is all it lists,
+/// otherwise each `ext` entry through to the next entry (a last one from the
+/// previous entry to the `;`).  Only the leading directive block is scanned -
+/// a `requires` after a declaration is already invalid and stays naga's to
+/// report.
+pub(crate) fn requires_entry_spans(cleaned: &str, ext: &str) -> Vec<Range<usize>> {
+    let directives = split_directives(cleaned).0;
+    let mut spans = Vec::new();
+    let mut start = 0;
+    for (semi, _) in directives.match_indices(';') {
+        let segment = &directives[start..semi];
+        let keyword = start + (segment.len() - segment.trim_start().len());
+        start = semi + 1;
+        let Some(list) = segment.trim_start().strip_prefix("requires") else {
+            continue;
+        };
+        if !list.starts_with([' ', '\t', '\n', '\r']) {
+            continue;
+        }
+        // Trimmed bounds of each entry; an empty one is a trailing comma.
+        let mut entries: Vec<(usize, usize)> = Vec::new();
+        let mut pos = semi - list.len();
+        for raw in list.split(',') {
+            let s = pos + (raw.len() - raw.trim_start().len());
+            let e = s + raw.trim().len();
+            if s < e {
+                entries.push((s, e));
+            }
+            pos += raw.len() + 1;
+        }
+        let is_ext = |&(s, e): &(usize, usize)| &directives[s..e] == ext;
+        if !entries.is_empty() && entries.iter().all(is_ext) {
+            spans.push(keyword..semi + 1);
+            continue;
+        }
+        // Some entry is not `ext` (else the directive went above), so a last
+        // `ext` entry always has a predecessor.
+        for (k, entry) in entries.iter().enumerate().filter(|(_, e)| is_ext(e)) {
+            spans.push(match entries.get(k + 1) {
+                Some(&(next, _)) => entry.0..next,
+                None => entries[k - 1].1..semi,
+            });
+        }
+    }
+    spans
 }
 
 /// Lexically compact WGSL text that never goes through the generator: strip

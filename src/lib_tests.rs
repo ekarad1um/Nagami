@@ -887,6 +887,19 @@ fn ptr_workgroup_param_whole_var_root_is_recovered() {
     );
 }
 
+/// The spec's own directive for pointer parameters must reach the pass
+/// instead of stopping at naga's parser (wgpu #5158).
+#[test]
+fn requires_unrestricted_pointer_parameters_shader_is_recovered() {
+    assert_ptr_param_recovered(
+        "requires unrestricted_pointer_parameters;\n\
+         var<workgroup> sh: array<f32, 8>;\n\
+         fn touch(p: ptr<workgroup, array<f32, 8>>, i: u32) { (*p)[i] = 1.0; }\n\
+         @compute @workgroup_size(8) fn m(@builtin(local_invocation_id) l: vec3u) { touch(&sh, l.x); }",
+        "touch",
+    );
+}
+
 /// The first clone of a specialized helper carries the helper's own name,
 /// so the name map keys it by the original and `--preserve-symbol` keeps
 /// it verbatim; a second root's clone carries a `_sp` suffix.
@@ -973,6 +986,34 @@ fn compact_keeps_space_before_non_ascii_identifier() {
         compacted.starts_with("let \u{2118}"),
         "non-ASCII identifier fused with the keyword: {compacted}"
     );
+}
+
+/// A directive naga declines inside the PREAMBLE takes the same bailout as
+/// one in a single file: the consumer's preamble carries it, so the compacted
+/// body concatenates into a shader their compiler accepts.
+#[test]
+fn preamble_declared_unknown_directive_bails_out_with_body_compacted() {
+    let config = Config {
+        preamble: Some(
+            "enable chromium_experimental_subgroup_matrix;\n\
+             @group(0) @binding(0) var<storage, read_write> buf: array<i32>;"
+                .to_string(),
+        ),
+        ..Config::default()
+    };
+    let body = "@compute @workgroup_size(64) fn m() { // uses the preamble's extension\n\
+                subgroupMatrixStore(&buf, 0, subgroup_matrix_left<i8, 8, 8>(), false, 64); }";
+    let output = run(body, &config).expect("bailout returns Ok");
+    assert_eq!(
+        output.source,
+        "@compute@workgroup_size(64)fn m(){subgroupMatrixStore(&buf,0,subgroup_matrix_left<i8,8,8>(),false,64);}"
+    );
+    let reason = output.report.bailout.as_deref().expect("reason carried");
+    assert!(
+        reason.starts_with("naga cannot parse the preamble: "),
+        "{reason}"
+    );
+    assert!(output.name_map.is_none());
 }
 
 #[test]
@@ -1116,6 +1157,35 @@ fn preprocess_injects_for_real_f16_use() {
     );
 }
 
+/// Blanked, not cut: every other byte keeps its offset so naga's diagnostics
+/// still point at the user's columns.  Comments are not scanned.
+#[test]
+fn preprocess_blanks_requires_unrestricted_pointer_parameters() {
+    let src = "requires unrestricted_pointer_parameters;\nfn f() {}\n";
+    let out = preprocess_source_for_naga(src);
+    assert_eq!(out.len(), src.len());
+    assert!(!out.contains("requires"), "{out:?}");
+
+    let src = "// requires unrestricted_pointer_parameters;\n\
+               requires pointer_composite_access, unrestricted_pointer_parameters;\n";
+    let out = preprocess_source_for_naga(src);
+    assert_eq!(out.len(), src.len());
+    assert!(out.contains("requires pointer_composite_access"), "{out:?}");
+    assert_eq!(
+        out.matches("unrestricted_pointer_parameters").count(),
+        1,
+        "only the comment's copy survives: {out:?}"
+    );
+
+    // A list broken across lines keeps its line count.
+    let src =
+        "requires\n  unrestricted_pointer_parameters,\n  pointer_composite_access;\nfn f() {}\n";
+    let out = preprocess_source_for_naga(src);
+    assert_eq!(out.len(), src.len());
+    assert_eq!(out.lines().count(), src.lines().count(), "{out:?}");
+    assert!(out.contains("pointer_composite_access;"), "{out:?}");
+}
+
 #[test]
 fn preprocess_does_not_duplicate_enable_f16_with_extra_whitespace() {
     let src = "enable  f16;\nfn f() -> f16 { return 0h; }\n";
@@ -1141,32 +1211,28 @@ fn preprocess_does_not_duplicate_enable_f16_with_extra_whitespace() {
 // These tests fail if `UNSUPPORTED_EXTENSION_PATTERNS` or
 // `KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS` drift out of sync with
 // the naga error phrasings they target.
-#[test]
-fn unsupported_extension_patterns_match_documented_phrasings() {
-    // These are the exact phrasings naga produces today.  All must
-    // be recognised by `is_unsupported_extension_parse_error` or
-    // the short-circuit return path in `run` falls over into a
-    // hard error the moment naga rewords them.
-    let samples = [
-        "error: enable extension is not enabled",
-        "error: the `wgpu_ray_query` enable-extension is not yet supported",
-    ];
-    for s in samples {
-        let err = Error::Parse(s.to_string());
-        assert!(
-            is_unsupported_extension_parse_error(&err),
-            "naga error phrasing should be recognized as unsupported-extension: {s}"
-        );
-    }
-}
 
+/// Real parses, so a naga rewording fails here instead of silently turning
+/// a bailout into a hard error.  `EnableExtensionNotSupported` is
+/// unreachable through `parse_str` (every capability granted) and shares
+/// the `extension is not` key by construction.
 #[test]
-fn unsupported_extension_patterns_reject_unrelated_errors() {
-    let err = Error::Parse("error: expected identifier, found `{`".into());
-    assert!(
-        !is_unsupported_extension_parse_error(&err),
-        "unrelated parse errors must not be treated as unsupported-extension"
-    );
+fn unsupported_extension_patterns_track_naga_phrasings() {
+    let declined = [
+        "enable no_such_extension;",
+        "requires no_such_extension;",
+        "enable subgroups;",
+        "requires unrestricted_pointer_parameters;",
+        "@fragment fn m() -> @location(0) @blend_src(0) vec4f { return vec4f(); }",
+    ];
+    for src in declined {
+        let err = io::parse_wgsl(src).expect_err("naga declines the directive");
+        assert!(is_unsupported_extension_parse_error(&err), "{err}");
+    }
+    // naga quotes user identifiers on the first line: the bare word is no key.
+    let err =
+        io::parse_wgsl("fn m() { let x = extension_of_life; }").expect_err("unknown identifier");
+    assert!(!is_unsupported_extension_parse_error(&err), "{err}");
 }
 
 /// Regression: a parse error whose codespan snippet quotes a user
@@ -1239,19 +1305,11 @@ fn known_text_validation_limitation_only_matches_parse_or_validation() {
     }
 }
 
+/// Real parse, so a naga rewording (or subgroup support landing) fails here.
 #[test]
-fn known_text_validation_limitation_matches_subgroup_phrasings() {
-    let samples = [
-        "error: `subgroups` enable-extension is not yet supported",
-        "error: subgroups enable-extension is not yet supported",
-    ];
-    for s in samples {
-        let err = Error::Parse(s.to_string());
-        assert!(
-            is_known_text_validation_limitation(&err),
-            "subgroup limitation phrasing should be recognized: {s}"
-        );
-    }
+fn known_text_validation_limitation_matches_subgroup_phrasing() {
+    let err = io::parse_wgsl("enable subgroups;").expect_err("naga 30 declines subgroups");
+    assert!(is_known_text_validation_limitation(&err), "{err}");
 }
 
 #[test]
@@ -1263,17 +1321,11 @@ fn known_text_validation_limitation_matches_validation_variant_too() {
     // `enable` directive through either path.  This regression pins
     // the Validation branch so a future tightening to "Parse only"
     // fails loudly here.
-    let samples = [
-        "error: `subgroups` enable-extension is not yet supported",
-        "error: subgroups enable-extension is not yet supported",
-    ];
-    for s in samples {
-        let err = Error::Validation(s.to_string());
-        assert!(
-            is_known_text_validation_limitation(&err),
-            "subgroup limitation phrasing must also be recognized when wrapped as Validation: {s}"
-        );
-    }
+    let err = Error::Validation("error: `subgroups` enable-extension is not yet supported".into());
+    assert!(
+        is_known_text_validation_limitation(&err),
+        "subgroup limitation phrasing must also be recognized when wrapped as Validation: {err}"
+    );
 }
 
 #[test]
