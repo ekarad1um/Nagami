@@ -8,14 +8,14 @@
 
   let { profile, onProfileChange }: Props = $props();
 
-  const profiles: Config["profile"][] = ["baseline", "aggressive", "max"];
+  const profiles = ["baseline", "aggressive", "max"] as const;
 
-  const profileTooltips: Record<"baseline" | "aggressive" | "max", string> = {
+  const profileTooltips: Record<(typeof profiles)[number], string> = {
     baseline:
-      "Baseline: DCE, constant folding, dead parameter elimination, emit-merge, rename. Fast and safe. Mangle: off.",
+      "Baseline: DCE, constant folding, dead-branch and dead-parameter elimination, emit-merge, rename. Fast and safe. Mangle: off.",
     aggressive:
-      "Aggressive: baseline + function inlining (24 nodes / 3 sites), load-dedup, variable coalescing, struct-build coalescing, vector-constant hoisting. Mangle: off.",
-    max: "Max (default): aggressive + CSE, higher inlining limits (48 nodes / 6 sites). Mangle: on.",
+      "Aggressive: baseline + dead-local elimination, function inlining (24 nodes / 3 sites), load-dedup, struct-build coalescing, variable coalescing. Mangle: off.",
+    max: "Max (default): aggressive + higher inlining limits (48 nodes / 6 sites), CSE and vector-constant hoisting (both need mangle on). Mangle: on.",
   };
 </script>
 
@@ -30,23 +30,21 @@
   </div>
 
   <div class="flex items-center gap-3">
-    <!-- Profile segmented control -->
     <div class="flex rounded-md bg-white/6 p-0.5 text-xs">
-      {#each profiles as p}
+      {#each profiles as p (p)}
         <button
           class="px-2.5 py-1 rounded-[5px] font-medium capitalize transition-colors cursor-pointer {profile ===
           p
             ? 'bg-white/8 text-slate-100'
             : 'text-slate-400 hover:text-slate-300'}"
           onclick={() => onProfileChange(p)}
-          title={profileTooltips[p as "baseline" | "aggressive" | "max"]}
+          title={profileTooltips[p]}
         >
           {p}
         </button>
       {/each}
     </div>
 
-    <!-- GitHub link -->
     <a
       href="https://github.com/ekarad1um/Nagami"
       target="_blank"

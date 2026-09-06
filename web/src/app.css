@@ -12,13 +12,13 @@ textarea {
   field-sizing: content;
 }
 
-/* Scrollbar styling for code panels - rely on native overlay, style subtly */
 .code-panel {
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
 }
 
-/* Editor typography - single source of truth for code font metrics */
+/* Shared by the textarea, its highlight overlay and the gutter: the metrics
+   must match or the overlay drifts. */
 .code-text {
   font-size: 13px;
   line-height: 20px;
@@ -26,13 +26,11 @@ textarea {
   font-family: var(--font-mono);
 }
 
-/* Line number gutter */
 .line-gutter {
   background: #0c0c0c;
   border-right: 1px solid rgba(255, 255, 255, 0.06);
 }
 
-/* Loading shimmer bar */
 @keyframes shimmer {
   0% {
     transform: translateX(-100%);
@@ -54,20 +52,25 @@ textarea {
   display: block;
   height: 100%;
   width: 50%;
-  background: linear-gradient(90deg, transparent, var(--color-emerald-400), transparent);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--color-emerald-400),
+    transparent
+  );
   animation: shimmer 1.2s ease-in-out infinite;
 }
 
-/* Editor input stack: grid overlay for code highlighting */
+/* Textarea and highlight overlay share one grid cell. */
 .editor-stack {
   display: grid;
 }
 
-.editor-stack>* {
+.editor-stack > * {
   grid-area: 1 / 1;
 }
 
-/* Shiki highlight overrides (output panel + input overlay) */
+/* Shiki's own box and font would offset the overlay from the textarea. */
 .highlight-panel .shiki,
 .highlight-input .shiki {
   background: transparent !important;
@@ -89,7 +92,7 @@ textarea {
   word-break: break-all;
 }
 
-/* Options panel collapse animation (grid-template-rows 0fr -> 1fr) */
+/* 0fr -> 1fr animates what height: auto cannot. */
 .options-tray {
   display: grid;
   grid-template-rows: 0fr;
@@ -100,11 +103,7 @@ textarea {
   grid-template-rows: 1fr;
 }
 
-.options-tray>.options-inner {
+.options-tray > .options-inner {
   min-height: 0;
-  overflow: clip;
-}
-
-.options-tray.options-open>.options-inner {
   overflow: clip;
 }

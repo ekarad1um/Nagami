@@ -1,17 +1,11 @@
-import { mount } from 'svelte'
-import './app.css'
-import App from './App.svelte'
-import { warmupHighlighter } from './lib/highlight'
-import { registerPWA } from './lib/pwa'
+import { mount } from "svelte";
+import "./app.css";
+import App from "./App.svelte";
+import { warmupHighlighter } from "./lib/highlight.svelte";
+import { registerPWA } from "./lib/pwa";
 
-const app = mount(App, {
-  target: document.getElementById('app')!,
-})
+mount(App, { target: document.getElementById("app")! });
 
-// Preload the syntax highlighter off the critical path, once the page is idle.
-warmupHighlighter()
-
-// Offline support + silent background updates (applied on the next manual refresh).
-registerPWA()
-
-export default app
+// Highlighter off the critical path; service worker for offline + silent updates.
+warmupHighlighter();
+registerPWA();

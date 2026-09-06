@@ -1,79 +1,83 @@
 /// <reference lib="webworker" />
-import init, { initSync, run as wasmRun, type Config, type Output } from "nagami-rs";
-
-interface RunRequest {
-  id: number;
-  source: string;
-  config?: Config;
-}
-
-type InitMessage =
-  | { type: "init-module"; module: WebAssembly.Module }
-  | { type: "init-fallback" };
-
-type IncomingMessage = RunRequest | InitMessage;
-
-interface RunResponse {
-  id: number;
-  output: Output | null;
-  error: string | null;
-}
+import init, { initSync, run as wasmRun } from "nagami-rs";
+import type { InitMessage, RunRequest, RunResponse } from "./worker-protocol";
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope;
 
-// Resolved by the init message; run() requests queue on this until then.
-let resolveModule!: (m: WebAssembly.Module | null) => void;
-const modulePromise = new Promise<WebAssembly.Module | null>((r) => {
-  resolveModule = r;
+// Settled by the init message; requests wait on it.
+let startInit!: (init: Promise<void>) => void;
+const ready = new Promise<void>((resolve) => {
+  startInit = resolve;
 });
+ready.catch(() => {}); // no unhandled rejection before the first request
 
-let readyPromise: Promise<void> | null = null;
-function ensureReady(): Promise<void> {
-  if (!readyPromise) {
-    readyPromise = modulePromise
-      .then((module) => {
-        if (module) {
-          initSync({ module });
-          return;
-        }
-        return init().then(() => undefined);
-      })
-      .then(
-        () => undefined,
-        (err) => {
-          readyPromise = null; // allow a future request to retry
-          throw err;
-        },
-      );
-  }
-  return readyPromise;
+// Once the instance is unusable this worker answers nothing further with it;
+// the host replaces it. A trap, or any exception unwinding wasm frames (V8's
+// stack-overflow RangeError included), leaves the shadow stack pointer and
+// possibly the heap mid-operation.
+let dead: string | null = null;
+
+function isTrap(err: unknown): boolean {
+  return err instanceof WebAssembly.RuntimeError || err instanceof RangeError;
 }
 
-function isInitMessage(d: IncomingMessage): d is InitMessage {
+function message(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function die(id: number, reason: string): void {
+  dead = reason;
+  ctx.postMessage({
+    id,
+    output: null,
+    error: reason,
+    fatal: true,
+  } satisfies RunResponse);
+}
+
+function isInitMessage(d: RunRequest | InitMessage): d is InitMessage {
   const t = (d as InitMessage).type;
   return t === "init-module" || t === "init-fallback";
 }
 
-ctx.onmessage = (e: MessageEvent<IncomingMessage>) => {
+ctx.onmessage = (e: MessageEvent<RunRequest | InitMessage>) => {
   const data = e.data;
 
   if (isInitMessage(data)) {
-    resolveModule(data.type === "init-module" ? data.module : null);
-    ensureReady().catch(() => { }); // instantiate eagerly so the first run is fast
+    startInit(
+      (async () => {
+        if (data.type === "init-module") initSync({ module: data.module });
+        else await init();
+      })(),
+    );
     return;
   }
 
   const { id, source, config } = data;
   void (async () => {
+    if (dead) return die(id, dead);
     try {
-      await ensureReady();
-      const output = wasmRun(source, config);
-      const response: RunResponse = { id, output, error: null };
-      ctx.postMessage(response);
+      await ready;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const response: RunResponse = { id, output: null, error: msg };
-      ctx.postMessage(response);
+      // Fatal so the host retries the load with a fresh worker.
+      return die(id, `Minifier failed to start: ${message(err)}`);
+    }
+    try {
+      const output = wasmRun(source, config);
+      ctx.postMessage({ id, output, error: null } satisfies RunResponse);
+    } catch (err) {
+      if (isTrap(err)) {
+        die(
+          id,
+          `Minifier crashed: ${message(err)}\nIt was restarted. Very long operator chains or deeply nested code exhaust its stack.`,
+        );
+      } else {
+        ctx.postMessage({
+          id,
+          output: null,
+          error: message(err),
+        } satisfies RunResponse);
+      }
     }
   })();
 };

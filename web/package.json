@@ -1,7 +1,7 @@
 {
   "name": "nagami-playground",
   "private": true,
-  "version": "2026.7.2",
+  "version": "2026.9.0",
   "type": "module",
   "description": "Web playground for Nagami - IR-level WGSL shader minifier with DCE, folding, inlining, and mangling, powered by WebAssembly.",
   "homepage": "https://nagami.0xfff8e7.dev",
@@ -16,23 +16,33 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json"
+    "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json",
+    "fmt": "prettier --write .",
+    "lint": "prettier --check . && eslint ."
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@sveltejs/vite-plugin-svelte": "^7.2.0",
     "@tailwindcss/vite": "^4.3.2",
     "@tsconfig/svelte": "^5.0.8",
     "@types/node": "^26.1.1",
+    "eslint": "^10.10.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-svelte": "^3.23.0",
+    "globals": "^17.12.0",
+    "prettier": "^3.9.6",
+    "prettier-plugin-svelte": "^4.1.1",
     "svelte": "^5.56.4",
     "svelte-check": "^4.7.2",
     "tailwindcss": "^4.3.2",
     "typescript": "~6.0.2",
+    "typescript-eslint": "^8.69.0",
     "vite": "^8.1.4",
     "vite-plugin-minify": "^3.0.0",
     "vite-plugin-pwa": "^1.3.0"
   },
   "dependencies": {
-    "nagami-rs": "^2026.7.2",
+    "nagami-rs": "^2026.9.0",
     "shiki": "^4.3.1"
   }
 }

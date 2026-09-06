@@ -5,10 +5,11 @@
   Cache-Control: public, max-age=31536000, immutable
 
 # HTML shell + service worker: always revalidate so deploys/updates are picked up.
+# Link (RFC 8288) lets agents find the site description, docs, and license
+# without parsing HTML.
 /
   Cache-Control: public, max-age=0, must-revalidate
-/index.html
-  Cache-Control: public, max-age=0, must-revalidate
+  Link: </llms.txt>; rel="describedby", <https://github.com/ekarad1um/Nagami>; rel="service-doc", <https://github.com/ekarad1um/Nagami/blob/main/LICENSE>; rel="license"
 /sw.js
   Cache-Control: public, max-age=0, must-revalidate
 

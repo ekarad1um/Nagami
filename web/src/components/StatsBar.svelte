@@ -3,6 +3,7 @@
     inputBytes: number;
     outputBytes: number;
     error: string | null;
+    bailout: string | null;
     loading: boolean;
     optionsOpen: boolean;
     onToggleOptions: () => void;
@@ -12,27 +13,40 @@
     inputBytes,
     outputBytes,
     error,
+    bailout,
     loading,
     optionsOpen,
     onToggleOptions,
   }: Props = $props();
 
-  let errorExpanded = $state(false);
-  let errorContainer: HTMLDivElement | undefined = $state(undefined);
+  // Error (red) or bailout (amber); a bailout ships the input compacted, so
+  // byte stats would overstate the win.
+  let notice = $derived(
+    error
+      ? { text: error, amber: false }
+      : bailout
+        ? {
+            text: `Not optimized: ${bailout}\nThe output is the input with comments removed and whitespace collapsed.`,
+            amber: true,
+          }
+        : null,
+  );
 
-  // Collapse error popover when error changes
+  let noticeExpanded = $state(false);
+  let noticeContainer: HTMLDivElement | undefined = $state(undefined);
+
   $effect(() => {
-    error;
-    errorExpanded = false;
+    void notice;
+    noticeExpanded = false;
   });
 
   function handleWindowClick(e: MouseEvent) {
     if (
-      errorExpanded &&
-      errorContainer &&
-      !errorContainer.contains(e.target as Node)
+      noticeExpanded &&
+      noticeContainer &&
+      !noticeContainer.contains(e.target as Node)
     ) {
-      errorExpanded = false;
+      noticeExpanded = false;
     }
   }
 
@@ -43,11 +57,7 @@
   );
 
   function capitalize(s: string): string {
-    if (!s) return s;
-    let hasNewlineSuffix = s.endsWith("\n");
-    return (
-      s.charAt(0).toUpperCase() + s.slice(1, hasNewlineSuffix ? -1 : undefined)
-    );
+    return s.charAt(0).toUpperCase() + s.slice(1).trimEnd();
   }
 </script>
 
@@ -57,19 +67,20 @@
   class="flex items-center justify-between px-3 py-1.5 border-t border-white/6 bg-[#111111] text-xs shrink-0 select-none relative z-20"
 >
   <div class="flex items-center gap-2 text-slate-400 tabular-nums">
-    {#if error}
-      <div class="relative flex items-center" bind:this={errorContainer}>
+    {#if notice}
+      <div class="relative flex items-center" bind:this={noticeContainer}>
         <button
-          class="flex items-center gap-1 text-red-400 hover:text-red-300 transition-colors px-1.5 py-0.5 rounded hover:bg-white/6 cursor-pointer max-w-[60vw]"
-          onclick={() => (errorExpanded = !errorExpanded)}
-          title={errorExpanded
-            ? "Collapse error details"
-            : "Expand error details"}
+          class="flex items-center gap-1 transition-colors px-1.5 py-0.5 rounded hover:bg-white/6 cursor-pointer max-w-[60vw] {notice.amber
+            ? 'text-amber-400 hover:text-amber-300'
+            : 'text-red-400 hover:text-red-300'}"
+          onclick={() => (noticeExpanded = !noticeExpanded)}
+          aria-expanded={noticeExpanded}
+          title={noticeExpanded ? "Collapse details" : "Expand details"}
         >
-          <span class="truncate">{capitalize(error.split("\n")[0])}</span>
+          <span class="truncate">{capitalize(notice.text.split("\n")[0])}</span>
           <svg
             class="w-3 h-3 shrink-0 transition-transform"
-            style="transform: rotate({errorExpanded ? '0' : '180'}deg)"
+            style="transform: rotate({noticeExpanded ? '0' : '180'}deg)"
             viewBox="0 0 16 16"
             fill="currentColor"
           >
@@ -78,11 +89,13 @@
             />
           </svg>
         </button>
-        {#if errorExpanded}
+        {#if noticeExpanded}
           <div
-            class="absolute bottom-full left-0 mb-5 bg-[#1a1a1a] border border-white/8 rounded-lg shadow-xl p-3 whitespace-pre font-mono text-[11px] text-red-400 max-w-[calc(100vw-1.5rem)] max-h-48 overflow-auto z-50 select-text cursor-text"
+            class="absolute bottom-full left-0 mb-5 bg-[#1a1a1a] border border-white/8 rounded-lg shadow-xl p-3 whitespace-pre font-mono text-[11px] max-w-[calc(100vw-1.5rem)] max-h-48 overflow-auto z-50 select-text cursor-text {notice.amber
+              ? 'text-amber-400'
+              : 'text-red-400'}"
           >
-            {capitalize(error)}
+            {capitalize(notice.text)}
           </div>
         {/if}
       </div>
@@ -103,6 +116,7 @@
   <button
     class="flex items-center gap-1 text-slate-400 hover:text-slate-300 transition-colors px-1.5 py-0.5 rounded hover:bg-white/6 cursor-pointer"
     onclick={onToggleOptions}
+    aria-expanded={optionsOpen}
     title={optionsOpen
       ? "Hide options (mangle, precision, preserve symbols, preamble)"
       : "Show options (mangle, precision, preserve symbols, preamble)"}

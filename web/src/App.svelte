@@ -1,24 +1,46 @@
 <script lang="ts">
   import Header from "./components/Header.svelte";
-  import CodePanel from "./components/CodePanel.svelte";
+  import InputPanel from "./components/InputPanel.svelte";
+  import OutputPanel from "./components/OutputPanel.svelte";
   import StatsBar from "./components/StatsBar.svelte";
   import OptionsPanel from "./components/OptionsPanel.svelte";
   import FindBar from "./components/FindBar.svelte";
-  import { run, type Config } from "./lib/nagami";
+  import { run, type Config, type NameMap } from "./lib/nagami";
   import { downloadTextFile } from "./lib/filename";
 
+  interface Result {
+    output: string;
+    inputBytes: number;
+    outputBytes: number;
+    bailout: string | null;
+    nameMap: NameMap | null;
+    wrap: boolean;
+  }
+  const EMPTY: Result = {
+    output: "",
+    inputBytes: 0,
+    outputBytes: 0,
+    bailout: null,
+    nameMap: null,
+    wrap: true,
+  };
+
   let input = $state("");
-  let output = $state("");
-  let inputBytes = $state(0);
-  let outputBytes = $state(0);
+  let inputFileName = $state("");
+  let userTouched = false;
+  // Replaced wholesale per run, so every consumer changes together.
+  let result: Result = $state.raw(EMPTY);
   let error: string | null = $state(null);
   let loading = $state(false);
-  let userTouched = false;
+  let options: Config = $state({ profile: "max" });
+  let optionsOpen = $state(false);
+  let findOpen = $state(false);
+  let findFocusTrigger = $state(0);
 
-  // Deferred load with retry - keeps the sample shader out of the JS bundle
+  // The sample stays out of the bundle; an HTML body is a SPA fallback, not a
+  // shader. Network throws are retried with backoff.
   (async () => {
-    for (let attempt = 0; attempt < 3; ++attempt) {
-      if (userTouched) return;
+    for (let attempt = 0; attempt < 3 && !userTouched; ++attempt) {
       try {
         const r = await fetch(import.meta.env.BASE_URL + "example.wgsl");
         const ct = r.headers.get("content-type") ?? "";
@@ -27,87 +49,58 @@
         if (!userTouched) input = text;
         return;
       } catch {
-        if (attempt < 2)
-          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
       }
     }
   })();
-  let optionsOpen = $state(false);
-  let options: Config = $state({ profile: "max" });
-  let outputWrap = $state(true);
-  let inputFileName = $state("");
-  let findOpen = $state(false);
-  let findFocusTrigger = $state(0);
 
   let downloadName = $derived(
     inputFileName
       ? inputFileName.replace(/\.(wgsl|glsl)$/i, "") + ".min.wgsl"
       : "shader.min.wgsl",
   );
-
   let debounceTimer: ReturnType<typeof setTimeout>;
   let minifyGen = 0;
 
-  function snapshotOptions(config: Config): Config {
-    return $state.snapshot(config) as Config;
-  }
-
-  function scheduleMinify() {
-    clearTimeout(debounceTimer);
-    if (!input.trim()) {
-      ++minifyGen;
-      output = "";
-      outputWrap = options.beautify !== true;
-      inputBytes = 0;
-      outputBytes = 0;
-      error = null;
-      loading = false;
-      return;
-    }
-    debounceTimer = setTimeout(doMinify, 300);
-  }
-
-  async function doMinify() {
+  async function minify() {
     const gen = ++minifyGen;
-    const config = snapshotOptions(options);
+    const config = $state.snapshot(options) as Config;
     loading = true;
     error = null;
-    const result = await run(input, config);
+    const r = await run(input, config);
     if (gen !== minifyGen) return;
     loading = false;
-    if (result.error !== null) {
-      error = result.error;
-      output = "";
-      outputWrap = config.beautify !== true;
-      inputBytes = 0;
-      outputBytes = 0;
-    } else {
-      output = result.output.source;
-      outputWrap = config.beautify !== true;
-      inputBytes = result.output.report.inputBytes;
-      outputBytes = result.output.report.outputBytes;
-      error = null;
-    }
+    error = r.error;
+    result = r.output
+      ? {
+          output: r.output.source,
+          inputBytes: r.output.report.inputBytes,
+          outputBytes: r.output.report.outputBytes,
+          bailout: r.output.report.bailout,
+          nameMap: r.output.nameMap,
+          wrap: config.beautify !== true,
+        }
+      : EMPTY;
   }
 
   $effect(() => {
-    // Re-run when input or options change
-    input;
-    options;
-    scheduleMinify();
+    void options;
+    if (input.trim()) {
+      debounceTimer = setTimeout(minify, 300);
+    } else {
+      ++minifyGen;
+      result = EMPTY;
+      error = null;
+      loading = false;
+    }
     return () => clearTimeout(debounceTimer);
   });
-
-  function downloadOutput() {
-    if (!output) return;
-    downloadTextFile(output, downloadName);
-  }
 
   function handleGlobalKeydown(e: KeyboardEvent) {
     if (e.repeat) return;
     if ((e.metaKey || e.ctrlKey) && e.key === "s") {
       e.preventDefault();
-      downloadOutput();
+      if (result.output) downloadTextFile(result.output, downloadName);
     }
     if ((e.metaKey || e.ctrlKey) && e.key === "f") {
       e.preventDefault();
@@ -131,9 +124,19 @@
       }
     }
   }
+
+  // A file dropped outside the input panel would otherwise navigate the tab to
+  // it; a refused drop (dropEffect "none") navigates too, so the copy cursor stays.
+  function blockFileDrop(e: DragEvent) {
+    if (e.dataTransfer?.types.includes("Files")) e.preventDefault();
+  }
 </script>
 
-<svelte:window onkeydown={handleGlobalKeydown} />
+<svelte:window
+  onkeydown={handleGlobalKeydown}
+  ondragover={blockFileDrop}
+  ondrop={blockFileDrop}
+/>
 
 <Header
   profile={options.profile}
@@ -147,32 +150,25 @@
     <FindBar
       focusTrigger={findFocusTrigger}
       inputContent={input}
-      outputContent={output}
+      outputContent={result.output}
       onclose={() => (findOpen = false)}
     />
   {/if}
-  <CodePanel
-    label="Input"
+  <InputPanel
     value={input}
-    placeholder="Paste or drop a WGSL shader here..."
-    oninput={(v) => {
+    oninput={(v, name) => {
       userTouched = true;
       input = v;
-    }}
-    ondrop={(text, name) => {
-      userTouched = true;
-      input = text;
       if (name) inputFileName = name;
     }}
+    onreject={(reason) => (error = reason)}
   />
-  <CodePanel
-    label="Output"
-    value={output}
-    readonly
+  <OutputPanel
+    value={result.output}
     {loading}
+    wrap={result.wrap}
     {downloadName}
-    wrap={outputWrap}
-    placeholder={loading ? "Minifying..." : "Minified output appears here"}
+    nameMap={result.nameMap}
   />
 </main>
 
@@ -183,9 +179,10 @@
 />
 
 <StatsBar
-  {inputBytes}
-  {outputBytes}
+  inputBytes={result.inputBytes}
+  outputBytes={result.outputBytes}
   {error}
+  bailout={result.bailout}
   {loading}
   {optionsOpen}
   onToggleOptions={() => (optionsOpen = !optionsOpen)}

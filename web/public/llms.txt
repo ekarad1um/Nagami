@@ -1,0 +1,30 @@
+# Nagami
+
+> Nagami[n] (Naga + Minify) is an IR-level WGSL shader minifier: it lowers WGSL into Naga IR, runs optimization passes in fixed-point sweeps, and emits the smallest valid WGSL it can. MIT licensed. This site is the browser playground; the same engine ships as an npm package (WebAssembly), a Rust crate, and a CLI.
+
+Notes for agents:
+
+- The playground runs entirely client-side. Shaders are never uploaded and this host has no HTTP API; to minify from code, use the npm package or the CLI rather than driving the page.
+- JavaScript: `npm install nagami-rs`, then `import init, { run } from 'nagami-rs'; await init(); const { source, report, nameMap } = run(wgsl, config);` (Node 20.6+: `initSync`).
+- CLI: `cargo install nagami`, then `nagami shader.wgsl -o shader.min.wgsl` (`-p baseline|aggressive|max`).
+- Rust: `cargo add nagami --no-default-features`, then `nagami::run(src, &nagami::config::Config::default())`.
+- Profiles: baseline = dead code elimination, constant folding, dead-parameter elimination, renaming. aggressive = baseline + inlining, load dedup, dead stores, variable and struct-build coalescing. max (default) = aggressive with higher inlining limits + CSE, vector-constant hoisting, and mangling of struct types and members, constants, and overrides.
+- `report.bailout` holds naga's error when the input could only be text-compacted (comments stripped, whitespace collapsed). `nameMap` maps original -> final names for entry points, globals, functions, constants, overrides, and structs with their members; it is null when the shipped text is not the generator's output.
+- Shaders that use declarations injected by a host (Shadertoy-style uniforms) need them passed as `preamble`: parsed for optimization, stripped from the output, names preserved.
+
+## Documentation
+
+- [README](https://github.com/ekarad1um/Nagami#readme): every optimization, CLI flags, config reference, preamble, JavaScript and Rust usage
+- [README as raw markdown](https://raw.githubusercontent.com/ekarad1um/Nagami/main/README.md): the same content without page chrome
+- [TypeScript definitions](https://cdn.jsdelivr.net/npm/nagami-rs/nagami.d.ts): exact shapes of Config, Report, NameMap, and Output
+
+## Packages
+
+- [nagami-rs on npm](https://www.npmjs.com/package/nagami-rs): WebAssembly build for browsers, bundlers, and Node
+- [nagami on crates.io](https://crates.io/crates/nagami): CLI and Rust library
+- [Rust API reference on docs.rs](https://docs.rs/nagami)
+- [Source on GitHub](https://github.com/ekarad1um/Nagami): issues, history, MIT license
+
+## Optional
+
+- [Sample shader](https://nagami.0xfff8e7.dev/example.wgsl): the playground's default input, handy as a smoke test

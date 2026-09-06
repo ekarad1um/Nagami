@@ -1,7 +1,8 @@
-import type { Config, Output, Report, PassReport } from "nagami-rs";
+import type { Config, Output, Report, PassReport, NameMap } from "nagami-rs";
+import type { RunRequest, RunResponse } from "./worker-protocol";
 import MinifyWorker from "./minify.worker.ts?worker";
 
-export type { Config, Output, Report, PassReport };
+export type { Config, Output, Report, PassReport, NameMap };
 
 export interface RunResult {
   output: Output;
@@ -15,49 +16,95 @@ export interface RunError {
 
 export type RunOutput = RunResult | RunError;
 
-interface WorkerResponse {
-  id: number;
-  output: Output | null;
-  error: string | null;
-}
+// A worker silent for this long while requests wait is dropped; one killed by
+// the browser fires no event.
+const STALL_MS = 30_000;
 
 let worker: Worker | null = null;
 let nextId = 0;
-const pending = new Map<number, (r: RunOutput) => void>();
+// Requests are kept whole so a replacement worker can replay them.
+const pending = new Map<
+  number,
+  { req: RunRequest; resolve: (r: RunOutput) => void }
+>();
+// Fetched and compiled once on the main thread; every worker instantiates it.
+let modulePromise: Promise<WebAssembly.Module> | null = null;
+let stallTimer: ReturnType<typeof setTimeout> | undefined;
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+// Re-armed on every response, so a slow but progressing worker survives.
+function armStall(): void {
+  clearTimeout(stallTimer);
+  if (pending.size > 0) stallTimer = setTimeout(onStall, STALL_MS);
+}
+
+function onStall(): void {
+  failAllPending("minifier stopped responding");
+  dropWorker();
+}
+
+function settle(id: number, result: RunOutput): void {
+  const entry = pending.get(id);
+  if (!entry) return;
+  pending.delete(id);
+  entry.resolve(result);
+  armStall();
+}
+
 function failAllPending(reason: string): void {
-  for (const resolve of pending.values()) {
+  for (const { resolve } of pending.values()) {
     resolve({ output: null, error: reason });
   }
   pending.clear();
+  clearTimeout(stallTimer);
 }
 
-function handleMessage(e: MessageEvent<WorkerResponse>): void {
-  const { id, output, error } = e.data;
-  const resolve = pending.get(id);
-  if (!resolve) return;
-  pending.delete(id);
-  if (output !== null) {
-    resolve({ output, error: null });
-  } else {
-    resolve({ output: null, error: error ?? "unknown worker error" });
-  }
-}
-
-function handleError(e: Event): void {
-  const msg = e instanceof ErrorEvent && e.message ? e.message : "worker error";
-  failAllPending(msg);
-  // Drop the dead worker so the next call can spin up a fresh one.
-  worker?.terminate();
+// Events still queued from the old worker must not reach the handlers.
+function dropWorker(): void {
+  if (!worker) return;
+  worker.removeEventListener("message", handleMessage);
+  worker.removeEventListener("error", handleError);
+  worker.removeEventListener("messageerror", handleError);
+  worker.terminate();
   worker = null;
 }
 
-// URL of the wasm the document preloads. Fetching this exact URL consumes the
-// <link rel="preload"> instead of wasting it. Absent in dev -> worker self-fetches.
+function handleMessage(e: MessageEvent<RunResponse>): void {
+  const { id, output, error, fatal } = e.data;
+  settle(
+    id,
+    output !== null
+      ? { output, error: null }
+      : { output: null, error: error ?? "unknown worker error" },
+  );
+  if (!fatal) return;
+  // The instance is gone: replace the worker and replay what is still queued.
+  dropWorker();
+  try {
+    const w = ensureWorker();
+    for (const { req } of pending.values()) {
+      try {
+        w.postMessage(req);
+      } catch (err) {
+        settle(req.id, { output: null, error: errorMessage(err) });
+      }
+    }
+  } catch (err) {
+    failAllPending(errorMessage(err));
+  }
+}
+
+// The worker script itself failed to load or run; replaying would repeat it.
+function handleError(e: Event): void {
+  const msg = e instanceof ErrorEvent && e.message ? e.message : "worker error";
+  failAllPending(msg);
+  dropWorker();
+}
+
+// Injected at build time by vite.config.ts; absent in dev.
 function getPreloadedWasmUrl(): string | null {
   if (typeof document === "undefined") return null;
   const link = document.querySelector<HTMLLinkElement>(
@@ -66,95 +113,60 @@ function getPreloadedWasmUrl(): string | null {
   return link?.href ?? null;
 }
 
-// Fetch + compile the wasm on the main thread (consuming the preload, one download)
-// and hand the compiled Module to the worker.
-function primeWorkerWasm(w: Worker, url: string): void {
-  void (async () => {
-    try {
-      // mode/credentials must match the crossorigin="anonymous" preload key.
-      const resp = await fetch(url, { mode: "cors", credentials: "same-origin" });
-      if (!resp.ok) throw new Error(`wasm fetch failed: ${resp.status}`);
-      const ct = resp.headers.get("content-type") ?? "";
-      const canStream =
-        typeof WebAssembly.compileStreaming === "function" &&
-        ct.includes("application/wasm");
-      const module = canStream
-        ? await WebAssembly.compileStreaming(resp)
-        : await WebAssembly.compile(await resp.arrayBuffer());
-      w.postMessage({ type: "init-module", module });
-    } catch {
-      // Couldn't compile on the main thread: let the worker fetch it itself.
-      try {
-        w.postMessage({ type: "init-fallback" });
-      } catch {
-        // Worker already torn down; nothing to do.
-      }
-    }
-  })();
+// Consumes the preload: mode/credentials must match its crossorigin="anonymous" key.
+async function compileWasm(url: string): Promise<WebAssembly.Module> {
+  const resp = await fetch(url, { mode: "cors", credentials: "same-origin" });
+  if (!resp.ok) throw new Error(`wasm fetch failed: ${resp.status}`);
+  const ct = resp.headers.get("content-type") ?? "";
+  return typeof WebAssembly.compileStreaming === "function" &&
+    ct.includes("application/wasm")
+    ? WebAssembly.compileStreaming(resp)
+    : WebAssembly.compile(await resp.arrayBuffer());
 }
 
 function ensureWorker(): Worker {
   if (worker) return worker;
-  worker = new MinifyWorker();
-  worker.addEventListener("message", handleMessage);
-  worker.addEventListener("error", handleError);
-  worker.addEventListener("messageerror", handleError);
-  const wasmUrl = getPreloadedWasmUrl();
-  if (wasmUrl) {
-    primeWorkerWasm(worker, wasmUrl);
-  } else {
-    // No preload (dev mode): tell the worker to self-fetch the wasm.
-    worker.postMessage({ type: "init-fallback" });
+  const w = new MinifyWorker();
+  w.addEventListener("message", handleMessage);
+  w.addEventListener("error", handleError);
+  w.addEventListener("messageerror", handleError);
+  worker = w;
+  const url = getPreloadedWasmUrl();
+  if (!url) {
+    w.postMessage({ type: "init-fallback" });
+    return w;
   }
-  return worker;
+  // Posting to a worker dropped meanwhile is a no-op.
+  (modulePromise ??= compileWasm(url)).then(
+    (module) => w.postMessage({ type: "init-module", module }),
+    () => {
+      // This worker fetches it itself; the next one retries the compile.
+      modulePromise = null;
+      w.postMessage({ type: "init-fallback" });
+    },
+  );
+  return w;
 }
 
+// Never rejects: a worker that cannot start (e.g. CSP) or an unclonable config
+// comes back as a RunError.
 export function run(source: string, config?: Config): Promise<RunOutput> {
-  let w: Worker;
-  try {
-    w = ensureWorker();
-  } catch (err) {
-    return Promise.resolve({ output: null, error: errorMessage(err) });
-  }
-  const id = ++nextId;
+  const req: RunRequest = { id: ++nextId, source, config };
   return new Promise<RunOutput>((resolve) => {
-    pending.set(id, resolve);
+    pending.set(req.id, { req, resolve });
     try {
-      postRequest(w, { id, source, config });
+      ensureWorker().postMessage(req);
+      if (pending.size === 1) armStall();
     } catch (err) {
-      // postMessage threw even after sanitising (e.g. a structurally
-      // un-serialisable config). Honour run()'s never-reject contract: drop
-      // the now-unanswerable pending entry and surface a structured error.
-      pending.delete(id);
+      pending.delete(req.id);
       resolve({ output: null, error: errorMessage(err) });
     }
   });
 }
 
-// Post a request to the worker, guarding the structuredClone boundary.
-function postRequest(
-  w: Worker,
-  req: { id: number; source: string; config?: Config },
-): void {
-  try {
-    w.postMessage(req);
-  } catch {
-    w.postMessage({
-      id: req.id,
-      source: req.source,
-      config: req.config
-        ? (JSON.parse(JSON.stringify(req.config)) as Config)
-        : undefined,
-    });
-  }
-}
-
-// Eagerly construct the worker on module load so WASM streaming-compile
-// happens in parallel with the rest of the app boot. A failure here (e.g.
-// strict CSP without worker-src) must not crash module evaluation - the
-// lazy path in run() will surface the error at call time.
+// Eager so the wasm compiles during app boot.
 try {
   ensureWorker();
 } catch {
-  // swallow; run() handles the same failure with a structured RunError
+  /* a failure (e.g. CSP) resurfaces from run() */
 }
