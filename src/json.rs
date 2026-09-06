@@ -5,7 +5,7 @@
 //! the schema.
 
 use std::collections::BTreeMap;
-use std::fmt::Display;
+use std::fmt::{Display, Write};
 
 use crate::Output;
 use crate::name_map::NameMap;
@@ -14,12 +14,14 @@ use crate::name_map::NameMap;
 /// [`Output::name_map`] is `None`.
 pub fn render_output(output: &Output) -> String {
     let report = &output.report;
-    let mut out = String::from("{\"source\":");
+    let mut out = String::with_capacity(output.source.len() + 1024);
+    out.push_str("{\"source\":");
     push_string(&output.source, &mut out);
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         ",\"report\":{{\"inputBytes\":{},\"outputBytes\":{},\"converged\":{},\"sweeps\":{},\"bailout\":",
         report.input_bytes, report.output_bytes, report.converged, report.sweeps
-    ));
+    );
     match &report.bailout {
         None => out.push_str("null"),
         Some(reason) => push_string(reason, &mut out),
@@ -31,7 +33,8 @@ pub fn render_output(output: &Output) -> String {
         }
         out.push_str("{\"passName\":");
         push_string(&p.pass_name, &mut out);
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             ",\"beforeBytes\":{},\"afterBytes\":{},\"changed\":{},\"durationUs\":{},\
              \"validationOk\":{},\"textValidationOk\":{},\"rolledBack\":{}}}",
             opt(p.before_bytes),
@@ -41,43 +44,49 @@ pub fn render_output(output: &Output) -> String {
             p.validation_ok,
             opt(p.text_validation_ok),
             p.rolled_back
-        ));
+        );
     }
     out.push_str("]},\"nameMap\":");
-    out.push_str(&render_name_map(output.name_map.as_ref()));
+    push_name_map(output.name_map.as_ref(), &mut out);
     out.push('}');
     out
 }
 
 /// The `NameMap` object, or `null`.
 pub fn render_name_map(map: Option<&NameMap>) -> String {
+    let mut out = String::new();
+    push_name_map(map, &mut out);
+    out
+}
+
+fn push_name_map(map: Option<&NameMap>, out: &mut String) {
     let Some(m) = map else {
-        return "null".to_string();
+        out.push_str("null");
+        return;
     };
-    let mut out = String::from("{");
-    push_string_map("entryPoints", &m.entry_points, &mut out);
+    out.push('{');
+    push_string_map("entryPoints", &m.entry_points, out);
     out.push(',');
-    push_string_map("globals", &m.globals, &mut out);
+    push_string_map("globals", &m.globals, out);
     out.push(',');
-    push_string_map("functions", &m.functions, &mut out);
+    push_string_map("functions", &m.functions, out);
     out.push(',');
-    push_string_map("constants", &m.constants, &mut out);
+    push_string_map("constants", &m.constants, out);
     out.push(',');
-    push_string_map("overrides", &m.overrides, &mut out);
+    push_string_map("overrides", &m.overrides, out);
     out.push_str(",\"structs\":{");
     for (i, (orig, sr)) in m.structs.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        push_string(orig, &mut out);
+        push_string(orig, out);
         out.push_str(":{\"name\":");
-        push_string(&sr.name, &mut out);
+        push_string(&sr.name, out);
         out.push(',');
-        push_string_map("members", &sr.members, &mut out);
+        push_string_map("members", &sr.members, out);
         out.push('}');
     }
     out.push_str("}}");
-    out
 }
 
 fn opt<T: Display>(v: Option<T>) -> String {
@@ -98,17 +107,27 @@ fn push_string_map(key: &str, entries: &BTreeMap<String, String>, out: &mut Stri
     out.push('}');
 }
 
-/// Control characters as `\uXXXX`, so shader text stays on one line.
+/// Only `"`, `\` and control characters need escaping (the latter as
+/// `\uXXXX`, keeping shader text on one line); everything else, non-ASCII
+/// included, is copied by span.
 fn push_string(s: &str, out: &mut String) {
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    let mut plain = 0;
+    for (i, b) in s.bytes().enumerate() {
+        if b >= 0x20 && b != b'"' && b != b'\\' {
+            continue;
         }
+        out.push_str(&s[plain..i]);
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            _ => {
+                let _ = write!(out, "\\u{b:04x}");
+            }
+        }
+        plain = i + 1;
     }
+    out.push_str(&s[plain..]);
     out.push('"');
 }
 

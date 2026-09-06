@@ -65,7 +65,8 @@ pub struct NameMap {
     /// Module-scope `var` declarations, resource bindings included.
     pub globals: BTreeMap<String, String>,
     /// Function declarations; a specialization's first clone keeps the
-    /// original's name, later clones carry a `_sp<n>` suffix.
+    /// original's name, later clones have no original and are keyed by
+    /// their synthesized `<name>_sp<n>`.
     pub functions: BTreeMap<String, String>,
     /// Module-scope `const` declarations.
     pub constants: BTreeMap<String, String>,

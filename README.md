@@ -79,11 +79,11 @@ Three optimization profiles control which IR passes run. Generator-level optimiz
 | Load dedup + dead stores | - | ✓ | ✓ |
 | Variable coalescing | - | ✓ | ✓ |
 | Struct-build coalescing | - | ✓ | ✓ |
-| Vector-constant hoisting | - | ✓ | ✓ |
+| Vector-constant hoisting | - | - | ✓ |
 | Common subexpression elim | - | - | ✓ |
 | Identifier mangling | - | - | ✓ |
 
-Passes run in fixed-point sweeps (up to 16) until the output stops shrinking. `baseline` is fast and safe; `aggressive` adds the full IR pipeline without mangling; `max` enables CSE and raises inlining limits for maximum compression.
+Passes run in fixed-point sweeps (up to 16) until the output stops shrinking. `baseline` is fast and safe; `aggressive` adds the full IR pipeline without mangling; `max` raises inlining limits and enables CSE and vector-constant hoisting (both only while mangling is on) for maximum compression.
 
 ## Preamble
 
@@ -144,8 +144,9 @@ console.log(source);  // minified WGSL
 console.log(report);  // optimization report; report.bailout holds naga's
                       // error when the output is text-compacted only
 console.log(nameMap); // original -> final names for bindings, functions,
-                      // overrides, entry points, struct members - null when
-                      // output names match the input
+                      // overrides, entry points, struct members; null when
+                      // the shipped text is not the generator's output
+                      // (bailout, emitter fallback, input already smaller)
 ```
 
 With config (all fields optional):
