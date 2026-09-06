@@ -675,7 +675,43 @@ impl<'a> Generator<'a> {
         {
             stmts.push(rewritten);
         }
-        self.emit_stmts(&stmts, ctx)
+        let hazard_mark = ctx.const_hazard_bindings.len();
+        let result = self.emit_stmts(&stmts, ctx);
+        release_hazard_scope(ctx, hazard_mark);
+        result
+    }
+
+    /// `let` a hazard operand (see `const_hazard`) at the current position
+    /// and route its later uses through the name; the caller places the
+    /// line.
+    fn emit_const_hazard_binding(
+        &mut self,
+        operand: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        let (annotation, value) = self.const_hazard_binding_value(operand, ctx)?;
+        let name = ctx.next_expr_name();
+        self.out.push_str("let ");
+        self.out.push_str(&name);
+        if let Some(ty) = annotation {
+            self.out.push(':');
+            self.out.push_str(&ty);
+        }
+        self.push_assign();
+        self.out.push_str(&value);
+        self.out.push(';');
+        ctx.expr_names.insert(operand, name);
+        ctx.const_hazard_bindings.push(operand);
+        Ok(())
+    }
+}
+
+/// Hazard bindings are block-scoped `let`s over pre-emitted operands later
+/// blocks may use again; every block-emission path (generic blocks, the
+/// for-loop body) pairs a mark with this.
+fn release_hazard_scope(ctx: &mut FunctionCtx<'_, '_>, mark: usize) {
+    for operand in ctx.const_hazard_bindings.drain(mark..) {
+        ctx.expr_names.remove(&operand);
     }
 }
 
@@ -1059,6 +1095,21 @@ impl<'a> Generator<'a> {
     ) -> Result<(), Error> {
         let mut emitted_any = false;
         for h in range.clone() {
+            // Bind a tint-rejected const-expression's operand first so the
+            // consumer evaluates at runtime as the input did
+            // (`const_hazard`).
+            if ctx.ref_counts[h.index()] > 0
+                && let Some(operand) =
+                    super::const_hazard::creation_error_operand(self.module, ctx, h)
+                && !ctx.expr_names.contains_key(&operand)
+            {
+                if emitted_any {
+                    self.push_newline();
+                    self.push_indent();
+                }
+                emitted_any = true;
+                self.emit_const_hazard_binding(operand, ctx)?;
+            }
             // A `Load` whose place is written between this `Emit` and a
             // use MUST be bound; inlining it would read the post-write
             // value (silent miscompile).  `is_uniformity_pinned` shares
@@ -1801,6 +1852,33 @@ impl<'a> Generator<'a> {
             None
         };
 
+        // Header expressions render inline, bypassing `generate_emit_stmt`:
+        // bind their hazards before the loop, in the enclosing scope.
+        let mut pending = vec![condition];
+        if let Some(stmt) = update_stmt {
+            crate::passes::expr_util::visit_statement_expression_handles(stmt, false, &mut |h| {
+                pending.push(h)
+            });
+        }
+        let mut cone = std::collections::BTreeSet::new();
+        while let Some(h) = pending.pop() {
+            if cone.insert(h) {
+                crate::passes::expr_util::visit_expression_children(
+                    &ctx.func.expressions[h],
+                    |c| pending.push(c),
+                );
+            }
+        }
+        for h in cone {
+            if let Some(operand) = super::const_hazard::creation_error_operand(self.module, ctx, h)
+                && !ctx.expr_names.contains_key(&operand)
+            {
+                self.push_indent();
+                self.emit_const_hazard_binding(operand, ctx)?;
+                self.push_newline();
+            }
+        }
+
         // Emit the for-loop
         self.push_indent();
         self.push_for_open();
@@ -1972,6 +2050,8 @@ impl<'a> Generator<'a> {
                 non_emit.push(k);
             }
         }
+        // The body is its own scope; leading Emits bind here too.
+        let hazard_mark = ctx.const_hazard_bindings.len();
         if non_emit.len() == 1
             && let naga::Statement::Block(inner) = remaining[non_emit[0]]
         {
@@ -1991,12 +2071,14 @@ impl<'a> Generator<'a> {
                 }
             }
             self.generate_block(inner, ctx)?;
+            release_hazard_scope(ctx, hazard_mark);
             self.close_brace();
             self.push_newline();
             return Ok(true);
         }
 
         self.emit_stmts(&remaining, ctx)?;
+        release_hazard_scope(ctx, hazard_mark);
 
         self.close_brace();
         self.push_newline();

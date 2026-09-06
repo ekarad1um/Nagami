@@ -17,7 +17,8 @@ use crate::name_gen::next_name_unique;
 
 use super::core::Generator;
 use super::expr_emit::{
-    ConcretizedAbstract, compose_is_splat, concretize_abstract_literal_via_inner, literal_is_width8,
+    ConcretizedAbstract, as_operand_keeps_suffix, compose_is_splat,
+    concretize_abstract_literal_via_inner, literal_bare_form_changes_type, literal_is_width8,
 };
 use super::syntax::{LiteralExtractKey, literal_extract_key};
 
@@ -253,24 +254,45 @@ impl<'a> Generator<'a> {
                                 adjust[e.index()] += 1;
                             }
                         }
-                        // Scalar `bitcast` forces a CONCRETE literal operand to
-                        // typed form, bypassing `extracted_literals` (see the
-                        // bypass list above), so subtract its over-count.  An
-                        // abstract operand is NOT forced, so it is left eligible.
-                        naga::Expression::As {
-                            expr: src,
-                            convert: None,
+                        // Forced typed by the emitter (no sibling pins
+                        // them).
+                        naga::Expression::Binary {
+                            op: naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight,
+                            left,
                             ..
                         } => {
-                            if matches!(
-                                func.expressions[*src],
-                                naga::Expression::Literal(l)
-                                    if !matches!(
-                                        l,
-                                        naga::Literal::AbstractInt(_)
-                                            | naga::Literal::AbstractFloat(_)
-                                    )
-                            ) {
+                            if literal_lit(*left).is_some_and(literal_bare_form_changes_type) {
+                                adjust[left.index()] += 1;
+                            }
+                        }
+                        naga::Expression::Math {
+                            fun: naga::MathFunction::ExtractBits,
+                            arg,
+                            ..
+                        } => {
+                            if literal_lit(*arg).is_some_and(literal_bare_form_changes_type) {
+                                adjust[arg.index()] += 1;
+                            }
+                        }
+                        naga::Expression::Math {
+                            fun: naga::MathFunction::InsertBits,
+                            arg,
+                            arg1,
+                            ..
+                        } => {
+                            for a in [Some(*arg), *arg1].into_iter().flatten() {
+                                if literal_lit(a).is_some_and(literal_bare_form_changes_type) {
+                                    adjust[a.index()] += 1;
+                                }
+                            }
+                        }
+                        // Kept-suffix operands bypass `extracted_literals`.
+                        naga::Expression::As {
+                            expr: src, convert, ..
+                        } => {
+                            if literal_lit(*src)
+                                .is_some_and(|l| as_operand_keeps_suffix(l, *convert))
+                            {
                                 adjust[src.index()] += 1;
                             }
                         }

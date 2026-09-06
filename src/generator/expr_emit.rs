@@ -52,6 +52,34 @@ fn literal_needs_typed_form_outside_constructor(literal: naga::Literal) -> bool 
     )
 }
 
+/// Bare form re-infers a different type in a position nothing pins (shift
+/// left operand, `extractBits` value): only `I32` / `F32` / `Bool` match
+/// the abstract defaults. Stricter than
+/// [`literal_needs_typed_form_outside_constructor`], whose positions still
+/// coerce u32. `literal_extract` subtracts exactly the occurrences this
+/// forces typed.
+pub(super) fn literal_bare_form_changes_type(literal: naga::Literal) -> bool {
+    !matches!(
+        literal,
+        naga::Literal::I32(_) | naga::Literal::F32(_) | naga::Literal::Bool(_)
+    )
+}
+
+/// A bitcast operand always keeps its suffix (bits); a conversion's only
+/// when the abstract value converts differently: a u32 above i32::MAX or a
+/// negative i32 into the other integer type (rejected where the typed form
+/// wraps), a width with no abstract spelling, or an f16 target (`f16(.1)`
+/// double-rounds). Shared with `literal_extract`.
+pub(super) fn as_operand_keeps_suffix(literal: naga::Literal, convert: Option<u8>) -> bool {
+    let differs = match literal {
+        naga::Literal::U32(v) => v > i32::MAX as u32,
+        naga::Literal::I32(v) => v < 0,
+        naga::Literal::F32(_) | naga::Literal::Bool(_) => false,
+        _ => true,
+    };
+    convert.is_none() || differs || convert == Some(2)
+}
+
 /// `true` when `literal`, rendered in the BARE form constructor components
 /// use, re-infers exactly `scalar` as a `vecN(...)` component - i.e. it can
 /// pin the elided constructor's element type.
@@ -1208,24 +1236,22 @@ impl<'a> Generator<'a> {
                 let wrap_l = child_needs_parens(eff_l, arena, *op, false, eff_lc);
                 let mut wrap_r = child_needs_parens(eff_r, arena, *op, true, eff_rc);
 
-                // Splat-elision drops the scalar out of its
-                // type-pinning constructor context.  Use `emit_expr`
-                // (not `emit_constructor_arg`): the latter's
-                // defensive comparison-wrap would double-paren
-                // operands (`vec3(a<b) * v` -> `((a<b)) * v`) and its
-                // bare-literal path would emit a literal whose
-                // abstract default might mismatch the vector operand's
-                // scalar type.  `child_needs_parens` (above) already
-                // handles precedence-driven parenthesisation.
-                //
-                // The literal-side mismatch is exactly the case
-                // [`literal_needs_typed_form_outside_constructor`]
-                // exists for: F16/F64/I64/U64 literals get typed
-                // suffixes (`0h`/`0lf`/`0li`/`0lu`) when emitted via
-                // `emit_expr`'s Literal arm.  Splat-elision is the
-                // primary site that creates the "outside a
-                // constructor" condition, so the two are interdependent.
-                let ls = if elide_l {
+                // A shift types as its left operand (`e2` is always u32),
+                // so a bare literal there stays abstract: tint concretizes
+                // it to i32 (`4294967295>>x` rejected, `100u>>x` retyped)
+                // while naga converts it to the consumer's type. Typed
+                // form, bypassing `extracted_literals` (a hoisted bare
+                // const is abstract too).
+                let ls = if !elide_l
+                    && matches!(
+                        op,
+                        naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight
+                    )
+                    && let Some(lit) = self.inline_scalar_literal(*left, ctx)
+                    && literal_bare_form_changes_type(lit)
+                {
+                    literal_to_wgsl(lit, &self.options.float_precision)
+                } else if elide_l {
                     self.emit_expr(left_scalar.unwrap(), ctx)?
                 } else {
                     self.emit_expr(*left, ctx)?
@@ -1361,10 +1387,35 @@ impl<'a> Generator<'a> {
                 let mut s = String::new();
                 s.push_str(math_name(*fun));
                 s.push('(');
-                s.push_str(&self.emit_expr(*arg, ctx)?);
+                // `extractBits` / `insertBits` type as their value
+                // operand(s) alone, so `offset` / `count` pin nothing;
+                // every other builtin shares one type across its arguments
+                // and any runtime sibling pins a literal.
+                let pins_alone = matches!(
+                    fun,
+                    naga::MathFunction::ExtractBits | naga::MathFunction::InsertBits
+                );
+                let typed_if_literal = |g: &Self,
+                                        h: naga::Handle<naga::Expression>,
+                                        ctx: &mut FunctionCtx<'a, '_>|
+                 -> Result<String, Error> {
+                    if pins_alone
+                        && let Some(lit) = g.inline_scalar_literal(h, ctx)
+                        && literal_bare_form_changes_type(lit)
+                    {
+                        Ok(literal_to_wgsl(lit, &g.options.float_precision))
+                    } else {
+                        g.emit_expr(h, ctx)
+                    }
+                };
+                s.push_str(&typed_if_literal(self, *arg, ctx)?);
                 if let Some(v) = arg1 {
                     s.push_str(sep);
-                    s.push_str(&self.emit_expr(*v, ctx)?);
+                    if *fun == naga::MathFunction::InsertBits {
+                        s.push_str(&typed_if_literal(self, *v, ctx)?);
+                    } else {
+                        s.push_str(&self.emit_expr(*v, ctx)?);
+                    }
                 }
                 if let Some(v) = arg2 {
                     s.push_str(sep);
@@ -1507,38 +1558,12 @@ impl<'a> Generator<'a> {
                     return Ok(folded);
                 }
                 let target = self.type_name_for_inner(&target_inner)?;
-                // A scalar `bitcast<T>` reinterprets its operand's BITS, so an
-                // inline literal operand must be emitted in TYPED (suffixed) form
-                // to pin its concrete type.  The bare form drops the suffix and
-                // re-parses as an abstract literal that materialises to a
-                // different concrete type than the source had: a whole-number
-                // float collapses to an int token (`1.0f` -> `1` -> `AbstractInt`
-                // -> default i32), so `bitcast<u32>(1.0f)` reinterprets `0x1` and
-                // not the float's `0x3F800000` (a silent VALUE miscompile); and a
-                // `u32` above `i32::MAX` (`bitcast<f32>(3212836864u)` ->
-                // `3212836864`) overflows the i32 default and is rejected outright
-                // by spec-conformant consumers.  Vector bitcasts and
-                // `convert.is_some()` conversions pin the operand via their
-                // constructor, so only the scalar-bitcast case is forced.
-                //
-                // This also bypasses `extracted_literals`: a hoisted
-                // `const N = <bare>;` is abstract-typed (the bare form merges
-                // types, so `F32(1024.0)` and `I32(1024)` share one
-                // `const N=1024;`), and `bitcast<u32>(N)` would reinterpret the
-                // abstract-int default - the same miscompile via a reference.  The
-                // extraction counter MUST subtract this same occurrence (the
-                // `As { convert: None }` arm in `literal_extract`) or it leaves a
-                // dangling const.  Abstract literals are excluded: `emit_expr`'s
-                // concretization already yields the correct typed form.
-                let source = if convert.is_none()
-                    && vec_size.is_none()
-                    && !ctx.expr_names.contains_key(expr)
-                    && let E::Literal(lit) = &ctx.func.expressions[*expr]
-                    && !matches!(
-                        lit,
-                        naga::Literal::AbstractInt(_) | naga::Literal::AbstractFloat(_)
-                    ) {
-                    literal_to_wgsl(*lit, &self.options.float_precision)
+                // Conversions keep the suffix per
+                // `as_operand_keeps_suffix`; a literal is always scalar.
+                let source = if let Some(lit) = self.inline_scalar_literal(*expr, ctx)
+                    && as_operand_keeps_suffix(lit, *convert)
+                {
+                    literal_to_wgsl(lit, &self.options.float_precision)
                 } else {
                     self.emit_expr(*expr, ctx)?
                 };
@@ -1617,6 +1642,72 @@ impl<'a> Generator<'a> {
                 )));
             }
         })
+    }
+
+    /// The concrete scalar literal `h` inlines as (a `Literal` or an
+    /// unnamed `Constant` over one) unless already `let`-bound; every
+    /// position that pins a literal's type resolves through this so the
+    /// emitter and `literal_extract` agree.
+    fn inline_scalar_literal(
+        &self,
+        h: naga::Handle<naga::Expression>,
+        ctx: &FunctionCtx<'a, '_>,
+    ) -> Option<naga::Literal> {
+        if ctx.expr_names.contains_key(&h) {
+            return None;
+        }
+        let lit = match ctx.func.expressions[h] {
+            naga::Expression::Literal(lit) => lit,
+            naga::Expression::Constant(c) if self.module.constants[c].name.is_none() => {
+                match self.module.global_expressions[self.module.constants[c].init] {
+                    naga::Expression::Literal(lit) => lit,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        (!matches!(
+            lit,
+            naga::Literal::AbstractInt(_) | naga::Literal::AbstractFloat(_)
+        ))
+        .then_some(lit)
+    }
+
+    /// `(annotation, initializer)` of a hazard `let`. A `let` initializer
+    /// pins nothing (`let a=5;` is i32), so a concrete literal takes its
+    /// typed form and everything else (extracted or named constants,
+    /// constructors) an explicit type; abstract operands bind bare since
+    /// the default is their type.
+    pub(super) fn const_hazard_binding_value(
+        &self,
+        operand: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(Option<String>, String), Error> {
+        if let naga::Expression::Literal(lit) = ctx.func.expressions[operand]
+            && !matches!(
+                lit,
+                naga::Literal::AbstractInt(_) | naga::Literal::AbstractFloat(_)
+            )
+        {
+            let key = literal_extract_key(lit, &self.options.float_precision);
+            if !self.extracted_literals.contains_key(&key) {
+                return Ok((None, literal_to_wgsl(lit, &self.options.float_precision)));
+            }
+        }
+        let inner = ctx.info[operand].ty.inner_with(&self.module.types);
+        let abstract_typed = matches!(
+            inner.scalar(),
+            Some(naga::Scalar {
+                kind: naga::ScalarKind::AbstractInt | naga::ScalarKind::AbstractFloat,
+                ..
+            })
+        );
+        let annotation = if abstract_typed {
+            None
+        } else {
+            Some(self.type_name_for_inner(inner)?)
+        };
+        Ok((annotation, self.emit_expr(operand, ctx)?))
     }
 
     fn concretize_abstract_literal_for_expr(

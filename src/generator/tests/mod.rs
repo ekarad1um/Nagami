@@ -10,6 +10,7 @@
 mod helpers;
 
 mod compound_assign;
+mod const_hazard;
 mod dead_code;
 mod expressions;
 mod miscompile_regressions;

@@ -209,6 +209,10 @@ pub(super) struct FunctionCtx<'a, 'm> {
     /// as nested leaves and escapes the depth cap entirely (tint's parser
     /// recursion limit then rejects text naga's self-check accepts).
     pub(super) stashed_call_depth: std::collections::HashMap<naga::Handle<naga::Expression>, u16>,
+    /// Operands `let`-bound by the hazard guard (`const_hazard`), in
+    /// emission order: pre-emitted expressions usable from any block, so
+    /// each name must leave `expr_names` when its block closes.
+    pub(super) const_hazard_bindings: Vec<naga::Handle<naga::Expression>>,
     /// Display name for the current function, used to decorate
     /// diagnostic messages.
     pub(super) display_name: String,

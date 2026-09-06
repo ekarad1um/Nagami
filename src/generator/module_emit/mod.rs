@@ -1097,6 +1097,7 @@ impl<'a> Generator<'a> {
             must_bind_loads,
             render_depth_memo: vec![0; func.expressions.len()],
             stashed_call_depth: HashMap::new(),
+            const_hazard_bindings: Vec::new(),
             display_name: displayed_name.to_string(),
         };
 

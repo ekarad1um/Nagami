@@ -21,6 +21,7 @@
 //!   scope (expression, statement, module), each driving the
 //!   generator buffer.
 
+mod const_hazard;
 mod core;
 mod cost;
 mod expr_emit;

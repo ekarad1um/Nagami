@@ -363,8 +363,8 @@ fn matrix_compound_assign_preserves_non_commutative_order() {
 /// absorbing rule, because `eval_binary` has no F16 arm to compute the IEEE
 /// sign of the product: cloning the matched `0.0h` would take its sign, not
 /// the product's (`-2.0h * 0.0h` is `-0.0h`, not `+0.0h`).  The fold is
-/// declined so the bare product survives and re-parses to the right signed
-/// zero.  Guards the `is_integer_zero` gate on the absorbing-Multiply arm.
+/// declined so the product survives and evaluates to the right signed zero.
+/// Guards the `is_integer_zero` gate on the absorbing-Multiply arm.
 #[test]
 fn f16_multiply_by_zero_is_not_mis_signed() {
     let out = minify(
@@ -372,10 +372,11 @@ fn f16_multiply_by_zero_is_not_mis_signed() {
          @group(0)@binding(0) var<storage,read_write> out: array<f16, 4>;\
          @compute @workgroup_size(1) fn main() { let a = -2.0h; out[0] = a * 0.0h; }",
     );
-    // The signed product must survive as `-2h*0h` (re-parses to -0.0h), never
-    // collapse to a positive-zero store `A[0]=0h;`.
+    // The signed product must survive as a multiply by `0h` (inline or with
+    // the `-2h` operand `let`-bound), never collapse to a positive-zero store
+    // `A[0]=0h;`.
     assert!(
-        out.contains("-2h*0h"),
+        out.contains("*0h"),
         "f16 `-2.0h * 0.0h` must keep the signed product, not fold to +0.0h: {out}"
     );
     assert!(
@@ -1800,23 +1801,29 @@ fn manufactured_min_div_rem_shl_fold_to_defined_values() {
     );
 }
 
-/// A pass-manufactured float division by literal zero has NO valid WGSL
-/// spelling (its runtime value is inf, const-eval-rejected by every
-/// consumer); the generator output and the naga fallback both fail
-/// re-validation.  That must degrade to the compacted-input bailout, not a
-/// hard error that kills a batch run on valid input.
+/// A pass-manufactured float division by literal zero has NO valid
+/// const-expression spelling (its value is inf, rejected by every consumer's
+/// const-eval), so the generator's hazard guard `let`-binds one operand and
+/// ships the division as a runtime expression - never the compacted-input
+/// bailout, and never a hard error that kills a batch run on valid input.
 #[test]
-fn untextable_float_div_zero_ships_compacted_input() {
+fn float_div_zero_ships_as_runtime_division() {
     let src = "@group(0) @binding(0) var<storage, read_write> out: f32;\n\
         @compute @workgroup_size(1)\n\
         fn main() {\n  var a: f32 = 5.0;\n  var b: f32 = 0.0;\n  out = a / b;\n}";
     let result = crate::run(src, &crate::config::Config::default())
-        .expect("un-textable IR must bail out, not error");
+        .expect("float division by zero must minify, not error");
     assert!(
-        result.source.contains("out=a/b;"),
-        "bailout must ship the input compacted, division intact: {}",
+        result.report.bailout.is_none(),
+        "division by zero must not bail out: {}",
         result.source
     );
+    assert!(
+        result.source.contains("let a=5f;A=a/0;"),
+        "one operand must be let-bound so the division stays runtime: {}",
+        result.source
+    );
+    assert_valid_wgsl(&result.source);
 }
 
 /// A chain of single-use pure calls stashes each call's text inside the
