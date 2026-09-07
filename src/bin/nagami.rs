@@ -26,8 +26,8 @@ enum OutputFormat {
     Json,
 }
 
-/// CLI-facing mirror of [`nagami::config::Profile`].  Kept separate so
-/// the `clap` derives do not leak into the library's public surface.
+/// Mirror of [`nagami::config::Profile`] so the `clap` derives stay out of
+/// the library's public surface.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CLIProfile {
     Baseline,
@@ -48,6 +48,7 @@ impl From<CLIProfile> for nagami::config::Profile {
 #[derive(Debug, Parser)]
 #[command(
     name = "nagami",
+    version,
     about = "Shrinks WGSL shaders via Naga IR optimization passes",
     long_about = "Nagami[n] - Naga + Minify. Shrinks WGSL shaders by lowering to Naga IR, running optimization passes, and emitting minimal valid WGSL."
 )]
@@ -108,7 +109,6 @@ struct Args {
 
     #[arg(
         long,
-        requires = "trace",
         help = "Re-validate emitted WGSL text after every pass and escalate any failure to a hard error (instead of the default silent per-pass rollback)."
     )]
     validate_each_pass: bool,
@@ -213,9 +213,8 @@ fn main() -> ExitCode {
     // Forward-substitution builds expression trees as deep as the input's
     // statement count and several IR walks recurse per level: the 8 MiB
     // main stack overflows (SIGABRT under `panic = "abort"`) near ~9k
-    // chained reassignments.  A lazily-committed 256 MiB worker stack moves
-    // that cliff far past any real shader; the depth cap that would bound
-    // it is tracked in docs/PLAN.md.
+    // chained reassignments; a lazily-committed 256 MiB worker stack moves
+    // that cliff far past any real shader.
     const WORKER_STACK_BYTES: usize = 256 * 1024 * 1024;
     match std::thread::Builder::new()
         .name("nagami".into())
@@ -255,10 +254,8 @@ fn run_cli() -> Result<u8, Box<dyn std::error::Error>> {
         .into());
     }
 
-    // Refuse to write the output over the `--preamble` file: the run strips
-    // the preamble's declarations, so writing back would destroy them.
-    // `same_file` matches by inode (symlinks and hard links included); a
-    // not-yet-created output never false-matches.
+    // Writing the output over the `--preamble` file would destroy the
+    // declarations the run strips.
     if let Some(preamble_path) = args.preamble.as_ref() {
         let dest: Option<&Path> = if args.in_place {
             Some(args.input.as_path())
@@ -366,9 +363,7 @@ fn run_cli() -> Result<u8, Box<dyn std::error::Error>> {
     let output = nagami::run(&input, &config)?;
     let changed = output.source != input;
 
-    // Say the degradation out loud (not gated on --quiet, which silences
-    // the success summary only); under --strict-fallback it is an error and
-    // nothing is written.
+    // Not gated on --quiet, which silences only the success summary.
     if let Some(reason) = &output.report.bailout {
         if args.strict_fallback {
             return Err(format!("--strict-fallback: {reason}").into());
@@ -398,14 +393,11 @@ fn run_cli() -> Result<u8, Box<dyn std::error::Error>> {
     }
 
     if args.in_place {
-        // Sibling temp file + atomic rename: a crash mid-write cannot
-        // truncate the input.
         write_atomic(&args.input, &output.source)
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", args.input.display())))?;
     } else if let Some(path) = args.output.as_deref() {
-        // Prefix the offending path like the other file errors, except for
-        // `-o -` where `-` is no path.  `-o` onto the input file itself
-        // writes atomically like --in-place.
+        // `-o -` gets no path prefix (`-` is no path); `-o` onto the input
+        // itself writes atomically like --in-place.
         let r = if !is_dash_path(path) && same_file(path, &args.input) {
             write_atomic(path, &output.source)
         } else {
@@ -571,7 +563,6 @@ mod tests {
         Args::command().debug_assert();
     }
 
-    /// Clap rejects the both-set case; each single-set arm plus the default.
     #[test]
     fn precision_from_cli_maps_flags_to_modes() {
         use nagami::config::{FloatPrecision, PrecisionMode};

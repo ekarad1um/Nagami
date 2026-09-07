@@ -1,27 +1,21 @@
-//! Common-subexpression elimination across a single function body.
+//! Common-subexpression elimination within one function body.
 //!
-//! The pass walks each statement tree with a dominance-scoped map from
-//! structural expression keys to the first (canonical) occurrence of
-//! that expression.  Duplicate evaluations are rewritten to reference
-//! the canonical handle, and the `Emit` ranges around the replaced
-//! handles are rebuilt in a single fused traversal.
-//!
-//! Only side-effect-free expressions are eligible; loads, image ops,
-//! derivatives, and statement-attached result expressions remain
-//! unique because their value can depend on program state beyond
-//! their operands.
+//! A dominance-scoped map from structural expression keys to the first
+//! (canonical) occurrence redirects every later duplicate to it; the
+//! `Emit` ranges around replaced handles are then rebuilt in one walk.
+//! Only pure expressions are eligible: loads, image ops, derivatives and
+//! statement-attached results depend on state beyond their operands.
 
 use super::scoped_map::ScopedMap;
 use crate::pipeline::{Pass, PassContext};
-use rustc_hash::FxHashMap;
 use std::hash::{Hash, Hasher};
 
 use crate::error::Error;
 
 use super::expr_util::{flatten_replacement_chains, try_map_expression_handles_in_place};
+use crate::handle_set::HandleMap;
 
-/// Replace duplicate pure expression sub-DAGs with a reference to the
-/// first dominating evaluation.
+/// Replace duplicate pure expressions with the first dominating evaluation.
 #[derive(Debug, Default)]
 pub struct CSEPass;
 
@@ -44,9 +38,9 @@ impl Pass for CSEPass {
 
 // MARK: Key type
 
-/// Hashable structural key for an expression.  Child handles are
-/// pre-resolved through the replacement map so two expressions that
-/// differ only in which canonical operand they reference hash equal.
+/// Structural expression key.  Child handles are pre-resolved through
+/// the replacement map so duplicates that already reference a canonical
+/// operand compare equal.
 #[derive(Clone, Eq, PartialEq)]
 enum CseKey {
     Compose {
@@ -68,12 +62,9 @@ enum CseKey {
     Swizzle {
         size: naga::VectorSize,
         vector: naga::Handle<naga::Expression>,
-        // Stored as `[u8; 4]` because `SwizzleComponent` lacks `Hash` and there
-        // are only four lanes.  The `as u8` cast is an identity on the
-        // discriminant byte: naga's `SwizzleComponent` is `#[repr(u8)]` with
-        // discriminants 0..=3 (X / Y / Z / W).  A future fifth discriminant still
-        // fits in `u8`; any mismatch surfaces as a CSE-key miss (different pattern
-        // -> different key), never a wrong fold.
+        // `SwizzleComponent` lacks `Hash`; it is `#[repr(u8)]`, so `as u8`
+        // is exact and a future discriminant can only cause a key miss,
+        // never a wrong fold.
         pattern: [u8; 4],
     },
     Unary {
@@ -111,8 +102,8 @@ enum CseKey {
 
 impl Hash for CseKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Mix in the discriminant so keys from different variants with
-        // structurally identical payloads cannot collide.
+        // Discriminant first so identical payloads of different variants
+        // cannot collide.
         std::mem::discriminant(self).hash(state);
         match self {
             CseKey::Compose { ty, components } => {
@@ -193,22 +184,17 @@ impl Hash for CseKey {
 
 // MARK: Key construction
 
-/// Resolve `handle` through the replacement map, returning the handle
-/// unchanged when no replacement has been registered yet.
 #[inline]
 fn resolve(
     handle: naga::Handle<naga::Expression>,
-    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
 ) -> naga::Handle<naga::Expression> {
-    replacements.get(&handle).copied().unwrap_or(handle)
+    replacements.get(handle).copied().unwrap_or(handle)
 }
 
-/// Build a [`CseKey`] for `expr`, or `None` when the expression is
-/// ineligible for CSE.  Every child handle is resolved first so
-/// duplicates that already reference a canonical operand hash equal.
 fn build_cse_key(
     expr: &naga::Expression,
-    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
 ) -> Option<CseKey> {
     let r = |h: naga::Handle<naga::Expression>| resolve(h, replacements);
     let ro = |h: &Option<naga::Handle<naga::Expression>>| h.map(|h| resolve(h, replacements));
@@ -290,27 +276,18 @@ fn build_cse_key(
         }),
         naga::Expression::ArrayLength(h) => Some(CseKey::ArrayLength(r(*h))),
 
-        // Ineligible variants: loads (state-dependent), image and
-        // derivative ops (side effects and execution-mask coupling),
-        // `*Result` variants (tied to their originating statement),
-        // non-emittable declarative expressions, and literals or
-        // constants (trivially unique or canonicalised elsewhere).
+        // Impure or statement-bound (Load, image / derivative ops,
+        // `*Result`), pre-emit declaratives, and literals / constants
+        // (canonicalised elsewhere).
         _ => None,
     }
 }
 
 // MARK: Per-function driver
 
-/// Run CSE across the function body: collect replacements under a
-/// scoped map, flatten any transitive chains, rewrite the expression
-/// arena, then fuse emit-range surgery with statement-level handle
-/// remapping in a single traversal.  Returns `true` when at least one
-/// replacement fired.
 fn cse_function(function: &mut naga::Function) -> bool {
-    let mut replacements: FxHashMap<
-        naga::Handle<naga::Expression>,
-        naga::Handle<naga::Expression>,
-    > = FxHashMap::default();
+    let mut replacements: HandleMap<naga::Expression, naga::Handle<naga::Expression>> =
+        Default::default();
 
     let mut cse_map: ScopedMap<CseKey, naga::Handle<naga::Expression>> = ScopedMap::new();
 
@@ -325,27 +302,18 @@ fn cse_function(function: &mut naga::Function) -> bool {
         return false;
     }
 
-    // Flatten `A -> B -> C` into `A -> C` and `B -> C` so the arena
-    // walk below resolves every handle in a single step.
+    // The arena walk resolves one level, so chains must be flat.
     flatten_replacement_chains(&mut replacements);
 
-    // Rewrite each expression's children to reference canonical handles.
     for (_, expr) in function.expressions.iter_mut() {
         let _ = try_map_expression_handles_in_place(expr, &mut |h| {
-            Some(replacements.get(&h).copied().unwrap_or(h))
+            Some(replacements.get(h).copied().unwrap_or(h))
         });
     }
 
-    // Fused traversal: rebuild `Emit` ranges around survivors and
-    // remap statement-level handles in one descent (formerly two
-    // separate walks via `apply_replacements_to_block` and
-    // `rebuild_emit_ranges_after_removal`).  The "replaced" predicate
-    // is `replacements.contains_key(h)` directly, avoiding the extra
-    // `HashSet<Handle>` the previous shape allocated.
     apply_and_rebuild(&mut function.body, &replacements);
 
-    // Drop named-expression entries whose handle was replaced so the
-    // generator does not emit dangling `let` bindings.
+    // A name on a replaced handle would become a dangling `let`.
     function
         .named_expressions
         .retain(|h, _| !replacements.contains_key(h));
@@ -355,19 +323,14 @@ fn cse_function(function: &mut naga::Function) -> bool {
 
 // MARK: Dominance-scoped collection
 
-/// Walk the statement tree, populating `cse_map` with canonical
-/// expressions and `replacements` with each duplicate's redirection.
-///
-/// `cse_map` is a [`ScopedMap`] keyed by [`CseKey`]; every control-flow
-/// boundary takes a checkpoint and rolls back on exit so the map always
-/// reflects the current dominator set rather than whatever sibling
-/// branches happened to register.  Cost is `O(in-scope writes)` per
-/// scope instead of `O(map_size)`.
+/// Checkpoint / rollback at every nested block keeps `cse_map` equal to
+/// the dominator set of the current statement, never to what sibling
+/// branches registered.
 fn collect_cse_replacements(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
     cse_map: &mut ScopedMap<CseKey, naga::Handle<naga::Expression>>,
-    replacements: &mut FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &mut HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
 ) {
     for statement in block {
         match statement {
@@ -376,37 +339,26 @@ fn collect_cse_replacements(
                     let expr = &expressions[handle];
                     if let Some(key) = build_cse_key(expr, replacements) {
                         if let Some(canonical) = cse_map.get(&key) {
-                            // Duplicate: redirect to the dominating handle.
                             replacements.insert(handle, *canonical);
                         } else {
-                            // First occurrence: register as canonical.
                             cse_map.insert(key, handle);
                         }
                     }
                 }
             }
 
-            // No canonical registered inside a nested block may leak to
-            // code after it, so roll back to the parent-scope checkpoint
-            // after EVERY nested block.  This one rule is the meet of the
-            // per-variant requirements:
-            //   * If / Switch arms and `Statement::Block` bodies are real
-            //     lexical scopes in the generated text; a leaked canonical
-            //     becomes a reference to an out-of-scope `let` - invalid
-            //     WGSL that naga's flow-insensitive validator accepts but
-            //     re-parse / tint reject.
-            //   * A loop body does not dominate its continuing block: a
-            //     `continue` jumps straight there, skipping every body
-            //     `Emit` lexically after it, so redirecting a continuing
-            //     expression to a body canonical reads a value that
-            //     iteration never produced - a silent miscompile naga
-            //     validates happily.  Rolling back to the pre-body state
-            //     conservatively forgoes body->continuing CSE in
-            //     `continue`-free loops.
-            // Leaf statements iterate zero blocks (their expression
-            // operands are keyed via their `Emit` ranges above); a future
-            // block-bearing variant inherits the conservative scoping
-            // automatically.
+            // Roll back after EVERY nested block: a canonical registered
+            // inside one must not reach code after it.  If / Switch arms
+            // and `Block` bodies are lexical scopes in the output, so a
+            // leaked canonical references an out-of-scope `let` - naga's
+            // flow-insensitive validator accepts it, re-parse and tint do
+            // not.  A loop body does not dominate its continuing block
+            // (`continue` skips the body's later `Emit`s), so a continuing
+            // expression redirected to a body canonical reads a value that
+            // iteration never produced - a silent miscompile naga
+            // validates; forgoing body->continuing CSE in `continue`-free
+            // loops is the price.  Leaf statements iterate zero blocks,
+            // and a future block-bearing variant inherits this scoping.
             _ => {
                 let checkpoint = cse_map.checkpoint();
                 for nested in super::expr_util::nested_blocks(statement) {
@@ -420,15 +372,11 @@ fn collect_cse_replacements(
 
 // MARK: Fused fixup walk
 
-/// Single-pass fixup: rebuild every `Emit` range so replaced handles
-/// drop out (splitting into contiguous sub-ranges around survivors,
-/// discarding emits that become empty) and remap statement-level
-/// expression handles to their canonical replacements.  Recurses into
-/// every control-flow sub-block once; mirrors [`super::load_dedup`]'s
-/// `apply_to_block`.
+/// Rebuild `Emit` ranges around surviving handles and remap statement
+/// operands to their canonicals in one walk.
 fn apply_and_rebuild(
     block: &mut naga::Block,
-    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
 ) {
     let original = std::mem::take(block);
     for (mut statement, span) in original.span_into_iter() {
@@ -437,39 +385,15 @@ fn apply_and_rebuild(
                 .clone()
                 .filter(|h| !replacements.contains_key(h))
                 .collect();
-            if surviving.is_empty() {
-                continue;
-            }
-            // Emit the surviving handles as contiguous sub-ranges.
-            let mut start = surviving[0];
-            let mut end = surviving[0];
-            for &h in &surviving[1..] {
-                if h.index() == end.index() + 1 {
-                    end = h;
-                } else {
-                    block.push(
-                        naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
-                        span,
-                    );
-                    start = h;
-                    end = h;
-                }
-            }
-            block.push(
-                naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
-                span,
-            );
+            super::expr_util::push_emit_runs(block, &surviving, span);
             continue;
         }
         for nested in super::expr_util::nested_blocks_mut(&mut statement) {
             apply_and_rebuild(nested, replacements);
         }
 
-        // Remap statement-level expression handles to canonical
-        // replacements (covers `Store`, `Call`, `If::condition`,
-        // `Switch::selector`, `Atomic`, `ImageStore`, and friends).
         super::expr_util::remap_statement_handles(&mut statement, &mut |h| {
-            replacements.get(&h).copied().unwrap_or(h)
+            replacements.get(h).copied().unwrap_or(h)
         });
 
         block.push(statement, span);
@@ -496,14 +420,8 @@ mod tests {
         (changed, module)
     }
 
-    // `ScopedMap` invariant tests live under `passes::scoped_map::tests`.
-    // The integration tests below (`does_not_cse_across_if_branches`,
-    // `cse_dominates_into_if`, `pre_loop_expression_deduped_in_loop_body`)
-    // exercise the CSE-side scope semantics end-to-end.
-
     #[test]
     fn eliminates_duplicate_binary_expressions() {
-        // `a * a` appears twice - CSE should unify them.
         let source = r#"
 fn f(a: f32) -> f32 {
     let x = a * a;
@@ -517,7 +435,6 @@ fn f(a: f32) -> f32 {
 
     #[test]
     fn eliminates_duplicate_math_calls() {
-        // `sin(a)` appears twice.
         let source = r#"
 fn f(a: f32) -> f32 {
     let x = sin(a);
@@ -544,8 +461,6 @@ fn f(a: f32, b: f32) -> f32 {
 
     #[test]
     fn does_not_cse_across_if_branches() {
-        // The same expression in accept and reject branches should NOT be
-        // unified because neither dominates the other.
         let source = r#"
 fn f(a: f32, cond: bool) -> f32 {
     if cond {
@@ -558,14 +473,11 @@ fn f(a: f32, cond: bool) -> f32 {
 }
 "#;
         let (changed, _module) = run_pass(source);
-        // Both `a * a` are in separate branches.  The CSE pass should NOT
-        // unify them (neither dominates the other).
         assert!(!changed, "CSE should not unify across if/else branches");
     }
 
     #[test]
     fn cse_dominates_into_if() {
-        // An expression before the if dominates both branches.
         let source = r#"
 fn f(a: f32, cond: bool) -> f32 {
     let x = a * a;
@@ -582,7 +494,6 @@ fn f(a: f32, cond: bool) -> f32 {
 
     #[test]
     fn cse_nested_expressions() {
-        // duplicate nested tree: sin(a * a)
         let source = r#"
 fn f(a: f32) -> f32 {
     let x = sin(a * a);
@@ -596,7 +507,6 @@ fn f(a: f32) -> f32 {
 
     #[test]
     fn does_not_cse_loads() {
-        // Loads should not be CSE'd (handled by load_dedup).
         let source = r#"
 fn f(a: f32) -> f32 {
     var x = a;
@@ -606,7 +516,6 @@ fn f(a: f32) -> f32 {
 }
 "#;
         let (changed, _module) = run_pass(source);
-        // Loads from `x` should not be eliminated by CSE.
         assert!(!changed, "CSE should not eliminate Loads");
     }
 
@@ -638,7 +547,6 @@ fn f(a: f32, b: f32, c: bool) -> f32 {
 
     #[test]
     fn cse_within_loop_body() {
-        // Duplicate expressions within the same loop iteration should be unified.
         let source = r#"
 fn f(a: f32) -> f32 {
     var sum = 0.0;
@@ -656,7 +564,6 @@ fn f(a: f32) -> f32 {
 
     #[test]
     fn pre_loop_expression_deduped_in_loop_body() {
-        // Expression before loop dominates loop body (first iteration).
         let source = r#"
 fn f(a: f32) -> f32 {
     let pre = a * a;
@@ -677,7 +584,6 @@ fn f(a: f32) -> f32 {
 
     #[test]
     fn validates_complex_shader() {
-        // A more complex shader to stress-test validation.
         let source = r#"
 fn calc(p: vec3f) -> f32 {
     let d = dot(p, p);
@@ -693,7 +599,6 @@ fn main() -> @location(0) vec4f {
 }
 "#;
         let (changed, _module) = run_pass(source);
-        // There should be CSE opportunities (duplicate dot(p,p), dot(n,n)).
         assert!(changed, "complex shader should have CSE opportunities");
     }
 }

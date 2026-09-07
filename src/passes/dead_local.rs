@@ -1,27 +1,22 @@
-//! Dead-local elimination.  naga's compactor deliberately roots every
-//! `LocalVariable` (they are user declarations), so a local whose reads and
-//! writes have all been optimised away survives DCE forever - pinning its
-//! type (and, transitively, struct declarations and `enable` directives
-//! through the type arena) and vetoing function inlining, which refuses
-//! bodies with locals.  Removing the arena entry, not just skipping its
-//! declaration at emit time, is what unblocks those downstream decisions.
+//! Dead-local elimination.  naga's compactor roots every `LocalVariable`
+//! (user declarations), so a local whose reads and writes were all
+//! optimised away survives DCE forever, pinning its type (transitively
+//! struct declarations and `enable` directives) and vetoing inlining,
+//! which refuses bodies with locals.  Only removing the arena entry, not
+//! skipping the declaration at emit time, unblocks those decisions.
 //!
-//! Scheduled immediately after `CompactPass`: compaction culls
-//! statement-unreachable expressions first, so "no `LocalVariable(h)`
-//! expression left in the arena" means "dead local" here - no statement
-//! walking and no expression-arena surgery.  (A sound under-approximation:
-//! naga's compact also roots `named_expressions`, which can keep a
-//! statement-unreachable reference - and with it the local - alive.)  A
-//! local whose last reference dies later in the same sweep is caught by the
-//! next sweep's compact -> dead-local prefix; the convergence loop already
-//! runs until no pass reports a change.  A floating expression this removal
-//! orphans (a dead local's initialiser) is valid IR and is culled by the
-//! next compact; if the sweep cap lands first, it reaches the generator
-//! outside any `Emit` range and is simply never rendered.
-
-use rustc_hash::FxHashSet;
+//! Runs right after `CompactPass`, whose culling of statement-unreachable
+//! expressions makes "no `LocalVariable(h)` expression in the arena" mean
+//! "dead local" without statement walking.  This under-approximates
+//! soundly: compact also roots `named_expressions`, which can keep a
+//! statement-unreachable reference alive.  A local whose last reference
+//! dies later in the sweep is caught by the next sweep's compact ->
+//! dead-local prefix, and an orphaned initialiser is valid floating IR
+//! that the next compact culls; if the sweep cap lands first it sits
+//! outside every `Emit` range and is never rendered.
 
 use crate::error::Error;
+use crate::handle_set::HandleSet;
 use crate::pipeline::{Pass, PassContext};
 
 /// Remove locals no expression references and remap survivors' handles.
@@ -49,7 +44,7 @@ fn remove_dead_locals(func: &mut naga::Function) -> bool {
     if func.local_variables.is_empty() {
         return false;
     }
-    let referenced: FxHashSet<naga::Handle<naga::LocalVariable>> = func
+    let referenced: HandleSet<naga::LocalVariable> = func
         .expressions
         .iter()
         .filter_map(|(_, e)| match e {
@@ -57,7 +52,7 @@ fn remove_dead_locals(func: &mut naga::Function) -> bool {
             _ => None,
         })
         .collect();
-    // `referenced` only holds valid local handles, so equal cardinality
+    // `referenced` holds only valid local handles, so equal cardinality
     // means every local is referenced.
     if referenced.len() == func.local_variables.len() {
         return false;
@@ -67,15 +62,15 @@ fn remove_dead_locals(func: &mut naga::Function) -> bool {
         vec![None; func.local_variables.len()];
     let mut rebuilt: naga::Arena<naga::LocalVariable> = naga::Arena::new();
     for (h, local) in func.local_variables.iter() {
-        if referenced.contains(&h) {
+        if referenced.contains(h) {
             let span = func.local_variables.get_span(h);
             remap[h.index()] = Some(rebuilt.append(local.clone(), span));
         }
     }
     func.local_variables = rebuilt;
 
-    // The remap is total over surviving references by construction: every
-    // `LocalVariable` expression's target was just re-appended.
+    // Total over surviving references: every `LocalVariable` target was
+    // just re-appended.
     for (_, expr) in func.expressions.iter_mut() {
         if let naga::Expression::LocalVariable(h) = expr {
             *h = remap[h.index()].expect("referenced local survives the rebuild");
@@ -107,8 +102,8 @@ mod tests {
 
     #[test]
     fn removes_unreferenced_local_and_remaps_survivors() {
-        // `dead` precedes `live`, so removing it shifts `live`'s handle -
-        // validation above proves the remap kept the IR well-typed.
+        // `dead` precedes `live`, so removal shifts `live`'s handle;
+        // validation proves the remap.
         let (changed, module) = run_pass(
             "fn f() -> f32 { var dead: f32; var live: f32 = 2.0; live = live + 1.0; return live; }\
              @fragment fn main() -> @location(0) vec4f { return vec4f(f()); }",

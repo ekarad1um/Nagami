@@ -3,9 +3,8 @@
 //! # Interaction matrix
 //!
 //! The driver sweeps the sequence to a fixed point, so a missed
-//! opportunity usually costs one extra sweep, not the optimization.
-//! The exceptions - ordering constraints that are load-bearing within a
-//! sweep or across the rename boundary - are exactly these:
+//! opportunity usually costs one extra sweep, not the optimization; the
+//! load-bearing exceptions are exactly these:
 //!
 //! * `compact` -> `dead_local`: only after statement-unreachable
 //!   expressions are culled is "no `LocalVariable` expression" exactly
@@ -15,8 +14,9 @@
 //! * `const_fold` <-> `dead_branch`: folds expose constant branches,
 //!   pruned branches shrink bodies toward the inlinable
 //!   `[Emit*, Return]` shape; the pair therefore repeats after
-//!   `inlining` and after `load_dedup` (forwarded values surface fresh
-//!   constants).
+//!   `load_dedup` (inlined bodies and forwarded values surface fresh
+//!   constants; a third copy right after `inlining` never changed a
+//!   corpus byte and cost a tenth of all pass runs).
 //! * `inlining` -> `cse` / `load_dedup`: both must see the
 //!   fully-materialised call bodies, or they dedup/forward across a
 //!   boundary the inliner is about to erase.
@@ -34,8 +34,6 @@
 //!   (idempotence).
 //! * `rename` last: its output is the stable identifier surface
 //!   everything downstream reads.
-//!
-//! Individual pass modules document their own invariants.
 
 use crate::config::{Config, Profile};
 use crate::pipeline::Pass;
@@ -67,8 +65,7 @@ pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
 
     match config.profile {
         Profile::Baseline => {
-            // Quick sanity pipeline that keeps the IR recognisable for
-            // debugging: no inlining, CSE, or load dedup.
+            // Keeps the IR recognisable for debugging: no inlining, CSE, or load dedup.
             vec![
                 Box::new(compact::CompactPass) as Box<dyn Pass>,
                 Box::new(const_fold::ConstFoldPass),
@@ -100,8 +97,6 @@ pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
                 Box::new(const_fold::ConstFoldPass),
                 Box::new(dead_branch::DeadBranchPass),
                 inline_pass,
-                Box::new(const_fold::ConstFoldPass),
-                Box::new(dead_branch::DeadBranchPass),
             ];
 
             if config.profile == Profile::Max && config.mangle() {

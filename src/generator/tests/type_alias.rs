@@ -1,20 +1,12 @@
-//! Tests for the generator's `alias T = ...;` introduction pass.
-//! Each section pins one threshold or interaction: when aliasing is
-//! profitable, when it is skipped, how it interacts with mangling,
-//! which type categories participate (matrices, compounds, pointers,
-//! samplers, textures, splats), and that aliased output still
-//! round-trips through naga.
+//! `alias T = ...;` introduction: profitability thresholds, mangling
+//! interaction, which type categories participate, and round-trip validity.
 
 use super::helpers::{assert_valid_wgsl, compact, compact_aliased, compact_mangled_aliased};
 
 // MARK: Basic alias thresholds
 
-/// A type referenced ONLY by dead-eliminated locals must not be aliased.
-/// `generate_function` never prints a dead local, so an `alias X=T;` for
-/// that type would be referenced zero times - pure overhead.  Without the
-/// dead-local gate in `count_type_handle_refs`, the six unused `vec4<f32>`
-/// locals below tip `vec4<f32>` over the alias break-even and emit a dead
-/// `alias`.  Guards that gate.
+/// Dead locals are never printed, so their type's refs must not count toward
+/// the alias break-even or the `alias` itself is dead text.
 #[test]
 fn no_alias_for_type_used_only_by_dead_locals() {
     let src = r#"
@@ -38,7 +30,6 @@ fn no_alias_for_type_used_only_by_dead_locals() {
 
 #[test]
 fn no_alias_when_single_use() {
-    // A single use of an array type - aliasing costs more than it saves.
     let src = r#"
         fn foo() -> array<vec4<f32>, 16> {
             return array<vec4<f32>, 16>();
@@ -46,13 +37,7 @@ fn no_alias_when_single_use() {
     "#;
     let out = compact_aliased(src);
     assert_valid_wgsl(&out);
-    // The output should NOT contain "alias" because the type is used too few
-    // times to justify the declaration overhead.
-    // (2 uses * 15 chars saved per use = 30; decl cost ~= 8 + 1 + 16 = 25, so
-    //  it might or might not alias depending on exact count.  Use a truly-single
-    //  reference case to be sure.)
-    // Actually with Compose expression + return type, the count is still small.
-    // Let's just verify the output is valid.
+    // Near the break-even, so only validity is asserted.
 }
 
 // MARK: Alias introduced for frequent types
@@ -71,14 +56,10 @@ fn alias_for_array_type_many_refs() {
     "#;
     let out = compact_aliased(src);
     assert_valid_wgsl(&out);
-    // With 5+ references to array<vec4f,16>, an alias should be introduced.
     assert!(
         out.contains("alias "),
         "expected alias declaration in output: {out}"
     );
-    // The full type string should NOT appear directly in struct members or
-    // function signatures if the alias is used.
-    // (It may appear once in the alias declaration itself.)
     let alias_decl_count = out.matches("array<vec4f,16>").count();
     assert!(
         alias_decl_count <= 1,
@@ -113,7 +94,6 @@ fn alias_for_array_type_used_in_struct_and_functions() {
 
 #[test]
 fn no_alias_for_scalar_type_few_uses() {
-    // Scalars like f32 (3 chars) need many uses to justify aliasing.
     let src = r#"
         fn foo(a: f32, b: f32) -> f32 {
             return a + b;
@@ -121,7 +101,6 @@ fn no_alias_for_scalar_type_few_uses() {
     "#;
     let out = compact_aliased(src);
     assert_valid_wgsl(&out);
-    // With so few uses, aliasing f32 shouldn't happen.
     assert!(!out.contains("alias "), "unexpected alias in output: {out}");
 }
 
@@ -152,7 +131,6 @@ fn alias_with_mangle() {
 
 #[test]
 fn alias_for_matrix_type() {
-    // Many references to mat4x4f should trigger aliasing
     let src = r#"
         struct Transform {
             model: mat4x4<f32>,
@@ -173,17 +151,13 @@ fn alias_for_matrix_type() {
     "#;
     let out = compact_aliased(src);
     assert_valid_wgsl(&out);
-    // mat4x4f is only 7 chars; alias saves 6 per use minus ~16 decl overhead.
-    // With 3 struct members + 1 return type + compose = 5+ refs, it may alias.
-    // Just verify validity - the cost-benefit analysis may or may not trigger
-    // depending on exact counts.
+    // Near the break-even, so only validity is asserted.
 }
 
 // MARK: Compound types
 
 #[test]
 fn compound_type_benefits_from_base_alias() {
-    // If vec4f gets aliased, array<aliased_vec4f, N> strings get shorter too.
     let src = r#"
         fn a(x: vec4<f32>) -> vec4<f32> { return x; }
         fn b(x: vec4<f32>) -> vec4<f32> { return x; }
@@ -199,7 +173,6 @@ fn compound_type_benefits_from_base_alias() {
     "#;
     let out = compact_aliased(src);
     assert_valid_wgsl(&out);
-    // vec4f has 16+ references (8 args + 8 returns) - should definitely alias.
 }
 
 // MARK: Disabled
@@ -216,7 +189,7 @@ fn no_alias_when_disabled() {
             return x;
         }
     "#;
-    // Use the standard compact helper which has type_alias=false.
+    // `compact` runs with `type_alias` off.
     let out = compact(src);
     assert_valid_wgsl(&out);
     assert!(
@@ -286,7 +259,6 @@ fn roundtrip_with_aliases() {
 
 #[test]
 fn alias_for_pointer_types() {
-    // ptr<function, vec4f> used many times
     let src = r#"
         fn modify(p: ptr<function, vec4<f32>>) {
             *p = *p + vec4<f32>(1.0);
@@ -339,9 +311,8 @@ fn sampler_and_texture_types() {
 
 #[test]
 fn splat_uses_type_alias() {
-    // Splat expressions (e.g. vec3f(0.0)) should use the type alias when one
-    // exists.  Previously Splat bypassed alias lookup because naga resolves
-    // their type as TypeResolution::Value rather than Handle.
+    // A Splat's type resolves as `TypeResolution::Value`, not a handle, so the
+    // alias lookup cannot key on the handle alone.
     let src = r#"
         fn a(x: vec3<f32>) -> vec3<f32> { return x; }
         fn b(x: vec3<f32>) -> vec3<f32> { return x; }
@@ -356,13 +327,10 @@ fn splat_uses_type_alias() {
     "#;
     let out = compact_aliased(src);
     assert_valid_wgsl(&out);
-    // vec3f should be aliased given 10+ refs (5 args + 5 returns).
     assert!(
         out.contains("alias "),
         "expected alias declaration for vec3f: {out}"
     );
-    // The splat expressions inside main_fn must NOT use the raw "vec3f" name.
-    // They should use the alias.  The alias decl itself will have "vec3f" once.
     let raw_count = out.matches("vec3f").count();
     assert!(
         raw_count <= 1,
@@ -395,7 +363,6 @@ fn splat_vec2_uses_type_alias() {
 
 #[test]
 fn global_splat_uses_type_alias() {
-    // Global const splat expressions should also use the alias.
     let src = r#"
         const ZERO: vec3<f32> = vec3<f32>(0.0);
         const ONE: vec3<f32> = vec3<f32>(1.0);
@@ -419,7 +386,6 @@ fn global_splat_uses_type_alias() {
 
 #[test]
 fn cast_uses_type_alias() {
-    // Type cast (As) expressions should also use the alias for the target type.
     let src = r#"
         fn a(x: vec3<i32>) -> vec3<i32> { return x; }
         fn b(x: vec3<i32>) -> vec3<i32> { return x; }
@@ -443,10 +409,9 @@ fn cast_uses_type_alias() {
 
 #[test]
 fn splat_alias_with_source_alias_duplicate_inner() {
-    // When the source contains `alias F3 = vec3f;`, naga creates two Type
-    // entries with the same TypeInner (one named "F3", one unnamed).  The
-    // minifier's alias should still apply to Splat expressions regardless of
-    // which handle the arena scan encounters first.
+    // A source-level `alias F3 = vec3f;` gives naga two Type entries with one
+    // TypeInner; the alias must apply whichever handle the arena scan meets
+    // first.
     let src = r#"
         alias F3 = vec3<f32>;
         fn a(x: F3) -> F3 { return x; }
@@ -472,14 +437,9 @@ fn splat_alias_with_source_alias_duplicate_inner() {
 
 #[test]
 fn alias_with_split_ref_counts_across_duplicate_inner() {
-    // When refs are split across two handles (one from `alias F3 = vec3f`,
-    // one from bare `vec3f`), neither handle individually may meet the alias
-    // threshold.  The combined count across same-TypeInner handles must be
-    // used for the cost-benefit decision.
-    //
-    // vec3f: savings_per_use = 4, decl_cost = 14.
-    // 2 refs via F3 + 2 refs via vec3f = 4 combined, 4*4=16 > 14 -> alias.
-    // But individually 2*4=8 < 14 -> no alias without combining.
+    // Refs split across the two same-TypeInner handles (2 via F3 + 2 bare)
+    // each miss the threshold (2*4=8 < decl cost 14); the combined 4*4=16 > 14
+    // must alias.
     let src = r#"
         alias F3 = vec3<f32>;
         fn a(x: F3) -> F3 { return x; }

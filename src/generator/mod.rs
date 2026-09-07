@@ -1,29 +1,15 @@
-//! Custom WGSL emitter.
-//!
-//! Sits behind [`generate`] as an alternative to naga's built-in
-//! WGSL backend.  Where naga emphasises round-tripping, this emitter
-//! aggressively minifies: short identifiers, literal extraction,
-//! splat elision, and single-use expression inlining.  The pipeline
-//! ([`crate::run`]) falls back to naga's emitter when this one errors
-//! or produces output that fails validation, so the custom path only
-//! has to optimise for the happy case.
-//!
-//! Sub-modules split by responsibility:
-//!
-//! * `syntax` - grammar constants (operator precedence, symbol sets).
-//! * `core` - the `Generator` type, output buffer, and the options
-//!   that flow in from [`crate::run`].
-//! * `cost` - byte-cost pricing conventions shared by the size
-//!   heuristics.
-//! * `literal_extract` - per-run extraction of repeated literals
-//!   into named `const` declarations.
-//! * `expr_emit` / `stmt_emit` / `module_emit` - one module per IR
-//!   scope (expression, statement, module), each driving the
-//!   generator buffer.
+//! Custom WGSL emitter behind [`generate`], an alternative to naga's WGSL
+//! backend that minifies aggressively (short identifiers, literal extraction,
+//! splat elision, single-use inlining).  The pipeline ([`crate::run`]) falls
+//! back to naga's emitter when this one errors or its output fails validation,
+//! so the custom path only optimises the happy case.  `syntax` holds grammar
+//! constants, `core` the `Generator` state and options, `cost` the shared
+//! byte pricing, `literal_extract` the repeated-literal `const` extraction,
+//! `const_hazard` the tint const-expression guard, and `expr_emit` /
+//! `stmt_emit` / `module_emit` one emitter per IR scope.
 
 mod const_hazard;
 mod core;
-mod cost;
 mod expr_emit;
 mod literal_extract;
 mod module_emit;
@@ -37,21 +23,19 @@ use std::time::Instant;
 
 pub use core::GenerateOptions;
 
-/// Emitter output bundle: the final WGSL source plus the wall-clock
-/// cost of producing it.  `duration_us` is zero on wasm where no
-/// high-resolution clock is available.
+/// Emitter output: the WGSL source plus what the name map needs.
 #[derive(Debug)]
 pub struct Emission {
-    /// Minified WGSL source produced by the generator.
+    /// Minified WGSL source.
     pub source: String,
-    /// Wall-clock cost in microseconds; zero on wasm.
+    /// Wall-clock cost in microseconds; zero on wasm (no high-resolution clock).
     pub duration_us: u64,
-    /// Struct type / member names as emitted, keyed by original struct
-    /// name; struct renaming lives here, the IR keeps source names.
-    /// Host-addressable structs only.
+    /// Emitted struct / member names keyed by original struct name, for
+    /// host-addressable structs only; struct renaming lives here, the IR keeps
+    /// source names.
     pub structs: std::collections::BTreeMap<String, crate::name_map::StructRename>,
-    /// Constants this emission declared; a constant can survive the IR
-    /// with every use folded away, so the name map filters through this.
+    /// Constants this emission declared; a constant can survive the IR with
+    /// every use folded away, so the name map filters through this.
     pub live_const_names: std::collections::HashSet<String>,
 }
 
@@ -67,12 +51,11 @@ fn struct_name_table(
         let naga::TypeInner::Struct { members, .. } = &ty.inner else {
             continue;
         };
-        // Dead structs get no declaration; naga-predeclared ones are not
-        // declarable WGSL.
-        if !generator.map_visible_structs.contains(&ty_h) {
+        // Dead structs get no declaration; naga-predeclared ones are not WGSL.
+        if !generator.map_visible_structs.contains(ty_h) {
             continue;
         }
-        let Some(emitted) = generator.type_names.get(&ty_h) else {
+        let Some(emitted) = generator.type_names.get(ty_h) else {
             continue;
         };
         let mut member_map = std::collections::BTreeMap::new();
@@ -104,9 +87,7 @@ type GeneratedWgsl = (
     std::collections::HashSet<String>,
 );
 
-/// Internal entry point shared by [`generate`] and the test harness.
-/// Holds the pattern that threads options through a fresh
-/// [`Generator`] and drains its output buffer.
+/// Entry point shared by [`generate`] and the test harness.
 fn generate_wgsl(
     module: &naga::Module,
     info: &naga::valid::ModuleInfo,
@@ -124,18 +105,14 @@ fn generate_wgsl(
     Ok((generator.into_output(), structs, live_const_names))
 }
 
-/// Emit minified WGSL for `module` using the custom generator.
-///
-/// Wraps the internal generator entry point with timing
-/// instrumentation and packages the result in [`Emission`].  Caller
-/// is [`crate::run`]; if this function errors, the pipeline silently
-/// falls back to naga's emitter except when a preamble is active.
+/// Emit minified WGSL for `module` with the custom generator.  On error the
+/// pipeline ([`crate::run`]) falls back to naga's emitter, except when a
+/// preamble is active.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Emit`] when the backing generator cannot render
-/// a construct (for example an unsupported `ImageClass` or naga IR
-/// that survived validation but fails emission).
+/// [`Error::Emit`] when a construct cannot be rendered (an unsupported
+/// `ImageClass`, or IR that validates but fails emission).
 pub fn generate(
     module: &naga::Module,
     info: &naga::valid::ModuleInfo,

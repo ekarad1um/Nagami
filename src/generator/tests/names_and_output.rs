@@ -1,10 +1,8 @@
-//! Tests for the generator's identifier-allocation logic and
-//! mode-specific output formatting.  Covers short expression-binding
-//! names, mangling (with and without preserved symbols), shared
-//! literal extraction, deferred-variable emission, struct layout
-//! attributes, workgroup-size trimming, override `@id` annotations,
-//! the `float_precision` round-trip, beautify combined with mangling,
-//! and a handful of parenthesisation edge cases.
+//! Identifier allocation and mode-specific output: short binding names,
+//! mangling with preserved symbols, shared literal extraction, deferred
+//! variables, struct layout attributes, workgroup-size trimming, override
+//! `@id`, float precision, beautify with mangling, and parenthesisation
+//! edge cases.
 
 use super::super::{GenerateOptions, generate_wgsl};
 use super::helpers::*;
@@ -13,8 +11,7 @@ use super::helpers::*;
 
 #[test]
 fn expr_names_avoid_collision_with_args() {
-    // If a function argument is named "A" (the first mangle name),
-    // expression bindings should skip "A" and use the next available name.
+    // "A" is the first mangle name.
     let src = r#"
             fn f(A: f32) -> f32 {
                 let x = A + 1.0;
@@ -29,7 +26,6 @@ fn expr_names_avoid_collision_with_args() {
 
 #[test]
 fn expr_names_are_short() {
-    // Multi-use expressions should get 1-char names, not _eN patterns.
     let src = r#"
             fn f(x: f32, y: f32) -> f32 {
                 let a = x * y + 1.0;
@@ -48,10 +44,6 @@ fn expr_names_are_short() {
 
 #[test]
 fn expr_names_do_not_shadow_globals() {
-    // The global variable is renamed to a short name (e.g. "A").
-    // Inside the function, multi-use expressions get let-bindings
-    // via next_expr_name().  Those names must skip any module-scope
-    // name to avoid shadowing in the emitted WGSL text.
     let src = r#"
             @group(0) @binding(0) var tex: texture_2d<f32>;
             @group(0) @binding(1) var samp: sampler;
@@ -66,7 +58,6 @@ fn expr_names_do_not_shadow_globals() {
             }
         "#;
     let out = compact(src);
-    // The output must re-parse and re-validate successfully.
     assert_valid_wgsl(&out);
 }
 
@@ -101,7 +92,6 @@ fn mangle_renames_struct_types_and_members() {
         !out.contains("anotherField"),
         "struct field name should be mangled: {out}"
     );
-    // Round-trip validation
     assert_valid_wgsl(&out);
 }
 
@@ -130,7 +120,6 @@ fn mangle_produces_shorter_output() {
 
 #[test]
 fn mangle_round_trip_complex_shader() {
-    // Comprehensive mangle mode round-trip test.
     let src = r#"
             struct Material {
                 color: vec3<f32>,
@@ -150,7 +139,6 @@ fn mangle_round_trip_complex_shader() {
             }
         "#;
     let out = compact_mangled(src);
-    // Must not contain original long names.
     assert!(
         !out.contains("Material"),
         "Material should be mangled: {out}"
@@ -184,7 +172,6 @@ fn mangle_preserves_struct_type_name() {
         out.contains("Uniforms"),
         "preserved struct type name should survive mangling: {out}"
     );
-    // Members should still be mangled since they're not in the preserve list.
     assert!(
         !out.contains("resolution"),
         "non-preserved member should be mangled: {out}"
@@ -216,12 +203,10 @@ fn mangle_preserves_struct_member_name() {
         out.contains("resolution"),
         "preserved member name should survive mangling: {out}"
     );
-    // Struct type name should still be mangled.
     assert!(
         !out.contains("Uniforms"),
         "non-preserved struct type should be mangled: {out}"
     );
-    // Other member should still be mangled.
     assert!(
         !out.contains("time"),
         "non-preserved member should be mangled: {out}"
@@ -261,7 +246,6 @@ fn mangle_preserves_both_type_and_member() {
 
 #[test]
 fn mangle_no_preserve_still_mangles_everything() {
-    // Verify the default (empty preserve) still mangles all struct names.
     let out = compact_mangled_preserved(
         r#"
             struct Params { scale: f32, offset: f32 }
@@ -290,13 +274,9 @@ fn mangle_no_preserve_still_mangles_everything() {
 
 #[test]
 fn mangle_preserve_short_type_no_collision_with_next_struct() {
-    // Regression: preserved struct type name "A" must not collide with the
-    // mangled name assigned to another struct.  The preserved "A" must be in
-    // the generator's `used_names`, else the counter can generate "A" for
-    // struct B -> duplicate struct definitions -> invalid WGSL.
-    //
-    // Struct B is declared BEFORE struct A so that the counter reaches "A"
-    // first, then the preserved "A" duplicates it.
+    // A preserved "A" must sit in `used_names` or the counter hands "A" to
+    // struct B as well; B is declared first so the counter reaches "A" before
+    // the preserved one.
     let out = compact_mangled_preserved(
         r#"
             struct B { y: f32 }
@@ -313,7 +293,6 @@ fn mangle_preserve_short_type_no_collision_with_next_struct() {
         out.contains("struct A"),
         "preserved struct A must survive: {out}"
     );
-    // The mangled name for struct B must NOT be "A".
     let struct_a_count = out.matches("struct A").count();
     assert_eq!(
         struct_a_count, 1,
@@ -324,8 +303,6 @@ fn mangle_preserve_short_type_no_collision_with_next_struct() {
 
 #[test]
 fn mangle_preserve_short_member_no_collision_within_struct() {
-    // Regression: preserved member name "A" must not collide with mangled
-    // names of other members in the same struct.
     let out = compact_mangled_preserved(
         r#"
             struct S { A: f32, other: f32 }
@@ -345,9 +322,8 @@ fn mangle_preserve_short_member_no_collision_within_struct() {
 
 #[test]
 fn mangle_struct_names_avoid_collision_with_short_param_names() {
-    // When function parameters already have short names (e.g. after the
-    // rename pass), the generator's struct mangle counter must skip those
-    // names to avoid shadowing the struct type inside the function body.
+    // Parameters may already carry short names (rename pass); the struct
+    // counter must skip them.
     let out = compact_mangled(
         r#"
             struct S { val: f32 }
@@ -362,7 +338,6 @@ fn mangle_struct_names_avoid_collision_with_short_param_names() {
             }
         "#,
     );
-    // The struct must not be named "A" since the parameter is already "A".
     assert_valid_wgsl(&out);
 }
 
@@ -370,7 +345,6 @@ fn mangle_struct_names_avoid_collision_with_short_param_names() {
 
 #[test]
 fn extracts_repeated_long_literal_into_const() {
-    // Use a long literal (3.333333 = 8 chars) across multiple functions.
     let src = r#"
             fn a() -> f32 { return 3.333333; }
             fn b() -> f32 { return 3.333333; }
@@ -402,12 +376,9 @@ fn no_extraction_for_short_or_rare_literal() {
 
 #[test]
 fn extracts_typed_only_f64_literal_at_lower_break_even() {
-    // A needs-typed literal (F64) used only in standalone (typed) positions
-    // emits the longer `123.456lf` form (9 chars), so its per-use cost is priced
-    // there.  Three such uses break even (3*(9-1) - (8+1+9) = 6 > 0) and extract;
-    // pricing them at the bare length (3*(7-1) - 18 = 0) would miss it.  Each
-    // `return` is a standalone (non-constructor) position, so `has_bare` is false
-    // and the typed price applies.
+    // Standalone (non-constructor) uses emit the typed `123.456lf` (9 chars),
+    // so three uses break even (3*(9-1) - (8+1+9) = 6 > 0); priced at the bare
+    // length (3*(7-1) - 18 = 0) the extraction would be missed.
     let src = r#"
             fn a() -> f64 { return 123.456lf; }
             fn b() -> f64 { return 123.456lf; }
@@ -428,12 +399,10 @@ fn extracts_typed_only_f64_literal_at_lower_break_even() {
 
 #[test]
 fn does_not_over_extract_bare_heavy_needs_typed_literal() {
-    // Regression guard: an F64 literal used only BARE inside
-    // constructors emits the short `1.5` (3 chars), so pricing it at the typed
-    // `1.5lf` length (the UNSAFE naive fix) would over-extract and GROW the
-    // output.  With any bare use present the model keeps the bare price, so
-    // this stays inline (5*(3-1) - (8+1+5) = -4 <= 0).  Distinct second
-    // components keep the constructors from being treated as one value.
+    // Bare constructor uses emit the short `1.5`; pricing them at the typed
+    // `1.5lf` length would over-extract and grow the output.  With any bare
+    // use the bare price holds: 5*(3-1) - (8+1+5) = -4 <= 0.  Distinct second
+    // components keep the constructors from being one value.
     let src = r#"
             fn a() -> vec2<f64> { return vec2<f64>(1.5lf, 2lf); }
             fn b() -> vec2<f64> { return vec2<f64>(1.5lf, 3lf); }
@@ -547,25 +516,15 @@ fn literal_extraction_no_collision_with_mangled_names() {
 
 // MARK: count_literals adjustment regressions
 
-// These tests pin the three emission-bypass paths in
-// `src/generator/literal_extract.rs::count_literals`:
-//   (a) splat-collapse for vector `Compose` (only `components[0]` is emitted)
-//   (b) `Select` / `Derivative` direct-`Literal`-operand type-pin
-//   (c) integer-literal atomic operand type-pin
-//
-// In each case `ref_counts[h]` overstates the textual emission count, and
-// `count_literals` must compensate.  If the adjustment drifts out of sync
-// with the corresponding emission code in `expr_emit.rs` / `stmt_emit.rs`,
-// the literal would be wrongly extracted into a `const` that is never
-// referenced (because the bypass path emits the typed-suffix form
-// directly), bloating output.
+// Emission-bypass paths where `ref_counts` overstates the textual emission
+// count `count_literals` must price: splat-collapsed vector `Compose` (only
+// `components[0]` is emitted), `Select`/`Derivative` direct-literal type-pins,
+// and integer-literal atomic operands.  An uncorrected count extracts a
+// `const` the typed-form emission never references.
 
 #[test]
 fn count_literals_does_not_extract_splat_only_literal() {
-    // Two splat-collapsable vec3f composes share the same long literal.
-    // Naive ref counting would see 6 references (3 per Compose) and
-    // greenlight extraction.  Splat-collapse adjustment must drop this
-    // to 2 textual emissions so no `const` is created.
+    // Naive counting sees 6 refs (3 per Compose); only 2 splats are emitted.
     let src = r#"
             fn h(p: vec3f) -> vec3f {
                 return p + vec3f(1.234567, 1.234567, 1.234567);
@@ -579,8 +538,6 @@ fn count_literals_does_not_extract_splat_only_literal() {
             }
         "#;
     let out = compact(src);
-    // Literal must remain present (twice, once per splat).  No `const`
-    // declaration should have been emitted for it.
     assert!(
         out.contains("1.234567"),
         "literal should still appear in output: {out}"
@@ -594,12 +551,9 @@ fn count_literals_does_not_extract_splat_only_literal() {
 
 #[test]
 fn count_literals_does_not_over_extract_deferred_var_store_literal() {
-    // A deferred local's FIRST store emits `var acc = 3.333333f` in typed
-    // form, bypassing `extracted_literals`.  Naive counting sees 3 uses of
-    // `3.333333` (the deferred store + two extraction-aware storage writes)
-    // and extracts a `const`; but only 2 uses actually shrink, which is below
-    // break-even, so extraction yields a NET-LARGER output.  The deferred-store
-    // typed-form adjustment must drop the count to 2 so no const is created.
+    // The deferred first store emits `var acc = 3.333333f` in typed form;
+    // discounting it leaves 2 shrinking uses, below break-even, so extraction
+    // would grow the output.
     let src = r#"
             @group(0) @binding(0) var<storage, read_write> buf: array<f32, 4>;
             @compute @workgroup_size(1)
@@ -626,11 +580,8 @@ fn count_literals_does_not_over_extract_deferred_var_store_literal() {
 
 #[test]
 fn count_literals_does_not_extract_select_literal_operand() {
-    // Direct `Literal` operands of `Select` are emitted in typed-suffix
-    // form regardless of `extracted_literals`.  Without the Select
-    // type-pin adjustment, three uses would count as 3 textual emissions
-    // and trigger extraction; with it, zero emissions count and no const
-    // is created.
+    // `Select`'s direct literal operands emit typed regardless of
+    // `extracted_literals`.
     let src = r#"
             fn p(c: bool) -> f32 { return select(0.1234567f, 0.7654321f, c); }
             fn q(c: bool) -> f32 { return select(0.1234567f, 0.7654321f, c); }
@@ -639,8 +590,6 @@ fn count_literals_does_not_extract_select_literal_operand() {
             fn main() { _ = p(true) + q(false) + r(true); }
         "#;
     let out = compact(src);
-    // Literal still appears (once per select call site).  No `const`
-    // declaration should have been generated for the bare-form key.
     assert!(
         out.contains(".1234567"),
         "literal should still appear in output: {out}"
@@ -654,10 +603,8 @@ fn count_literals_does_not_extract_select_literal_operand() {
 
 #[test]
 fn count_literals_does_not_extract_atomic_int_literal() {
-    // Integer literal operands of atomic statements are type-pinned to
-    // the atomic's scalar type by `emit_expr_for_atomic`, bypassing
-    // `extracted_literals`.  The integer-literal-only adjustment must
-    // suppress extraction here.
+    // `emit_expr_for_atomic` type-pins integer operands, bypassing
+    // `extracted_literals`.
     let src = r#"
             @group(0) @binding(0) var<storage, read_write> ai: atomic<i32>;
             fn t1() { atomicAdd(&ai, 12345678); }
@@ -680,10 +627,7 @@ fn count_literals_does_not_extract_atomic_int_literal() {
 
 #[test]
 fn count_literals_does_not_extract_atomic_store_int_literal() {
-    // `atomicStore`'s integer value is type-pinned by `emit_atomic_store`,
-    // bypassing `extracted_literals` exactly like `atomicAdd`, so its
-    // over-count must also be subtracted - else a dead `const` is extracted
-    // that no (typed-form) use site references.
+    // `emit_atomic_store` type-pins its value like `atomicAdd`.
     let src = r#"
             @group(0) @binding(0) var<storage, read_write> au: atomic<u32>;
             fn t1() { atomicStore(&au, 12345678u); }
@@ -727,7 +671,6 @@ fn deferred_var_not_in_nested_block() {
 
 #[test]
 fn multiple_deferred_vars() {
-    // Two independent variables should both be deferred to first store.
     let out = compact(
         r#"
             fn f(a: f32) -> f32 {
@@ -996,11 +939,9 @@ fn precision_rounds_float() {
 
 #[test]
 fn significant_figures_round_trips_f16_near_max() {
-    // Regression: f16 emits through f32 widening, and SignificantFigures
-    // of a near-max value (65504 -> 70000) produced an out-of-range token
-    // (`70000h`) that naga rejects.  Exercised through `generate_wgsl`
-    // directly (no `run()` validation-fallback to mask it), the output
-    // must re-parse as valid WGSL.
+    // f16 emits through f32 widening, so rounding 65504 up (-> 70000) can
+    // produce an out-of-range `70000h`; driven through `generate_wgsl` so no
+    // `run()` fallback masks it.
     let src = r#"
         enable f16;
         @compute @workgroup_size(1)
@@ -1024,9 +965,8 @@ fn significant_figures_round_trips_f16_near_max() {
 
 #[test]
 fn significant_figures_round_trips_near_type_max() {
-    // Companion to the f16 case: f32/f64 literals at their type maximum
-    // must not round UP across the leading decade into `inf` under
-    // SignificantFigures, which would emit `inff` / `inflf`.
+    // A literal at the type maximum must not round up across the leading
+    // decade into `inff`/`inflf`.
     let src = r#"
         @compute @workgroup_size(1)
         fn main() {
@@ -1063,11 +1003,9 @@ fn precision_preserves_integers() {
 
 #[test]
 fn typed_f64_and_f16_short_suffix_forms_round_trip() {
-    // The F64/F16 typed arms now emit hex-float (`0x1p50lf`) and
-    // scientific (`1e15lf`, `1e4h`) literals where shorter.  Drive those
-    // exact forms through the full generator and re-parse to guarantee
-    // naga still accepts them (a future naga grammar change would trip
-    // this rather than silently shipping invalid output).
+    // The hex-float (`0x1p50lf`) and scientific (`1e15lf`, `1e4h`) typed forms
+    // are re-parsed so a naga grammar change trips here rather than shipping
+    // invalid output.
     let src = r#"
         enable f16;
         @compute @workgroup_size(1)
@@ -1153,7 +1091,6 @@ fn different_literal_types_not_conflated() {
 
 #[test]
 fn postfix_access_on_binary_base_is_parenthesized() {
-    // AccessIndex on a Binary base must emit `(a-b).x`, not `a-b.x`.
     let src = r#"
             fn f(a: vec2f, b: vec2f) -> f32 {
                 return (a - b).x + (a * b).y;
@@ -1169,8 +1106,7 @@ fn postfix_access_on_binary_base_is_parenthesized() {
 
 #[test]
 fn less_than_comparison_in_vec_bool_constructor() {
-    // Bare `<` inside vec3<bool>() is ambiguous with WGSL template syntax;
-    // the generator must parenthesize it.
+    // A bare `<` inside `vec3<bool>(...)` is ambiguous with template syntax.
     let src = r#"
             fn f(p: vec2f, a: vec2f, b: vec2f) -> f32 {
                 let c = vec3<bool>(p.y >= a.y, (p.y < b.y), (a.x > b.x));
@@ -1184,13 +1120,10 @@ fn less_than_comparison_in_vec_bool_constructor() {
     assert_valid_wgsl(&out);
 }
 
-/// A bare `<` comparison as a NON-FINAL call / `select` argument pairs with
-/// a later argument's top-level `>` in WGSL's template-list scanner
-/// (`f(a<b,c>d)` scans as the template `a<b,c>` applied to `d`); the
-/// emitter must parenthesise it.  Before the guard, the self-check caught
-/// the broken text and shipped the INPUT verbatim - total minification
-/// loss - which the newline assertion detects (real minified output is one
-/// line).
+/// A bare `<` in a non-final argument pairs with a later argument's `>` in
+/// the template-list scanner (`f(a<b,c>d)` is the template `a<b,c>` applied
+/// to `d`).  A self-check failure ships the input verbatim, which the newline
+/// assertion detects.
 #[test]
 fn less_than_call_and_select_arguments_get_template_guard_parens() {
     let src = r#"
@@ -1220,12 +1153,10 @@ fn less_than_call_and_select_arguments_get_template_guard_parens() {
     );
 }
 
-/// `!` over a comparison must NOT flip in VALUE contexts: parenthesization
-/// and the template-list guards classify children by ARENA variant, so a
-/// `Unary` that rendered as a bare comparison would ship atom-tight into a
-/// comparison parent (`a<b==c` - tint rejects, naga's self-check accepts,
-/// the miscompile class EE-B-1 closed).  The flip is condition-only
-/// (if/break_if).
+/// Parenthesisation and template guards classify children by arena variant,
+/// so a `Unary` rendered as a bare comparison would ship atom-tight into a
+/// comparison parent (`a<b==c`: tint rejects, naga's self-check accepts).
+/// The flip is condition-only (if/break_if).
 #[test]
 fn value_context_negated_comparison_keeps_unary_shape() {
     let src = r#"
@@ -1239,18 +1170,15 @@ fn value_context_negated_comparison_keeps_unary_shape() {
         "#;
     let out = compact(src);
     assert_valid_wgsl(&out);
-    // A regressed flip renders r2's negation as a bare comparison,
-    // dropping its `!(`.
+    // A regressed flip renders r2's negation as a bare comparison.
     assert!(
         out.matches("!(").count() >= 2,
         "value-context negations must keep the prefix form: {out}"
     );
 }
 
-/// A root-level `>>` right operand under a bare `<` parent closes the
-/// template candidate the `<` opened (`a<b>>c` scans as `a<b>` plus `>c`);
-/// precedence alone leaves the tighter-binding shift bare, so the emitter
-/// needs the dedicated wrap.
+/// `a<b>>c` scans as the template `a<b>` plus `>c`; precedence alone leaves
+/// the tighter-binding shift bare, so the emitter needs a dedicated wrap.
 #[test]
 fn shift_right_under_less_gets_template_guard_parens() {
     let src = r#"

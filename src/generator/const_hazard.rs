@@ -15,16 +15,75 @@
 
 use super::core::FunctionCtx;
 
-/// Shapes whose text is a const-expression; everything else is runtime.
-fn is_const_shape(expr: &naga::Expression) -> bool {
-    matches!(
-        expr,
-        naga::Expression::Literal(_)
-            | naga::Expression::Constant(_)
-            | naga::Expression::Compose { .. }
-            | naga::Expression::Splat { .. }
-            | naga::Expression::ZeroValue(_)
-    )
+/// `Some` when `h` renders as one const-expression: literal / `const` leaves
+/// under `@const` operators and builtins, nothing bound to a name (a `let` is
+/// runtime in WGSL).  The payload is `true` when the tree is opaque: it holds a
+/// `bitcast` or `unpack*`, which neither naga's evaluator nor `const_fold`
+/// computes, so the caller can only bind on the operator's ability to fail.
+/// Any other constant tree the folder left alone (a matrix product, say) was
+/// evaluated by tint in the input too, so an unknown value there binds
+/// nothing; binding those as well cost 7 tint-corpus files 67 bytes for a
+/// hazard no shader writes (`var v = m * u; v * 1e38`), the accepted residual.
+/// `override` leaves are excluded: an override-expression fails at pipeline
+/// creation exactly as the input's own would.
+fn const_tree(
+    exprs: &naga::Arena<naga::Expression>,
+    bound: &dyn Fn(naga::Handle<naga::Expression>) -> bool,
+    h: naga::Handle<naga::Expression>,
+    depth: usize,
+) -> Option<bool> {
+    use naga::Expression as E;
+    use naga::MathFunction as M;
+    if depth > 16 || bound(h) {
+        return None;
+    }
+    let sub = |e: naga::Handle<naga::Expression>| const_tree(exprs, bound, e, depth + 1);
+    let all = |es: &[naga::Handle<naga::Expression>]| {
+        es.iter().try_fold(false, |acc, &e| Some(acc | sub(e)?))
+    };
+    match &exprs[h] {
+        E::Literal(_) | E::Constant(_) | E::ZeroValue(_) => Some(false),
+        E::Compose { components, .. } => all(components),
+        E::Splat { value, .. } | E::Swizzle { vector: value, .. } => sub(*value),
+        E::AccessIndex { base, .. } | E::Unary { expr: base, .. } => sub(*base),
+        E::As { expr, convert, .. } => Some(sub(*expr)? | convert.is_none()),
+        E::Relational { argument, .. } => sub(*argument),
+        E::Access { base, index }
+        | E::Binary {
+            left: base,
+            right: index,
+            ..
+        } => all(&[*base, *index]),
+        E::Select {
+            condition,
+            accept,
+            reject,
+        } => all(&[*condition, *accept, *reject]),
+        E::Math {
+            fun,
+            arg,
+            arg1,
+            arg2,
+            arg3,
+        } => {
+            let args: Vec<_> = [Some(*arg), *arg1, *arg2, *arg3]
+                .into_iter()
+                .flatten()
+                .collect();
+            let opaque = matches!(
+                fun,
+                M::Unpack4x8snorm
+                    | M::Unpack4x8unorm
+                    | M::Unpack2x16snorm
+                    | M::Unpack2x16unorm
+                    | M::Unpack2x16float
+                    | M::Unpack4xI8
+                    | M::Unpack4xU8
+            );
+            Some(all(&args)? | opaque)
+        }
+        _ => None,
+    }
 }
 
 /// Scalar lanes of a constant tree; `None` once anything is runtime, a
@@ -35,13 +94,7 @@ pub(super) fn const_lanes(
     ctx: &FunctionCtx<'_, '_>,
     h: naga::Handle<naga::Expression>,
 ) -> Option<Vec<naga::Literal>> {
-    lanes_in(
-        module,
-        &ctx.func.expressions,
-        &|h| ctx.expr_names.contains_key(&h),
-        h,
-        0,
-    )
+    lanes_in(module, ctx.exprs, &|h| ctx.expr_names.contains_key(h), h, 0)
 }
 
 fn lanes_in(
@@ -169,7 +222,7 @@ fn result_float_width(
     ctx: &FunctionCtx<'_, '_>,
     h: naga::Handle<naga::Expression>,
 ) -> Option<u8> {
-    match ctx.info[h].ty.inner_with(&module.types).scalar()? {
+    match ctx.ty(h).inner_with(&module.types).scalar()? {
         naga::Scalar {
             kind: naga::ScalarKind::Float | naga::ScalarKind::AbstractFloat,
             width,
@@ -178,24 +231,99 @@ fn result_float_width(
     }
 }
 
-/// The constant operand whose inlined text makes `h` a const-expression
-/// tint rejects; the caller binds it before emitting `h`.
+/// `true` when `e` prints as `Type(<one operand>)`: a conversion or a splat,
+/// both of which Dawn's MSL writer renders as a type name applied to one
+/// argument.  A named expression prints as that name instead, ending the
+/// chain.
+fn msl_type_constructor(
+    exprs: &naga::Arena<naga::Expression>,
+    bound: &dyn Fn(naga::Handle<naga::Expression>) -> bool,
+    e: naga::Handle<naga::Expression>,
+) -> Option<naga::Handle<naga::Expression>> {
+    if bound(e) {
+        return None;
+    }
+    match exprs[e] {
+        naga::Expression::As {
+            expr,
+            convert: Some(_),
+            ..
+        }
+        | naga::Expression::Splat { value: expr, .. } => Some(expr),
+        _ => None,
+    }
+}
+
+/// The second constructor of a unary operator's `T1(T2(..(x)))` operand,
+/// which the caller binds so Dawn's MSL never prints `~(uint(int(v)))` or
+/// `-(float4(int4(v)))`: Metal's C++ front-end reads the innermost
+/// `T(identifier)` as a parameter declaration, making the parenthesized
+/// operand a function type and the operator that follows a cast (`& 3u`
+/// becomes an address-of).  Binding the second constructor leaves
+/// `T1(name)`, a single level, which no declarator can match.  Multi-operand
+/// constructors (`int2(v, v)`) are no parameter list and need nothing.
+pub(super) fn msl_cast_ambiguity_operand(
+    ctx: &FunctionCtx<'_, '_>,
+    h: naga::Handle<naga::Expression>,
+) -> Option<naga::Handle<naga::Expression>> {
+    msl_cast_ambiguity_operand_in(ctx.exprs, &|e| ctx.expr_names.contains_key(e), h)
+}
+
+/// [`msl_cast_ambiguity_operand`] over a bare arena.  The `for(...)` header
+/// renders before any name is bound, so it asks with `bound` always false.
+pub(super) fn msl_cast_ambiguity_operand_in(
+    exprs: &naga::Arena<naga::Expression>,
+    bound: &dyn Fn(naga::Handle<naga::Expression>) -> bool,
+    h: naga::Handle<naga::Expression>,
+) -> Option<naga::Handle<naga::Expression>> {
+    use naga::Expression as E;
+    let E::Unary { expr: outer, .. } = exprs[h] else {
+        return None;
+    };
+    let inner = msl_type_constructor(exprs, bound, outer)?;
+    let mut leaf = msl_type_constructor(exprs, bound, inner)?;
+    while let Some(next) = msl_type_constructor(exprs, bound, leaf) {
+        leaf = next;
+    }
+    let identifier = bound(leaf)
+        || match exprs[leaf] {
+            E::FunctionArgument(_) => true,
+            E::Load { pointer } => {
+                matches!(exprs[pointer], E::LocalVariable(_) | E::GlobalVariable(_))
+            }
+            _ => false,
+        };
+    identifier.then_some(inner)
+}
+
+/// The constant operand whose inlined text makes `h` a const-expression tint
+/// rejects; the caller binds it before emitting `h`.  An opaque tree binds
+/// whenever the operator can fail at all.
 pub(super) fn creation_error_operand(
     module: &naga::Module,
     ctx: &FunctionCtx<'_, '_>,
     h: naga::Handle<naga::Expression>,
 ) -> Option<naga::Handle<naga::Expression>> {
     use naga::Expression as E;
-    let exprs = &ctx.func.expressions;
+    let exprs = &ctx.exprs;
+    let bound = |e: naga::Handle<naga::Expression>| ctx.expr_names.contains_key(e);
+    let tree = |e: naga::Handle<naga::Expression>| const_tree(exprs, &bound, e, 0);
     let lanes = |e: naga::Handle<naga::Expression>| const_lanes(module, ctx, e);
     match &exprs[h] {
         E::As {
             expr,
             kind: naga::ScalarKind::Float,
             convert,
-        } if is_const_shape(&exprs[*expr]) => {
-            let src = lanes(*expr)?;
+        } if let Some(opaque) = tree(*expr) => {
             let width = result_float_width(module, ctx, h)?;
+            let Some(src) = lanes(*expr) else {
+                // Unknown bits may read as inf / NaN and an unknown float may
+                // overflow a narrower target; an integer overflows only f16
+                // (`f16(70000i)` is rejected, f32 spans every integer type).
+                let hazard = opaque
+                    && (convert.is_none() || width == 2 || scalar_is_float(module, ctx, *expr));
+                return hazard.then_some(*expr);
+            };
             let hazard = match convert {
                 None => bitcast_non_finite(&src, width),
                 Some(_) => {
@@ -206,11 +334,26 @@ pub(super) fn creation_error_operand(
             };
             hazard.then_some(*expr)
         }
-        E::Binary { op, left, right }
-            if is_const_shape(&exprs[*left]) && is_const_shape(&exprs[*right]) =>
-        {
-            let (l, r) = (lanes(*left)?, lanes(*right)?);
-            binary_hazard(*op, &l, &r, result_float_width(module, ctx, h)).then_some(*left)
+        E::Binary { op, left, right } if let (Some(lo), Some(ro)) = (tree(*left), tree(*right)) => {
+            let width = result_float_width(module, ctx, h);
+            // A value `const_lanes` cannot compute (an unmodeled builtin in
+            // the tree) binds like an opaque one for the integer operators:
+            // `-100i << (reverseBits(u32(-100i)) & 31u)` overflows at
+            // const-evaluation.  Float add / sub / mul keep the residual.
+            let hazard = match (lanes(*left), lanes(*right)) {
+                (Some(l), Some(r)) => binary_hazard(*op, &l, &r, width),
+                _ => {
+                    let integer_op = matches!(
+                        op,
+                        naga::BinaryOperator::Divide
+                            | naga::BinaryOperator::Modulo
+                            | naga::BinaryOperator::ShiftLeft
+                            | naga::BinaryOperator::ShiftRight
+                    );
+                    (lo || ro || integer_op) && binary_can_fail(*op, width)
+                }
+            };
+            hazard.then_some(*left)
         }
         E::Math {
             fun,
@@ -221,12 +364,12 @@ pub(super) fn creation_error_operand(
         } => {
             let width = result_float_width(module, ctx, h);
             let values = |e: Option<naga::Handle<naga::Expression>>| -> Option<Vec<f64>> {
-                let e = e.filter(|&e| is_const_shape(&exprs[e]))?;
+                let e = e.filter(|&e| tree(e).is_some())?;
                 lanes(e)?.into_iter().map(lane_f64).collect()
             };
-            // Argument rules first: they name the operand tint checks, and
-            // an all-constant call must bind that one
-            // (`extractBits(a,40,1)` stays rejected).
+            // Argument rules first: they name the operand tint checks, and an
+            // all-constant call must bind that one (`extractBits(a,40,1)` stays
+            // rejected).
             if let Some(operand) =
                 argument_rule_hazard(*fun, *arg, *arg1, *arg2, *arg3, width, &values)
             {
@@ -236,11 +379,33 @@ pub(super) fn creation_error_operand(
                 .into_iter()
                 .flatten()
                 .collect();
+            let opaque = args
+                .iter()
+                .try_fold(false, |acc, &a| Some(acc | tree(a)?))?;
             let all: Option<Vec<Vec<f64>>> = args.iter().map(|&a| values(Some(a))).collect();
-            math_hazard(*fun, &all?, width).then_some(*arg)
+            let hazard = match all {
+                Some(all) => math_hazard(*fun, &all, width),
+                None => opaque && math_can_fail(*fun),
+            };
+            hazard.then_some(*arg)
         }
         _ => None,
     }
+}
+
+/// `true` when `h` is a float scalar or vector (abstract included).
+fn scalar_is_float(
+    module: &naga::Module,
+    ctx: &FunctionCtx<'_, '_>,
+    h: naga::Handle<naga::Expression>,
+) -> bool {
+    matches!(
+        ctx.ty(h).inner_with(&module.types).scalar(),
+        Some(naga::Scalar {
+            kind: naga::ScalarKind::Float | naga::ScalarKind::AbstractFloat,
+            ..
+        })
+    )
 }
 
 /// tint's per-argument rules, enforced even with a runtime value operand:
@@ -334,6 +499,18 @@ fn moderate(lanes: &[naga::Literal], max: f64) -> bool {
         .all(|&l| lane_f64(l).is_none_or(|v| v.is_finite() && v.abs() <= bound))
 }
 
+/// Operators [`binary_hazard`] can ever reject, for an operand whose value
+/// is out of reach: division and shifts for any width, add / sub / mul only
+/// where a float result can leave the finite range.
+fn binary_can_fail(op: naga::BinaryOperator, width: Option<u8>) -> bool {
+    use naga::BinaryOperator as B;
+    match op {
+        B::Divide | B::Modulo | B::ShiftLeft | B::ShiftRight => true,
+        B::Add | B::Subtract | B::Multiply => width.is_some(),
+        _ => false,
+    }
+}
+
 /// Float results outside the finite range, integer division by zero or MIN
 /// / -1, shifts by the width or more, left shifts losing bits or the sign;
 /// wrapping add/sub/mul and comparisons never fail.
@@ -387,6 +564,46 @@ fn binary_hazard(
     })
 }
 
+/// Builtins with a [`math_hazard`] arm, for arguments whose value is out of
+/// reach; the two lists must move together.
+fn math_can_fail(fun: naga::MathFunction) -> bool {
+    use naga::MathFunction as M;
+    matches!(
+        fun,
+        M::Sqrt
+            | M::InverseSqrt
+            | M::Log
+            | M::Log2
+            | M::Acos
+            | M::Asin
+            | M::Acosh
+            | M::Atanh
+            | M::Exp
+            | M::Exp2
+            | M::Sinh
+            | M::Cosh
+            | M::Pow
+            | M::Atan2
+            | M::Normalize
+            | M::Refract
+            | M::Dot
+            | M::Cross
+            | M::Length
+            | M::Distance
+            | M::Fma
+            | M::Outer
+            | M::Reflect
+            | M::Degrees
+            | M::Radians
+            | M::Determinant
+            | M::Mix
+            | M::FaceForward
+            | M::QuantizeToF16
+            | M::Pack2x16float
+            | M::Unpack2x16float
+    )
+}
+
 /// Domain errors (`sqrt(-1)`, `log(0)`, `acos(2)`, `normalize(vec(0))`),
 /// result overflow, packing / quantizing range; functions absent here are
 /// total on finite input.
@@ -422,7 +639,9 @@ fn math_hazard(fun: naga::MathFunction, args: &[Vec<f64>], width: Option<u8>) ->
         | M::Reflect
         | M::Degrees
         | M::Radians
-        | M::Determinant => args.iter().any(|v| big(v)),
+        | M::Determinant
+        | M::Mix
+        | M::FaceForward => args.iter().any(|v| big(v)),
         M::QuantizeToF16 | M::Pack2x16float => {
             any(a(0), &|x| !x.is_finite() || x.abs() > float_max(Some(2)))
         }
@@ -560,5 +779,29 @@ mod tests {
             &[L::F32(4.0)],
             Some(2)
         ));
+    }
+
+    #[test]
+    fn interpolation_builtins_can_overflow() {
+        use naga::MathFunction as M;
+        // tint rejects `mix(3e38, -3e38, 2.0)` and a `faceForward` whose dot
+        // product leaves the f32 range; moderate operands stay inline.
+        assert!(math_hazard(
+            M::Mix,
+            &[vec![3e38], vec![-3e38], vec![2.0]],
+            Some(4)
+        ));
+        assert!(!math_hazard(
+            M::Mix,
+            &[vec![1.0], vec![2.0], vec![0.5]],
+            Some(4)
+        ));
+        assert!(math_hazard(
+            M::FaceForward,
+            &[vec![1e38, 1e38], vec![1e38, 1e38], vec![1e38, 1e38]],
+            Some(4)
+        ));
+        assert!(math_can_fail(M::Mix) && math_can_fail(M::FaceForward));
+        assert!(!math_can_fail(M::Step) && !math_can_fail(M::SmoothStep));
     }
 }

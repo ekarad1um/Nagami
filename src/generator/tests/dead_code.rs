@@ -1,8 +1,6 @@
-//! Tests covering the generator's dead-declaration pruning for
-//! constants, structs, and globals.  The assertions treat
-//! reachability (not textual absence) as the contract, which leaves
-//! room for naga's inliner to additionally drop references the
-//! generator would otherwise keep.
+//! Dead-declaration pruning for constants, structs, and globals.  naga's
+//! inliner may fold a live constant into a literal, so liveness assertions
+//! accept either spelling.
 
 use super::helpers::*;
 
@@ -10,9 +8,6 @@ use super::helpers::*;
 
 #[test]
 fn dead_constant_is_omitted() {
-    // DEAD is never referenced from any live code.
-    // naga may inline USED into the function body as a literal, making it
-    // dead too - that's fine; the key assertion is that DEAD is gone.
     let src = r#"
         const USED: array<f32, 2> = array<f32, 2>(1.0, 2.0);
         const DEAD: array<f32, 2> = array<f32, 2>(3.0, 4.0);
@@ -30,7 +25,6 @@ fn dead_constant_is_omitted() {
 
 #[test]
 fn multiple_dead_constants_all_omitted() {
-    // Several dead constants of various types - none should appear.
     let src = r#"
         const D1: f32 = 1.0;
         const D2: vec3f = vec3f(1.0, 2.0, 3.0);
@@ -43,7 +37,6 @@ fn multiple_dead_constants_all_omitted() {
     assert!(!out.contains("D1"), "dead D1 must be omitted: {out}");
     assert!(!out.contains("D2"), "dead D2 must be omitted: {out}");
     assert!(!out.contains("D3"), "dead D3 must be omitted: {out}");
-    // The output should only be the entry point.
     assert_valid_wgsl(&out);
 }
 
@@ -71,7 +64,7 @@ fn constant_from_global_var_init_is_live() {
 
 #[test]
 fn library_module_preserves_all_constants() {
-    // No entry points -> library module; all constants should survive.
+    // No entry points -> library module.
     let src = r#"
         const A: f32 = 1.0;
         const B: f32 = 2.0;

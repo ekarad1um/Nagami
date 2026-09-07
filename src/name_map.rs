@@ -24,7 +24,6 @@ impl NameLog {
     /// ANOTHER pair's new name (`x -> a` while `a -> b`), so originals
     /// resolve against the pre-batch state before any insert.
     pub fn record_batch(&mut self, renames: &[(String, String)]) {
-        // Identity pairs are no-ops.
         let renames: Vec<&(String, String)> =
             renames.iter().filter(|(old, new)| old != new).collect();
         let originals: Vec<String> = renames

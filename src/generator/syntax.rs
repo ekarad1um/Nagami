@@ -1,39 +1,28 @@
-//! Grammar-aware helpers shared across the generator.
-//!
-//! Holds two clusters of functionality that must stay in one place
-//! because every emit site consults them:
-//!
-//! * Literal formatting (shortest decimal / hex / scientific form that
-//!   still round-trips, plus per-type [`PrecisionMode`] rounding), and
-//!   the literal-extraction key [`super::literal_extract`] shares.
-//! * Type / attribute / enum-name rendering for WGSL type constructors,
-//!   including alias lookup, binding attributes
-//!   (`@location`/`@builtin`/`@interpolate`/`@invariant`/`@blend_src`/
-//!   `@per_primitive`) via `binding_attrs`, builtins, and math names.
-//!   (Struct-member `@align`/`@size` LAYOUT reconstruction is NOT here -
-//!   it lives in the struct emitter in `super::module_emit`; operator
-//!   precedence / parenthesisation lives in `super::expr_emit`.)
+//! Grammar-aware helpers every emit site consults: literal formatting (the
+//! shortest round-tripping decimal/hex/scientific form under the per-type
+//! [`PrecisionMode`] rounding) with the extraction key
+//! [`super::literal_extract`] shares, and type/attribute/enum-name rendering
+//! (alias lookup, `binding_attrs`, builtins, math names).  Struct-member
+//! `@align`/`@size` layout belongs to the struct emitter, operator precedence
+//! to `super::expr_emit`.
 
 use crate::config::{FloatPrecision, PrecisionMode};
 use crate::error::Error;
+use crate::handle_set::HandleMap;
 use naga::proc::TypeResolution;
-use rustc_hash::FxHashMap;
 
 // MARK: Literal formatting
 
-/// Key used to deduplicate extracted literals: the raw expression
-/// text plus the declaration text.  Identical expressions that render
-/// the same way share a single extracted `const`.
+/// Deduplication key for extracted literals: expression text plus
+/// declaration text, so literals that render alike share one `const`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct LiteralExtractKey {
     pub(super) expr_text: String,
     pub(super) decl_text: String,
 }
 
-/// Strip redundant zeros from a float literal token while preserving
-/// every syntactic cue the parser needs (suffix, sign, exponent,
-/// decimal point).  Shortens `-0.50f` to `-.5f` and similar without
-/// changing the parsed value.
+/// Strip redundant zeros from a float token (`-0.50f` -> `-.5f`) while
+/// keeping suffix, sign, exponent and decimal point.
 fn compact_float_literal_token(token: String) -> String {
     let s = token.as_str();
     let (core, suffix) = if let Some(stripped) = s.strip_suffix("lf") {
@@ -85,48 +74,33 @@ fn compact_float_literal_token(token: String) -> String {
     format!("{sign}{compact_mantissa}{exponent}{suffix}")
 }
 
-/// Round an `f64` to `sig_figs` significant figures.  `sig_figs` must be
-/// `>= 1` (callers map `0 -> 1`) and `v` must be finite and non-zero
-/// (callers short-circuit both).
+/// Round `v` (finite, non-zero) to `sig_figs >= 1` significant figures.
 ///
-/// In the *exact* range - `scale_exp` in `0..=22`, where `10^scale_exp` is
-/// representable - the value is scaled so the requested figures sit just
-/// left of the decimal point, rounded half-away-from-zero, then scaled back
-/// exactly.
+/// With `scale_exp` in `0..=22`, `10^scale_exp` is exact, so the value is
+/// scaled to put the requested figures left of the decimal point, rounded
+/// half-away-from-zero and scaled back cleanly.  Outside that window the
+/// power is inexact: both the scale and the scale-back leave binary noise
+/// that mis-rounds (`1.495e-308` at 2 figures lands near `1.0e-308`, not
+/// `1.5e-308`) and bloats the mantissa (`1.2300000000000007e300`), so the
+/// rounding goes through `{:.*e}` with `sig_figs - 1` mantissa digits, which
+/// `core::fmt` computes correctly (half-to-even, differing from half-away
+/// only on exact ties this extreme range never hits), parsed back to the
+/// nearest `f64`.
 ///
-/// Outside that window (`scale_exp < 0` or `> 22`) `10^scale_exp` is NOT
-/// representable, so BOTH the forward `v * scale` and any scale-back leave
-/// binary noise that mis-rounds the value (e.g. `1.495e-308` to 2 figs gave
-/// `~1.0e-308` instead of `1.5e-308`) and bloats the mantissa with noise
-/// digits (`1.23456e300` to 3 figs gave `1.2300000000000007e300` instead of
-/// `1.23e300`), defeating the size goal of this lossy mode.  There the
-/// rounding is done through a decimal string,
-/// which `core::fmt` computes correctly: `{:.*e}` with `sig_figs - 1`
-/// fractional mantissa digits yields exactly `sig_figs` significant figures
-/// (round-half-to-even, which only differs from half-away on exact ties that
-/// this extreme range never hits in practice).  The parse-back is the nearest
-/// `f64` to that rounded value.
-///
-/// The scale-back can overflow to infinity for magnitudes near `f64::MAX`;
-/// callers must treat a non-finite result as "leave the value unrounded" and
-/// fall back to the original.  A lossy round must also never collapse a
-/// nonzero value to exactly zero, so both paths fall back to `v` if they do.
+/// The scale-back can overflow near `f64::MAX`, so callers treat a
+/// non-finite result as "leave unrounded"; a lossy round must also never
+/// collapse a nonzero value to zero, so both paths fall back to `v` if they
+/// would.
 fn round_sig_figs_f64(v: f64, sig_figs: i32) -> f64 {
-    // Enforce the `>= 1` precondition in the function itself: `sig_figs - 1`
-    // is used as an unsigned fractional-digit count below, so a `0` (or
-    // negative) would underflow to an astronomically large width.  Callers
-    // already clamp, but this keeps the helper safe against a future one.
+    // `sig_figs - 1` becomes an unsigned digit count; `0` would underflow it
+    // to an enormous width.
     let sig_figs = sig_figs.max(1);
     let e = v.abs().log10().floor() as i32;
-    // Clamp to f64's representable power-of-ten range (not the tighter
-    // f32 range, even when the caller is an f32): the math runs in f64,
-    // and clamping at f32's exponent limit would strip significant
-    // digits from f32 subnormals and values near `f32::MIN_POSITIVE`.
+    // Clamp to f64's power-of-ten range even for an f32 caller: the math
+    // runs in f64, and an f32 clamp would strip digits from f32 subnormals.
     let scale_exp = ((sig_figs - 1) - e).clamp(-f64::MAX_10_EXP, f64::MAX_10_EXP);
 
     if !(0..=22).contains(&scale_exp) {
-        // Inexact-power range: round via a correctly-computed decimal string
-        // rather than the noise-prone multiply/divide by an inexact `10^k`.
         let rounded: f64 = format!("{:.*e}", (sig_figs - 1) as usize, v)
             .parse()
             .unwrap_or(v);
@@ -137,8 +111,6 @@ fn round_sig_figs_f64(v: f64, sig_figs: i32) -> f64 {
         };
     }
 
-    // Exact-power range: `10^scale_exp` is exact and `>= 1`, so the forward
-    // scale and the divide-back are both clean (half-away-from-zero).
     let scale = 10f64.powi(scale_exp);
     let mantissa = (v * scale).round();
     if mantissa == 0.0 {
@@ -147,18 +119,12 @@ fn round_sig_figs_f64(v: f64, sig_figs: i32) -> f64 {
     mantissa / scale
 }
 
-/// Round an `f32` according to a [`PrecisionMode`].  `Full` and
-/// non-finite inputs pass through unchanged.  Rounding runs in `f64` so
-/// the intermediate never overflows near `f32::MAX`; for
-/// `SignificantFigures` the final narrowing cast still can, so a finite
-/// input that rounds out of `f32` range falls back to the original -
-/// a lossy round must never manufacture an `inf`.
-///
-/// Call this **once** per literal arm and pass the rounded value to
-/// every candidate path (decimal, hex, scientific) so the alternatives
-/// fed to [`pick_shortest`] all describe the same numeric value -
-/// otherwise an alternative form might silently emit the precise
-/// original of a value the user asked to truncate.
+/// Round an `f32` per `mode`; `Full` and non-finite inputs pass through.
+/// Rounding runs in `f64`, but the final narrowing can still overflow, so a
+/// finite input that rounds out of `f32` range keeps its original value - a
+/// lossy round must never manufacture an `inf`.  Call once per literal arm
+/// and feed the rounded value to every candidate form, or an alternative
+/// could emit the precise original of a value the user asked to truncate.
 fn round_f32(v: f32, mode: PrecisionMode) -> f32 {
     if !v.is_finite() {
         return v;
@@ -166,11 +132,9 @@ fn round_f32(v: f32, mode: PrecisionMode) -> f32 {
     match mode {
         PrecisionMode::Full => v,
         PrecisionMode::DecimalPlaces(p) => {
-            // Cap at `f32::MAX_10_EXP` - past that there is no f32
-            // value with a fractional part of that precision left to
-            // round; the multiplication would only waste cycles.  The
-            // product cannot overflow f64 (`f32::MAX * 1e38 ~= 3.4e76`),
-            // so no finite-result guard is needed here.
+            // Past `f32::MAX_10_EXP` no f32 has a fractional part left to
+            // round; the product cannot overflow f64 (`f32::MAX * 1e38 ~=
+            // 3.4e76`), so no finite-result guard is needed.
             let exp = (p as i32).min(f32::MAX_10_EXP);
             let scale = 10f64.powi(exp);
             (((v as f64) * scale).round() / scale) as f32
@@ -179,26 +143,17 @@ fn round_f32(v: f32, mode: PrecisionMode) -> f32 {
             if v == 0.0 {
                 return v;
             }
-            // `0` sig figs is treated as `1` - zero would always round
-            // to zero, which is rarely what the user wants.
+            // `0` figures would always round to zero; treat as `1`.
             let rounded = round_sig_figs_f64(v as f64, s.max(1) as i32) as f32;
-            // The f64->f32 narrowing saturates to infinity when a value
-            // just below `f32::MAX` rounds up across its leading decade;
-            // keep the original rather than emit the invalid `inff`.
             if rounded.is_finite() { rounded } else { v }
         }
     }
 }
 
-/// `f64` sibling of [`round_f32`].  For `DecimalPlaces` the exponent is
-/// capped at `f64::MAX_10_EXP` (a no-op for the `u8` count, which never
-/// reaches it) and the `|v| >= f64::MAX / scale` short-circuit keeps the
-/// `v * scale` product from overflowing for huge magnitudes.
-///
-/// `SignificantFigures` shares [`round_sig_figs_f64`] with the f32 path;
-/// its scale-back can overflow to infinity near `f64::MAX`, so a
-/// non-finite result falls back to the original value - a lossy round
-/// must never emit an `inflf` / `inf` token.
+/// `f64` sibling of [`round_f32`]: the `|v| >= f64::MAX / scale` guard keeps
+/// `v * scale` from overflowing, and a `SignificantFigures` scale-back that
+/// overflowed near `f64::MAX` falls back to the original rather than an
+/// `inflf` / `inf` token.
 fn round_f64(v: f64, mode: PrecisionMode) -> f64 {
     if !v.is_finite() {
         return v;
@@ -223,59 +178,45 @@ fn round_f64(v: f64, mode: PrecisionMode) -> f64 {
     }
 }
 
-/// `f16` sibling of [`round_f32`].  The IR widens `f16` to `f32` for
-/// emission, so `v` arrives already widened and rounding runs in `f32`.
-/// A lossy round can push the magnitude past `f16::MAX` (e.g.
-/// `SignificantFigures(1)` of `65504` rounds to `70000`) - finite as
-/// `f32`, yet out of range for `f16`.  Emitting `70000h` would make naga
-/// reject the whole output, so the rounded value is kept only while it
-/// stays within `f16`'s finite range; otherwise the original (already
-/// in-range) value is returned.
+/// `f16` sibling of [`round_f32`], on the `f32`-widened value the IR carries.
+/// A lossy round can leave `f16`'s finite range (`SignificantFigures(1)` of
+/// `65504` is `70000`, finite as `f32`), and `70000h` makes naga reject the
+/// whole output, so an out-of-range result falls back to the original.
 fn round_f16(v: f32, mode: PrecisionMode) -> f32 {
-    // `f16::MAX`, the largest finite value the type holds.  Inlined as a
-    // literal so the emitter needs no direct `half` dependency.
+    // `f16::MAX`, inlined to avoid a `half` dependency.
     const F16_MAX: f32 = 65504.0;
     let rounded = round_f32(v, mode);
     if rounded.abs() <= F16_MAX { rounded } else { v }
 }
 
-/// Guarantee that a bare (unsuffixed) float literal cannot be
-/// mistaken for an integer.  Appends a trailing `.` when `s` contains
-/// no decimal point, exponent, or hex marker (`1` becomes `1.`).  Non
-/// numeric tokens such as `inf` or `NaN` pass through unchanged.
+/// Append `.` to a bare float token that would otherwise lex as an integer
+/// (`1` -> `1.`); tokens with a dot, exponent, hex marker or letters (`inf`,
+/// `NaN`) pass through.
 pub(super) fn ensure_bare_float(s: String) -> String {
     if s.contains('.') || s.contains('e') || s.contains('E') || s.contains('x') || s.contains('X') {
         return s;
     }
-    // Leave non-numeric representations (inf, NaN, and so on) alone.
     if s.bytes().any(|b| b.is_ascii_alphabetic()) {
         return s;
     }
     format!("{s}.")
 }
 
-/// `f64` formatter that defers to `Debug` rendering.  Used by the F64
-/// literal arms so whole-number values keep a trailing `.0` that survives
-/// [`compact_float_literal_token`] as `1.lf` - without it the `lf` suffix
-/// would attach to a bare integer (`1lf`), which the naga parser does
-/// not accept.  Callers are responsible for pre-rounding `v` via
-/// [`round_f64`] when a non-`Full` [`PrecisionMode`] is in play.
+/// `Debug` keeps a whole number's `.0`, which survives
+/// [`compact_float_literal_token`] as `1.lf`; naga rejects `1lf`.  `v` must
+/// already be rounded.
 fn fmt_f64_debug(v: f64) -> String {
     format!("{v:?}")
 }
 
-/// Return the shortest text form (decimal or lower-case hex) for an
-/// unsigned integer, appending `suffix` (for example `u`, `lu`, or
-/// empty) to both candidates before comparing lengths.
+/// Shorter of decimal and lower-case hex, `suffix` included in both.
 fn shortest_uint_repr(v: u64, suffix: &str) -> String {
     let dec = format!("{v}{suffix}");
     let hex = format!("0x{v:x}{suffix}");
     if hex.len() < dec.len() { hex } else { dec }
 }
 
-/// Signed-integer sibling of [`shortest_uint_repr`].  Non-negative
-/// values delegate directly; negative values compare
-/// `-{abs}{suffix}` against `-0x{abs:x}{suffix}`.
+/// Signed sibling of [`shortest_uint_repr`].
 fn shortest_int_repr(v: i64, suffix: &str) -> String {
     if v >= 0 {
         shortest_uint_repr(v as u64, suffix)
@@ -287,10 +228,8 @@ fn shortest_int_repr(v: i64, suffix: &str) -> String {
     }
 }
 
-/// Render a normal (non-zero, non-subnormal, finite) `f32` as
-/// `{sign}0x1[.{hex}]p{exp}{suffix}`.  Returns `None` for zero,
-/// subnormal, infinity, and NaN, which are handled by the decimal
-/// path.
+/// `{sign}0x1[.{hex}]p{exp}{suffix}` for a normal `f32`; `None` for zero,
+/// subnormal, infinity and NaN, which the decimal path handles.
 fn hex_float_f32(v: f32, suffix: &str) -> Option<String> {
     let bits = v.to_bits();
     let sign = if v.is_sign_negative() { "-" } else { "" };
@@ -310,11 +249,7 @@ fn hex_float_f32(v: f32, suffix: &str) -> Option<String> {
     })
 }
 
-/// Hex float representation for a normal f64 value.
-/// Returns `None` for zero, subnormal, infinity, and NaN.
-/// `f64` sibling of [`hex_float_f32`], using IEEE-754 double layout
-/// (11 exponent bits, 52 mantissa bits) with the same normal-only
-/// precondition.
+/// `f64` sibling of [`hex_float_f32`] (11 exponent bits, 52 mantissa bits).
 fn hex_float_f64(v: f64, suffix: &str) -> Option<String> {
     let bits = v.to_bits();
     let sign = if v.is_sign_negative() { "-" } else { "" };
@@ -334,50 +269,37 @@ fn hex_float_f64(v: f64, suffix: &str) -> Option<String> {
     })
 }
 
-/// Bit-exact hex form of `v` for the single f32 magnitude whose shortest decimal
-/// is out of range, `f32::MAX`; `None` for every other value, leaving the common
-/// path to pick the shortest decimal/hex/scientific form.
-///
-/// `f32::MAX`'s shortest decimal, `3.4028235e38`, sits a fraction of a ULP above
-/// the true maximum.  naga rounds it back and accepts it (so nagami's naga-based
-/// self-check passes), but tint/Dawn reject any literal whose *exact* magnitude
-/// exceeds the maximum - so the decimal form is a silent portability miscompile.
-/// `+/-f32::MAX` is the only offender: as the largest finite f32 its upper
-/// neighbour is infinity, so its rounding interval reaches past MAX, whereas
-/// every smaller value's shortest decimal stays in an interval bounded below MAX.
-/// `f16::MAX` (65504) and `f64::MAX` have shortest decimals at or below their
-/// maxima, so no sibling type needs this guard.  The hex form is always exact,
-/// and `f32::MAX` is normal so it always has one.
+/// Bit-exact hex for `+/-f32::MAX`, the one f32 whose shortest decimal
+/// (`3.4028235e38`) exceeds the true maximum: naga rounds it back and accepts
+/// it, so the self-check passes, but tint/Dawn reject a literal whose exact
+/// magnitude is out of range - a silent portability miscompile.  Only the
+/// largest finite value has a rounding interval reaching past the maximum
+/// (its upper neighbour is infinity); `f16::MAX` and `f64::MAX` have shortest
+/// decimals at or below their maxima and need no guard.  `None` for every
+/// other value.
 fn f32_overshoot_safe_hex(v: f32, suffix: &str) -> Option<String> {
     (v.abs() == f32::MAX)
         .then(|| hex_float_f32(v, suffix))
         .flatten()
 }
 
-/// `true` when a decimal / scientific f32 candidate `token` (carrying `suffix`,
-/// `"f"` or `""`) recovers `v` bit-for-bit through WGSL's concretization path:
-/// the lexer reads the literal as an AbstractFloat (f64), then converts to f32.
-///
-/// Rust's shortest-float formatting only guarantees a round-trip through the
-/// DIRECT `str -> f32` parse (which is naga's front-end path); tint/Dawn
-/// double-round through f64, and for a handful of bit patterns the two disagree
-/// by 1 ULP (e.g. `7.038531e-26` narrows to `0x15ae43fe` via f64 but the value
-/// is `0x15ae43fd`).  A token that fails this check would ship a different
-/// constant than intended, invisibly to the naga self-check (which parses direct
-/// to f32).
+/// `true` when a decimal/scientific candidate recovers `v` bit-for-bit
+/// through WGSL's concretization path (lexed as an AbstractFloat `f64`, then
+/// narrowed).  Rust's shortest formatting only guarantees the direct
+/// `str -> f32` parse (naga's path); tint/Dawn double-round through f64, and
+/// for some bit patterns the two differ by 1 ULP (`7.038531e-26` narrows to
+/// `0x15ae43fe` via f64, the value is `0x15ae43fd`), shipping a different
+/// constant invisibly to the naga self-check.
 fn f32_candidate_narrows_exactly(token: &str, suffix: &str, v: f32) -> bool {
     let numeric = token.strip_suffix(suffix).unwrap_or(token);
     numeric.parse::<f64>().map(|d| (d as f32).to_bits()) == Ok(v.to_bits())
 }
 
-/// Pick the shortest f32 token that recovers `v` through WGSL's f64
-/// concretization path.  `dec` (always present) and `sci` (optional) are the
-/// shortest decimal / scientific forms; `hex` (present for normals) is exact.
-/// A decimal / scientific candidate is adopted only when it narrows exactly;
-/// otherwise the exact hex form wins.  The final `dec` fallthrough is defensive:
-/// every finite f32 narrows exactly (normals via hex; every subnormal via its
-/// shortest decimal, verified exhaustively), so only a non-representable NaN
-/// could reach it - which valid WGSL const-eval never produces.
+/// Shortest f32 token that narrows exactly: a decimal/scientific candidate is
+/// adopted only when [`f32_candidate_narrows_exactly`], else the exact hex.
+/// The final `dec` fallthrough is defensive - every finite f32 narrows
+/// exactly (normals via hex, every subnormal via its shortest decimal,
+/// verified exhaustively), so only a NaN could reach it.
 fn f32_shortest_exact(
     v: f32,
     suffix: &str,
@@ -397,19 +319,13 @@ fn f32_shortest_exact(
     }
 }
 
-/// Scientific-notation candidate for a finite `f32` value, appending
-/// `suffix` (for example `f` or empty).  Returns `None` only for zero,
-/// infinity, and NaN - for zero the decimal `"0"` form always wins and
-/// `"0e0"` is just noise.  Unlike [`hex_float_f32`], subnormals ARE
-/// emitted here: subnormal scientific notation is valid WGSL and
-/// round-trips, whereas the leading-`1` hex form cannot represent them.
-///
-/// Rust's `{:e}` formatter picks the shortest mantissa that round-trips
-/// and emits the exponent without a `+` sign, matching WGSL grammar.
-/// Useful when neither decimal (long digit run for very large / small
-/// magnitudes) nor hex (mantissa bits show up at non-power-of-2 values)
-/// produces a short token: `1e20f` is 5 chars vs `100000000000000000000f`
-/// (22) or `0x1.5af1d8p66f` (14).
+/// `{v:e}{suffix}` for a finite non-zero `f32` (`0e0` never beats `0`).
+/// Subnormals are included, unlike [`hex_float_f32`]: their scientific form
+/// is valid WGSL and round-trips, while the leading-`1` hex form cannot
+/// represent them.  Rust's `{:e}` picks the shortest round-tripping mantissa
+/// and omits the exponent's `+`, matching WGSL grammar; it wins where decimal
+/// and hex are both long (`1e20f` vs `100000000000000000000f` or
+/// `0x1.5af1d8p66f`).
 fn scientific_float_f32(v: f32, suffix: &str) -> Option<String> {
     if !v.is_finite() || v == 0.0 {
         return None;
@@ -425,12 +341,8 @@ fn scientific_float_f64(v: f64, suffix: &str) -> Option<String> {
     Some(format!("{v:e}{suffix}"))
 }
 
-/// Choose the shortest of `decimal` and any opportunistic
-/// `alternatives` (typically hex and scientific forms returned by
-/// [`hex_float_f32`] / [`scientific_float_f32`] and their f64
-/// siblings).  `decimal` is always valid; each alternative is adopted
-/// only when strictly shorter than the current best so ties prefer
-/// the more familiar decimal token.
+/// Shortest of `decimal` and the present `alternatives`; an alternative
+/// wins only when strictly shorter, so ties keep the decimal.
 fn pick_shortest<I>(decimal: String, alternatives: I) -> String
 where
     I: IntoIterator<Item = Option<String>>,
@@ -444,17 +356,11 @@ where
     best
 }
 
-/// Decimal candidate for a *bare* (unsuffixed) float literal, given the
-/// `Display`-formatted token and whether the value is negative zero.
-///
-/// Whole-number bare floats intentionally collapse to bare integer
-/// tokens (`1.0 -> 1`) - safe because the enclosing constructor pins the
-/// type.  Negative zero is the one exception: `Display` renders it as
-/// `-0`, which re-parses as the *integer* `0`, silently dropping the sign
-/// bit (a real value change, observable through sign-sensitive ops such
-/// as `1.0 / x -> -inf` vs `+inf`).  Keep a trailing dot (`-0.`) so the
-/// negative zero survives the round-trip while every other whole number
-/// still collapses to its short bare-int form.
+/// Decimal candidate for a bare float from its `Display` token.  Whole
+/// numbers collapse to bare integers (`1.0` -> `1`) because the enclosing
+/// constructor pins the type; negative zero is the exception, since `-0`
+/// re-parses as the integer `0` and drops the sign bit (observable through
+/// `1.0 / x`), so it keeps a trailing dot (`-0.`).
 fn bare_float_decimal(token: String, is_negative_zero: bool) -> String {
     let compact = compact_float_literal_token(token);
     if is_negative_zero {
@@ -464,20 +370,15 @@ fn bare_float_decimal(token: String, is_negative_zero: bool) -> String {
     }
 }
 
-/// Emit a literal with a concrete type suffix (e.g. `1.5f`, `42i`, `3u`).
-///
-/// Safe to use wherever the literal must carry its own type: standalone
-/// expressions, `let` bindings, arithmetic operands.  Float literals are
-/// rounded per `precision`'s per-type [`PrecisionMode`] (`Full` preserves
-/// the original value).  Use [`literal_to_wgsl_bare`] when an enclosing
-/// constructor pins the type and the suffix would just bloat the output.
+/// A literal with its concrete type suffix (`1.5f`, `42i`, `3u`), safe
+/// wherever it must carry its own type; floats are rounded per `precision`.
+/// [`literal_to_wgsl_bare`] drops the suffix where an enclosing constructor
+/// pins the type.
 pub(super) fn literal_to_wgsl(literal: naga::Literal, precision: &FloatPrecision) -> String {
     match literal {
         naga::Literal::F16(v) => {
-            // F16 typed: decimal or scientific.  Naga accepts a scientific
-            // `h` literal (`1e4h`) but rejects a hex-float `h` literal
-            // (`0x1p10h`), so - unlike the bare path inside a `vec3h(...)`
-            // constructor - only the scientific alternative is offered.
+            // naga accepts a scientific `h` literal (`1e4h`) but rejects a
+            // hex-float one (`0x1p10h`).
             let v = round_f16(f32::from(v), precision.f16);
             let dec = compact_float_literal_token(format!("{v}h"));
             pick_shortest(dec, [scientific_float_f32(v, "h")])
@@ -496,18 +397,15 @@ pub(super) fn literal_to_wgsl(literal: naga::Literal, precision: &FloatPrecision
             })
         }
         naga::Literal::F64(v) => {
-            // F64 typed.  The decimal candidate uses Debug rendering so a
-            // whole number keeps its trailing `.0` (`1.lf` re-parses as a
-            // float, not the rejected bare-int `1lf`).  Naga also accepts
-            // hex-float and scientific `lf` literals, so both are offered
-            // as shorter alternatives (e.g. `0x1p50lf`, `1e15lf`); neither
-            // can collapse to a bare int, so the float type is preserved.
+            // `Debug` keeps a whole number's `.0` (`1.lf` re-parses as a
+            // float, `1lf` is rejected); hex-float and scientific `lf`
+            // literals are accepted and cannot collapse to a bare int.
             let v = round_f64(v, precision.f64);
             let dec = compact_float_literal_token(format!("{}lf", fmt_f64_debug(v)));
             pick_shortest(dec, [hex_float_f64(v, "lf"), scientific_float_f64(v, "lf")])
         }
-        // WGSL has no bare int16 literal; both `f16`-adjacent 16-bit integer
-        // types are written via their constructor, matching naga's WGSL backend.
+        // WGSL has no 16-bit integer literal; the constructor form matches
+        // naga's WGSL backend.
         naga::Literal::U16(v) => format!("u16({v})"),
         naga::Literal::I16(v) => format!("i16({v})"),
         naga::Literal::U32(v) => shortest_uint_repr(v as u64, "u"),
@@ -547,39 +445,20 @@ pub(super) fn literal_to_wgsl(literal: naga::Literal, precision: &FloatPrecision
     }
 }
 
-/// Emit a literal without any type suffix (e.g. `1.5` instead of `1.5f`).
+/// A literal without its type suffix (`1.5`, `42`); floats are rounded per
+/// `precision`.
 ///
-/// **Invariant - callers must pin the type via enclosing context.**
-/// Whole-number concrete floats (`F32(1.0)`, `F64(2.0)`, `F16(3.0)`)
-/// collapse to bare integer tokens (`1`, `2`, `3`) because WGSL's
-/// `.0` stripping picks the shortest decimal, and the resulting token
-/// then parses as `AbstractInt` rather than the original float type.
-/// (The same holds for non-suffixed integer tokens: `I32(42) -> 42`
-/// parses as `AbstractInt`.)
-///
-/// Approved call sites - ordered by how strongly the enclosing context
-/// pins the type:
-///
-/// 1. Inside a concrete type constructor `T(...)`.  The constructor's
-///    signature determines every argument's type.  Covers `Compose` /
-///    `Splat` in [`super::expr_emit::Generator::emit_constructor_arg`]
-///    and the global-expression Compose/Splat arms in
-///    [`super::module_emit`].
-/// 2. As the RHS of an extracted `const NAME = ...;` declaration.  The
-///    const is abstract-typed (a bare form merges across concrete types),
-///    so it is valid only where each use pins a concrete type by coercion;
-///    a use that cannot (a scalar `bitcast` source) bypasses the const and
-///    emits the typed inline form instead.  This is [`literal_extract_key`]'s
-///    decl path.
-///
-/// All other sites must use [`literal_to_wgsl`] (typed form).  In
-/// particular: binary operands where either side is itself a literal,
-/// overload-resolution arguments (e.g. `atan2(1.0, x)`), and standalone
-/// `let` / `var` initializers must NOT receive a bare-form literal -
-/// an abstract-coercion surprise could flip overload resolution.
-///
-/// Float literals are rounded per `precision`'s per-type
-/// [`PrecisionMode`] (`Full` preserves the original value).
+/// Invariant: the caller's context must pin the type, because a bare token
+/// re-parses as an abstract literal and a whole-number float (`F32(1.0)`)
+/// collapses to a bare integer (`1`).  Two positions qualify: inside a
+/// concrete type constructor `T(...)`, whose signature types every argument,
+/// and the RHS of an extracted `const NAME = ...;`, which is abstract-typed
+/// and valid only where each use pins a concrete type by coercion (a use
+/// that cannot, such as a scalar `bitcast` source, bypasses the const for
+/// the typed inline form).  Every other position - binary operands where
+/// either side is a literal, overload-resolution arguments (`atan2(1.0, x)`),
+/// standalone `let`/`var` initialisers - takes [`literal_to_wgsl`], or an
+/// abstract-coercion surprise could flip overload resolution.
 pub(super) fn literal_to_wgsl_bare(literal: naga::Literal, precision: &FloatPrecision) -> String {
     match literal {
         naga::Literal::F16(v) => {
@@ -601,17 +480,12 @@ pub(super) fn literal_to_wgsl_bare(literal: naga::Literal, precision: &FloatPrec
             })
         }
         naga::Literal::F64(v) => {
-            // Mirror the F16/F32 siblings: `Display` collapses whole
-            // numbers to bare ints (`2.0 -> 2`), and `pick_shortest`
-            // recovers the short hex/scientific forms for large/small
-            // magnitudes that `Display` would otherwise expand in full.
             let v = round_f64(v, precision.f64);
             let dec = bare_float_decimal(format!("{v}"), v == 0.0 && v.is_sign_negative());
             pick_shortest(dec, [hex_float_f64(v, ""), scientific_float_f64(v, "")])
         }
-        // The constructor form is the only WGSL spelling for a 16-bit integer;
-        // it is unambiguous in a type-pinned position, so the bare path matches
-        // the typed one (mirrors naga's WGSL backend).
+        // The constructor form is the only 16-bit integer spelling; bare
+        // equals typed.
         naga::Literal::U16(v) => format!("u16({v})"),
         naga::Literal::I16(v) => format!("i16({v})"),
         naga::Literal::U32(v) => shortest_uint_repr(v as u64, ""),
@@ -648,38 +522,31 @@ pub(super) fn literal_to_wgsl_bare(literal: naga::Literal, precision: &FloatPrec
     }
 }
 
+/// Fixed overhead of one `<keyword> <name>=<body>;` module-scope declaration
+/// (`const` and `alias` are both 5 characters): compact `const N=D;` = 8,
+/// beautify `const N = D;\n` = 11.  Callers pass their actual output style;
+/// pricing compact under beautify accepts borderline extractions that
+/// net-cost two bytes per use.  Savings formulas themselves live with the
+/// decisions that make them.
+pub(super) fn decl_boilerplate(beautify: bool) -> usize {
+    if beautify { 11 } else { 8 }
+}
+
 // MARK: Type rendering
 
-/// Build the `(expr, decl)` [`LiteralExtractKey`] used by
-/// [`super::literal_extract`] to canonicalise repeated literals.
-///
-/// `expr_text` is the shortest valid form at ordinary use sites.
-/// `decl_text` is the valid form for `const NAME = ...;`.  For
-/// almost all literals the two strings are equal.  The only exception
-/// is U64 values that exceed the `AbstractInt` range (>= 2^63): those
-/// need the explicit `lu` suffix to stay well-typed in a const
-/// declaration.
-///
-/// `expr_text` uses the bare form per [`literal_to_wgsl_bare`]'s
-/// call-site invariant #2: extracted literals appear as
-/// `const NAME = <expr_text>;` and every use of `NAME` re-binds via
-/// normal abstract coercion.
+/// The `(expr, decl)` [`LiteralExtractKey`] for [`super::literal_extract`]:
+/// `expr_text` is the bare form (every use of an extracted `NAME` re-binds
+/// by abstract coercion), `decl_text` the RHS of `const NAME = ...;`.
 pub(super) fn literal_extract_key(
     literal: naga::Literal,
     precision: &FloatPrecision,
 ) -> LiteralExtractKey {
     let expr_text = literal_to_wgsl_bare(literal, precision);
-    // The decl_text appears as the RHS of `const NAME = <decl_text>;`.
-    // WGSL's abstract-type concretisation defaults `AbstractInt -> i32`
-    // and `AbstractFloat -> f32`; for literals whose original concrete
-    // type is one of those defaults (`I32`/`U32`/`F32`/`Bool`/abstract
-    // already), the bare form re-binds correctly at every use site.
-    // For literals whose abstract-default does NOT match the original
-    // type (`F16`/`F64`/`I64`/`U64`), force the typed form so the
-    // const carries the original type and abstract-coercion at use
-    // sites cannot down-cast (`AbstractFloat -> f32` in an f16 context
-    // is illegal; `AbstractInt -> i32` in an i64 context loses range).
-    // This mirrors the gate used in `expr_emit::literal_needs_typed_form_outside_constructor`.
+    // A bare decl is abstract and re-binds by the i32/f32 defaults, correct
+    // for `I32`/`U32`/`F32`/`Bool`; `F16`/`F64`/`I64`/`U64` keep the typed
+    // form so the const carries its type (an f32 default refuses an f16
+    // context, an i32 default loses i64 range).  Must agree with
+    // `literal_needs_typed_form_outside_constructor`.
     let decl_text = match literal {
         naga::Literal::U64(v) if v > i64::MAX as u64 => literal_to_wgsl(literal, precision),
         naga::Literal::F16(_)
@@ -694,9 +561,7 @@ pub(super) fn literal_extract_key(
     }
 }
 
-/// Map `(kind, width)` to its WGSL scalar type name (`f32`, `i32`,
-/// `u32`, `bool`, `f16`, `f64`, `i64`, `u64`).  Returns [`Error::Emit`]
-/// when the combination is unsupported by WGSL.
+/// WGSL scalar type name; [`Error::Emit`] for a combination WGSL lacks.
 pub(super) fn scalar_name(kind: naga::ScalarKind, width: u8) -> Result<&'static str, Error> {
     Ok(match (kind, width) {
         (naga::ScalarKind::Bool, _) => "bool",
@@ -718,10 +583,8 @@ pub(super) fn scalar_name(kind: naga::ScalarKind, width: u8) -> Result<&'static 
     })
 }
 
-/// Return the single-character shorthand suffix (`f`, `i`, `u`, `h`) used
-/// to build the predeclared vector/matrix alias names (e.g. `vec3f`,
-/// `mat2x2f`).  Returns `None` for component types without a shorthand
-/// alias (bool, i64, u64, f64).
+/// Suffix of the predeclared `vec3f` / `mat2x2f` aliases; `None` for
+/// bool/i64/u64/f64, which have none.
 fn scalar_short_suffix(kind: naga::ScalarKind, width: u8) -> Option<&'static str> {
     match (kind, width) {
         (naga::ScalarKind::Float, 2) => Some("h"),
@@ -732,15 +595,8 @@ fn scalar_short_suffix(kind: naga::ScalarKind, width: u8) -> Option<&'static str
     }
 }
 
-/// Return the zero literal for the given scalar type (`0`, `0u`,
-/// `0.`, `0f`, `false`, and so on) so callers can splat concrete-typed
-/// zeros without re-deriving the suffix logic.
-///
-/// `AbstractInt`/`AbstractFloat` resolve to `0` / `0.0` respectively;
-/// in valid naga IR they should be concretised before reaching the
-/// emitter, but the explicit arms here keep round-trip behaviour
-/// well-defined (and prevent a future variant from silently falling
-/// through to a bare `0` that re-parses as `AbstractInt`).
+/// Typed zero literal (`0u`, `0f`, `false`).  The abstract kinds map to
+/// `0` / `0.0` so an unconcretised literal still round-trips as its kind.
 pub(super) fn scalar_zero(kind: naga::ScalarKind, width: u8) -> &'static str {
     match (kind, width) {
         (naga::ScalarKind::Bool, _) => "false",
@@ -753,26 +609,21 @@ pub(super) fn scalar_zero(kind: naga::ScalarKind, width: u8) -> &'static str {
         (naga::ScalarKind::Float, 8) => "0lf",
         (naga::ScalarKind::AbstractInt, _) => "0",
         (naga::ScalarKind::AbstractFloat, _) => "0.0",
-        // Unknown (kind, width) combinations should not occur in valid
-        // naga IR (the validator rejects non-canonical widths).  Fall
-        // back to bare `0` rather than panicking; any downstream parse
-        // failure surfaces through the round-trip validator.
+        // Non-canonical widths fail naga validation; a bare `0` surfaces
+        // through the round-trip validator rather than a panic.
         _ => "0",
     }
 }
 
-/// Convert a [`naga::VectorSize`] to its numeric component count.
 pub(super) fn vector_size_num(size: naga::VectorSize) -> u8 {
     size as u8
 }
 
-/// Render a [`TypeResolution`] to its WGSL type-name string.
-/// Resolves handles through the alias map so extracted aliases render
-/// by their short name.
+/// WGSL name of a [`TypeResolution`], aliases first.
 pub(super) fn type_resolution_name(
     resolution: &TypeResolution,
     module: &naga::Module,
-    struct_names: &FxHashMap<naga::Handle<naga::Type>, String>,
+    struct_names: &HandleMap<naga::Type, String>,
     override_names: &[String],
 ) -> Result<String, Error> {
     match resolution {
@@ -788,13 +639,12 @@ pub(super) fn type_resolution_name(
             )
         }
         TypeResolution::Value(inner) => {
-            // Multiple Type entries may share the same TypeInner when the
-            // source uses named aliases alongside bare types (UniqueArena
-            // deduplicates by the full Type including its name field).
-            // Scan for any handle whose inner matches AND has an alias.
+            // `UniqueArena` deduplicates by the full `Type` including its
+            // name, so several handles can share one `TypeInner`; any of
+            // them with an alias wins.
             if let Some(name) = module.types.iter().find_map(|(handle, ty)| {
                 (&ty.inner == inner)
-                    .then(|| struct_names.get(&handle).cloned())
+                    .then(|| struct_names.get(handle).cloned())
                     .flatten()
             }) {
                 return Ok(name);
@@ -804,14 +654,12 @@ pub(super) fn type_resolution_name(
     }
 }
 
-/// Render a [`naga::TypeInner`] to its WGSL type-name string.
-/// Handles scalars, vectors (choosing alias vs explicit form),
-/// matrices, arrays, pointers, atomics, images, samplers, and opaque
-/// resource types.  Aliases are substituted when available.
+/// WGSL name of a [`naga::TypeInner`], aliases substituted where a handle
+/// has one.
 pub(super) fn type_inner_name(
     inner: &naga::TypeInner,
     module: &naga::Module,
-    struct_names: &FxHashMap<naga::Handle<naga::Type>, String>,
+    struct_names: &HandleMap<naga::Type, String>,
     override_names: &[String],
 ) -> Result<String, Error> {
     Ok(match inner {
@@ -849,9 +697,10 @@ pub(super) fn type_inner_name(
         }
         naga::TypeInner::Pointer { base, space } => {
             format!(
-                "ptr<{},{}>",
+                "ptr<{},{}{}>",
                 address_space(*space),
-                type_ref_from_handle(*base, module, struct_names, override_names)?
+                type_ref_from_handle(*base, module, struct_names, override_names)?,
+                pointer_access_suffix(*space)
             )
         }
         naga::TypeInner::ValuePointer {
@@ -870,7 +719,12 @@ pub(super) fn type_inner_name(
                 },
                 None => scalar_name(scalar.kind, scalar.width)?.to_string(),
             };
-            format!("ptr<{},{}>", address_space(*space), value_ty)
+            format!(
+                "ptr<{},{}{}>",
+                address_space(*space),
+                value_ty,
+                pointer_access_suffix(*space)
+            )
         }
         naga::TypeInner::Array { base, size, .. } => {
             let base_ty = type_ref_from_handle(*base, module, struct_names, override_names)?;
@@ -909,10 +763,8 @@ pub(super) fn type_inner_name(
                 }
             }
         }
-        // Mirror naga's own WGSL writer: the `vertex_return` capability
-        // (getCommittedHitVertexPositions / candidate-hit vertex positions) is
-        // part of the type and must be rendered, or the emitted type silently
-        // re-parses as the non-vertex-return form (a capability loss).
+        // `vertex_return` is part of the type: dropped, it re-parses as the
+        // plain form and silently loses the vertex-position query capability.
         naga::TypeInner::AccelerationStructure { vertex_return } => {
             if *vertex_return {
                 "acceleration_structure<vertex_return>".to_string()
@@ -920,9 +772,7 @@ pub(super) fn type_inner_name(
                 "acceleration_structure".to_string()
             }
         }
-        // Same `vertex_return` contract as `acceleration_structure` above;
-        // dropping the flag on re-parse would silently lose the
-        // vertex-position query capability.
+        // Same `vertex_return` contract.
         naga::TypeInner::RayQuery { vertex_return } => {
             if *vertex_return {
                 "ray_query<vertex_return>".to_string()
@@ -936,15 +786,14 @@ pub(super) fn type_inner_name(
     })
 }
 
-/// Shortcut for rendering a type by handle, dereferencing through
-/// the type arena and honouring alias substitution.
+/// WGSL name of a type handle, alias first.
 pub(super) fn type_ref_from_handle(
     ty: naga::Handle<naga::Type>,
     module: &naga::Module,
-    struct_names: &FxHashMap<naga::Handle<naga::Type>, String>,
+    struct_names: &HandleMap<naga::Type, String>,
     override_names: &[String],
 ) -> Result<String, Error> {
-    if let Some(name) = struct_names.get(&ty) {
+    if let Some(name) = struct_names.get(ty) {
         return Ok(name.clone());
     }
     type_inner_name(
@@ -957,11 +806,9 @@ pub(super) fn type_ref_from_handle(
 
 // MARK: Attribute and qualifier rendering
 
-/// Map a [`naga::AddressSpace`] to its WGSL keyword.  `Function` returns
-/// `"function"` (not the empty string): the keyword is mandatory wherever a
-/// `ptr<function, T>` type is rendered.  (A `var<function>` *declaration*
-/// leaves the space implicit, but that path emits no qualifier via this
-/// helper.)
+/// WGSL keyword.  `Function` renders `function` because `ptr<function, T>`
+/// requires it; a `var<function>` declaration leaves the space implicit but
+/// does not use this helper.
 pub(super) fn address_space(space: naga::AddressSpace) -> &'static str {
     match space {
         naga::AddressSpace::Function => "function",
@@ -971,30 +818,33 @@ pub(super) fn address_space(space: naga::AddressSpace) -> &'static str {
         naga::AddressSpace::Storage { .. } => "storage",
         naga::AddressSpace::RayPayload => "ray_payload",
         naga::AddressSpace::IncomingRayPayload => "incoming_ray_payload",
-        // naga's WGSL front-end spells push-constant / immediate-data space
-        // `immediate` (it rejects `push_constant`); rendering it as `private`
-        // would silently swap the host-supplied data source for zero-init
-        // per-invocation memory - a miscompile.
+        // naga's WGSL frontend spells the push-constant space `immediate`
+        // (it rejects `push_constant`); `private` would silently swap host
+        // data for zero-init per-invocation memory.
         naga::AddressSpace::Immediate => "immediate",
-        // No surface-WGSL `var<...>` form: reaching this arm for a global var
-        // would silently emit `var<private>`.  Safe ONLY because `Handle` is
-        // intercepted upstream (emits a bare `var`) and a `TaskPayload` global
-        // fails naga validation before emission; the `private` text is an
-        // arbitrary placeholder for that unreachable case, not a semantic pick.
+        // No `var<...>` spelling exists.  `Handle` globals are intercepted
+        // upstream (bare `var`) and a `TaskPayload` global fails naga
+        // validation, so `private` is an unreachable placeholder, not a
+        // semantic pick.
         naga::AddressSpace::Handle | naga::AddressSpace::TaskPayload => "private",
     }
 }
 
-/// Map [`naga::StorageAccess`] flags to the WGSL access-mode keyword
-/// (`read`, `read_write`, `write`, `atomic`).
-///
-/// `atomic` is a WGSL access mode for atomic storage textures
-/// (`texture_storage_2d<r32uint, atomic>`).  Naga's IR sets the
-/// `ATOMIC` flag on those texture bindings and the frontend rejects
-/// any other access mode for a texture that participates in atomic
-/// ops - so the flag must take precedence here.  For non-texture
-/// storage (`var<storage, ...>`) `ATOMIC` is never set, so the
-/// branch is exclusive to texture bindings in practice.
+/// The `,mode` tail of a `ptr<storage,T,mode>` type.  A storage pointer
+/// defaults to `read`, so only a writable one spells its mode; every other
+/// space fixes the mode.
+fn pointer_access_suffix(space: naga::AddressSpace) -> String {
+    match space {
+        naga::AddressSpace::Storage { access } if storage_access(access) != "read" => {
+            format!(",{}", storage_access(access))
+        }
+        _ => String::new(),
+    }
+}
+
+/// WGSL access mode.  `ATOMIC` takes precedence: naga sets it on atomic
+/// storage textures (`texture_storage_2d<r32uint, atomic>`) and the frontend
+/// rejects any other mode there; `var<storage>` never carries it.
 pub(super) fn storage_access(access: naga::StorageAccess) -> &'static str {
     if access.contains(naga::StorageAccess::ATOMIC) {
         return "atomic";
@@ -1043,9 +893,8 @@ pub(super) fn binding_attrs(binding: &naga::Binding, compact: bool) -> Result<St
                 out.push_str(sep);
                 out.push_str("@per_primitive");
             }
-            // Elide @interpolate(perspective,center) - it is the WGSL
-            // default for float location bindings.  naga always stores
-            // the default explicitly, so we suppress it to save bytes.
+            // `@interpolate(perspective,center)` is the WGSL default, which
+            // naga stores explicitly.
             let non_default_interp =
                 interpolation.is_some_and(|i| i != naga::Interpolation::Perspective);
             let non_default_sampling = sampling.is_some_and(|s| s != naga::Sampling::Center);
@@ -1070,7 +919,6 @@ pub(super) fn binding_attrs(binding: &naga::Binding, compact: bool) -> Result<St
     Ok(out)
 }
 
-/// Map [`naga::Interpolation`] to its WGSL keyword.
 pub(super) fn interpolation_name(i: naga::Interpolation) -> &'static str {
     match i {
         naga::Interpolation::Perspective => "perspective",
@@ -1080,7 +928,6 @@ pub(super) fn interpolation_name(i: naga::Interpolation) -> &'static str {
     }
 }
 
-/// Map [`naga::Sampling`] to its WGSL keyword.
 pub(super) fn sampling_name(s: naga::Sampling) -> &'static str {
     match s {
         naga::Sampling::Center => "center",
@@ -1091,9 +938,8 @@ pub(super) fn sampling_name(s: naga::Sampling) -> &'static str {
     }
 }
 
-/// Map a [`naga::BuiltIn`] to its WGSL `@builtin(...)` keyword.  Infallible for
-/// WGSL-frontend input (every reachable variant maps); the `Result` mirrors the
-/// other rendering helpers so callers stay uniform.
+/// `@builtin(...)` keyword.  Infallible for WGSL-frontend input; the `Result`
+/// keeps callers uniform with the other renderers.
 pub(super) fn builtin_name(bi: naga::BuiltIn) -> Result<&'static str, Error> {
     Ok(match bi {
         naga::BuiltIn::PrimitiveIndex => "primitive_index",
@@ -1149,9 +995,7 @@ pub(super) fn builtin_name(bi: naga::BuiltIn) -> Result<&'static str, Error> {
     })
 }
 
-/// Render a [`naga::ImageClass`] to its WGSL `texture_*` type
-/// expression, including element type and storage format where
-/// applicable.  Returns [`Error::Emit`] for unsupported combinations.
+/// WGSL `texture_*` type; [`Error::Emit`] for a combination WGSL lacks.
 pub(super) fn image_type(
     dim: naga::ImageDimension,
     arrayed: bool,
@@ -1230,8 +1074,6 @@ pub(super) fn image_type(
     })
 }
 
-/// Map [`naga::StorageFormat`] to its WGSL texel-format keyword
-/// (`rgba8unorm`, `r32float`, and so on).
 pub(super) fn storage_format_name(format: naga::StorageFormat) -> &'static str {
     match format {
         naga::StorageFormat::R8Unorm => "r8unorm",
@@ -1278,9 +1120,7 @@ pub(super) fn storage_format_name(format: naga::StorageFormat) -> &'static str {
     }
 }
 
-/// Map every [`naga::MathFunction`] variant to its WGSL built-in
-/// function name.  Exhaustive by design so a future naga variant
-/// fails the build and forces an explicit mapping.
+/// WGSL builtin name; exhaustive so a new naga variant fails the build.
 pub(super) fn math_name(fun: naga::MathFunction) -> &'static str {
     use naga::MathFunction as M;
     match fun {
@@ -1377,19 +1217,14 @@ mod tests {
     };
     use half::f16;
 
-    /// All-types-Full precision; the baseline for tests that want the
-    /// emitter to preserve every digit of the input value.
     fn full() -> FloatPrecision {
         FloatPrecision::default()
     }
 
-    /// Apply `DecimalPlaces(n)` to every float kind.  Used by the
-    /// legacy "single u8" tests that pre-date per-type precision.
     fn dp(n: u8) -> FloatPrecision {
         FloatPrecision::all(PrecisionMode::DecimalPlaces(n))
     }
 
-    /// Apply `SignificantFigures(n)` to every float kind.
     fn sf(n: u8) -> FloatPrecision {
         FloatPrecision::all(PrecisionMode::SignificantFigures(n))
     }
@@ -1437,18 +1272,15 @@ mod tests {
 
     #[test]
     fn compacts_float_literal_variants() {
-        // Typed: F32 gets 'f' suffix, AbstractFloat stays bare, F64 keeps 'lf'
         assert_eq!(literal_to_wgsl(naga::Literal::F32(0.25), &full()), ".25f");
         assert_eq!(
             literal_to_wgsl(naga::Literal::AbstractFloat(0.5), &full()),
             ".5"
         );
         assert_eq!(literal_to_wgsl(naga::Literal::F64(0.5), &full()), ".5lf");
-        // Typed: I32 gets 'i' suffix
         assert_eq!(literal_to_wgsl(naga::Literal::I32(42), &full()), "42i");
         assert_eq!(literal_to_wgsl(naga::Literal::U32(7), &full()), "7u");
 
-        // Bare: all suffixes stripped for use inside Compose
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F32(0.25), &full()),
             ".25"
@@ -1474,7 +1306,7 @@ mod tests {
     fn literal_i64_typed_and_bare() {
         assert_eq!(literal_to_wgsl(naga::Literal::I64(99), &full()), "99li");
         assert_eq!(literal_to_wgsl_bare(naga::Literal::I64(99), &full()), "99");
-        // The i64::MIN uses overflow-safe constructor
+        // `-9223372036854775808li` would overflow before negation.
         assert_eq!(
             literal_to_wgsl(naga::Literal::I64(i64::MIN), &full()),
             "i64(-0x7fffffffffffffff - 1)"
@@ -1513,7 +1345,7 @@ mod tests {
             literal_to_wgsl_bare(naga::Literal::AbstractInt(-7), &full()),
             "-7"
         );
-        // AbstractInt i64::MIN must use overflow-safe subtraction form.
+        // Same overflow-safe form for `AbstractInt`.
         assert_eq!(
             literal_to_wgsl(naga::Literal::AbstractInt(i64::MIN), &full()),
             "(-0x7fffffffffffffff - 1)"
@@ -1539,30 +1371,24 @@ mod tests {
 
     #[test]
     fn decimal_places_rounds_to_n_places() {
-        // F32 typed: 0.123456 rounded to 3 decimal places -> 0.123f -> .123f
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(0.123456), &dp(3)),
             ".123f"
         );
-        // F32 typed: 0.876543 rounded to 2 -> 0.88f -> .88f
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(0.876543), &dp(2)),
             ".88f"
         );
-        // F32 bare: same value, no suffix
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F32(0.876543), &dp(2)),
             ".88"
         );
-        // AbstractFloat (f64): precision limiting works
         assert_eq!(
             literal_to_wgsl(naga::Literal::AbstractFloat(7.65432198), &dp(4)),
             "7.6543"
         );
-        // Integer literals are unaffected by any float-precision mode.
         assert_eq!(literal_to_wgsl(naga::Literal::I32(42), &dp(2)), "42i");
         assert_eq!(literal_to_wgsl(naga::Literal::U32(7), &dp(2)), "7u");
-        // None preserves full precision (baseline)
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(0.123456), &full()),
             ".123456f"
@@ -1571,22 +1397,18 @@ mod tests {
 
     #[test]
     fn precision_preserves_whole_number_shortest_form() {
-        // Whole-number concrete floats must stay one byte shorter with
-        // precision enabled - the suffix pins the type, so no trailing
-        // `.0` is needed.  This is the regression that switching from
-        // `{:.prec$}` to round-then-shortest fixes.
+        // With precision enabled a whole-number float still drops the `.0`:
+        // the suffix pins the type.
         assert_eq!(literal_to_wgsl(naga::Literal::F32(1.0), &dp(6)), "1f");
         assert_eq!(literal_to_wgsl(naga::Literal::F32(-2.0), &dp(2)), "-2f");
         assert_eq!(literal_to_wgsl(naga::Literal::F32(0.0), &dp(6)), "0f");
         assert_eq!(literal_to_wgsl(naga::Literal::F32(-0.0), &dp(6)), "-0f");
 
-        // Bare form (inside `T(...)`) drops the suffix.
         assert_eq!(literal_to_wgsl_bare(naga::Literal::F32(1.0), &dp(6)), "1");
         assert_eq!(literal_to_wgsl_bare(naga::Literal::F32(-2.0), &dp(2)), "-2");
         assert_eq!(literal_to_wgsl_bare(naga::Literal::F32(0.0), &dp(6)), "0");
 
-        // Values that round *up* to a whole number also collapse: 0.999
-        // with precision 2 rounds to 1.0, which formats as "1f"/"1".
+        // A value that rounds up to a whole number collapses too.
         assert_eq!(literal_to_wgsl(naga::Literal::F32(0.999), &dp(2)), "1f");
         assert_eq!(literal_to_wgsl_bare(naga::Literal::F32(0.999), &dp(2)), "1");
 
@@ -1594,9 +1416,8 @@ mod tests {
         assert_eq!(literal_to_wgsl(naga::Literal::F32(0.5), &dp(0)), "1f");
         assert_eq!(literal_to_wgsl(naga::Literal::F32(0.49), &dp(0)), "0f");
 
-        // AbstractFloat: bare form mirrors the F32 collapse, while the
-        // typed form still keeps a dot via `ensure_bare_float` so it does
-        // not reparse as `AbstractInt`.
+        // The typed AbstractFloat keeps a dot so it does not re-parse as
+        // AbstractInt.
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::AbstractFloat(1.0), &dp(6)),
             "1"
@@ -1606,17 +1427,14 @@ mod tests {
             "1."
         );
 
-        // F64 keeps the trailing `.0` via the Debug path so `1.lf`
-        // remains a valid float literal (naga rejects `1lf`).
+        // F64 keeps the dot: naga rejects `1lf`.
         assert_eq!(literal_to_wgsl(naga::Literal::F64(1.0), &dp(6)), "1.lf");
     }
 
     #[test]
     fn precision_hex_path_still_wins_when_shorter() {
-        // 2^20 = 1048576: decimal "1048576f" (8) loses to hex "0x1p20f" (7).
-        // Rounding to 6 decimal places leaves the value at 2^20, so the
-        // hex form (computed from the rounded value) continues to be the
-        // shortest candidate.
+        // Rounding leaves 2^20 intact, so hex (`0x1p20f`) still beats the
+        // 8-char decimal.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(1048576.0), &dp(6)),
             "0x1p20f"
@@ -1625,12 +1443,8 @@ mod tests {
 
     #[test]
     fn precision_handles_non_finite_values() {
-        // +/-inf / NaN round through unchanged so the emitted token is
-        // identical regardless of which precision mode is active.
-        // (The output is not valid WGSL for these inputs - naga has no
-        // `inf` / `nan` literal - but the formatter must remain
-        // deterministic so a future fix can address both code paths in
-        // one place.)
+        // No WGSL spelling exists for these either way; the token must at
+        // least be mode-independent.
         for v in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
             assert_eq!(
                 literal_to_wgsl(naga::Literal::F32(v), &dp(6)),
@@ -1641,9 +1455,8 @@ mod tests {
 
     #[test]
     fn f32_max_emits_exact_hex_not_overshooting_decimal() {
-        // `f32::MAX`'s shortest decimal (`3.4028235e38`) overshoots the true
-        // maximum, which tint/Dawn reject; both the typed and bare paths must
-        // emit the bit-exact, in-range hex form instead.
+        // `f32::MAX`'s shortest decimal overshoots the maximum and tint/Dawn
+        // reject it.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(f32::MAX), &full()),
             "0x1.fffffep127f"
@@ -1652,7 +1465,6 @@ mod tests {
             literal_to_wgsl_bare(naga::Literal::F32(f32::MAX), &full()),
             "0x1.fffffep127"
         );
-        // The negative boundary is equally affected.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(-f32::MAX), &full()),
             "-0x1.fffffep127f"
@@ -1661,8 +1473,7 @@ mod tests {
             literal_to_wgsl_bare(naga::Literal::F32(-f32::MAX), &full()),
             "-0x1.fffffep127"
         );
-        // The guard is exactly `+/-f32::MAX`: the next value down keeps the
-        // ordinary shortest-form path (its decimal does not overshoot).
+        // The guard is exactly `+/-f32::MAX`.
         let below_max = f32::from_bits(f32::MAX.to_bits() - 1);
         assert_ne!(
             literal_to_wgsl(naga::Literal::F32(below_max), &full()),
@@ -1672,48 +1483,34 @@ mod tests {
 
     #[test]
     fn precision_hex_form_uses_rounded_value() {
-        // Invariant: every candidate passed to `pick_shortest` must
-        // encode the same numeric value.  Before the rounding was
-        // hoisted to the dispatch arm, `hex_float_f32` received the
-        // original `v` while `compact_float_literal_token` received a
-        // truncated decimal - the picker could then emit a precise
-        // hex of a value the user asked to round.
-        //
-        // F32(1048575.9) rounds up to 1048576 = 2^20; hex of the
-        // rounded value is the short "0x1p20f" form, while hex of the
-        // original would carry mantissa bits and be much longer.  Both
-        // routes pick a token, but only the rounded one is semantically
-        // honest about the truncation the user opted into.
+        // Every candidate passed to `pick_shortest` must encode the same
+        // value: hex of the rounded 1048576 is `0x1p20f`, while hex of the
+        // original 1048575.9 would describe a value the user asked to
+        // truncate away.
         let s = literal_to_wgsl(naga::Literal::F32(1048575.9), &dp(0));
         assert_eq!(s, "0x1p20f");
-        // Same value re-emerges via the bare path.
         let s = literal_to_wgsl_bare(naga::Literal::F32(1048575.9), &dp(0));
         assert_eq!(s, "0x1p20");
     }
 
     #[test]
     fn scientific_form_chosen_when_shorter() {
-        // Pure decimal magnitudes win in scientific notation: `1e6f`
-        // (4 chars) beats `1000000f` (8) and `0x1.e848p19f` (12).
+        // `1e6f` beats `1000000f` and `0x1.e848p19f`.
         assert_eq!(literal_to_wgsl(naga::Literal::F32(1e6), &full()), "1e6f");
         assert_eq!(literal_to_wgsl(naga::Literal::F32(1e10), &full()), "1e10f");
         assert_eq!(literal_to_wgsl(naga::Literal::F32(1e20), &full()), "1e20f");
 
-        // Negative-exponent scientific wins for tiny magnitudes.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(1e-30), &full()),
             "1e-30f"
         );
 
-        // Bare form drops the `f` suffix: `1e10` (4) vs `10000000000` (11).
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F32(1e10), &full()),
             "1e10"
         );
 
-        // AbstractFloat - bare and typed paths both use the sci form
-        // when shorter, and `ensure_bare_float` is happy because the
-        // `e` already marks it as a float.
+        // `ensure_bare_float` accepts the `e` as the float marker.
         assert_eq!(
             literal_to_wgsl(naga::Literal::AbstractFloat(1e20), &full()),
             "1e20"
@@ -1723,43 +1520,32 @@ mod tests {
             "1e100"
         );
 
-        // F64 bare: `1e15f` mantissa makes scientific potentially long,
-        // but for pure powers of 10 it still wins.
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F64(1e15), &full()),
             "1e15"
         );
 
-        // F16 bare path also considers scientific (no suffix conflict).
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F16(f16::from_f32(1e4)), &full()),
             "1e4"
         );
 
-        // Small magnitudes stay decimal - `5e-1f` (5) loses to `.5f` (3).
         assert_eq!(literal_to_wgsl(naga::Literal::F32(0.5), &full()), ".5f");
 
-        // Powers of 2 still pick hex when shorter than both decimal
-        // and scientific: 2^20 -> "0x1p20f" (7) < "1.048576e6f" (11).
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(1048576.0), &full()),
             "0x1p20f"
         );
 
-        // Zero and -0 short-circuit out of the sci candidate so we
-        // never emit the useless `0e0f` form.
+        // Zero never takes the `0e0f` form.
         assert_eq!(literal_to_wgsl(naga::Literal::F32(0.0), &full()), "0f");
         assert_eq!(literal_to_wgsl(naga::Literal::F32(-0.0), &full()), "-0f");
     }
 
     #[test]
     fn scientific_form_aligns_with_rounding() {
-        // A non-`Full` mode rounds the value first, then the rounded
-        // value feeds every candidate (decimal, hex, scientific) - so
-        // a value that rounds up to a clean power of 10 picks up the
-        // short scientific form even when the original wouldn't have.
-        // F32(999999.5) rounds away-from-zero to 1e6: `1e6f` (4) beats
-        // decimal `1000000f` (8) and hex `0x1.e848p19f` (12).
+        // Rounding precedes candidate formation: 999999.5 rounds away from
+        // zero to 1e6 and picks `1e6f`.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(999999.5), &dp(0)),
             "1e6f"
@@ -1768,38 +1554,26 @@ mod tests {
 
     #[test]
     fn significant_figures_round_independent_of_magnitude() {
-        // SignificantFigures is the dual of DecimalPlaces: instead of
-        // pinning the count after the dot, it pins the total non-zero
-        // digit count regardless of where the value sits on the number
-        // line.  `1234567.9` with 3 sig figs -> 1230000 (`1.23e6f`).
+        // Significant figures pin the digit count regardless of magnitude.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(1234567.9), &sf(3)),
             "1.23e6f"
         );
-        // `0.001234` with 3 sig figs -> 0.00123 -> `.00123f` (decimal
-        // wins over `1.23e-3f`).
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(0.001234), &sf(3)),
             ".00123f"
         );
-        // 1 sig fig: any value collapses to a single significant digit.
         assert_eq!(literal_to_wgsl(naga::Literal::F32(789.0), &sf(1)), "800f");
-        // SignificantFigures(0) treated as (1) - zero sig figs would
-        // always round to 0, which is rarely useful.
+        // `SignificantFigures(0)` is treated as `1`.
         assert_eq!(literal_to_wgsl(naga::Literal::F32(123.0), &sf(0)), "100f");
-        // Zero / non-finite pass through unchanged.
         assert_eq!(literal_to_wgsl(naga::Literal::F32(0.0), &sf(4)), "0f");
-        // Integer literals unaffected by float-precision mode.
         assert_eq!(literal_to_wgsl(naga::Literal::I32(42), &sf(2)), "42i");
     }
 
-    /// In the inexact-power range the old `10^k` scaling both mis-rounded the
-    /// value and bloated the mantissa with binary noise; the decimal-string
-    /// path rounds correctly and stays short.  The `.max(1)` guard keeps
-    /// `sig_figs <= 0` from underflowing the fractional-digit count.
+    /// The inexact-power range must round correctly and render short, and
+    /// `sig_figs <= 0` must not underflow the fractional-digit count.
     #[test]
     fn round_sig_figs_f64_extreme_magnitudes() {
-        // Value correctness: the old code mis-rounded these by ~a decade.
         let tiny = round_sig_figs_f64(1.495e-308, 2);
         assert!(
             (1.4e-308..=1.6e-308).contains(&tiny),
@@ -1810,42 +1584,32 @@ mod tests {
             (2.1e-308..=2.3e-308).contains(&min_pos),
             "f64::MIN_POSITIVE @ 2sf should be ~2.2e-308, got {min_pos:e}"
         );
-        // Cleanliness: the rounded value must render SHORT, not as a 20+ char
-        // noise mantissa (old gave `1.2300000000000007e300`).
+        // Must render short, not as a noise mantissa.
         let clean = round_sig_figs_f64(1.23456e300, 3);
         assert!(
             format!("{clean:e}").len() <= 10,
             "1.23456e300 @ 3sf should render short, got {clean:e}"
         );
-        // Large magnitude rounds correctly (9.5e307's nearest f64 is < 9.5,
-        // so 1 sig fig is 9e307) and stays clean.
+        // 9.5e307's nearest f64 is below 9.5e307, so one figure is 9e307.
         let big = round_sig_figs_f64(9.5e307, 1);
         assert!(
             big.is_finite() && format!("{big:e}").len() <= 8,
             "9.5e307 @ 1sf should be a clean finite value, got {big:e}"
         );
-        // Robustness: a rounded form that overflows falls back to the finite
-        // original, never infinity; `sig_figs <= 0` must not underflow the
-        // fractional-digit width (no OOM/panic).
+        // An overflowing round falls back to the finite original.
         assert!(round_sig_figs_f64(f64::MAX, 1).is_finite());
         assert!(round_sig_figs_f64(123.0, 0).is_finite());
-        // Exact-range path unchanged: 1.23456 @ 3sf -> 1.23.
         assert_eq!(round_sig_figs_f64(1.23456, 3), 1.23);
     }
 
     #[test]
     fn significant_figures_covers_f16_and_f64_kinds() {
-        // F16 routes through `round_f32` (f16 widens to f32 in emit)
-        // with the f16-mode.  Pick a non-special-constant value so the
-        // assertion isn't a stand-in for `std::f32::consts`-flavoured
-        // expectations.  0.456 in f16 ~= 0.456; sf=2 rounds to 0.46.
-        // f16 sf=2 rounding of 0.456 is deterministic - pin it exactly.
+        // f16 rounds through `round_f32` with the f16 mode.
         let s = literal_to_wgsl(naga::Literal::F16(f16::from_f32(0.456)), &sf(2));
         assert_eq!(s, ".46h", "got {s:?}");
 
-        // F64 sig-figs uses `round_f64` directly.  Both the typed and the
-        // bare path offer the scientific candidate (naga accepts `...e...lf`),
-        // so the rounded `1.23e6` value emits in scientific form either way.
+        // Both f64 paths offer the scientific candidate (naga accepts
+        // `...e...lf`).
         let s = literal_to_wgsl(naga::Literal::F64(1234567.89_f64), &sf(3));
         assert_eq!(s, "1.23e6lf");
         let s = literal_to_wgsl_bare(naga::Literal::F64(1234567.89_f64), &sf(3));
@@ -1854,38 +1618,27 @@ mod tests {
 
     #[test]
     fn significant_figures_preserves_precision_at_f32_boundaries() {
-        // Regression: values near `f32::MIN_POSITIVE` and below were
-        // erroneously losing significant digits because `round_f32`
-        // clamped its scale exponent at +/-38.  The arithmetic runs in
-        // f64, which can comfortably represent the scale, so the clamp
-        // now matches f64's range and the sig-figs target is honoured.
-        //
-        // 1.18e-38 (near MIN_POSITIVE) with sf=2 should keep 2 digits -
-        // not collapse to "1e-38" with the old clamp.
+        // Near `f32::MIN_POSITIVE` the figures survive: the scale exponent
+        // is clamped to f64's range, not f32's.
         let s = literal_to_wgsl(naga::Literal::F32(1.18e-38), &sf(2));
         assert!(
             s.starts_with("1.2e-38") || s == "1.2e-38f",
             "expected 2 sig figs of 1.18e-38, got {s:?}"
         );
-        // Subnormal: 1e-40 with sf=2 should survive.  We accept any
-        // representation that parses back near 1e-40 since exact f32
-        // subnormal values are not exact rationals.
+        // A subnormal survives; exact f32 subnormals are not short decimals,
+        // so any nearby rendering is accepted.
         let s = literal_to_wgsl(naga::Literal::F32(1e-40), &sf(2));
         assert!(
             !s.starts_with("0") && (s.contains("e-40") || s.contains("e-41")),
             "expected sf=2 of 1e-40 subnormal to be preserved, got {s:?}"
         );
-        // f32::MAX with extreme sig-figs count still works (overflow
-        // guard prevents the multiplication itself from going to inf).
+        // An extreme figure count on f32::MAX still yields a finite token.
         let s = literal_to_wgsl(naga::Literal::F32(f32::MAX), &sf(255));
         assert!(s.contains("e38f") || s.contains("0x"), "got {s:?}");
     }
 
     #[test]
     fn per_type_precision_dispatch() {
-        // Different float kinds can carry different precision modes.
-        // Here f32 gets aggressive `DecimalPlaces(2)` while f64 stays
-        // `Full`; both kinds reach the dispatch arm through `literal_to_wgsl`.
         let precision = FloatPrecision {
             f32: PrecisionMode::DecimalPlaces(2),
             f64: PrecisionMode::Full,
@@ -1900,27 +1653,22 @@ mod tests {
             ".123456lf"
         );
 
-        // f16 has its own slot: ask for 1 decimal place on f16 but
-        // leave f32 at Full.  The f16 path goes through `round_f32`
-        // (the IR widens f16 to f32 for emission) with the f16-mode.
+        // f16 has its own slot, routed through `round_f32`.
         let precision = FloatPrecision {
             f16: PrecisionMode::DecimalPlaces(1),
             f32: PrecisionMode::Full,
             ..Default::default()
         };
-        // f16(0.876) at 1 decimal place -> 0.9 -> ".9h".
         assert_eq!(
             literal_to_wgsl(naga::Literal::F16(f16::from_f32(0.876)), &precision,),
             ".9h",
         );
-        // f32(0.876) still emits at full precision.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(0.876), &precision),
             ".876f"
         );
 
-        // AbstractFloat slot is independent: a sig-figs cap on
-        // abstract floats does not affect concrete f32 emission.
+        // The AbstractFloat slot is independent of f32.
         let precision = FloatPrecision {
             abstract_float: PrecisionMode::SignificantFigures(2),
             f32: PrecisionMode::Full,
@@ -1938,7 +1686,7 @@ mod tests {
 
     #[test]
     fn hex_repr_used_when_shorter() {
-        // u64::MAX: 20 decimal digits -> 16 hex digits + 0x = 18 chars (saves 2)
+        // u64::MAX: 20 decimal digits vs `0x` + 16 hex.
         assert_eq!(
             literal_to_wgsl(naga::Literal::U64(u64::MAX), &full()),
             "0xfffffffffffffffflu"
@@ -1947,29 +1695,25 @@ mod tests {
             literal_to_wgsl_bare(naga::Literal::U64(u64::MAX), &full()),
             "0xffffffffffffffff"
         );
-        // Large u64: 10^19 = 19 decimal digits
         assert_eq!(
             literal_to_wgsl(naga::Literal::U64(10_000_000_000_000_000_000), &full()),
             "0x8ac7230489e80000lu"
         );
-        // i64::MAX: 19 decimal digits -> hex saves 1
         assert_eq!(
             literal_to_wgsl(naga::Literal::I64(i64::MAX), &full()),
             "0x7fffffffffffffffli"
         );
-        // Large AbstractInt: 13 decimal digits -> hex can save 1
         assert_eq!(
             literal_to_wgsl(naga::Literal::AbstractInt(1_000_000_000_000), &full()),
             "0xe8d4a51000"
         );
-        // Small values stay decimal (hex is longer due to 0x prefix)
         assert_eq!(literal_to_wgsl(naga::Literal::U64(255), &full()), "255lu");
         assert_eq!(
             literal_to_wgsl(naga::Literal::AbstractInt(42), &full()),
             "42"
         );
         assert_eq!(literal_to_wgsl(naga::Literal::I32(-5), &full()), "-5i");
-        // u32 values: hex never shorter (max 10 decimal digits = 10 hex chars)
+        // u32: hex is never shorter (10 decimal digits at most).
         assert_eq!(
             literal_to_wgsl(naga::Literal::U32(u32::MAX), &full()),
             "4294967295u"
@@ -1978,69 +1722,55 @@ mod tests {
 
     #[test]
     fn hex_float_used_when_shorter() {
-        // 2^20 = 1048576.0: decimal "1048576f" (8) vs hex "0x1p20f" (7)
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(1048576.0), &full()),
             "0x1p20f"
         );
-        // 2^24 = 16777216.0: decimal "16777216f" (9) vs hex "0x1p24f" (7)
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(16777216.0), &full()),
             "0x1p24f"
         );
-        // Negative power of 2: -2^20
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(-1048576.0), &full()),
             "-0x1p20f"
         );
-        // Small values stay decimal - hex is longer
         assert_eq!(literal_to_wgsl(naga::Literal::F32(0.5), &full()), ".5f");
         assert_eq!(literal_to_wgsl(naga::Literal::F32(3.0), &full()), "3f");
         assert_eq!(literal_to_wgsl(naga::Literal::F32(1.0), &full()), "1f");
-        // Negative exponent: 2^-14 decimal ".000061035156f"(16) vs hex "0x1p-14f"(8)
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(2.0_f32.powi(-14)), &full()),
             "0x1p-14f"
         );
-        // f32::MAX is the exception to the shortest-form rule: its shorter
-        // decimal/scientific forms (`3.4028235e38f`) overshoot the maximum and
-        // tint rejects them, so the bit-exact hex form is forced.
+        // f32::MAX is the exception: its shorter decimal overshoots the
+        // maximum and tint rejects it, so the bit-exact hex is forced.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(f32::MAX), &full()),
             "0x1.fffffep127f"
         );
-        // f32::MIN_POSITIVE: decimal is 49 chars, hex "0x1p-126f" (9)
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(f32::MIN_POSITIVE), &full()),
             "0x1p-126f"
         );
-        // Non-power-of-2 with mantissa bits: 3.0 = 0x1.8p1f (8) vs "3f" (2) -> decimal wins
         assert_eq!(literal_to_wgsl(naga::Literal::F32(3.0), &full()), "3f");
-        // Bare 2^20: decimal "1048576" (7) vs hex "0x1p20" (6)
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F32(1048576.0), &full()),
             "0x1p20"
         );
-        // Bare small value stays decimal
         assert_eq!(literal_to_wgsl_bare(naga::Literal::F32(0.5), &full()), ".5");
-        // F64 bare: 2^50 hex wins
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F64(2.0_f64.powi(50)), &full()),
             "0x1p50"
         );
-        // F64 typed: naga accepts a hex-float `lf` literal, so 2^50 wins
-        // in hex (`0x1p50lf`, 8 chars) over decimal (`1125899906842624.lf`).
+        // naga accepts a hex-float `lf` literal.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F64(2.0_f64.powi(50)), &full()),
             "0x1p50lf"
         );
-        // F16 typed: hex + 'h' is rejected by naga, so a power of two with
-        // no shorter scientific form stays decimal.
+        // naga rejects hex `h`, so a power of two stays decimal.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F16(f16::from_f32(1024.0)), &full()),
             "1024h"
         );
-        // F16 bare with hex: 2^-14 as bare is shorter in hex
         assert_eq!(
             literal_to_wgsl_bare(
                 naga::Literal::F16(f16::from_f32(2.0_f32.powi(-14))),
@@ -2048,24 +1778,20 @@ mod tests {
             ),
             "0x1p-14"
         );
-        // AbstractFloat 2^50 typed: hex much shorter (no suffix needed)
         assert_eq!(
             literal_to_wgsl(naga::Literal::AbstractFloat(1125899906842624.0), &full()),
             "0x1p50"
         );
-        // AbstractFloat bare: same as typed (no suffix in either form)
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::AbstractFloat(1125899906842624.0), &full()),
             "0x1p50"
         );
-        // Zero falls back to decimal (hex_float returns None for zero)
         assert_eq!(literal_to_wgsl(naga::Literal::F32(0.0), &full()), "0f");
         assert_eq!(literal_to_wgsl(naga::Literal::F32(-0.0), &full()), "-0f");
     }
 
     #[test]
     fn whole_number_float_literals_are_context_aware() {
-        // Bare constructor literals stay as short as possible.
         assert_eq!(literal_to_wgsl_bare(naga::Literal::F32(1.0), &full()), "1");
         assert_eq!(literal_to_wgsl_bare(naga::Literal::F32(0.0), &full()), "0");
         assert_eq!(
@@ -2073,14 +1799,12 @@ mod tests {
             "-1"
         );
         assert_eq!(literal_to_wgsl_bare(naga::Literal::F32(3.0), &full()), "3");
-        // Negative zero keeps a trailing dot - the bare int `-0` would
-        // re-parse as the integer 0 and silently drop the sign bit.
+        // `-0` would re-parse as the integer 0 and drop the sign bit.
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F32(-0.0), &full()),
             "-0."
         );
 
-        // F16 bare whole numbers - also no dot inside constructors
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F16(f16::from_f32(1.0)), &full()),
             "1"
@@ -2090,8 +1814,6 @@ mod tests {
             "0"
         );
 
-        // AbstractFloat bare whole numbers are also kept short inside
-        // constructor contexts.
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::AbstractFloat(1.0), &full()),
             "1"
@@ -2101,8 +1823,7 @@ mod tests {
             "0"
         );
 
-        // Standalone AbstractFloat literals must keep a decimal point so WGSL
-        // does not parse them as AbstractInt.
+        // A standalone AbstractFloat keeps its dot so it is not AbstractInt.
         assert_eq!(
             literal_to_wgsl(naga::Literal::AbstractFloat(1.0), &full()),
             "1."
@@ -2122,28 +1843,24 @@ mod tests {
         assert_eq!(u64_key.expr_text, "0xffffffffffffffff");
         assert_eq!(u64_key.decl_text, "0xfffffffffffffffflu");
 
-        // ensure_bare_float standalone helper
         assert_eq!(ensure_bare_float("1".into()), "1.");
         assert_eq!(ensure_bare_float("-1".into()), "-1.");
         assert_eq!(ensure_bare_float("0".into()), "0.");
-        assert_eq!(ensure_bare_float(".5".into()), ".5"); // already has dot
-        assert_eq!(ensure_bare_float("1.5".into()), "1.5"); // already has dot
-        assert_eq!(ensure_bare_float("0x1p20".into()), "0x1p20"); // hex
-        assert_eq!(ensure_bare_float("1e5".into()), "1e5"); // exponent
+        assert_eq!(ensure_bare_float(".5".into()), ".5");
+        assert_eq!(ensure_bare_float("1.5".into()), "1.5");
+        assert_eq!(ensure_bare_float("0x1p20".into()), "0x1p20");
+        assert_eq!(ensure_bare_float("1e5".into()), "1e5");
 
-        // Suffixed forms are NOT affected (suffix provides the type)
         assert_eq!(literal_to_wgsl(naga::Literal::F32(1.0), &full()), "1f");
         assert_eq!(literal_to_wgsl(naga::Literal::F32(0.0), &full()), "0f");
         assert_eq!(literal_to_wgsl(naga::Literal::F32(-1.0), &full()), "-1f");
 
-        // Fractional values remain unchanged (already have a dot)
         assert_eq!(literal_to_wgsl_bare(naga::Literal::F32(0.5), &full()), ".5");
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F32(1.5), &full()),
             "1.5"
         );
 
-        // Hex representations remain unchanged (already have 'x' marker)
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F32(1048576.0), &full()),
             "0x1p20"
@@ -2152,23 +1869,16 @@ mod tests {
 
     #[test]
     fn significant_figures_never_overflows_finite_input_to_infinity() {
-        // Regression: a finite literal near the type maximum could round
-        // UP across its leading decade and overflow to +/-inf, emitting the
-        // invalid tokens `inff` / `inflf` / `inf`.  A lossy round must
-        // never turn a finite value into a non-finite one; the rounding
-        // helpers now fall back to the original value when the scale-back
-        // (or the f32 narrowing cast) overflows.
-        //
-        // f32::MAX to 4 sig figs rounds 3.4028235 -> 3.403, scaled back
-        // that exceeds f32::MAX, so the cast would saturate to inf.
+        // A finite literal near the type maximum can round UP across its
+        // leading decade (f32::MAX at 4 figures is 3.403e38); the overflow
+        // must fall back to the original, never `inff` / `inflf` / `inf`.
         for s in 1..=8u8 {
             let typed = literal_to_wgsl(naga::Literal::F32(f32::MAX), &sf(s));
             let bare = literal_to_wgsl_bare(naga::Literal::F32(f32::MAX), &sf(s));
             assert!(!typed.contains("inf"), "F32::MAX sf={s} typed -> {typed:?}");
             assert!(!bare.contains("inf"), "F32::MAX sf={s} bare -> {bare:?}");
         }
-        // f64::MAX divides back by a sub-unity scale near 1e-308; the
-        // division overflows even though the multiplication never does.
+        // f64::MAX overflows on the scale-back division, not the multiply.
         for s in 1..=8u8 {
             let typed = literal_to_wgsl(naga::Literal::F64(f64::MAX), &sf(s));
             let bare = literal_to_wgsl_bare(naga::Literal::F64(f64::MAX), &sf(s));
@@ -2180,14 +1890,12 @@ mod tests {
                 "AbstractFloat::MAX sf={s} -> {abstr:?}"
             );
         }
-        // The fallback keeps the original value verbatim and still emits a
-        // valid, in-range token: the bit-exact hex form for `f32::MAX`.
+        // The fallback keeps the exact original: `f32::MAX`'s hex form.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(f32::MAX), &sf(4)),
             "0x1.fffffep127f"
         );
-        // Negative extremes are symmetric: no inf, and the sign survives
-        // the fallback (the overflow guard returns the original signed v).
+        // Negative extremes keep their sign through the fallback.
         for s in 1..=8u8 {
             let f32n = literal_to_wgsl(naga::Literal::F32(f32::MIN), &sf(s));
             let f64n = literal_to_wgsl(naga::Literal::F64(f64::MIN), &sf(s));
@@ -2204,12 +1912,9 @@ mod tests {
 
     #[test]
     fn significant_figures_keeps_f16_within_representable_range() {
-        // Regression: f16 emits through round_f32 (f16 widens to f32), and
-        // SignificantFigures of f16::MAX (65504) rounds UP to 66000 (sf=2)
-        // or 70000 (sf=1) - finite as f32 but past f16::MAX, so the token
-        // `66000h` / `70000h` made naga reject the whole output.  The f16
-        // path now falls back to the in-range original when a round leaves
-        // f16's range.
+        // f16::MAX (65504) rounds to 66000 / 70000, finite as f32 but past
+        // f16::MAX, and `66000h` makes naga reject the whole output; the
+        // original is kept.
         let max16 = f16::from_f32(65504.0);
         assert_eq!(literal_to_wgsl(naga::Literal::F16(max16), &sf(1)), "65504h");
         assert_eq!(literal_to_wgsl(naga::Literal::F16(max16), &sf(2)), "65504h");
@@ -2217,8 +1922,7 @@ mod tests {
             literal_to_wgsl_bare(naga::Literal::F16(max16), &sf(1)),
             "65504"
         );
-        // In-range rounding is unaffected: a value whose sig-fig round
-        // stays <= 65504 still rounds normally.
+        // In-range rounding is unaffected.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F16(f16::from_f32(61234.0)), &sf(2)),
             "61000h"
@@ -2227,12 +1931,8 @@ mod tests {
 
     #[test]
     fn significant_figures_emits_clean_powers_of_ten() {
-        // Regression: scaling a power-of-ten value back by dividing by a
-        // sub-unity power (e.g. `/ 1e-5`) reintroduced binary noise, so
-        // `100000` to one sig fig came out as `99999.99999999999lf` -
-        // longer than the input and a violation of the requested figure
-        // count.  Picking the cleaner scale-back keeps it exact, and the
-        // scientific candidate then trims it further.
+        // A power of ten must not pick up scale-back noise (`100000` at one
+        // figure as `99999.99999999999lf`).
         assert_eq!(
             literal_to_wgsl(naga::Literal::F64(100000.0), &sf(1)),
             "1e5lf"
@@ -2245,8 +1945,6 @@ mod tests {
             literal_to_wgsl(naga::Literal::AbstractFloat(1000000.0), &sf(2)),
             "1e6"
         );
-        // The f32 path was masked by its narrowing cast but is verified
-        // here too for coherence with the f64 sibling.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F32(100000.0), &sf(1)),
             "1e5f"
@@ -2255,11 +1953,8 @@ mod tests {
 
     #[test]
     fn significant_figures_stays_clean_at_large_magnitudes() {
-        // Regression: the multiply-back that fixed small clean powers
-        // (1e5) reintroduced noise at LARGE magnitudes on the f64 /
-        // AbstractFloat paths - `2.5e25` to one sig fig emitted the
-        // 21-char `3.0000000000000005e25` instead of `3e25`.  Picking the
-        // cleaner of the two scale-backs keeps both ends clean.
+        // Large magnitudes stay clean too: `2.5e25` at one figure is `3e25`,
+        // not `3.0000000000000005e25`.
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F64(2.5e25), &sf(1)),
             "3e25"
@@ -2268,7 +1963,6 @@ mod tests {
             literal_to_wgsl(naga::Literal::AbstractFloat(2.5e25), &sf(1)),
             "3e25"
         );
-        // Typed F64 reaches the same clean value (scientific `lf` form).
         assert_eq!(
             literal_to_wgsl(naga::Literal::F64(2.5e25), &sf(1)),
             "3e25lf"
@@ -2280,9 +1974,8 @@ mod tests {
             "expected a clean token, got {rounded:?}"
         );
 
-        // Symmetric case at TINY magnitudes (scale_exp > 22): dividing by
-        // an inexact power of ten left noise (`9e-25 -> 8.999...e-25`).  The
-        // pick-cleaner path now covers scale_exp outside `0..=22` too.
+        // Tiny magnitudes (`scale_exp > 22`): `9e-25` must not become
+        // `8.999...e-25`.
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F64(9e-25), &sf(1)),
             "9e-25"
@@ -2299,9 +1992,7 @@ mod tests {
 
     #[test]
     fn bare_negative_zero_keeps_float_marker() {
-        // A bare `-0` re-parses as the integer 0 and drops the sign bit, a
-        // real value change; the bare float arms keep `-0.` so the sign
-        // survives.  Other whole numbers still collapse to bare ints.
+        // A bare `-0` re-parses as the integer 0 and drops the sign bit.
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F32(-0.0), &full()),
             "-0."
@@ -2314,12 +2005,10 @@ mod tests {
             literal_to_wgsl_bare(naga::Literal::AbstractFloat(-0.0), &full()),
             "-0."
         );
-        // F64 bare goes through the same `bare_float_decimal` guard.
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F64(-0.0), &full()),
             "-0."
         );
-        // Positive zero stays the short bare int; non-zero wholes too.
         assert_eq!(literal_to_wgsl_bare(naga::Literal::F32(0.0), &full()), "0");
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F32(-2.0), &full()),
@@ -2334,21 +2023,17 @@ mod tests {
 
     #[test]
     fn bare_f64_collapses_whole_numbers() {
-        // The F64 bare arm collapses whole numbers to bare ints like its
-        // F16/F32/AbstractFloat siblings (the constructor pins the type),
-        // matching the doc contract and saving a byte per literal.
+        // The constructor pins the type, so F64 collapses like its siblings.
         assert_eq!(literal_to_wgsl_bare(naga::Literal::F64(2.0), &full()), "2");
         assert_eq!(literal_to_wgsl_bare(naga::Literal::F64(0.0), &full()), "0");
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F64(-1.0), &full()),
             "-1"
         );
-        // Negative zero still keeps its sign-preserving `-0.` marker.
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F64(-0.0), &full()),
             "-0."
         );
-        // Fractions and large/small magnitudes are unchanged (hex/sci win).
         assert_eq!(literal_to_wgsl_bare(naga::Literal::F64(0.5), &full()), ".5");
         assert_eq!(
             literal_to_wgsl_bare(naga::Literal::F64(2.0_f64.powi(50)), &full()),
@@ -2358,11 +2043,9 @@ mod tests {
 
     #[test]
     fn significant_figures_does_not_zero_f64_subnormals() {
-        // Regression: a nonzero f64 subnormal (e.g. 1e-310) up-scaled by
-        // the +/-308-clamped power rounds its mantissa to 0; a lossy round
-        // must never turn a nonzero value into exactly zero, so it falls
-        // back to the original.  (f32/f16 subnormals widen to f64 normals
-        // and never hit this; the f64/abstract path needs the guard.)
+        // A nonzero f64 subnormal scaled by the clamped power rounds its
+        // mantissa to 0 and must fall back to the original (f32/f16
+        // subnormals widen to f64 normals and never hit this).
         let s = literal_to_wgsl_bare(naga::Literal::F64(1e-310), &sf(1));
         assert!(!s.starts_with('0'), "f64 subnormal zeroed under sf: {s:?}");
         let s = literal_to_wgsl(naga::Literal::AbstractFloat(1e-310), &sf(1));
@@ -2374,23 +2057,18 @@ mod tests {
 
     #[test]
     fn typed_f64_and_f16_use_valid_short_suffix_forms() {
-        // Naga accepts hex-float and scientific `lf` literals and
-        // scientific `h` literals (but NOT hex `h`).  The typed arms offer
-        // those shorter forms, matching the bare arms where the suffix
-        // allows it.
-        // F64: clean power of two -> hex; clean power of ten -> scientific.
+        // naga accepts hex-float and scientific `lf` and scientific `h`, but
+        // not hex `h`.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F64(2.0_f64.powi(50)), &full()),
             "0x1p50lf"
         );
         assert_eq!(literal_to_wgsl(naga::Literal::F64(1e15), &full()), "1e15lf");
-        // F16: clean power of ten -> scientific; hex `h` stays excluded.
         assert_eq!(
             literal_to_wgsl(naga::Literal::F16(f16::from_f32(10000.0)), &full()),
             "1e4h"
         );
-        // Whole numbers keep the float type (no bare-int reparse): the
-        // decimal candidate wins because the alternatives are not shorter.
+        // Whole numbers keep the float type.
         assert_eq!(literal_to_wgsl(naga::Literal::F64(1.0), &full()), "1.lf");
         assert_eq!(
             literal_to_wgsl(naga::Literal::F16(f16::from_f32(1.0)), &full()),

@@ -1,21 +1,18 @@
 use super::*;
 use crate::config::Config;
+use crate::handle_set::{HandleMap, HandleSet};
 
-/// Test shim for [`fold_local_expressions`].  Unit tests build bare
-/// expression arenas with no `Function` body, so there are no real
-/// `Emit` ranges to feed the store-aware relocation guard.  Mapping
-/// every handle to a single shared range models the safe "all
-/// co-located, no intervening statement" case, so the guard is a
-/// no-op and these tests keep exercising the folding logic they
-/// target.  Tests that specifically need a cross-range (hazardous)
-/// layout call [`fold_local_expressions`] directly with a custom map.
+/// Shim for [`fold_local_expressions`]: bare arenas have no `Emit` ranges,
+/// so mapping every handle to one shared range models the safe co-located
+/// case and the store-aware relocation guard is a no-op.  Cross-range tests
+/// call [`fold_local_expressions`] with their own map.
 fn fold_local(
     arena: &mut naga::Arena<naga::Expression>,
     refcounts: &[u32],
-    const_literals: &FxHashMap<naga::Handle<naga::Constant>, naga::Literal>,
+    const_literals: &HandleMap<naga::Constant, naga::Literal>,
     types: &naga::UniqueArena<naga::Type>,
     vector_type_cache: &FxHashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>>,
-) -> (FxHashSet<naga::Handle<naga::Expression>>, usize) {
+) -> (HandleSet<naga::Expression>, usize) {
     let ranges = vec![0u32; arena.len()];
     fold_local_expressions(
         arena,
@@ -147,6 +144,117 @@ fn run_pass(module: &mut naga::Module) -> bool {
     pass.run(module, &ctx).expect("const fold pass should run")
 }
 
+fn constant_refs(function: &naga::Function) -> usize {
+    function
+        .expressions
+        .iter()
+        .filter(|(_, e)| matches!(e, naga::Expression::Constant(_)))
+        .count()
+}
+
+#[test]
+fn library_module_keeps_named_constant_references() {
+    // Without an entry point `PI` survives compaction whatever the fold does,
+    // so its runtime references stay; an entry-point module folds them.
+    // (`2.0 * PI` never reaches the pass: naga's front-end evaluates it.)
+    let lib = r#"
+const PI: f32 = 3.14159;
+fn a(x: f32) -> f32 { return x * PI; }
+fn b(x: f32) -> f32 { return x / PI; }
+"#;
+    let mut module = naga::front::wgsl::parse_str(lib).expect("source should parse");
+    run_pass(&mut module);
+    let refs: usize = module.functions.iter().map(|(_, f)| constant_refs(f)).sum();
+    assert_eq!(refs, 2, "library module must keep both `PI` references");
+
+    let entry = format!(
+        "{lib}@fragment fn fs(@location(0) x: f32) -> @location(0) vec4f {{ return vec4f(a(x) + b(x)); }}"
+    );
+    let mut module = naga::front::wgsl::parse_str(&entry).expect("source should parse");
+    run_pass(&mut module);
+    let refs: usize = module.functions.iter().map(|(_, f)| constant_refs(f)).sum();
+    assert_eq!(refs, 0, "entry-point module folds `PI` into literals");
+
+    // Unmangled, the name `PI` stays as written and the literal is the
+    // cheaper spelling: the library gate follows the mangle setting.
+    let mut module = naga::front::wgsl::parse_str(lib).expect("source should parse");
+    let config = Config {
+        mangle: Some(false),
+        ..Config::default()
+    };
+    let ctx = PassContext {
+        config: &config,
+        name_log: None,
+    };
+    ConstFoldPass
+        .run(&mut module, &ctx)
+        .expect("const fold pass should run");
+    let refs: usize = module.functions.iter().map(|(_, f)| constant_refs(f)).sum();
+    assert_eq!(
+        refs, 0,
+        "an unmangled library module folds `PI` into literals"
+    );
+}
+
+#[test]
+fn bitcast_literal_reinterprets_bits_and_declines_unspellable_floats() {
+    use naga::Literal as L;
+    use naga::ScalarKind as K;
+    assert_eq!(bitcast_literal(L::I32(-1), K::Uint), Some(L::U32(u32::MAX)));
+    assert_eq!(bitcast_literal(L::U32(2), K::Sint), Some(L::I32(2)));
+    assert_eq!(
+        bitcast_literal(L::F32(1.0), K::Uint),
+        Some(L::U32(0x3f80_0000))
+    );
+    assert_eq!(
+        bitcast_literal(L::U32(0x3f80_0000), K::Float),
+        Some(L::F32(1.0))
+    );
+    // inf, NaN, a subnormal and both zeros keep the runtime bitcast, on
+    // either side: the sign of a zero is the platform's call.
+    assert_eq!(bitcast_literal(L::U32(0x7f80_0000), K::Float), None);
+    assert_eq!(bitcast_literal(L::U32(0x7fc0_0000), K::Float), None);
+    assert_eq!(bitcast_literal(L::U32(1), K::Float), None);
+    assert_eq!(bitcast_literal(L::U32(0), K::Float), None);
+    assert_eq!(bitcast_literal(L::U32(0x8000_0000), K::Float), None);
+    assert_eq!(bitcast_literal(L::F32(0.0), K::Uint), None);
+    assert_eq!(bitcast_literal(L::F32(-0.0), K::Uint), None);
+    assert_eq!(bitcast_literal(L::F32(1e-40), K::Uint), None);
+    assert_eq!(
+        bitcast_literal(L::F16(half::f16::from_f32(1.0)), K::Uint),
+        None
+    );
+    assert_eq!(bitcast_literal(L::U16(0x3c00), K::Float), None);
+    assert_eq!(bitcast_literal(L::AbstractInt(1), K::Uint), None);
+    assert_eq!(bitcast_literal(L::Bool(true), K::Uint), None);
+}
+
+#[test]
+fn folds_scalar_bitcast_of_literal() {
+    // `bitcast<i32>(2u)` is a const-expression neither naga's evaluator nor
+    // tint leaves alone; folding it lets the tree above collapse.
+    let src = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<i32>;
+@compute @workgroup_size(1) fn main() { out[0] = clamp(sign(bitcast<i32>(2u)), -100i, 100i); }
+"#;
+    let mut module = naga::front::wgsl::parse_str(src).expect("source should parse");
+    run_pass(&mut module);
+    let func = &module.entry_points[0].function;
+    assert!(
+        !func
+            .expressions
+            .iter()
+            .any(|(_, e)| matches!(e, naga::Expression::As { convert: None, .. })),
+        "the literal bitcast must fold away"
+    );
+    assert!(
+        func.expressions
+            .iter()
+            .any(|(_, e)| matches!(e, naga::Expression::Literal(naga::Literal::I32(1)))),
+        "sign / clamp above the bitcast must fold to 1"
+    );
+}
+
 fn assert_f32_literal(
     arena: &naga::Arena<naga::Expression>,
     handle: naga::Handle<naga::Expression>,
@@ -183,9 +291,9 @@ fn folds_binary_add_in_local_expression_arena() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert_eq!(
         changed.len(),
@@ -230,9 +338,9 @@ fn folds_nested_binary_expressions() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert_eq!(changed.len(), 2, "both nested operations should be folded");
     assert_f32_literal(&arena, add, 3.0);
@@ -242,11 +350,9 @@ fn folds_nested_binary_expressions() {
 #[test]
 fn de_morgan_negated_equality_folds_in_place() {
     use naga::{BinaryOperator as B, UnaryOperator as U};
-    // `!(a == b)` -> `a != b` and `!(a != b)` -> `a == b`: the `!` node
-    // is rewritten into the flipped comparison reusing the operands in
-    // place, and the now-dead comparison's Emit is dropped (added to the
-    // folded set).  Operands are FunctionArguments so const-folding
-    // cannot pre-empt the rewrite by collapsing the comparison.
+    // The `!` node is rewritten in place into the flipped comparison and the
+    // dead comparison's Emit is dropped; FunctionArgument operands keep
+    // const-folding from pre-empting the rewrite.
     for (cmp_op, flipped) in [(B::Equal, B::NotEqual), (B::NotEqual, B::Equal)] {
         let mut arena = naga::Arena::new();
         let a = arena.append(naga::Expression::FunctionArgument(0), Default::default());
@@ -271,9 +377,9 @@ fn de_morgan_negated_equality_folds_in_place() {
         let (folded, _) = fold_local(
             &mut arena,
             &refcounts,
-            &FxHashMap::default(),
+            &Default::default(),
             &naga::UniqueArena::new(),
-            &FxHashMap::default(),
+            &Default::default(),
         );
         assert!(
             matches!(
@@ -285,7 +391,7 @@ fn de_morgan_negated_equality_folds_in_place() {
             arena[not]
         );
         assert!(
-            folded.contains(&cmp),
+            folded.contains(cmp),
             "the dead comparison's Emit must be dropped"
         );
     }
@@ -294,9 +400,8 @@ fn de_morgan_negated_equality_folds_in_place() {
 #[test]
 fn de_morgan_shared_equality_is_not_folded() {
     use naga::{BinaryOperator as B, UnaryOperator as U};
-    // A comparison referenced by more than the `!` (refcount > 1) is
-    // left alone: rewriting it in place would corrupt the other
-    // consumer, so the emitter keeps `!name`.
+    // A comparison with another consumer (refcount > 1) must not be rewritten
+    // in place; the emitter keeps `!name`.
     let mut arena = naga::Arena::new();
     let a = arena.append(naga::Expression::FunctionArgument(0), Default::default());
     let b = arena.append(naga::Expression::FunctionArgument(1), Default::default());
@@ -315,14 +420,13 @@ fn de_morgan_shared_equality_is_not_folded() {
         },
         Default::default(),
     );
-    // refcount 2 on the comparison -> shared, must NOT fold.
     let refcounts = vec![0u32, 0, 2, 0];
     let (folded, _) = fold_local(
         &mut arena,
         &refcounts,
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(
         matches!(
@@ -335,7 +439,7 @@ fn de_morgan_shared_equality_is_not_folded() {
         "a shared comparison must stay `!(==)`, not fold to `!=`"
     );
     assert!(
-        !folded.contains(&cmp),
+        !folded.contains(cmp),
         "a shared comparison's Emit must NOT be dropped"
     );
 }
@@ -367,9 +471,9 @@ fn folds_select_expression_with_literal_condition() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert_eq!(
         changed.len(),
@@ -406,7 +510,7 @@ fn folds_local_constant_reference_using_cache() {
         Default::default(),
     );
 
-    let mut const_literals = FxHashMap::default();
+    let mut const_literals = HandleMap::default();
     const_literals.insert(constant_handle, naga::Literal::F32(41.0));
 
     let (changed, _) = fold_local(
@@ -414,7 +518,7 @@ fn folds_local_constant_reference_using_cache() {
         &[],
         &const_literals,
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert_eq!(
         changed.len(),
@@ -448,9 +552,9 @@ fn does_not_fold_divide_by_zero() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert_eq!(changed.len(), 0, "division by zero should not be folded");
 
@@ -469,13 +573,9 @@ fn does_not_fold_divide_by_zero() {
 
 #[test]
 fn unary_negate_rejects_non_finite_result() {
-    // Naga's IR validator rejects `Literal::F32`/`F64` with NaN
-    // or infinity values (`check_literal_value` returns
-    // `LiteralError::NonFinite`).  The Negate fold therefore
-    // refuses both NaN -> NaN and +/-Inf -> -/+Inf, even though
-    // the latter is a valid IEEE operation - emitting a non-
-    // finite literal would produce IR the validator rejects.
-    // Tests both +Inf and NaN inputs.
+    // naga's validator rejects non-finite `Literal::F32`/`F64`
+    // (`LiteralError::NonFinite`), so Negate refuses NaN and +/-Inf even
+    // though negating Inf is valid IEEE.
     assert_eq!(
         eval_unary(
             naga::UnaryOperator::Negate,
@@ -524,11 +624,10 @@ fn abstract_int_modulo_min_by_neg1_not_folded() {
 
 // MARK: Math intrinsics WGSL-edge-case regressions
 //
-// Each of these pins a fold that was unsound vs. the WGSL spec:
-// `min/max/clamp` must propagate NaN (Rust's `min`/`max` treat
-// NaN as "missing"); `atan2(0,0)` is implementation-defined;
-// `pow(0, 0)` and `pow(0, negative)` are undefined; `sign(NaN)`
-// would have introduced a NaN-valued literal into the output.
+// Each pins a fold unsound vs the WGSL spec: `min/max/clamp` must propagate
+// NaN (Rust's treat it as missing), `atan2(0,0)` is implementation-defined,
+// `pow(0, 0)` and `pow(0, negative)` are undefined, `sign(NaN)` would emit a
+// NaN literal.
 
 #[test]
 fn min_propagates_nan_does_not_fold() {
@@ -554,9 +653,7 @@ fn max_propagates_nan_does_not_fold() {
 
 #[test]
 fn clamp_propagates_nan_does_not_fold() {
-    // NaN in any of v / lo / hi - all three must refuse fold so
-    // we never emit a NaN literal and never invoke
-    // `f32::clamp(NaN, ...)` which panics.
+    // Also guards the `f32::clamp` panic on a NaN bound.
     for (v, lo, hi) in [
         (f32::NAN, 0.0, 1.0),
         (0.5, f32::NAN, 1.0),
@@ -585,9 +682,7 @@ fn sign_rejects_nan_does_not_fold() {
 
 #[test]
 fn atan2_zero_zero_does_not_fold() {
-    // WGSL leaves atan2(0, 0) implementation-defined; GPUs may
-    // return 0, +/-pi/2, or pi.  Rust returns 0.0, which would
-    // disagree with some runtimes.
+    // GPUs may return 0, +/-pi/2, or pi; Rust returns 0.0.
     let r = eval_math_scalar(
         naga::MathFunction::Atan2,
         naga::Literal::F32(0.0),
@@ -613,7 +708,6 @@ fn atan2_with_one_nonzero_arg_still_folds() {
 
 #[test]
 fn pow_zero_zero_does_not_fold() {
-    // pow(0, 0) is implementation-defined in WGSL.
     let r = eval_math_scalar(
         naga::MathFunction::Pow,
         naga::Literal::F32(0.0),
@@ -650,7 +744,6 @@ fn pow_positive_base_still_folds() {
 
 #[test]
 fn pow_zero_positive_exp_still_folds() {
-    // pow(0, b > 0) = 0 - well-defined in WGSL.
     let r = eval_math_scalar(
         naga::MathFunction::Pow,
         naga::Literal::F32(0.0),
@@ -718,9 +811,9 @@ fn i32_mul_overflow_not_folded() {
 
 #[test]
 fn i32_divide_min_by_neg1_folds_to_defined_value() {
-    // WGSL defines runtime `e1 / -1` at MIN as e1; declined, the literal
-    // pair (only manufactured by nagami's own transforms) fails naga's text
-    // const-eval on re-parse and the emission dies with no fallback.
+    // WGSL defines runtime `MIN / -1` as MIN; declined, the literal pair
+    // (only manufactured by nagami's transforms) fails naga's re-parse
+    // const-eval with no fallback.
     let r = eval_binary(
         naga::BinaryOperator::Divide,
         naga::Literal::I32(i32::MIN),
@@ -731,7 +824,7 @@ fn i32_divide_min_by_neg1_folds_to_defined_value() {
 
 #[test]
 fn i32_modulo_min_by_neg1_folds_to_defined_value() {
-    // WGSL defines runtime `MIN % -1` as 0 (see the divide twin above).
+    // WGSL defines runtime `MIN % -1` as 0.
     let r = eval_binary(
         naga::BinaryOperator::Modulo,
         naga::Literal::I32(i32::MIN),
@@ -752,7 +845,7 @@ fn i64_add_overflow_not_folded() {
 
 #[test]
 fn i64_divide_min_by_neg1_folds_to_defined_value() {
-    // Mirrors the i32 rule: WGSL defines `MIN / -1` as MIN.
+    // WGSL defines `MIN / -1` as MIN.
     let r = eval_binary(
         naga::BinaryOperator::Divide,
         naga::Literal::I64(i64::MIN),
@@ -763,7 +856,7 @@ fn i64_divide_min_by_neg1_folds_to_defined_value() {
 
 #[test]
 fn i64_modulo_min_by_neg1_folds_to_defined_value() {
-    // Mirrors the i32 rule: WGSL defines `MIN % -1` as 0.
+    // WGSL defines `MIN % -1` as 0.
     let r = eval_binary(
         naga::BinaryOperator::Modulo,
         naga::Literal::I64(i64::MIN),
@@ -840,9 +933,8 @@ fn shift_right_i32_out_of_range_not_folded() {
     assert_eq!(result, None, "shift >= bit_width should not be folded");
 }
 
-// Note: the shift amount is always `u32` for WGSL-sourced IR (naga
-// concretises the right operand of `<<`/`>>` to u32), so 64-bit-base
-// shifts present as `U64/I64 << U32`, never `<< U64`.
+// naga concretises a shift amount to u32, so 64-bit-base shifts present as
+// `U64/I64 << U32`, never `<< U64`.
 
 #[test]
 fn shift_left_u64_in_range_folds() {
@@ -886,10 +978,9 @@ fn shift_left_i64_in_range_folds() {
 
 #[test]
 fn shift_left_i64_overflow_folds_bit_pattern() {
-    // `1i64 << 63` flips the sign bit; a concrete literal pair here sits in
-    // a runtime expression (const contexts died at naga's front-end), where
-    // WGSL defines the plain bit-pattern shift.  Declining instead poisons
-    // emission: the pair fails naga's text const-eval on re-parse.
+    // A concrete literal pair here is a runtime expression (const contexts
+    // died at naga's front-end), where WGSL defines the plain bit-pattern
+    // shift; declining poisons emission (the pair fails re-parse const-eval).
     let result = eval_binary(
         naga::BinaryOperator::ShiftLeft,
         naga::Literal::I64(1),
@@ -941,12 +1032,10 @@ fn shift_abstract_int_in_range_folds() {
     assert_eq!(result, Some(naga::Literal::AbstractInt(1024)));
 }
 
-// WGSL's sign-changing `<<` shader-creation error applies to CONST
-// contexts, which naga's front-end already rejected at ingest; concrete
-// literal pairs reaching the fold are runtime expressions manufactured by
-// nagami's own transforms, where the spec defines the bit-pattern result.
-// Folding it keeps the emission textable (a declined pair fails naga's
-// re-parse const-eval and kills the whole emission).
+// WGSL's sign-changing `<<` shader-creation error applies to const contexts,
+// which naga's front-end rejected at ingest; a concrete pair reaching the
+// fold is a runtime expression with a defined bit-pattern result, and
+// declining kills the emission on re-parse.
 #[test]
 fn shift_left_i32_sign_bit_overflow_folds_bit_pattern() {
     assert_eq!(
@@ -969,9 +1058,7 @@ fn shift_left_i32_sign_bit_overflow_folds_bit_pattern() {
 
 #[test]
 fn shift_left_i32_in_range_still_folds() {
-    // Boundary case: `1 << 30 = 0x40000000` keeps the sign bit at 0,
-    // and `-1 << 31 = i32::MIN` keeps the sign bit at 1 - both are
-    // valid and must continue folding.
+    // Boundary: the sign bit is unchanged in both.
     assert_eq!(
         eval_binary(
             naga::BinaryOperator::ShiftLeft,
@@ -992,9 +1079,8 @@ fn shift_left_i32_in_range_still_folds() {
 
 #[test]
 fn shift_left_i64_sign_bit_overflow_folds_bit_pattern() {
-    // RHS must be `U32` to reach the `(ShiftLeft, I64, U32)` arm: a WGSL
-    // shift amount is always `u32`.  (A `U64` RHS would match no arm and
-    // return `None` for the wrong reason - vacuously passing this test.)
+    // A WGSL shift amount is always `u32`; a `U64` RHS would match no arm and
+    // return `None` for the wrong reason.
     assert_eq!(
         eval_binary(
             naga::BinaryOperator::ShiftLeft,
@@ -1209,9 +1295,8 @@ fn make_identity_arena() -> IdentityArena {
     }
 }
 
-// Float Add/Subtract identity is intentionally NOT folded; see
-// `is_additive_identity_zero` and its IEEE-754 case analysis.
-// Integer zero identity remains safe.
+// Float Add/Subtract identity is not folded (`is_additive_identity_zero`,
+// IEEE-754 signed zero); integer zero identity is safe.
 
 #[test]
 fn identity_add_zero_left_integer() {
@@ -1239,11 +1324,8 @@ fn identity_sub_zero_right_integer() {
     assert_eq!(result, Some(a.param));
 }
 
-/// Regression for signed-zero correctness: `x + (+0.0) -> x`
-/// would be wrong when `x == -0.0` because IEEE 754 says
-/// `(-0.0) + (+0.0) = +0.0`.  The identity helper must refuse to
-/// fold either side of a float Add/Subtract identity, regardless
-/// of which zero is the literal.
+/// IEEE 754 gives `(-0.0) + (+0.0) = +0.0`, so `x + 0.0 -> x` mis-signs
+/// `x = -0.0`; neither side of a float Add/Subtract identity folds.
 #[test]
 fn identity_does_not_fold_float_zero_in_add_or_subtract() {
     let a = make_identity_arena();
@@ -1285,7 +1367,6 @@ fn identity_sub_zero_left_not_eliminated() {
 #[test]
 fn identity_mul_one_left() {
     let a = make_identity_arena();
-    // 1 * param -> param
     let result =
         check_identity_operand(naga::BinaryOperator::Multiply, a.one_f32, a.param, &a.arena);
     assert_eq!(result, Some(a.param));
@@ -1294,7 +1375,6 @@ fn identity_mul_one_left() {
 #[test]
 fn identity_mul_one_right() {
     let a = make_identity_arena();
-    // param * 1 -> param
     let result =
         check_identity_operand(naga::BinaryOperator::Multiply, a.param, a.one_f32, &a.arena);
     assert_eq!(result, Some(a.param));
@@ -1303,7 +1383,6 @@ fn identity_mul_one_right() {
 #[test]
 fn identity_div_one_right() {
     let a = make_identity_arena();
-    // param / 1 -> param
     let result = check_identity_operand(naga::BinaryOperator::Divide, a.param, a.one_f32, &a.arena);
     assert_eq!(result, Some(a.param));
 }
@@ -1311,7 +1390,6 @@ fn identity_div_one_right() {
 #[test]
 fn identity_div_one_left_not_eliminated() {
     let a = make_identity_arena();
-    // 1 / param != param
     let result = check_identity_operand(naga::BinaryOperator::Divide, a.one_f32, a.param, &a.arena);
     assert_eq!(result, None);
 }
@@ -1319,12 +1397,10 @@ fn identity_div_one_left_not_eliminated() {
 #[test]
 fn identity_integer_types() {
     let a = make_identity_arena();
-    // 0i + param -> param
     assert_eq!(
         check_identity_operand(naga::BinaryOperator::Add, a.zero_i32, a.param, &a.arena),
         Some(a.param)
     );
-    // 1i * param -> param
     assert_eq!(
         check_identity_operand(naga::BinaryOperator::Multiply, a.one_i32, a.param, &a.arena),
         Some(a.param)
@@ -1334,9 +1410,8 @@ fn identity_integer_types() {
 #[test]
 fn identity_no_false_positive_for_other_ops() {
     let a = make_identity_arena();
-    // Modulo with 1 is not an identity (it gives remainder),
-    // And with zero (not all-ones) is not an identity,
-    // ShiftLeft with float zero is not an identity (wrong type).
+    // `% 1` is a remainder, `& 0` is absorbing not identity, `<< 0.0` is the
+    // wrong type.
     assert_eq!(
         check_identity_operand(naga::BinaryOperator::Modulo, a.param, a.one_f32, &a.arena),
         None
@@ -1358,11 +1433,8 @@ fn identity_no_false_positive_for_other_ops() {
 
 #[test]
 fn identity_fires_on_f16_one_for_multiply_and_divide() {
-    // F16 multiplicative identity (`x * 1h`, `1h * x`, `x / 1h`)
-    // is safe and continues to fold.  The additive F16 identities
-    // (`x + 0h`, `x - 0h`) are intentionally NOT folded; see
-    // `identity_does_not_fold_float_zero_in_add_or_subtract` for
-    // the signed-zero rationale.
+    // The F16 multiplicative identity folds; the additive F16 identities are
+    // declined for the same signed-zero reason as f32.
     use half::f16;
     let mut arena = naga::Arena::new();
     let one_f16 = arena.append(
@@ -1371,31 +1443,25 @@ fn identity_fires_on_f16_one_for_multiply_and_divide() {
     );
     let param = arena.append(naga::Expression::FunctionArgument(0), Default::default());
 
-    // x * 1h -> x
     assert_eq!(
         check_identity_operand(naga::BinaryOperator::Multiply, param, one_f16, &arena),
         Some(param)
     );
-    // 1h * x -> x  (commutative)
     assert_eq!(
         check_identity_operand(naga::BinaryOperator::Multiply, one_f16, param, &arena),
         Some(param)
     );
-    // x / 1h -> x
     assert_eq!(
         check_identity_operand(naga::BinaryOperator::Divide, param, one_f16, &arena),
         Some(param)
     );
 }
 
-// Identity elimination: integration via fold_local_expressions
-
 #[test]
 fn identity_fold_non_emittable_added_to_folded() {
-    // 0 + FunctionArgument -> FunctionArgument is non-emittable,
-    // so it must be in the folded set for Emit removal.  Use
-    // integer zero because float-zero additive identity is
-    // intentionally refused under IEEE signed-zero rules.
+    // The replacement `FunctionArgument` is non-emittable, so it must enter
+    // `folded` for Emit removal; integer zero because the float identity is
+    // refused.
     let mut arena = naga::Arena::new();
     let zero = arena.append(
         naga::Expression::Literal(naga::Literal::I32(0)),
@@ -1414,16 +1480,16 @@ fn identity_fold_non_emittable_added_to_folded() {
     let (folded, identity) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(
         identity > 0,
         "0 + param should trigger identity elimination"
     );
     assert!(
-        folded.contains(&add),
+        folded.contains(add),
         "FunctionArgument replacement must be in folded set for Emit removal"
     );
     assert!(
@@ -1435,10 +1501,8 @@ fn identity_fold_non_emittable_added_to_folded() {
 
 #[test]
 fn identity_fold_emittable_not_in_folded() {
-    // 0 + Binary(Mul, a, b) -> Binary(Mul, a, b) is emittable,
-    // so it must NOT be in the folded set.  Use integer zero
-    // because float-zero additive identity is intentionally
-    // refused under IEEE signed-zero rules.
+    // The replacement `Binary(Mul)` is emittable, so it must stay out of
+    // `folded`; integer zero because the float identity is refused.
     let mut arena = naga::Arena::new();
     let zero = arena.append(
         naga::Expression::Literal(naga::Literal::I32(0)),
@@ -1466,20 +1530,18 @@ fn identity_fold_emittable_not_in_folded() {
     let (folded, identity) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(
         identity > 0,
         "0 + (a*b) should trigger identity elimination"
     );
-    // The result is Binary(Mul, ...) - emittable - NOT in folded.
     assert!(
-        !folded.contains(&add),
+        !folded.contains(add),
         "emittable replacement must NOT be in folded set"
     );
-    // The expression at `add` should now be the same as `mul`.
     assert!(
         matches!(
             arena[add],
@@ -1493,10 +1555,9 @@ fn identity_fold_emittable_not_in_folded() {
     );
 }
 
-/// Refcount escape: `0u + Load(p)` with a uniquely-owned Load
-/// folds to a Load clone, AND the original Load enters `folded`
-/// so the rebuild drops its Emit entry.  Without that drop the
-/// let-binding survives and runs a second memory read.
+/// `0u + Load(p)` with a uniquely-owned Load folds to a Load clone, and the
+/// original Load enters `folded` so the rebuild drops its Emit entry;
+/// otherwise the let-binding survives and runs a second read.
 #[test]
 fn identity_fold_unique_impure_clone_drops_source() {
     let mut arena = naga::Arena::new();
@@ -1504,9 +1565,8 @@ fn identity_fold_unique_impure_clone_drops_source() {
         naga::Expression::Literal(naga::Literal::U32(0)),
         Default::default(),
     );
-    // FunctionArgument(0) stands in for a pointer here - the
-    // const-fold pass doesn't type-check, it just observes
-    // expression shapes.
+    // `FunctionArgument(0)` stands in for a pointer: the fold observes
+    // shapes, not types.
     let ptr = arena.append(naga::Expression::FunctionArgument(0), Default::default());
     let load = arena.append(naga::Expression::Load { pointer: ptr }, Default::default());
     let add = arena.append(
@@ -1518,9 +1578,7 @@ fn identity_fold_unique_impure_clone_drops_source() {
         Default::default(),
     );
 
-    // Build refcounts inline because there's no Function to walk.
-    // The only intra-arena uses are: Load->ptr, Binary->{zero, load}.
-    // So `load` has refcount 1 (only the Binary references it).
+    // No Function to walk, so count refs inline.
     let mut refcounts = vec![0u32; arena.len()];
     for (_, expr) in arena.iter() {
         crate::passes::expr_util::visit_expression_children(expr, |child| {
@@ -1536,26 +1594,21 @@ fn identity_fold_unique_impure_clone_drops_source() {
     let (folded, identity) = fold_local(
         &mut arena,
         &refcounts,
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(
         identity > 0,
         "0u + Load should fold once Load is uniquely owned"
     );
-    // The original Load's Emit-range entry must be dropped (folded
-    // contains `load`).  Otherwise the generator would emit a
-    // dead let-binding that runs a second memory read.
     assert!(
-        folded.contains(&load),
+        folded.contains(load),
         "uniquely-owned impure source must be in `folded` so the \
              rebuild walk drops its Emit-range entry"
     );
-    // The `add` slot now carries a Load expression (clone of the
-    // original); it's still emittable, so it stays out of `folded`.
     assert!(
-        !folded.contains(&add),
+        !folded.contains(add),
         "the cloned Load at `add` is still emittable - must NOT be \
              dropped from its own Emit range"
     );
@@ -1566,11 +1619,9 @@ fn identity_fold_unique_impure_clone_drops_source() {
     );
 }
 
-/// Store-aware guard: a uniquely-owned impure operand whose
-/// `Emit` range differs from the folding Binary's MUST NOT be
-/// relocated - a statement (here, a hazardous memory write) sits
-/// between them, so cloning the Load into the Binary's later slot
-/// would move the read past the write (read-after-write reorder).
+/// A uniquely-owned impure operand in a different `Emit` range than the
+/// folding Binary must not be relocated: a statement (a hazardous write) sits
+/// between them, so cloning the Load would move the read past the write.
 /// Models `let a = data[0]; data[0] = ...; data[1] = 0u + a;`.
 #[test]
 fn identity_fold_unique_impure_cross_emit_range_blocked() {
@@ -1598,8 +1649,7 @@ fn identity_fold_unique_impure_cross_emit_range_blocked() {
     }
     assert_eq!(refcounts[load.index()], 1, "Load is uniquely owned");
 
-    // Load lives in Emit range 0, the Binary in range 1: a
-    // statement (a store) separates them.  The guard must refuse.
+    // Range 0 vs range 1: a statement separates them.
     let mut ranges = vec![NO_EMIT; arena.len()];
     ranges[load.index()] = 0;
     ranges[add.index()] = 1;
@@ -1607,16 +1657,16 @@ fn identity_fold_unique_impure_cross_emit_range_blocked() {
         &mut arena,
         &refcounts,
         &ranges,
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert_eq!(
         identity, 0,
         "cross-`Emit`-range impure operand must NOT be relocated by the identity fold"
     );
     assert!(
-        !folded.contains(&load),
+        !folded.contains(load),
         "the original Load must stay in its Emit range (not dropped)"
     );
     assert!(
@@ -1626,9 +1676,8 @@ fn identity_fold_unique_impure_cross_emit_range_blocked() {
     );
 }
 
-/// Involution arm of the store-aware guard: the same rule applies to
-/// `-(-x)` - a uniquely-owned impure inner operand whose `Emit` range
-/// differs from the outer Unary's must NOT be relocated.  Models
+/// The involution arm of the store-aware guard: `-(-x)` with the inner Load
+/// in another `Emit` range.  Models
 /// `let a = data[0]; data[0] = ...; data[1] = -(-a);`.
 #[test]
 fn involution_fold_unique_impure_cross_emit_range_blocked() {
@@ -1663,8 +1712,6 @@ fn involution_fold_unique_impure_cross_emit_range_blocked() {
         "intermediate Unary is uniquely owned"
     );
 
-    // Inner Load in Emit range 0; the outer Unary in range 1 - a
-    // statement (a store) separates them, so relocation is unsound.
     let mut ranges = vec![NO_EMIT; arena.len()];
     ranges[load.index()] = 0;
     ranges[neg1.index()] = 1;
@@ -1673,16 +1720,16 @@ fn involution_fold_unique_impure_cross_emit_range_blocked() {
         &mut arena,
         &refcounts,
         &ranges,
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert_eq!(
         identity, 0,
         "cross-`Emit`-range impure inner must NOT be relocated by the involution fold"
     );
     assert!(
-        !folded.contains(&load),
+        !folded.contains(load),
         "the inner Load must stay in its Emit range"
     );
     assert!(
@@ -1692,9 +1739,8 @@ fn involution_fold_unique_impure_cross_emit_range_blocked() {
     );
 }
 
-/// Counterpart: a multi-referenced impure operand stays alive
-/// even after the rewrite, so cloning would emit a second Load -
-/// observable for storage / workgroup vars.  Gate must refuse.
+/// A multi-referenced impure operand stays alive after the rewrite, so
+/// cloning would emit a second observable Load.
 #[test]
 fn identity_fold_multi_ref_impure_blocked() {
     let mut arena = naga::Arena::new();
@@ -1704,9 +1750,6 @@ fn identity_fold_multi_ref_impure_blocked() {
     );
     let ptr = arena.append(naga::Expression::FunctionArgument(0), Default::default());
     let load = arena.append(naga::Expression::Load { pointer: ptr }, Default::default());
-    // Two consumers of `load`: the identity Binary and a sibling
-    // Unary.  The sibling keeps `load` alive even if the Binary
-    // is rewritten.
     let _sibling = arena.append(
         naga::Expression::Unary {
             op: naga::UnaryOperator::Negate,
@@ -1738,16 +1781,16 @@ fn identity_fold_multi_ref_impure_blocked() {
     let (folded, identity) = fold_local(
         &mut arena,
         &refcounts,
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert_eq!(
         identity, 0,
         "multi-ref impure operand must NOT trigger identity fold"
     );
     assert!(
-        !folded.contains(&load),
+        !folded.contains(load),
         "multi-ref Load must stay in its Emit range"
     );
     assert!(
@@ -1785,22 +1828,22 @@ fn identity_fold_constant_added_to_folded() {
         Default::default(),
     );
 
-    // With const in literal cache -> const_expr folds to Literal(41.0) first,
-    // then 1 * 41.0 is identity-eliminated.
-    let mut const_literals = FxHashMap::default();
+    // Cached: the Constant folds to a literal first, then `1 * 41.0`
+    // identity-folds.
+    let mut const_literals = HandleMap::default();
     const_literals.insert(constant_handle, naga::Literal::F32(41.0));
     let (folded, _) = fold_local(
         &mut arena,
         &[],
         &const_literals,
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
-    assert!(folded.contains(&mul), "result should be in folded set");
+    assert!(folded.contains(mul), "result should be in folded set");
     assert_f32_literal(&arena, mul, 41.0);
 
-    // Without const in literal cache -> const_expr stays as Constant,
-    // identity elim makes mul = Constant (non-emittable -> in folded).
+    // Uncached: the Constant stays and identity makes `mul` a non-emittable
+    // Constant.
     let mut arena2 = naga::Arena::new();
     let one2 = arena2.append(
         naga::Expression::Literal(naga::Literal::F32(1.0)),
@@ -1821,16 +1864,16 @@ fn identity_fold_constant_added_to_folded() {
     let (folded2, identity2) = fold_local(
         &mut arena2,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(
         identity2 > 0,
         "1 * const should trigger identity elimination"
     );
     assert!(
-        folded2.contains(&mul2),
+        folded2.contains(mul2),
         "Constant replacement must be in folded set (non-emittable)"
     );
     assert!(
@@ -1839,8 +1882,6 @@ fn identity_fold_constant_added_to_folded() {
         arena2[mul2]
     );
 }
-
-// Absorbing operand tests
 
 #[test]
 fn absorbing_mul_zero_left() {
@@ -1860,7 +1901,6 @@ fn absorbing_mul_zero_left() {
 #[test]
 fn absorbing_mul_zero_right() {
     let a = make_identity_arena();
-    // Integer `param * 0 -> 0`.
     assert_eq!(
         check_absorbing_operand(
             naga::BinaryOperator::Multiply,
@@ -1872,10 +1912,9 @@ fn absorbing_mul_zero_right() {
     );
 }
 
-/// A FLOAT zero must NOT absorb in a multiply: `x * 0.0` carries the
-/// product's IEEE sign (and is NaN for non-finite `x`), which the
-/// absorbing arm cannot reconstruct by cloning the matched zero.  Only
-/// `eval_binary` (sign-aware, for the both-literal case) may fold it.
+/// `x * 0.0` carries the product's IEEE sign (NaN for non-finite `x`), which
+/// cloning the matched zero cannot reproduce; only the sign-aware
+/// `eval_binary` may fold the both-literal case.
 #[test]
 fn absorbing_mul_float_zero_declined() {
     let a = make_identity_arena();
@@ -1902,7 +1941,6 @@ fn absorbing_mul_float_zero_declined() {
 #[test]
 fn absorbing_mul_zero_integer() {
     let a = make_identity_arena();
-    // 0i * param -> 0i
     assert_eq!(
         check_absorbing_operand(
             naga::BinaryOperator::Multiply,
@@ -1922,12 +1960,10 @@ fn absorbing_and_zero() {
         Default::default(),
     );
     let param = arena.append(naga::Expression::FunctionArgument(0), Default::default());
-    // param & 0u -> 0u
     assert_eq!(
         check_absorbing_operand(naga::BinaryOperator::And, param, zero_u32, &arena),
         Some(zero_u32)
     );
-    // 0u & param -> 0u
     assert_eq!(
         check_absorbing_operand(naga::BinaryOperator::And, zero_u32, param, &arena),
         Some(zero_u32)
@@ -1942,12 +1978,10 @@ fn absorbing_or_all_ones() {
         Default::default(),
     );
     let param = arena.append(naga::Expression::FunctionArgument(0), Default::default());
-    // param | 0xFFFFFFFF -> 0xFFFFFFFF
     assert_eq!(
         check_absorbing_operand(naga::BinaryOperator::InclusiveOr, param, all_ones, &arena),
         Some(all_ones)
     );
-    // 0xFFFFFFFF | param -> 0xFFFFFFFF
     assert_eq!(
         check_absorbing_operand(naga::BinaryOperator::InclusiveOr, all_ones, param, &arena),
         Some(all_ones)
@@ -1993,19 +2027,15 @@ fn absorbing_logical_or_true() {
 #[test]
 fn absorbing_no_false_positive() {
     let a = make_identity_arena();
-    // Add with zero is identity, NOT absorbing.
     assert_eq!(
         check_absorbing_operand(naga::BinaryOperator::Add, a.zero_f32, a.param, &a.arena),
         None
     );
-    // Multiply with 1 is identity, NOT absorbing.
     assert_eq!(
         check_absorbing_operand(naga::BinaryOperator::Multiply, a.one_f32, a.param, &a.arena),
         None
     );
 }
-
-// Extended identity tests (bitwise / logical)
 
 #[test]
 fn identity_or_zero() {
@@ -2015,12 +2045,10 @@ fn identity_or_zero() {
         Default::default(),
     );
     let param = arena.append(naga::Expression::FunctionArgument(0), Default::default());
-    // param | 0 -> param
     assert_eq!(
         check_identity_operand(naga::BinaryOperator::InclusiveOr, param, zero, &arena),
         Some(param)
     );
-    // 0 | param -> param
     assert_eq!(
         check_identity_operand(naga::BinaryOperator::InclusiveOr, zero, param, &arena),
         Some(param)
@@ -2035,12 +2063,10 @@ fn identity_xor_zero() {
         Default::default(),
     );
     let param = arena.append(naga::Expression::FunctionArgument(0), Default::default());
-    // param ^ 0 -> param
     assert_eq!(
         check_identity_operand(naga::BinaryOperator::ExclusiveOr, param, zero, &arena),
         Some(param)
     );
-    // 0 ^ param -> param
     assert_eq!(
         check_identity_operand(naga::BinaryOperator::ExclusiveOr, zero, param, &arena),
         Some(param)
@@ -2055,12 +2081,10 @@ fn identity_and_all_ones() {
         Default::default(),
     );
     let param = arena.append(naga::Expression::FunctionArgument(0), Default::default());
-    // param & 0xFFFFFFFF -> param
     assert_eq!(
         check_identity_operand(naga::BinaryOperator::And, param, all_ones, &arena),
         Some(param)
     );
-    // 0xFFFFFFFF & param -> param
     assert_eq!(
         check_identity_operand(naga::BinaryOperator::And, all_ones, param, &arena),
         Some(param)
@@ -2106,7 +2130,7 @@ fn identity_logical_or_false() {
 #[test]
 fn identity_and_all_ones_i32() {
     let mut arena = naga::Arena::new();
-    // i32 -1 is all ones (0xFFFFFFFF)
+    // i32 -1 is all ones.
     let all_ones = arena.append(
         naga::Expression::Literal(naga::Literal::I32(-1)),
         Default::default(),
@@ -2117,8 +2141,6 @@ fn identity_and_all_ones_i32() {
         Some(param)
     );
 }
-
-// Involution tests
 
 #[test]
 fn involution_double_negate() {
@@ -2142,18 +2164,17 @@ fn involution_double_negate() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(count > 0, "-(-x) should be simplified");
-    // neg2 should now be FunctionArgument(0) (non-emittable -> in folded)
     assert!(
         matches!(arena[neg2], naga::Expression::FunctionArgument(0)),
         "expected FunctionArgument(0), got {:?}",
         arena[neg2]
     );
-    assert!(folded.contains(&neg2));
+    assert!(folded.contains(neg2));
 }
 
 #[test]
@@ -2178,9 +2199,9 @@ fn involution_double_logical_not() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(count > 0, "!(!x) should be simplified");
     assert!(
@@ -2188,7 +2209,7 @@ fn involution_double_logical_not() {
         "expected FunctionArgument(0), got {:?}",
         arena[not2]
     );
-    assert!(folded.contains(&not2));
+    assert!(folded.contains(not2));
 }
 
 #[test]
@@ -2213,9 +2234,9 @@ fn involution_double_bitwise_not() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(count > 0, "~(~x) should be simplified");
     assert!(
@@ -2223,7 +2244,7 @@ fn involution_double_bitwise_not() {
         "expected FunctionArgument(0), got {:?}",
         arena[not2]
     );
-    assert!(folded.contains(&not2));
+    assert!(folded.contains(not2));
 }
 
 #[test]
@@ -2248,9 +2269,9 @@ fn involution_different_ops_not_simplified() {
     let (_, count) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert_eq!(count, 0, "different unary ops should not be simplified");
     assert!(
@@ -2267,8 +2288,6 @@ fn involution_different_ops_not_simplified() {
 
 #[test]
 fn involution_emittable_inner_not_in_folded() {
-    // -(-Binary(Mul, a, b)) -> Binary(Mul, a, b) which is emittable,
-    // so it must NOT be in the folded set.
     let mut arena = naga::Arena::new();
     let param_a = arena.append(naga::Expression::FunctionArgument(0), Default::default());
     let param_b = arena.append(naga::Expression::FunctionArgument(1), Default::default());
@@ -2298,9 +2317,9 @@ fn involution_emittable_inner_not_in_folded() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(count > 0, "-(-Binary(Mul)) should be simplified");
     assert!(
@@ -2314,14 +2333,11 @@ fn involution_emittable_inner_not_in_folded() {
         "expected Binary(Multiply), got {:?}",
         arena[neg2]
     );
-    // Binary is emittable -> must NOT be in folded set
     assert!(
-        !folded.contains(&neg2),
+        !folded.contains(neg2),
         "emittable involution result must NOT be in folded set"
     );
 }
-
-// Select simplification tests
 
 #[test]
 fn select_same_arms_simplified() {
@@ -2340,9 +2356,9 @@ fn select_same_arms_simplified() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(count > 0, "select(x, x, cond) should be simplified");
     assert!(
@@ -2350,7 +2366,7 @@ fn select_same_arms_simplified() {
         "expected FunctionArgument(0), got {:?}",
         arena[sel]
     );
-    assert!(folded.contains(&sel));
+    assert!(folded.contains(sel));
 }
 
 #[test]
@@ -2374,35 +2390,25 @@ fn select_different_arms_not_simplified() {
     let (folded, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
-    // With constant condition, resolve_literal will fold this to param_b's value.
-    // But param_b is FunctionArgument(1), not a literal, so resolve_literal returns None.
-    // Select with different arms and non-foldable result stays as-is.
-    // Actually: resolve_literal for Select needs both arms to be literals too.
-    // So this should remain a Select.
+    // `resolve_literal` needs literal arms, so the Select stays.
     assert!(
         matches!(arena[sel], naga::Expression::Select { .. }),
         "select with different arms should not be simplified by the simplify loop, got {:?}",
         arena[sel]
     );
-    assert!(!folded.contains(&sel));
+    assert!(!folded.contains(sel));
 }
-
-// Absorbing integration test (fold_local_expressions)
 
 #[test]
 fn absorbing_fold_mul_zero_param_not_rewritten() {
-    // `param * 0.0` (param = FunctionArgument) must NOT be rewritten to the
-    // scalar literal `0.0` regardless of param's type: that would produce
-    // invalid IR whenever param is a vector or matrix.
-    //
-    // The new gate requires BOTH operands be scalar Literal for the
-    // simplify-loop absorbing rewrite to fire.  A non-literal operand
-    // (FunctionArgument here) carries unknown type, so absorbing is
-    // safely declined.  The Binary stays as a Binary.
+    // Rewriting `param * 0.0` to the scalar `0.0` is invalid IR whenever
+    // `param` is a vector or matrix; the simplify-loop absorbing rewrite fires
+    // only when both operands are scalar Literals, and a FunctionArgument has
+    // unknown type.
     let mut arena = naga::Arena::new();
     let zero = arena.append(
         naga::Expression::Literal(naga::Literal::F32(0.0)),
@@ -2421,9 +2427,9 @@ fn absorbing_fold_mul_zero_param_not_rewritten() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert_eq!(
         count, 0,
@@ -2434,12 +2440,11 @@ fn absorbing_fold_mul_zero_param_not_rewritten() {
         "Binary must be preserved, got {:?}",
         arena[mul]
     );
-    assert!(!folded.contains(&mul));
+    assert!(!folded.contains(mul));
 }
 
 #[test]
 fn absorbing_fold_and_zero_u32_param_not_rewritten() {
-    // Same absorbing case for integer `&`.
     let mut arena = naga::Arena::new();
     let zero = arena.append(
         naga::Expression::Literal(naga::Literal::U32(0)),
@@ -2458,9 +2463,9 @@ fn absorbing_fold_and_zero_u32_param_not_rewritten() {
     let (folded, count) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert_eq!(
         count, 0,
@@ -2471,16 +2476,14 @@ fn absorbing_fold_and_zero_u32_param_not_rewritten() {
         "Binary must be preserved, got {:?}",
         arena[and]
     );
-    assert!(!folded.contains(&and));
+    assert!(!folded.contains(and));
 }
 
 #[test]
 fn absorbing_fold_mul_zero_both_literal_produces_literal() {
-    // When BOTH operands are scalar Literals, absorbing is type-safe
-    // (the Binary's result type equals both operand types).  This is
-    // the only case the simplify-loop absorbing rewrite fires.
-    // (In practice, the preceding `resolve_const_value` stage usually
-    // folds it first, but the safety net is still exercised here.)
+    // Both operands scalar Literals is the one type-safe absorbing case;
+    // `resolve_const_value` usually folds it first, so this exercises the
+    // safety net.
     let mut arena = naga::Arena::new();
     let zero = arena.append(
         naga::Expression::Literal(naga::Literal::F32(0.0)),
@@ -2502,30 +2505,26 @@ fn absorbing_fold_mul_zero_both_literal_produces_literal() {
     let (_folded, _count) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
-    // Either eval_binary or absorbing must have collapsed this to a literal 0.
     assert_f32_literal(&arena, mul, 0.0);
 }
 
 #[test]
 fn absorbing_fold_logical_and_false_with_non_literal_rhs_rewritten() {
-    // `LogicalAnd`/`LogicalOr` are strictly scalar-bool in valid WGSL IR
-    // (no vector broadcasting possible),
-    // so absorbing is type-safe even when the other operand is NOT a
-    // literal.  This is the pattern produced by dead_branch Phase 0 when
-    // re-sugaring `var tmp = false && (j < -8)` from its lowered form;
-    // without this rewrite the dead loop `for(;0<0&&j<0-8;){}` cannot be
-    // collapsed and the minified output grows rather than shrinks.
+    // `LogicalAnd`/`LogicalOr` are strictly scalar-bool, so absorbing is
+    // type-safe with a non-literal operand; dead_branch's re-sugar of
+    // `var tmp = false && (j < -8)` produces this shape, and without the fold
+    // the dead loop `for(;0<0&&j<0-8;){}` cannot collapse and the output
+    // grows.
     let mut arena = naga::Arena::new();
     let false_lit = arena.append(
         naga::Expression::Literal(naga::Literal::Bool(false)),
         Default::default(),
     );
-    // Non-literal RHS (FunctionArgument stands in for `j < -8`, which at
-    // the point of absorbing is a Binary, also a non-Literal).
+    // The FunctionArgument stands in for the non-literal `j < -8`.
     let rhs = arena.append(naga::Expression::FunctionArgument(0), Default::default());
     let and_ = arena.append(
         naga::Expression::Binary {
@@ -2539,9 +2538,9 @@ fn absorbing_fold_logical_and_false_with_non_literal_rhs_rewritten() {
     let (_folded, count) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
 
     assert!(count > 0, "false && rhs must be absorbed to false");
@@ -2557,8 +2556,6 @@ fn absorbing_fold_logical_and_false_with_non_literal_rhs_rewritten() {
 
 #[test]
 fn absorbing_fold_logical_or_true_with_non_literal_rhs_rewritten() {
-    // Symmetric case: `true || rhs` must collapse to `true` even when
-    // `rhs` is non-literal.
     let mut arena = naga::Arena::new();
     let true_lit = arena.append(
         naga::Expression::Literal(naga::Literal::Bool(true)),
@@ -2577,9 +2574,9 @@ fn absorbing_fold_logical_or_true_with_non_literal_rhs_rewritten() {
     let (_folded, count) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
 
     assert!(count > 0, "true || rhs must be absorbed to true");
@@ -2593,12 +2590,9 @@ fn absorbing_fold_logical_or_true_with_non_literal_rhs_rewritten() {
     );
 }
 
-/// End-to-end regression for the `0<0 && j<-8` pattern inside a dead
-/// `for` loop.  If the absorbing rewrite declines to fold `false && (j < -8)`,
-/// the dead loop survives into the emitter as
-/// `loop { var a = false && A<-8; if !(a) { break; } }` and the minified
-/// output GROWS (66 -> 87 bytes); folding collapses the loop so the output
-/// stays at or below input size.
+/// If the absorbing rewrite declines `false && (j < -8)`, the dead loop
+/// reaches the emitter as `loop { var a = false && A<-8; if !(a) { break; } }`
+/// and the output grows (66 -> 87 bytes).
 #[test]
 fn e2e_dead_for_loop_with_short_circuit_condition_does_not_grow() {
     let source = "@compute @workgroup_size(1) fn d(){var j:i32;for(;0<0&&j<0-8;){}}\n";
@@ -2616,7 +2610,6 @@ fn e2e_dead_for_loop_with_short_circuit_condition_does_not_grow() {
 
 // MARK: Vector constant folding tests
 
-/// Helper: insert a vec type into the type arena and return its handle.
 fn make_vec_type(
     types: &mut naga::UniqueArena<naga::Type>,
     size: naga::VectorSize,
@@ -2631,7 +2624,6 @@ fn make_vec_type(
     )
 }
 
-/// Helper: assert that expression is a Compose of literal scalars.
 fn assert_compose_of_f32(
     arena: &naga::Arena<naga::Expression>,
     handle: naga::Handle<naga::Expression>,
@@ -2673,11 +2665,10 @@ fn vector_splat_folds_to_compose() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
-    // Splat of literal 1.0 -> Compose(vec3f, [1.0, 1.0, 1.0])
     assert_compose_of_f32(&arena, splat, &[1.0, 1.0, 1.0]);
 }
 
@@ -2711,7 +2702,7 @@ fn vector_compose_binary_add_folds() {
         naga::Expression::Literal(naga::Literal::F32(30.0)),
         Default::default(),
     );
-    // Pre-place result literals for materialization
+    // Result literals pre-placed for materialization.
     let _r1 = arena.append(
         naga::Expression::Literal(naga::Literal::F32(11.0)),
         Default::default(),
@@ -2751,11 +2742,10 @@ fn vector_compose_binary_add_folds() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
-    // vec3(1,2,3) + vec3(10,20,30) = vec3(11,22,33)
     assert_compose_of_f32(&arena, add, &[11.0, 22.0, 33.0]);
 }
 
@@ -2777,7 +2767,7 @@ fn vector_negate_folds() {
         naga::Expression::Literal(naga::Literal::F32(3.5)),
         Default::default(),
     );
-    // Pre-place result literals for materialization
+    // Result literals pre-placed for materialization.
     let _rn1 = arena.append(
         naga::Expression::Literal(naga::Literal::F32(-1.0)),
         Default::default(),
@@ -2808,11 +2798,10 @@ fn vector_negate_folds() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
-    // -vec3(1, -2, 3.5) = vec3(-1, 2, -3.5)
     assert_compose_of_f32(&arena, neg, &[-1.0, 2.0, -3.5]);
 }
 
@@ -2845,7 +2834,6 @@ fn vector_access_index_folds_to_scalar() {
         },
         Default::default(),
     );
-    // .y == index 1
     let access = arena.append(
         naga::Expression::AccessIndex { base: v, index: 1 },
         Default::default(),
@@ -2854,14 +2842,13 @@ fn vector_access_index_folds_to_scalar() {
     let (folded, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
-    // vec4f(10,20,30,40).y -> 20.0
     assert_f32_literal(&arena, access, 20.0);
     assert!(
-        folded.contains(&access),
+        folded.contains(access),
         "scalar result should be in folded set"
     );
 }
@@ -2896,7 +2883,6 @@ fn vector_swizzle_folds() {
         },
         Default::default(),
     );
-    // .zw swizzle -> vec2(3.0, 4.0)
     let swiz = arena.append(
         naga::Expression::Swizzle {
             size: naga::VectorSize::Bi,
@@ -2914,7 +2900,7 @@ fn vector_swizzle_folds() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -2939,7 +2925,7 @@ fn vector_scalar_broadcast_mul() {
         naga::Expression::Literal(naga::Literal::F32(4.0)),
         Default::default(),
     );
-    // Pre-place result literals for materialization
+    // Result literals pre-placed for materialization.
     let _r1 = arena.append(
         naga::Expression::Literal(naga::Literal::F32(20.0)),
         Default::default(),
@@ -2963,7 +2949,6 @@ fn vector_scalar_broadcast_mul() {
         naga::Expression::Literal(naga::Literal::F32(10.0)),
         Default::default(),
     );
-    // vec3(2,3,4) * 10.0
     let mul = arena.append(
         naga::Expression::Binary {
             op: naga::BinaryOperator::Multiply,
@@ -2976,7 +2961,7 @@ fn vector_scalar_broadcast_mul() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -2985,8 +2970,8 @@ fn vector_scalar_broadcast_mul() {
 
 #[test]
 fn vector_zero_value_stays_non_emittable() {
-    // ZeroValue is non-emittable, so it must NOT be replaced with
-    // an emittable Compose - that would produce invalid IR.
+    // ZeroValue is non-emittable; replacing it with an emittable Compose is
+    // invalid IR.
     let mut types = naga::UniqueArena::new();
     let vec3f_ty = make_vec_type(&mut types, naga::VectorSize::Tri, naga::Scalar::F32);
 
@@ -3000,7 +2985,7 @@ fn vector_zero_value_stays_non_emittable() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -3049,17 +3034,15 @@ fn vector_add_zero_value_folds() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
-    // vec3(1,2,3) + vec3(0,0,0) = vec3(1,2,3)
     assert_compose_of_f32(&arena, add, &[1.0, 2.0, 3.0]);
 }
 
 #[test]
 fn vector_splat_binary_scalar_add() {
-    // Splat(2.0) + Splat(3.0) -> Compose([5.0, 5.0])
     let mut types = naga::UniqueArena::new();
     let _vec2f_ty = make_vec_type(&mut types, naga::VectorSize::Bi, naga::Scalar::F32);
 
@@ -3072,7 +3055,7 @@ fn vector_splat_binary_scalar_add() {
         naga::Expression::Literal(naga::Literal::F32(3.0)),
         Default::default(),
     );
-    // Need a literal 5.0 in the arena for materialization
+    // Result literal pre-placed for materialization.
     let _five = arena.append(
         naga::Expression::Literal(naga::Literal::F32(5.0)),
         Default::default(),
@@ -3104,7 +3087,7 @@ fn vector_splat_binary_scalar_add() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -3113,7 +3096,6 @@ fn vector_splat_binary_scalar_add() {
 
 #[test]
 fn vector_nested_chain_folds() {
-    // Test: -negate(compose(1, 2, 3)) + compose(10, 20, 30) == compose(9, 18, 27)
     let mut types = naga::UniqueArena::new();
     let vec3f_ty = make_vec_type(&mut types, naga::VectorSize::Tri, naga::Scalar::F32);
 
@@ -3142,7 +3124,7 @@ fn vector_nested_chain_folds() {
         naga::Expression::Literal(naga::Literal::F32(30.0)),
         Default::default(),
     );
-    // Pre-place result literals for materialisation
+    // Result literals pre-placed for materialization.
     let _c9 = arena.append(
         naga::Expression::Literal(naga::Literal::F32(9.0)),
         Default::default(),
@@ -3189,11 +3171,10 @@ fn vector_nested_chain_folds() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
-    // -vec3(1,2,3) + vec3(10,20,30) = vec3(9, 18, 27)
     assert_compose_of_f32(&arena, add, &[9.0, 18.0, 27.0]);
 }
 
@@ -3219,7 +3200,7 @@ fn vector_integer_types_fold() {
         naga::Expression::Literal(naga::Literal::I32(7)),
         Default::default(),
     );
-    // Results
+    // Result literals pre-placed for materialization.
     let _r1 = arena.append(
         naga::Expression::Literal(naga::Literal::I32(13)),
         Default::default(),
@@ -3255,11 +3236,10 @@ fn vector_integer_types_fold() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
-    // vec2i(10,20) + vec2i(3,7) = vec2i(13,27)
     match &arena[add] {
         naga::Expression::Compose { components, .. } => {
             assert_eq!(components.len(), 2);
@@ -3278,8 +3258,7 @@ fn vector_integer_types_fold() {
 
 #[test]
 fn vector_no_matching_literal_skips_materialization() {
-    // If the result literal doesn't exist in the arena before the target,
-    // materialization is skipped and the expression remains unchanged.
+    // Materialization needs the result literals to precede the target.
     let mut types = naga::UniqueArena::new();
     let vec2f_ty = make_vec_type(&mut types, naga::VectorSize::Bi, naga::Scalar::F32);
 
@@ -3300,7 +3279,7 @@ fn vector_no_matching_literal_skips_materialization() {
         naga::Expression::Literal(naga::Literal::F32(200.0)),
         Default::default(),
     );
-    // Intentionally do NOT add literals 101.0 and 202.0
+    // No 101.0 / 202.0 literals on purpose.
 
     let va = arena.append(
         naga::Expression::Compose {
@@ -3328,11 +3307,10 @@ fn vector_no_matching_literal_skips_materialization() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
-    // Result 101.0 and 202.0 are not in the arena, so add stays as Binary
     assert!(
         matches!(arena[add], naga::Expression::Binary { .. }),
         "should remain Binary when materialization fails, got {:?}",
@@ -3342,7 +3320,6 @@ fn vector_no_matching_literal_skips_materialization() {
 
 #[test]
 fn vector_compose_mixed_scalar_and_vector() {
-    // Compose(vec4f, [scalar, vec3f]) should flatten to 4 components.
     let mut types = naga::UniqueArena::new();
     let vec3f_ty = make_vec_type(&mut types, naga::VectorSize::Tri, naga::Scalar::F32);
     let vec4f_ty = make_vec_type(&mut types, naga::VectorSize::Quad, naga::Scalar::F32);
@@ -3371,7 +3348,6 @@ fn vector_compose_mixed_scalar_and_vector() {
         },
         Default::default(),
     );
-    // Compose(vec4f, [scalar(1.0), vec3(2.0, 3.0, 4.0)])
     let v4 = arena.append(
         naga::Expression::Compose {
             ty: vec4f_ty,
@@ -3383,7 +3359,7 @@ fn vector_compose_mixed_scalar_and_vector() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -3392,7 +3368,6 @@ fn vector_compose_mixed_scalar_and_vector() {
 
 #[test]
 fn vector_relational_op_produces_bool_vector() {
-    // vec2(1.0, 3.0) < vec2(2.0, 2.0) -> vec2<bool>(true, false)
     let mut types = naga::UniqueArena::new();
     let vec2f_ty = make_vec_type(&mut types, naga::VectorSize::Bi, naga::Scalar::F32);
     let _vec2b_ty = make_vec_type(&mut types, naga::VectorSize::Bi, naga::Scalar::BOOL);
@@ -3414,7 +3389,7 @@ fn vector_relational_op_produces_bool_vector() {
         naga::Expression::Literal(naga::Literal::F32(2.0)),
         Default::default(),
     );
-    // Result literals for materialization
+    // Result literals pre-placed for materialization.
     let _t = arena.append(
         naga::Expression::Literal(naga::Literal::Bool(true)),
         Default::default(),
@@ -3450,11 +3425,10 @@ fn vector_relational_op_produces_bool_vector() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
-    // 1.0 < 2.0 -> true,  3.0 < 2.0 -> false
     match &arena[lt] {
         naga::Expression::Compose { components, .. } => {
             assert_eq!(components.len(), 2);
@@ -3473,7 +3447,6 @@ fn vector_relational_op_produces_bool_vector() {
 
 #[test]
 fn vector_select_constant_true() {
-    // select(accept_vec, reject_vec, true) -> accept_vec
     let mut types = naga::UniqueArena::new();
     let vec2f_ty = make_vec_type(&mut types, naga::VectorSize::Bi, naga::Scalar::F32);
 
@@ -3524,17 +3497,15 @@ fn vector_select_constant_true() {
     let (_, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
-    // select with true condition -> accept = vec2(1.0, 2.0)
     assert_compose_of_f32(&arena, sel, &[1.0, 2.0]);
 }
 
 #[test]
 fn scalar_zero_value_resolves() {
-    // ZeroValue(f32) should fold to Literal(F32(0.0))
     let mut types = naga::UniqueArena::new();
     let f32_ty = types.insert(
         naga::Type {
@@ -3550,7 +3521,7 @@ fn scalar_zero_value_resolves() {
     let (folded, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
         &build_vector_type_cache(&types),
     );
@@ -3560,7 +3531,7 @@ fn scalar_zero_value_resolves() {
         arena[zv]
     );
     assert!(
-        folded.contains(&zv),
+        folded.contains(zv),
         "scalar ZeroValue should be in folded set"
     );
 }
@@ -3596,10 +3567,8 @@ fn math_abs_u32_identity() {
 
 #[test]
 fn math_abs_i32_min_not_folded() {
-    // WGSL: abs(i32::MIN) has no positive representation; folding to
-    // wrapping i32::MIN would silently change observable semantics
-    // (naga would otherwise produce an execution error), so the folder
-    // must decline.
+    // abs(i32::MIN) has no positive representation; naga would raise an
+    // execution error.
     assert_eq!(
         eval_math_scalar(
             naga::MathFunction::Abs,
@@ -3750,7 +3719,7 @@ fn math_floor_ceil_trunc_round() {
         ),
         Some(naga::Literal::F32(-1.0))
     );
-    // Round uses ties-to-even: 0.5 -> 0.0, 1.5 -> 2.0
+    // Round is ties-to-even.
     assert_eq!(
         eval_math_scalar(
             naga::MathFunction::Round,
@@ -3781,7 +3750,6 @@ fn math_fract_f32() {
         None,
     );
     assert_eq!(result, Some(naga::Literal::F32(0.75)));
-    // Negative: fract(-0.25) = -0.25 - floor(-0.25) = -0.25 - (-1.0) = 0.75
     let result = eval_math_scalar(
         naga::MathFunction::Fract,
         naga::Literal::F32(-0.25),
@@ -3828,11 +3796,8 @@ fn math_sqrt_f32() {
 
 #[test]
 fn math_fract_huge_value_does_not_emit_non_finite() {
-    // Regression: `v - v.floor()` for very-large finite `v` can
-    // produce NaN/Inf when `v.floor()` saturates near the float
-    // range boundary or when the subtraction underflows precision.
-    // The fold must refuse such cases via the `finite_*` guard so
-    // the emitted literal is always representable WGSL.
+    // `v - v.floor()` near the float range boundary can produce NaN/Inf; the
+    // `finite_*` guard must refuse so the literal stays representable.
     for v in [f32::MAX, f32::MIN, -f32::MAX, 1.0e38_f32] {
         let result = eval_math_scalar(naga::MathFunction::Fract, naga::Literal::F32(v), None, None);
         match result {
@@ -3887,7 +3852,6 @@ fn math_inverse_sqrt_zero_not_folded() {
 
 #[test]
 fn math_fma_f32() {
-    // fma(2.0, 3.0, 1.0) = 2.0 * 3.0 + 1.0 = 7.0
     assert_eq!(
         eval_math_scalar(
             naga::MathFunction::Fma,
@@ -3913,12 +3877,10 @@ fn math_sin_cos_zero() {
 
 #[test]
 fn math_exp_log() {
-    // exp(0) = 1
     assert_eq!(
         eval_math_scalar(naga::MathFunction::Exp, naga::Literal::F32(0.0), None, None),
         Some(naga::Literal::F32(1.0))
     );
-    // log(1) = 0
     assert_eq!(
         eval_math_scalar(naga::MathFunction::Log, naga::Literal::F32(1.0), None, None),
         Some(naga::Literal::F32(0.0))
@@ -4153,7 +4115,7 @@ fn math_first_leading_bit_u32() {
 
 #[test]
 fn math_first_leading_bit_i32() {
-    // 0 and -1 both return -1
+    // 0 and -1 both return -1.
     assert_eq!(
         eval_math_scalar(
             naga::MathFunction::FirstLeadingBit,
@@ -4172,7 +4134,6 @@ fn math_first_leading_bit_i32() {
         ),
         Some(naga::Literal::I32(-1))
     );
-    // Positive: firstLeadingBit(8) = 3
     assert_eq!(
         eval_math_scalar(
             naga::MathFunction::FirstLeadingBit,
@@ -4208,7 +4169,7 @@ fn math_abstract_float_sqrt() {
 
 #[test]
 fn math_pow_negative_base_not_folded() {
-    // WGSL precondition: e1 >= 0.0; negative base is undefined.
+    // WGSL precondition `e1 >= 0.0`: a negative base is undefined.
     assert_eq!(
         eval_math_scalar(
             naga::MathFunction::Pow,
@@ -4223,7 +4184,6 @@ fn math_pow_negative_base_not_folded() {
 
 #[test]
 fn math_pow_zero_base_negative_exp_not_folded() {
-    // pow(0, -1) -> inf -> not finite -> None
     assert_eq!(
         eval_math_scalar(
             naga::MathFunction::Pow,
@@ -4238,7 +4198,7 @@ fn math_pow_zero_base_negative_exp_not_folded() {
 
 #[test]
 fn math_sign_negative_zero() {
-    // WGSL: sign(-0.0) should return 0.0 (or -0.0, impl-defined)
+    // WGSL: sign(-0.0) is 0.0 (or -0.0, implementation-defined).
     assert_eq!(
         eval_math_scalar(
             naga::MathFunction::Sign,
@@ -4303,7 +4263,6 @@ fn math_tanh_f32() {
 
 #[test]
 fn math_cosh_sinh_f32() {
-    // cosh(0) = 1, sinh(0) = 0
     assert_eq!(
         eval_math_scalar(
             naga::MathFunction::Cosh,
@@ -4380,7 +4339,7 @@ fn math_asin_domain_violation() {
 
 #[test]
 fn math_first_leading_bit_negative_i32_edge_cases() {
-    // -2 = 0xFFFFFFFE: first differing bit from sign is at position 0
+    // -2 = 0xFFFFFFFE: the first bit differing from the sign is at 0.
     assert_eq!(
         eval_math_scalar(
             naga::MathFunction::FirstLeadingBit,
@@ -4390,7 +4349,7 @@ fn math_first_leading_bit_negative_i32_edge_cases() {
         ),
         Some(naga::Literal::I32(0))
     );
-    // i32::MIN = 0x80000000: first differing bit from sign is at position 30
+    // i32::MIN = 0x80000000: the first bit differing from the sign is at 30.
     assert_eq!(
         eval_math_scalar(
             naga::MathFunction::FirstLeadingBit,
@@ -4556,9 +4515,9 @@ fn folds_math_sqrt_in_local_arena() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(
         !changed.is_empty(),
@@ -4592,9 +4551,9 @@ fn folds_math_max_in_local_arena() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(
         !changed.is_empty(),
@@ -4632,9 +4591,9 @@ fn folds_math_clamp_in_local_arena() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(!changed.is_empty(), "clamp(5.0, 0.0, 1.0) should be folded");
     assert_f32_literal(&arena, clamp_expr, 1.0);
@@ -4658,9 +4617,9 @@ fn does_not_fold_math_with_non_constant_arg() {
     let (changed, _) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
     assert!(
         changed.is_empty(),
@@ -4682,8 +4641,6 @@ fn main() -> @location(0) vec4f {
 }
 "#;
     let out = crate::run(source, &crate::config::Config::default()).expect("source should compile");
-    // After folding, sqrt(4.0) should become 2.0 (literal).
-    // The output should NOT contain "sqrt".
     assert!(
         !out.source.contains("sqrt"),
         "sqrt(4.0) should be folded away: {}",
@@ -4793,14 +4750,9 @@ fn main() -> @location(0) vec4f {
     );
 }
 
-// Regression: absorbing rewrite must not corrupt vec <op> scalar types.
-
-/// `vec3<f32> * 0.0` must stay well-typed end-to-end.  Prior to the
-/// "both operands must be scalar Literal" gate, the Binary was rewritten
-/// to the scalar literal `0.0`, corrupting every downstream use.  The
-/// pipeline rolled back each sweep, wasting the sweep budget; with the
-/// gate, either the Binary is left alone or a later stage folds it to a
-/// correctly-typed vec3 zero.  Either outcome keeps the output valid.
+/// Rewriting `vec3<f32> * 0.0` to the scalar `0.0` corrupts every downstream
+/// use and rolls the pipeline back each sweep; with the both-scalar-Literal
+/// gate the Binary is left alone or later folded to a typed vec3 zero.
 #[test]
 fn e2e_vec_times_scalar_zero_stays_valid() {
     let source = r#"
@@ -4811,14 +4763,12 @@ fn main(@location(0) v: vec3<f32>) -> @location(0) vec4<f32> {
 }
 "#;
     let out = crate::run(source, &crate::config::Config::default()).expect("source should compile");
-    // Output must parse back cleanly.
     crate::io::validate_wgsl_text(&out.source).expect("output must reparse");
 }
 
 #[test]
 fn e2e_vec_and_zero_stays_valid() {
-    // Integer-typed shader I/O must carry `@interpolate(flat)` (integers
-    // cannot be interpolated); naga 30 enforces this at validation.
+    // Integer shader I/O must carry `@interpolate(flat)`.
     let source = r#"
 @fragment
 fn main(@location(0) @interpolate(flat) v: vec4<u32>) -> @location(0) @interpolate(flat) vec4<u32> {
@@ -4843,10 +4793,9 @@ fn main(@location(0) v: vec3<f32>) -> @location(0) vec4<f32> {
     crate::io::validate_wgsl_text(&out.source).expect("output must reparse");
 }
 
-/// Unit-level regression: even when called with a vec operand, the
-/// simplify loop must NOT rewrite the Binary into a scalar literal.
-/// The type-safe gate requires both operands be scalar `Literal`; a
-/// `FunctionArgument` (typed as vec3) fails that gate.
+/// The simplify loop must not rewrite `vec * 0.0` to a scalar literal: the
+/// gate requires both operands to be scalar `Literal`s, which a
+/// `FunctionArgument` fails.
 #[test]
 fn simplify_vec_times_zero_does_not_rewrite_to_scalar() {
     let mut arena = naga::Arena::new();
@@ -4854,9 +4803,7 @@ fn simplify_vec_times_zero_does_not_rewrite_to_scalar() {
         naga::Expression::Literal(naga::Literal::F32(0.0)),
         Default::default(),
     );
-    // FunctionArgument(0) is *typed* as a vector at the module level,
-    // but within `fold_local_expressions` we have no type info for it.
-    // The gate must therefore err on the side of not rewriting.
+    // `fold_local_expressions` has no type info for the argument.
     let vec_param = arena.append(naga::Expression::FunctionArgument(0), Default::default());
     let mul = arena.append(
         naga::Expression::Binary {
@@ -4870,12 +4817,11 @@ fn simplify_vec_times_zero_does_not_rewrite_to_scalar() {
     let (_folded, simplified) = fold_local(
         &mut arena,
         &[],
-        &FxHashMap::default(),
+        &Default::default(),
         &naga::UniqueArena::new(),
-        &FxHashMap::default(),
+        &Default::default(),
     );
 
-    // The Binary must NOT be replaced by the scalar literal.
     assert!(
         matches!(arena[mul], naga::Expression::Binary { .. }),
         "Binary(vec * scalar_0) must remain Binary, got {:?}",
@@ -4887,11 +4833,9 @@ fn simplify_vec_times_zero_does_not_rewrite_to_scalar() {
     );
 }
 
-// Regression: literal cache correctness (NaN / -0.0 / smallest-handle invariant).
 #[test]
 fn literal_key_distinguishes_negative_zero_from_positive_zero() {
-    // `f32::to_bits` gives -0.0 and +0.0 different bit patterns, so the
-    // cache must not collapse them.
+    // The key is `f32::to_bits`, which separates them.
     assert_ne!(
         literal_key(naga::Literal::F32(0.0)),
         literal_key(naga::Literal::F32(-0.0)),
@@ -4901,8 +4845,7 @@ fn literal_key_distinguishes_negative_zero_from_positive_zero() {
 
 #[test]
 fn literal_key_distinguishes_distinct_nans() {
-    // Two NaN bit patterns must be distinguishable; the cache must not
-    // treat them as equal even though `f32::nan() != f32::nan()`.
+    // Distinct NaN payloads must not merge even though `NaN != NaN`.
     let nan_a = f32::from_bits(0x7FC00000); // quiet NaN
     let nan_b = f32::from_bits(0x7FC00001); // different payload
     assert_ne!(
@@ -4914,15 +4857,13 @@ fn literal_key_distinguishes_distinct_nans() {
 
 #[test]
 fn literal_cache_smallest_handle_wins() {
-    // Two Literal(1.0f32) appended at different handles; the cache
-    // must point to the one with the smaller index so materialize_vector
-    // can satisfy its topological-order check more often.
+    // The smallest index wins so `materialize_vector`'s topological-order
+    // check succeeds more often.
     let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
     let h_early = arena.append(
         naga::Expression::Literal(naga::Literal::F32(1.0)),
         Default::default(),
     );
-    // Insert an unrelated expression between the two literals.
     let _spacer = arena.append(naga::Expression::FunctionArgument(0), Default::default());
     let _h_late = arena.append(
         naga::Expression::Literal(naga::Literal::F32(1.0)),
@@ -4943,8 +4884,6 @@ fn literal_cache_smallest_handle_wins() {
 
 #[test]
 fn materialize_vector_uses_cache_for_component_lookup() {
-    // Verify the hash-cache path still produces a Compose with the right
-    // component handles (integration test for the API change).
     let mut types: naga::UniqueArena<naga::Type> = naga::UniqueArena::new();
     let vec3f_ty = types.insert(
         naga::Type {
@@ -4999,8 +4938,6 @@ fn materialize_vector_uses_cache_for_component_lookup() {
 
 #[test]
 fn materialize_vector_rejects_component_at_or_after_target() {
-    // When the only matching literal is at or after `target`, the
-    // topological-safety check must reject the materialization.
     let mut types: naga::UniqueArena<naga::Type> = naga::UniqueArena::new();
     types.insert(
         naga::Type {
@@ -5013,7 +4950,7 @@ fn materialize_vector_rejects_component_at_or_after_target() {
         Default::default(),
     );
     let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
-    // target first, then the literal.
+    // The target precedes the literal.
     let target = arena.append(naga::Expression::FunctionArgument(0), Default::default());
     arena.append(
         naga::Expression::Literal(naga::Literal::F32(1.0)),
@@ -5038,12 +4975,9 @@ fn materialize_vector_rejects_component_at_or_after_target() {
 
 // MARK: Clone-purity gate regressions
 
-/// `select(load, load, cond)` must not be folded to `load`, because
-/// the rewrite clones the `Load` expression into a second arena slot
-/// whose own `Emit` would re-execute the memory read at runtime - a
-/// second observable load that can return a different value under
-/// concurrent writes.  Pre-fix this passed the gate and produced
-/// IR that load_dedup or downstream consumers may have miscompiled.
+/// Folding `select(load, load, cond)` to `load` clones the `Load` into a
+/// second arena slot whose own `Emit` re-executes the read: a second
+/// observable load that can differ under concurrent writes.
 #[test]
 fn select_collapse_skips_impure_load() {
     let src = r#"
@@ -5055,7 +4989,6 @@ fn helper(c: bool) -> u32 {
 @compute @workgroup_size(1) fn main() { _ = helper(true); }
 "#;
     let mut module = naga::front::wgsl::parse_str(src).expect("parses");
-    // Pre-pass: locate the Select.
     let f = module
         .functions
         .iter()
@@ -5071,7 +5004,6 @@ fn helper(c: bool) -> u32 {
     let _ = run_pass(&mut module);
     crate::io::validate_module(&module).expect("post-fold module valid");
 
-    // The Select must NOT have been replaced with the Load operand.
     assert!(
         !matches!(
             module.functions[f].expressions[select_handle],
@@ -5084,11 +5016,8 @@ fn helper(c: bool) -> u32 {
     );
 }
 
-/// `-(- Load)` involution must not be folded to `Load` for the same
-/// reason: the inner Load gets cloned into the outer slot, doubling
-/// the runtime read.  Pure operands (Literal, Constant, Splat of a
-/// literal, etc.) ARE safe and should still fold; only impure
-/// operands are gated.
+/// `-(- Load)` would clone the inner Load into the outer slot, doubling the
+/// read; pure operands (Literal, Constant, Splat of a literal) still fold.
 #[test]
 fn involution_skips_impure_load() {
     let src = r#"
@@ -5106,7 +5035,6 @@ fn helper() -> i32 {
         .find(|(_, f)| f.name.as_deref() == Some("helper"))
         .map(|(h, _)| h)
         .expect("helper exists");
-    // The outermost Unary is the `-(-v)` we are testing.
     let outer_unary = module.functions[f]
         .expressions
         .iter()
@@ -5134,9 +5062,8 @@ fn helper() -> i32 {
     );
 }
 
-/// `x + 0` where `x = Load` must not be folded to `Load` either:
-/// the identity rewrite clones the non-literal operand into the
-/// Binary's slot, and a `Load` there is unsound.
+/// The identity rewrite clones the non-literal operand into the Binary's
+/// slot; a `Load` there doubles the read.
 #[test]
 fn identity_skips_impure_load() {
     let src = r#"
@@ -5173,11 +5100,10 @@ fn helper() -> i32 {
     );
 }
 
-/// Caching an `AbstractInt`/`AbstractFloat` constant would let the
-/// fold loop emit a function-arena `Literal(AbstractInt)`, which
-/// naga's validator rejects - the whole pass would roll back every
-/// sweep.  The shape is only reachable by hand-built IR because
-/// naga's WGSL frontend concretises constants before any pass runs.
+/// Caching an `AbstractInt`/`AbstractFloat` constant lets the fold loop emit
+/// a function-arena `Literal(AbstractInt)` naga's validator rejects, rolling
+/// the pass back every sweep; only hand-built IR reaches this since the
+/// frontend concretises constants.
 #[test]
 fn build_constant_literal_cache_skips_abstract_literals() {
     let mut module = naga::Module::default();
@@ -5226,24 +5152,21 @@ fn build_constant_literal_cache_skips_abstract_literals() {
     let cache = build_constant_literal_cache(&module);
 
     assert_eq!(
-        cache.get(&concrete),
+        cache.get(concrete),
         Some(&naga::Literal::I32(7)),
         "concrete-typed constant must land in the cache",
     );
     assert!(
-        !cache.contains_key(&abstract_int),
+        !cache.contains_key(abstract_int),
         "abstract literal must be filtered out of the cache; caching one \
              would silently roll the whole pass back every sweep",
     );
 }
 
-/// `Access` whose index folds to a constant, into a syntactic array
-/// `Compose`, must fold to the picked element.  naga materialises a
-/// dynamically-indexed function-scope `const` array as a full composite at
-/// the use site and load_dedup forwards the index variable's stored
-/// literal, so without this fold the emitter ships the entire array inline
-/// (`array<u32,2310>(...)[0]`) and only the NEXT minification round
-/// collapses it - the signature idempotence gap.
+/// naga materialises a dynamically-indexed function-scope `const` array as a
+/// full composite at the use site and load_dedup forwards the index literal;
+/// without this fold the emitter ships the whole array inline and only the
+/// next round collapses it (idempotence gap).
 #[test]
 fn access_with_const_index_into_array_compose_folds_to_element() {
     let mut types = naga::UniqueArena::new();
@@ -5313,9 +5236,9 @@ fn access_with_const_index_into_array_compose_folds_to_element() {
     let (folded, _) = fold_local(
         &mut arena,
         &refcounts,
-        &FxHashMap::default(),
+        &Default::default(),
         &types,
-        &FxHashMap::default(),
+        &Default::default(),
     );
 
     assert!(
@@ -5326,10 +5249,7 @@ fn access_with_const_index_into_array_compose_folds_to_element() {
         "in-bounds pick must fold to the element literal, got {:?}",
         arena[access]
     );
-    assert!(
-        folded.contains(&access),
-        "folded pick leaves its Emit range"
-    );
+    assert!(folded.contains(access), "folded pick leaves its Emit range");
     assert!(
         matches!(arena[oob], naga::Expression::Access { .. }),
         "out-of-bounds pick must decline, got {:?}",
@@ -5338,10 +5258,9 @@ fn access_with_const_index_into_array_compose_folds_to_element() {
 }
 
 /// Float `%` folds only while `trunc(a/b)` is exactly representable in the
-/// operand type: WGSL lowers `a % b` to `a - b*trunc(a/b)` in that
-/// precision, so beyond the 2^24 (f32) / 2^53 (f64) quotient limit the
-/// runtime value diverges from Rust's exact fmod and the fold must
-/// decline.
+/// operand type: WGSL lowers `a % b` to `a - b*trunc(a/b)` in that precision,
+/// so past the 2^24 (f32) / 2^53 (f64) quotient the runtime value diverges
+/// from exact fmod.
 #[test]
 fn float_modulo_beyond_trunc_precision_declines() {
     use naga::BinaryOperator as B;
@@ -5367,12 +5286,11 @@ fn float_modulo_beyond_trunc_precision_declines() {
     );
 }
 
-/// Even BELOW the `|a/b| < 2^24` cap the exact fmod can diverge from the
+/// Below the `|a/b| < 2^24` cap the exact fmod can still differ from the
 /// hardware's `a - b*trunc(a/b)` by a full divisor when the rounded quotient
-/// crosses an integer the exact one does not: `33554432f % 3f` is fmod 2.0 but
-/// 0.0 on every round-to-nearest device (`f32(a/b)` rounds 11184810.67 up to
-/// 11184811, so `a - 3*11184811 == 0`).  The stepwise-agreement guard declines
-/// it rather than baking the wrong constant; agreeing cases still fold.
+/// crosses an integer: `33554432f % 3f` is fmod 2.0 but 0.0 on every
+/// round-to-nearest device (`f32(a/b)` rounds 11184810.67 to 11184811).  The
+/// stepwise-agreement guard declines it; agreeing cases still fold.
 #[test]
 fn float_modulo_boundary_crossing_within_cap_declines() {
     use naga::BinaryOperator as B;

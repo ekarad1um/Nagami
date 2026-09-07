@@ -28,17 +28,13 @@ pub trait Pass {
     /// passes to rebuild the pre-failure state after a rollback: a pass
     /// must be a deterministic function of the module and must not touch
     /// it (or the name log) while returning `Ok(false)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error`] on an unrecoverable failure.
     fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error>;
 }
 
 /// naga's WGSL text for `module` under an already computed `info`, so the
 /// trace / `validate_each_pass` emissions never pay the validator twice
-/// per pass.  A stale `info` panics inside the backend through
-/// out-of-bounds arena indexing; debug builds re-validate as a drift guard.
+/// per pass; a stale `info` panics inside the backend through
+/// out-of-bounds arena indexing.
 fn emit_wgsl_with_info(
     module: &naga::Module,
     info: &naga::valid::ModuleInfo,
@@ -68,11 +64,6 @@ fn emit_wgsl_with_info(
 /// [`crate::config::TraceConfig::validate_each_pass`].  `info` must
 /// describe `module` as passed in; the returned info describes it as
 /// returned, so a caller never validates the same state twice.
-///
-/// # Errors
-///
-/// Returns [`Error`] on an unrecoverable pass failure, or on a validation
-/// failure when rollback is disabled.
 pub fn run_ir_passes(
     module: &mut naga::Module,
     info: naga::valid::ModuleInfo,
@@ -93,7 +84,6 @@ fn run_ir_passes_with(
 ) -> Result<(crate::name_map::NameLog, naga::valid::ModuleInfo), Error> {
     let trace_run_dir = prepare_trace_dir(config)?;
     let mut sweeps = 0usize;
-    // Module-scope renames across sweeps, for the name map.
     let name_log = std::cell::RefCell::new(crate::name_map::NameLog::default());
     let trace_enabled = config.trace.enabled;
     let needs_text_validation = config.trace.validate_each_pass;
@@ -107,8 +97,7 @@ fn run_ir_passes_with(
     // `version` counts accepted changes; `clean_at[i]` is the version at
     // which pass `i` last contributed none (no change, or rejected).  Passes
     // are deterministic in the module, so a pass clean at the current
-    // version is skipped: it would contribute none again.  Output and
-    // convergence are unaffected; only the report omits the idle runs.
+    // version is skipped; only the report omits the idle runs.
     let mut version = 0u64;
     let mut clean_at: Vec<Option<u64>> = vec![None; passes.len()];
 
@@ -117,8 +106,8 @@ fn run_ir_passes_with(
     // run since, in order.  A failure restores it and replays exactly those:
     // determinism rebuilds the pre-pass state, and a rejected pass never
     // joins the list, so a second failure cannot resurrect the first one's
-    // output.  One clone per run, taken before the first pass that runs;
-    // never under `validate_each_pass`, where every failure is an `Err`.
+    // output.  Cloned once per run, never under `validate_each_pass`, where
+    // every failure is an `Err`.
     let mut backup: Option<(naga::Module, crate::name_map::NameLog)> = None;
     let mut accepted: Vec<usize> = Vec::new();
 
@@ -158,7 +147,7 @@ fn run_ir_passes_with(
 
             // No declared change -> the module is still the state the last
             // validation blessed, so only CI mode re-validates; an
-            // under-reporting pass trips the traced debug_assert below.
+            // under-reporting pass trips the traced debug_assert.
             if declared_changed || needs_text_validation {
                 match io::validate_module(module) {
                     Ok(info) => {
@@ -182,8 +171,12 @@ fn run_ir_passes_with(
                             passes[i].name(),
                             e
                         );
-                        // Pre-pass state again, which `current_info` already
-                        // describes.
+                        // Pre-pass state again.  Replay is deterministic by
+                        // the `Pass` contract, so `current_info` should still
+                        // describe it; re-deriving it costs one validation on
+                        // a path few shaders take and turns a contract
+                        // violation into an error instead of a stale `info`
+                        // the backend indexes out of bounds.
                         let (saved_module, saved_log) = backup
                             .as_ref()
                             .expect("backup is taken whenever validate_each_pass is off");
@@ -192,6 +185,7 @@ fn run_ir_passes_with(
                         for &earlier in &accepted {
                             passes[earlier].run(module, &ctx)?;
                         }
+                        current_info = io::validate_module(module)?;
                         validation_ok = false;
                         rolled_back = true;
                     }
@@ -221,16 +215,17 @@ fn run_ir_passes_with(
                 && needs_text_validation
                 && !crate::module_needs_naga_baseline_skip(module)
             {
-                let ok = io::validate_wgsl_text(
+                let verdict = io::validate_wgsl_text(
                     after_text
                         .as_deref()
                         .expect("after text must be available for text validation"),
-                )
-                .is_ok();
-                text_validation_ok = Some(ok);
-                if !ok {
+                );
+                text_validation_ok = Some(verdict.is_ok());
+                if let Err(e) = verdict {
+                    // The diagnostic is the whole point of this mode; without
+                    // it the pass name alone leaves nothing to act on.
                     return Err(Error::Validation(format!(
-                        "pass '{}' produced IR that round-trips to invalid WGSL text",
+                        "pass '{}' produced IR that round-trips to invalid WGSL text: {e}",
                         passes[i].name()
                     )));
                 }
@@ -242,7 +237,7 @@ fn run_ir_passes_with(
             };
             // Convergence follows the declarations alone: `changed_by_text`
             // exists only under `--trace`, and letting it drive the loop
-            // would make convergence depth depend on a debug flag.  It only
+            // would make convergence depth depend on a debug flag; it only
             // enriches the report and, in debug builds, exposes an
             // under-reporting pass.
             any_changed |= !rolled_back && declared_changed;
@@ -310,10 +305,8 @@ fn run_ir_passes_with(
 
 // MARK: Trace directory allocation
 
-/// Prepare the trace output directory for the current run.  Returns
-/// `None` when tracing is disabled or when running on wasm (which has
-/// no filesystem); otherwise creates `trace/<base>/run-{stamp}` with
-/// collision-safe suffix handling.
+/// `None` when tracing is off or on wasm (no filesystem); otherwise a
+/// fresh `<base>/run-{stamp}[-suffix]`.
 fn prepare_trace_dir(config: &Config) -> Result<Option<PathBuf>, Error> {
     if !config.trace.enabled {
         return Ok(None);
@@ -341,15 +334,10 @@ fn prepare_trace_dir(config: &Config) -> Result<Option<PathBuf>, Error> {
     }
 }
 
-/// Atomically claim a fresh `run-{stamp}[-suffix]` directory under `base`.
-///
-/// Repeated calls within the same millisecond, or concurrent processes
-/// that happen to agree on a stamp, would otherwise collide on the
-/// plain `run-{stamp}` name.  Using `std::fs::create_dir` (not
-/// `create_dir_all`) as the claim primitive means the OS returns
-/// `AlreadyExists` on collision, at which point the suffix increments
-/// and the caller retries.  First available wins with no check-then-act
-/// race window.
+/// Claims `run-{stamp}[-suffix]` under `base` with `create_dir` (not
+/// `create_dir_all`) as the primitive: same-millisecond or concurrent
+/// callers agreeing on a stamp get `AlreadyExists`, the suffix increments,
+/// and first available wins with no check-then-act race window.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn allocate_trace_run_dir(
     base: &std::path::Path,
@@ -429,9 +417,7 @@ mod trace_dir_tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Unique-per-test directory under the OS temp dir, cleaned up on
-    /// `Drop`.  Hand-rolled to avoid pulling `tempfile` in purely for
-    /// this one test group.
+    /// Hand-rolled so `tempfile` is not a dev-dependency for one test group.
     struct TestTempDir(PathBuf);
 
     impl TestTempDir {
@@ -483,12 +469,8 @@ mod trace_dir_tests {
 
     #[test]
     fn concurrent_claims_do_not_share_a_directory() {
-        // Simulate two near-simultaneous callers agreeing on a stamp
-        // by invoking the allocator twice back-to-back.  They must
-        // land in distinct directories.  This is the exact failure
-        // the suffix retry targets: with the original `create_dir_all`
-        // primitive both callers would share `run-{stamp}` because
-        // `create_dir_all` is idempotent.
+        // Two callers agreeing on a stamp: an idempotent `create_dir_all`
+        // primitive would hand both `run-{stamp}`.
         let tmp = TestTempDir::new();
         let first = allocate_trace_run_dir(tmp.path(), 99).expect("first");
         let second = allocate_trace_run_dir(tmp.path(), 99).expect("second");
@@ -607,7 +589,6 @@ mod driver_tests {
         }
     }
 
-    /// Substrate for every synthetic pass.
     const TINY_WGSL: &str = "@compute @workgroup_size(1) fn main() { }\n";
 
     fn parsed_module() -> naga::Module {
@@ -716,8 +697,6 @@ mod driver_tests {
         );
     }
 
-    /// An idle pass is not re-run until the module changes; trace / CI
-    /// modes keep every run.
     /// The backup is taken once per run, so a rejection in sweep two must
     /// replay sweep one's accepted work as well as its own.
     #[test]
@@ -745,6 +724,7 @@ mod driver_tests {
         assert_eq!((adds, rollbacks, report.sweeps), (2, 2, 3));
     }
 
+    /// Trace / CI modes keep every run.
     #[test]
     fn idle_passes_are_skipped_until_the_module_changes() {
         for (validate_each_pass, expected_runs, expected_reports) in [(false, 1, 3), (true, 2, 4)] {

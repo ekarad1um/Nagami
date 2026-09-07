@@ -1,28 +1,22 @@
-//! Generator state and per-function context.
-//!
-//! [`Generator`] owns the output buffer, cached module-wide analyses
-//! (reachable constants and types, type-alias plan, per-function
-//! expression ref-counts, layout table), and the precomputed format
-//! tokens that beautify-mode and minify-mode both read from.
-//!
-//! [`FunctionCtx`] is the per-function bundle; the statement and
-//! expression emitters thread it through their recursive walks so
-//! name bindings, deferred-variable flags, and inline-eligibility
-//! decisions stay coherent inside a single function.
+//! Generator state and per-function context: [`Generator`] owns the output
+//! buffer, the cached module-wide analyses (liveness, alias plan, per-function
+//! ref counts, layouts) and the precomputed format tokens; [`FunctionCtx`] is
+//! the per-function bundle threaded through the statement and expression
+//! emitters so bindings, deferred-variable flags and inline decisions stay
+//! coherent within one function.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 
 use crate::config::FloatPrecision;
 
 use super::syntax::LiteralExtractKey;
+use crate::handle_set::{HandleMap, HandleSet};
 
 // MARK: Options
 
-/// Caller-facing generator knobs.  Every field is tied directly to a
-/// [`crate::config::Config`] entry resolved by [`crate::run`].  Changing
-/// a default here is a public-surface change and requires updating
-/// both that call site and the tests.
+/// Caller-facing generator knobs, each resolved from a [`crate::config::Config`]
+/// entry by [`crate::run`]; changing a default is a public-surface change.
 #[derive(Debug, Clone)]
 pub struct GenerateOptions {
     /// Emit human-readable output with indentation and newlines.
@@ -31,20 +25,16 @@ pub struct GenerateOptions {
     pub indent: u8,
     /// Rename struct types and struct members to short identifiers.
     pub mangle: bool,
-    /// Per-type precision caps applied to float literals at emission.
-    /// Default ([`FloatPrecision::default`]) preserves full precision
-    /// on every kind; any non-`Full` mode is lossy.
+    /// Per-type precision caps applied to float literals; any non-`Full` mode
+    /// is lossy.
     pub float_precision: FloatPrecision,
-    /// Reserve this many bytes up front in the output buffer to amortise
-    /// reallocation across the emission pass.
+    /// Output buffer reservation, to amortise reallocation across emission.
     pub initial_capacity: usize,
-    /// Symbol names to preserve from mangling (struct types and
-    /// members).  Consulted only when `mangle` is true.
+    /// Struct type / member names exempt from mangling.
     pub preserve_symbols: HashSet<String>,
     /// Names of preamble (external) declarations to exclude from output.
     pub preamble_names: HashSet<String>,
-    /// Emit `alias` declarations for frequently-referenced types when
-    /// the alias shortens total output.
+    /// Emit `alias` declarations for repeated types when that shortens output.
     pub type_alias: bool,
 }
 
@@ -65,21 +55,10 @@ impl Default for GenerateOptions {
 
 // MARK: Cached analyses
 
-/// Per-function expression analysis cached on [`Generator`] so both
-/// `ref_counts` and `live` are computed exactly once per function
-/// instead of once per consumer.  `compute_expression_ref_counts`
-/// produces the pair in lock-step; keeping them together eliminates
-/// the duplicate body walk that `literal_extract::count_literals`
-/// previously needed to rebuild `live`.
-///
-/// The two fields have different lifecycles:
-///
-/// - `live` is consumed once by
-///   [`super::literal_extract::scan_and_extract_literals`], which
-///   `mem::take`s the `Vec`.  Do not read `live` after that call.
-/// - `ref_counts` is consumed per function by
-///   `module_emit::generate_function`, which `mem::take`s the slot
-///   as each function is emitted.
+/// Per-function expression analysis, computed once and in lock-step by
+/// `compute_expression_ref_counts`.  `live` is `mem::take`n by literal
+/// extraction and `ref_counts` by `generate_function`, so neither is readable
+/// after its consumer has run.
 pub(super) struct FunctionExprInfo {
     pub(super) ref_counts: Vec<usize>,
     pub(super) live: Vec<bool>,
@@ -87,69 +66,52 @@ pub(super) struct FunctionExprInfo {
 
 // MARK: Generator state
 
-/// Owns the output buffer, cached module-wide analyses, and the
-/// identifier allocation tables the sub-emitters consult.  A fresh
-/// instance is created per [`super::generate_wgsl`] call; the state
-/// is never reused across modules.
+/// Emission state for one module; created per [`super::generate_wgsl`] call and
+/// never reused.
 pub(super) struct Generator<'a> {
     pub(super) module: &'a naga::Module,
     pub(super) info: &'a naga::valid::ModuleInfo,
     pub(super) options: GenerateOptions,
     pub(super) out: String,
     pub(super) indent_depth: u32,
-    pub(super) type_names: FxHashMap<naga::Handle<naga::Type>, String>,
+    pub(super) type_names: HandleMap<naga::Type, String>,
     pub(super) member_names: FxHashMap<(naga::Handle<naga::Type>, u32), String>,
     pub(super) constant_names: Vec<String>,
     pub(super) override_names: Vec<String>,
     pub(super) global_names: Vec<String>,
     pub(super) function_names: Vec<String>,
     pub(super) extracted_literals: FxHashMap<LiteralExtractKey, String>,
-    /// Alias declarations awaiting emission, stored as
-    /// `(alias_name, type_string)`.
+    /// `(alias_name, type_string)` alias declarations awaiting emission.
     pub(super) type_alias_decls: Vec<(String, String)>,
-    /// Map from global-expression handle to a named constant whose
-    /// `init` is that handle.  Populated incrementally during constant
-    /// emission so later constants can reference earlier ones by name
-    /// instead of re-inlining the entire expression tree.
-    pub(super) expr_to_const:
-        FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Constant>>,
-    /// Constants reachable from live code (functions, entry points,
-    /// global-variable initialisers).  Dead constants are skipped
-    /// during emission.
-    pub(super) live_constants: FxHashSet<naga::Handle<naga::Constant>>,
-    /// Types reachable from live code.  Dead struct declarations are
-    /// skipped during emission.
-    pub(super) live_types: FxHashSet<naga::Handle<naga::Type>>,
+    /// Global-expression handle -> named constant whose `init` it is, filled
+    /// as constants are emitted so later ones reference earlier ones by name
+    /// instead of re-inlining the tree.
+    pub(super) expr_to_const: HandleMap<naga::Expression, naga::Handle<naga::Constant>>,
+    /// Constants reachable from live code; dead ones are not emitted.
+    pub(super) live_constants: HandleSet<naga::Constant>,
+    /// Types reachable from live code; dead struct declarations are not emitted.
+    pub(super) live_types: HandleSet<naga::Type>,
     /// Struct types a host can address: live, not naga-predeclared,
     /// preamble-owned included (declared in the consumer's preamble text).
-    pub(super) map_visible_structs: FxHashSet<naga::Handle<naga::Type>>,
-    /// Pre-computed type layouts used when reconstructing `@size` and
-    /// `@align` attributes on struct members.
+    pub(super) map_visible_structs: HandleSet<naga::Type>,
+    /// Type layouts for reconstructing `@size` / `@align` on struct members.
     pub(super) layouter: naga::proc::Layouter,
-    /// `true` when `layouter` holds an entry for every type in the
-    /// arena.  Indexing it for a missing type panics, so emission
-    /// paths that depend on layout (e.g., `@align`/`@size`
-    /// reconstruction) must check this and refuse to emit on `false`.
+    /// `true` when `layouter` holds an entry for every type; indexing a missing
+    /// one panics, so layout-dependent emission must refuse on `false`.
     pub(super) layouter_complete: bool,
-    /// Cached per-function analyses: ref counts plus the live
-    /// (in-`Emit`-range) bitmap, indexed `[0..N)` for regular
-    /// functions and `[N..N+E)` for entry points.  Both halves are
-    /// produced together by `compute_expression_ref_counts` so
-    /// consumers that need the live mask (e.g. `literal_extract`) do
-    /// not re-walk the body.
+    /// Per-function analyses indexed `[0..N)` for functions and `[N..N+E)` for
+    /// entry points.
     pub(super) ref_count_cache: Vec<FunctionExprInfo>,
     /// Per-function `(deferrable, dead)` local bitmaps, indexed like
     /// `ref_count_cache`; computed once so the live-type census, alias cost
-    /// model, literal extraction, and emission cannot disagree.
+    /// model, literal extraction and emission cannot disagree.
     pub(super) defer_cache: Vec<(Vec<bool>, Vec<bool>)>,
-    /// Per-`module.functions` purity bitmap (`true` = no side effect
-    /// observable beyond the return value).  Computed once in
-    /// `generate_module` and read by `find_inlineable_calls` to keep impure
-    /// single-use calls bound rather than inlined past a read of what they
-    /// write.  Indexed by `Handle<Function>::index`.
+    /// Per-`module.functions` purity bitmap (`true` = no side effect beyond the
+    /// return value); keeps impure single-use calls bound rather than inlined
+    /// past a read of what they write.
     pub(super) pure_functions: Vec<bool>,
-    // Pre-computed format tokens chosen at construction time from
-    // `options.beautify` so the hot path never branches per character.
+    // Format tokens fixed at construction from `options.beautify`, so the hot
+    // path never branches per character.
     tok_separator: &'static str,
     tok_assign: &'static str,
     tok_colon: &'static str,
@@ -168,66 +130,84 @@ pub(super) struct Generator<'a> {
 
 // MARK: Function context
 
-/// Per-function emission context.  Created once per function by
-/// `module_emit::generate_function` and threaded through every
-/// statement and expression emitter so name bindings, deferred
-/// variable flags, and inline-eligibility decisions stay coherent
-/// inside a single function body.
+/// Per-function emission context, threaded through every statement and
+/// expression emitter.
 pub(super) struct FunctionCtx<'a, 'm> {
+    /// The enclosing function, or an empty one at module scope.
     pub(super) func: &'a naga::Function,
-    pub(super) info: &'a naga::valid::FunctionInfo,
+    /// Arena every handle here indexes: the function's expressions, or
+    /// `module.global_expressions` at module scope.
+    pub(super) exprs: &'a naga::Arena<naga::Expression>,
+    pub(super) types: ExprTypes<'a>,
+    /// `array<T,N>(..)` may drop to `array(..)` only in a function body: naga's
+    /// front-end rejects the elided form against a module-scope declaration
+    /// whose type resolves through an alias.
+    pub(super) elide_array_ctor: bool,
+    /// Root of a declaration that prints no `: T`, so its own text must spell
+    /// the concrete type: an elided `vec2(42,43)` would leave the constant
+    /// abstract, a different type that naga drops from the arena entirely.
+    pub(super) pinned_root: Option<naga::Handle<naga::Expression>>,
     pub(super) argument_names: Vec<String>,
-    pub(super) local_names: FxHashMap<naga::Handle<naga::LocalVariable>, String>,
-    pub(super) expr_names: FxHashMap<naga::Handle<naga::Expression>, String>,
+    pub(super) local_names: HandleMap<naga::LocalVariable, String>,
+    pub(super) expr_names: HandleMap<naga::Expression, String>,
     pub(super) ref_counts: Vec<usize>,
     pub(super) deferred_vars: Vec<bool>,
     pub(super) dead_vars: Vec<bool>,
-    /// Locals whose references stay inside a single `Loop` and can
-    /// therefore be absorbed into a `for (var x = init; ...)` header.
+    /// Locals whose references stay inside one `Loop`, absorbable into a
+    /// `for (var x = init; ...)` header.
     pub(super) for_loop_vars: Vec<bool>,
     pub(super) expr_name_counter: usize,
     /// Module-scope names shared across functions; not cloned per call.
     pub(super) module_names: &'m std::collections::HashSet<String>,
-    /// Names already claimed inside this function (arguments, locals,
-    /// and expression bindings).
+    /// Names claimed in this function: arguments, locals, expression bindings.
     pub(super) local_used_names: std::collections::HashSet<String>,
-    /// Call results that can safely be inlined at their use site:
-    /// `ref_count == 1`, no side-effecting statement between the
-    /// `Call` and its use.
-    pub(super) inlineable_calls: FxHashSet<naga::Handle<naga::Expression>>,
-    /// `Load` expressions that MUST be `let`-bound rather than inlined,
-    /// because the place they read is written between the `Load`'s
-    /// `Emit` and a use.  Inlining such a load relocates its memory read
-    /// past the write, yielding the post-write value - a silent
-    /// miscompile (e.g. the classic swap `let t=x;x=y;y=t`).  Computed
-    /// once per function by `module_emit::compute_must_bind_loads`.
-    pub(super) must_bind_loads: FxHashSet<naga::Handle<naga::Expression>>,
-    /// Memo for `stmt_emit`'s rendered-nesting-depth cap, indexed by
-    /// expression handle (`0` = not yet computed).  Depths are queried
-    /// child-first in arena order, so a child bound after its entry was
-    /// taken can only make an ancestor's stored depth an overestimate -
-    /// the safe direction (at worst an extra `let`).
+    /// Call results inlinable at their use site: `ref_count == 1` and no
+    /// side-effecting statement between the `Call` and the use.
+    pub(super) inlineable_calls: HandleSet<naga::Expression>,
+    /// `Load`s that must be `let`-bound: their place is written between the
+    /// `Load`'s `Emit` and a use, so inlining would relocate the read past the
+    /// write and yield the post-write value (the classic swap `let t=x;x=y;y=t`).
+    pub(super) must_bind_loads: HandleSet<naga::Expression>,
+    /// Memo for the rendered-depth cap (`0` = not computed).  Depths are
+    /// queried child-first in arena order, so a child bound after its entry was
+    /// taken can only make an ancestor's stored depth an overestimate, the safe
+    /// direction (at worst an extra `let`).
     pub(super) render_depth_memo: Vec<u16>,
-    /// True rendered depth of each STASHED single-use call text (see
-    /// `emit_call_result`), keyed by `CallResult` handle.  A `CallResult`
-    /// has no expression children - its arguments hang off the `Call`
-    /// statement - so without this record a chain of stashed calls prices
-    /// as nested leaves and escapes the depth cap entirely (tint's parser
-    /// recursion limit then rejects text naga's self-check accepts).
-    pub(super) stashed_call_depth: FxHashMap<naga::Handle<naga::Expression>, u16>,
-    /// Operands `let`-bound by the hazard guard (`const_hazard`), in
-    /// emission order: pre-emitted expressions usable from any block, so
-    /// each name must leave `expr_names` when its block closes.
+    /// True rendered depth of each stashed single-use call text, keyed by
+    /// `CallResult`: the result has no expression children (the arguments hang
+    /// off the `Call` statement), so without it a chain of stashed calls prices
+    /// as nested leaves and escapes the depth cap.
+    pub(super) stashed_call_depth: HandleMap<naga::Expression, u16>,
+    /// Operands `let`-bound by the `const_hazard` guard, in emission order:
+    /// pre-emitted expressions usable from any block, so each name must leave
+    /// `expr_names` when its block closes.
     pub(super) const_hazard_bindings: Vec<naga::Handle<naga::Expression>>,
-    /// Display name for the current function, used to decorate
-    /// diagnostic messages.
+    /// Function name for diagnostics.
     pub(super) display_name: String,
 }
 
+/// Where an expression's resolved type comes from: naga keeps function
+/// expressions in `FunctionInfo` and module-scope ones in `ModuleInfo`.
+pub(super) enum ExprTypes<'a> {
+    Function(&'a naga::valid::FunctionInfo),
+    Module(&'a naga::valid::ModuleInfo),
+}
+
+static EMPTY_FUNCTION: std::sync::LazyLock<naga::Function> =
+    std::sync::LazyLock::new(naga::Function::default);
+static NO_NAMES: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
+
 impl<'a, 'm> FunctionCtx<'a, 'm> {
-    /// Allocate the next short, collision-free expression-binding
-    /// name, claiming it in `local_used_names` so siblings cannot
-    /// reuse it later in the same function.
+    pub(super) fn ty(
+        &self,
+        expr: naga::Handle<naga::Expression>,
+    ) -> &'a naga::proc::TypeResolution {
+        match self.types {
+            ExprTypes::Function(info) => &info[expr].ty,
+            ExprTypes::Module(info) => &info[expr],
+        }
+    }
+
     pub(super) fn next_expr_name(&mut self) -> String {
         loop {
             let name = crate::name_gen::next_name(&mut self.expr_name_counter);
@@ -239,26 +219,60 @@ impl<'a, 'm> FunctionCtx<'a, 'm> {
     }
 }
 
+impl<'a> Generator<'a> {
+    /// Context for module-scope expressions: no locals, and every earlier named
+    /// constant's initializer bound to that constant's name, so a shared
+    /// initializer re-emits as the name.
+    pub(super) fn module_ctx(&self) -> FunctionCtx<'a, 'static> {
+        let n = self.module.global_expressions.len();
+        FunctionCtx {
+            func: &EMPTY_FUNCTION,
+            exprs: &self.module.global_expressions,
+            types: ExprTypes::Module(self.info),
+            elide_array_ctor: false,
+            pinned_root: None,
+            argument_names: Vec::new(),
+            local_names: HandleMap::default(),
+            expr_names: self
+                .expr_to_const
+                .iter()
+                .map(|(h, c)| (*h, self.constant_names[c.index()].clone()))
+                .collect(),
+            ref_counts: vec![0; n],
+            deferred_vars: Vec::new(),
+            dead_vars: Vec::new(),
+            for_loop_vars: Vec::new(),
+            expr_name_counter: 0,
+            module_names: &NO_NAMES,
+            local_used_names: HashSet::new(),
+            inlineable_calls: HandleSet::default(),
+            must_bind_loads: HandleSet::default(),
+            render_depth_memo: vec![0; n],
+            stashed_call_depth: HandleMap::default(),
+            const_hazard_bindings: Vec::new(),
+            display_name: String::from("<module>"),
+        }
+    }
+}
+
 // MARK: Type alias planning
 
-/// Count how many times each `Handle<Type>` is referenced by **live**
-/// declarations and expressions that flow through `type_ref()`.  Dead
-/// constants and dead types are excluded so the alias-cost estimate
-/// reflects what will actually appear in the emitted output.
+/// References to each `Handle<Type>` from live declarations and expressions
+/// that flow through `type_ref()`; dead constants and types are excluded so
+/// the alias-cost estimate matches the emitted output.
 fn count_type_handle_refs(
     module: &naga::Module,
-    live_constants: &FxHashSet<naga::Handle<naga::Constant>>,
-    live_types: &FxHashSet<naga::Handle<naga::Type>>,
+    live_constants: &HandleSet<naga::Constant>,
+    live_types: &HandleSet<naga::Type>,
     defer_cache: &[(Vec<bool>, Vec<bool>)],
-) -> FxHashMap<naga::Handle<naga::Type>, usize> {
-    let mut counts: FxHashMap<naga::Handle<naga::Type>, usize> = FxHashMap::default();
+) -> HandleMap<naga::Type, usize> {
+    let mut counts: HandleMap<naga::Type, usize> = Default::default();
     let mut inc = |h: naga::Handle<naga::Type>| {
         *counts.entry(h).or_default() += 1;
     };
 
-    // Struct member types (only live structs).
     for (h, ty) in module.types.iter() {
-        if !live_types.contains(&h) {
+        if !live_types.contains(h) {
             continue;
         }
         if let naga::TypeInner::Struct { members, .. } = &ty.inner {
@@ -268,18 +282,14 @@ fn count_type_handle_refs(
         }
     }
 
-    // Count a live constant's declared type only when the `: <type>`
-    // annotation is actually emitted, i.e. when the init text does NOT
-    // already spell its own type (see `const_init_has_explicit_type`).
-    // Otherwise the type is double-counted - here AND in the Compose /
-    // ZeroValue global-expression walk below - inflating the alias-savings
-    // estimate enough to introduce a net-larger alias.  Two known, safe
-    // imprecisions remain (both only ever forgo a borderline alias, never
-    // enlarge output): a `Splat`-init const under-counts because the
-    // global-expr walk does not tally `Splat`, and an unnamed constant
-    // (which `generate_constants` skips entirely) is still counted here.
+    // A live constant's `: <type>` is emitted only when the init text does not
+    // already spell it; counting it otherwise double-counts (here and in the
+    // Compose / ZeroValue walk) and can introduce a net-larger alias.  Two safe
+    // imprecisions only ever forgo a borderline alias: a `Splat`-init const
+    // under-counts (the global-expr walk skips `Splat`), and an unnamed
+    // constant that `generate_constants` skips is still counted.
     for (h, c) in module.constants.iter() {
-        if !live_constants.contains(&h) {
+        if !live_constants.contains(h) {
             continue;
         }
         if !super::module_emit::const_init_has_explicit_type(&module.global_expressions[c.init]) {
@@ -287,17 +297,14 @@ fn count_type_handle_refs(
         }
     }
 
-    // Overrides.
     for (_, ov) in module.overrides.iter() {
         inc(ov.ty);
     }
 
-    // Global variables.
     for (_, g) in module.global_variables.iter() {
         inc(g.ty);
     }
 
-    // Global expressions (Compose / ZeroValue) - only count types that are live.
     for (_, expr) in module.global_expressions.iter() {
         match expr {
             naga::Expression::Compose { ty, .. } if live_types.contains(ty) => inc(*ty),
@@ -306,18 +313,13 @@ fn count_type_handle_refs(
         }
     }
 
-    // Functions and entry points.  Skip a LOCAL's type when the local is
-    // dead-eliminated: `generate_function` never prints a dead local, yet DCE
-    // leaves it in `local_variables`, so counting its type credits the cost
-    // model with a type that appears zero times in the output and yields an
-    // `alias X=T;` used nowhere.  (Argument / result types are always printed
-    // in the signature; `Compose`/`ZeroValue` arena entries are still counted
-    // wholesale - the live-only gate that would also exclude their dead twins
-    // proved unsound here because `collect_emitted_handles` under-marks some
-    // expressions the emitter does print.)  The alias planner is greedy, so
-    // perturbing any count can flip a marginal choice; this is net-positive
-    // across real shaders but not regression-free - a few shaders trade one
-    // marginal alias for a slightly worse one.  All outputs stay valid.
+    // A dead local is never printed, so counting its type would credit an
+    // `alias X=T;` used nowhere.  Argument / result types always print;
+    // `Compose` / `ZeroValue` entries are counted wholesale because
+    // `collect_emitted_handles` under-marks some expressions the emitter does
+    // print, which makes a live-only gate unsound here.  The alias planner is
+    // greedy, so any count perturbation can flip a marginal choice; all outputs
+    // stay valid.
     for (func, (_, dead_locals)) in all_functions(module).zip(defer_cache) {
         for arg in &func.arguments {
             inc(arg.ty);
@@ -342,8 +344,8 @@ fn count_type_handle_refs(
     counts
 }
 
-/// Every function body in `ref_count_cache` / `defer_cache` order: regular
-/// functions, then entry points.
+/// Function bodies in `ref_count_cache` / `defer_cache` order: functions, then
+/// entry points.
 pub(super) fn all_functions(module: &naga::Module) -> impl Iterator<Item = &naga::Function> {
     module
         .functions
@@ -354,25 +356,20 @@ pub(super) fn all_functions(module: &naga::Module) -> impl Iterator<Item = &naga
 
 // MARK: Liveness analyses
 
-/// Transitively gather every `Constant` reachable from live code.
-/// Seeds are constants referenced by function and entry-point
-/// expressions, by global-variable initialisers, by override
-/// initialisers, and by any name the caller asked to preserve.
-/// Library modules (no entry points) keep every constant to match
-/// the `Compact` pass's `KeepUnused::Yes` behaviour.
+/// Constants transitively reachable from function / entry-point expressions,
+/// global-variable and override initialisers, and preserved names.  A library
+/// module (no entry points) keeps every constant, matching the `Compact`
+/// pass's `KeepUnused::Yes`.
 fn compute_live_constants(
     module: &naga::Module,
     preserve_names: &HashSet<String>,
-) -> FxHashSet<naga::Handle<naga::Constant>> {
-    let mut live: FxHashSet<naga::Handle<naga::Constant>> = FxHashSet::default();
+) -> HandleSet<naga::Constant> {
+    let mut live: HandleSet<naga::Constant> = Default::default();
 
-    // Library module (no entry points): keep everything, just like the compact
-    // pass does with KeepUnused::Yes.
     if module.entry_points.is_empty() {
         return module.constants.iter().map(|(h, _)| h).collect();
     }
 
-    // Constants whose names the user asked to preserve are always live.
     if !preserve_names.is_empty() {
         for (h, c) in module.constants.iter() {
             if let Some(name) = c.name.as_deref()
@@ -383,7 +380,6 @@ fn compute_live_constants(
         }
     }
 
-    // Seed: constants referenced directly in function / entry-point expressions.
     let all_funcs = module
         .functions
         .iter()
@@ -397,22 +393,18 @@ fn compute_live_constants(
         }
     }
 
-    // Seed: constants referenced in global variable initialisers.
     for (_, g) in module.global_variables.iter() {
         if let Some(init) = g.init {
             collect_const_refs_in_global_expr(init, module, &mut live);
         }
     }
 
-    // Seed: constants referenced in override initialisers.
     for (_, ov) in module.overrides.iter() {
         if let Some(init) = ov.init {
             collect_const_refs_in_global_expr(init, module, &mut live);
         }
     }
 
-    // Transitive closure: follow each live constant's init expression for
-    // further constant references.
     let mut changed = true;
     while changed {
         changed = false;
@@ -429,13 +421,12 @@ fn compute_live_constants(
     live
 }
 
-/// Recursively collect `Constant` references inside a global-expression
-/// tree, covering every `global_expressions` variant that can hold child
-/// expression handles (`Compose`, `Splat`, `Swizzle`, and relatives).
+/// Collect `Constant` references in a global-expression tree, following into
+/// each constant's own init.
 fn collect_const_refs_in_global_expr(
     expr_h: naga::Handle<naga::Expression>,
     module: &naga::Module,
-    live: &mut FxHashSet<naga::Handle<naga::Constant>>,
+    live: &mut HandleSet<naga::Constant>,
 ) {
     use naga::Expression as E;
     match &module.global_expressions[expr_h] {
@@ -493,22 +484,19 @@ fn collect_const_refs_in_global_expr(
         | E::Relational { argument: base, .. } => {
             collect_const_refs_in_global_expr(*base, module, live);
         }
-        // Leaf expressions: Literal, ZeroValue, Override - no child handles.
         _ => {}
     }
 }
 
-/// Transitively collect every `Type` reachable from live code so
-/// dead struct declarations can be skipped during emission.  Mirrors
-/// [`compute_live_constants`] with a different set of seed roots.
+/// Types transitively reachable from live code, so dead struct declarations
+/// can be skipped; a library module keeps every type.
 fn compute_live_types(
     module: &naga::Module,
-    live_constants: &FxHashSet<naga::Handle<naga::Constant>>,
+    live_constants: &HandleSet<naga::Constant>,
     defer_cache: &[(Vec<bool>, Vec<bool>)],
-) -> FxHashSet<naga::Handle<naga::Type>> {
-    let mut live: FxHashSet<naga::Handle<naga::Type>> = FxHashSet::default();
+) -> HandleSet<naga::Type> {
+    let mut live: HandleSet<naga::Type> = Default::default();
 
-    // Library module: keep everything.
     if module.entry_points.is_empty() {
         return module.types.iter().map(|(h, _)| h).collect();
     }
@@ -517,24 +505,20 @@ fn compute_live_types(
         live.insert(h);
     };
 
-    // From live constants.
     for (h, c) in module.constants.iter() {
-        if live_constants.contains(&h) {
+        if live_constants.contains(h) {
             mark(c.ty);
         }
     }
 
-    // From overrides.
     for (_, ov) in module.overrides.iter() {
         mark(ov.ty);
     }
 
-    // From global variables.
     for (_, g) in module.global_variables.iter() {
         mark(g.ty);
     }
 
-    // From functions and entry points.
     for (func, (_, dead_locals)) in all_functions(module).zip(defer_cache) {
         for arg in &func.arguments {
             mark(arg.ty);
@@ -542,11 +526,10 @@ fn compute_live_types(
         if let Some(result) = &func.result {
             mark(result.ty);
         }
-        // The emitter declares no dead local, so its type is not live either:
-        // naga's compactor roots ALL locals, and a DCE'd
-        // `var res: __frexp_result_f16;` would otherwise pin its special type
-        // and, through the member scalars, a spurious `enable f16;`.
-        // `defer_cache` is the emitter's own verdict, so the two views agree.
+        // A dead local is never declared, so its type is not live: naga's
+        // compactor roots ALL locals, and a DCE'd `var res: __frexp_result_f16;`
+        // would otherwise pin its special type and, through the member scalars,
+        // a spurious `enable f16;`.  `defer_cache` is the emitter's own verdict.
         for (h, local) in func.local_variables.iter() {
             if !dead_locals[h.index()] {
                 mark(local.ty);
@@ -562,17 +545,14 @@ fn compute_live_types(
         }
     }
 
-    // From global expressions of live constants (defense-in-depth: types
-    // referenced by Compose / ZeroValue in init trees should already be
-    // reachable through the constant's `.ty` member chain, but walking
-    // them explicitly guards against edge cases).
+    // Init-tree `Compose` / `ZeroValue` types should already be reachable
+    // through the constant's `.ty`; walking them is defense in depth.
     for (h, c) in module.constants.iter() {
-        if live_constants.contains(&h) {
+        if live_constants.contains(h) {
             collect_types_in_global_expr(c.init, module, &mut live);
         }
     }
 
-    // Transitive closure: struct member types and inner types.
     let mut changed = true;
     while changed {
         changed = false;
@@ -589,16 +569,12 @@ fn compute_live_types(
     live
 }
 
-/// Collect types referenced inside the given type (struct members, array
-/// element, pointer base, etc.).
-/// Push every nested `Handle<Type>` referenced by a
-/// [`naga::TypeInner`] into `out` (array element types, pointer
-/// pointee types, struct member types, and so on) so liveness
-/// propagates through composite declarations.
+/// Insert the types nested directly in `ty_h` (struct members, array element,
+/// pointer base) so liveness propagates through composites.
 fn collect_inner_types(
     ty_h: naga::Handle<naga::Type>,
     module: &naga::Module,
-    live: &mut FxHashSet<naga::Handle<naga::Type>>,
+    live: &mut HandleSet<naga::Type>,
 ) {
     match &module.types[ty_h].inner {
         naga::TypeInner::Struct { members, .. } => {
@@ -616,15 +592,12 @@ fn collect_inner_types(
     }
 }
 
-/// Recursively collect `Compose` / `ZeroValue` type handles inside a global
-/// expression tree.
-/// Walk a global expression and push every directly-referenced
-/// `Handle<Type>` into `out` (for example the target type of a
-/// `Compose` or `ZeroValue`).  Used during live-type discovery.
+/// Insert every `Compose` / `ZeroValue` type in a global-expression tree,
+/// following into constants' inits.
 fn collect_types_in_global_expr(
     expr_h: naga::Handle<naga::Expression>,
     module: &naga::Module,
-    live: &mut FxHashSet<naga::Handle<naga::Type>>,
+    live: &mut HandleSet<naga::Type>,
 ) {
     use naga::Expression as E;
     match &module.global_expressions[expr_h] {
@@ -638,7 +611,6 @@ fn collect_types_in_global_expr(
             live.insert(*ty);
         }
         E::Constant(h) => {
-            // Trace into the constant's own init.
             collect_types_in_global_expr(module.constants[*h].init, module, live);
         }
         E::Binary { left, right, .. }
@@ -691,23 +663,20 @@ fn collect_types_in_global_expr(
 // MARK: Construction and output
 
 impl<'a> Generator<'a> {
-    /// Construct a generator for `module` with `options`.  Pre-computes
-    /// liveness, layout, and alias tables up front so downstream
-    /// emission stays allocation-free along the hot path.
+    /// Pre-computes liveness, layout and alias tables so emission stays
+    /// allocation-free on the hot path.
     pub(super) fn new(
         module: &'a naga::Module,
         info: &'a naga::valid::ModuleInfo,
         options: GenerateOptions,
     ) -> Self {
-        use rustc_hash::FxHashSet;
-
         let mangle = options.mangle;
 
-        // Mangled struct type / member names must not collide with any name
-        // in scope where the type is referenced: every module-scope name and,
-        // because function-scope names shadow module-scope type names, every
-        // argument and local in any function.  Preserved names are reserved
-        // up front so the counter never mints one, whatever the arena order.
+        // Mangled struct / member names must not collide with any name in
+        // scope where the type is referenced: every module-scope name and,
+        // since function-scope names shadow module-scope type names, every
+        // argument and local anywhere.  Preserved names are reserved up front
+        // so the counter never mints one, whatever the arena order.
         let mut used_names = HashSet::new();
         if mangle {
             used_names.extend(
@@ -720,38 +689,24 @@ impl<'a> Generator<'a> {
         let mut mangle_counter = 0usize;
 
         let preserve = &options.preserve_symbols;
-        let mut type_names = FxHashMap::default();
+        let mut type_names = HandleMap::default();
         let mut member_names = FxHashMap::default();
 
-        // naga predeclared / special types must never have their struct or
-        // member names mangled: their members are accessed through canonical
-        // names (`.old_value`, `.exchanged`, `.fract`, `.whole`, `.exp`,
-        // `.kind`, `.t`, `.barycentrics`, ...) and `generate_module` emits no
-        // declaration for them, so a mangled accessor produces invalid WGSL.
+        // naga predeclared / special struct types are never renamed: their
+        // members are accessed through canonical names (`.old_value`,
+        // `.fract`, `.kind`, ...) and no declaration is emitted for them, so a
+        // mangled accessor would be invalid WGSL.
         let predeclared_type_handles = super::module_emit::special_struct_handles(module);
 
         for (h, ty) in module.types.iter() {
             if let naga::TypeInner::Struct { members, .. } = &ty.inner {
-                // `RayDesc` is a WGSL predeclared type for the ray-tracing extension.
-                // Its member names must be preserved so that the constructor
-                // `RayDesc(flags, cull_mask, ...)` remains valid, and no struct
-                // declaration is emitted for it.  Now also covered by
-                // `predeclared_type_handles` above, but the name-based
-                // check is kept as a fallback for IRs where
-                // `special_types.ray_desc` is not populated.
+                // Name-based fallback for IRs where `special_types.ray_desc` is
+                // not populated.
                 let is_ray_descriptor = ty.name.as_deref() == Some("RayDesc");
 
-                // All naga special/predeclared structs (AtomicCmpExch,
-                // Modf, Frexp, RayDesc, RayIntersection, ...) live in
-                // the combined set above.
-                let is_predeclared = predeclared_type_handles.contains(&h);
+                let is_predeclared = predeclared_type_handles.contains(h);
 
                 if mangle {
-                    // Keep predeclared struct type/member names stable.
-                    // Their field accessors must match the canonical WGSL names:
-                    // `.old_value`/`.exchanged` for atomicCompareExchangeWeak,
-                    // `.fract`/`.whole` for modf, `.fract`/`.exp` for frexp,
-                    // `.kind`/`.t`/`.barycentrics`/... for RayIntersection.
                     if is_predeclared || is_ray_descriptor {
                         type_names.insert(
                             h,
@@ -766,9 +721,6 @@ impl<'a> Generator<'a> {
                         continue;
                     }
 
-                    // Preserve the struct type name if it appears in the preserve set.
-                    // All preserved names were added to `used_names` upfront,
-                    // so `next_name_unique` will never generate a collision.
                     if let Some(name) = ty.name.as_deref() {
                         if preserve.contains(name) {
                             type_names.insert(h, name.to_string());
@@ -853,11 +805,9 @@ impl<'a> Generator<'a> {
             tok_for_sep,
             indent_unit,
         ) = if options.beautify {
-            // The buffer spans the full `u8` range, so any `options.indent`
-            // (a `u8`, hence <= 255 < 256) yields an in-bounds all-ASCII
-            // slice, honoured exactly and never clamped.  A `&'static str`
-            // slice keeps `indent_unit` borrow-free; a dynamic `String`
-            // would ripple through every emission helper that captures it.
+            // `options.indent` is a `u8`, so the 256-byte buffer always yields
+            // an in-bounds all-ASCII slice; a `&'static str` keeps `indent_unit`
+            // borrow-free.
             static SPACES: [u8; 256] = [b' '; 256];
             let unit = std::str::from_utf8(&SPACES[..options.indent as usize])
                 .expect("ASCII spaces are valid UTF-8");
@@ -897,12 +847,10 @@ impl<'a> Generator<'a> {
         };
 
         let mut layouter = naga::proc::Layouter::default();
-        // `Layouter::update` returns on the first un-layoutable type and
-        // leaves every later type's slot unpopulated; indexing such a
-        // slot panics.  Capture success so downstream emission can bail
-        // gracefully on partial state.  Triggers in practice are rare
-        // (overflowingly-large arrays, type-arena cycles) but a rare
-        // panic is still a panic.
+        // `Layouter::update` stops at the first un-layoutable type (overflowing
+        // arrays, type-arena cycles) and leaves later slots unpopulated, which
+        // panic on indexing; record success so layout-dependent emission can
+        // bail.
         let layouter_complete = layouter.update(module.to_ctx()).is_ok();
 
         let defer_cache: Vec<(Vec<bool>, Vec<bool>)> = all_functions(module)
@@ -911,15 +859,12 @@ impl<'a> Generator<'a> {
         let live_constants = compute_live_constants(module, &options.preserve_symbols);
         let live_types = compute_live_types(module, &live_constants, &defer_cache);
 
-        // Type aliasing: introduce `alias` declarations when they shrink output
         let type_alias_decls = if options.type_alias {
             let ref_counts =
                 count_type_handle_refs(module, &live_constants, &live_types, &defer_cache);
 
-            // Collect every name already in use so alias names don't collide.
-            // This includes function-local names (arguments, locals) because a
-            // local with the same name would shadow the type alias inside its
-            // function body, breaking type references.
+            // Every name in use, function-local ones included: a same-named
+            // local would shadow the alias inside its function.
             let mut alias_used: HashSet<String> = HashSet::new();
             alias_used.extend(type_names.values().cloned());
             alias_used.extend(constant_names.iter().cloned());
@@ -927,11 +872,10 @@ impl<'a> Generator<'a> {
             alias_used.extend(global_names.iter().cloned());
             alias_used.extend(function_names.iter().cloned());
             alias_used.extend(module.entry_points.iter().map(|ep| ep.name.clone()));
-            // Preserve-listed / preamble-declared names may no longer appear in
-            // any module arena (a pruned preamble binding) yet still exist in the
-            // consumer's spliced document; reserve them so a minted alias name
-            // cannot shadow or redeclare one.  Mirrors the mangle-counter seed at
-            // the top of this function.
+            // Preserve-listed / preamble names may be absent from every arena (a
+            // pruned preamble binding) yet exist in the consumer's spliced
+            // document; reserve them so a minted alias cannot shadow or
+            // redeclare one.
             alias_used.extend(options.preserve_symbols.iter().cloned());
             alias_used.extend(
                 all_functions(module)
@@ -942,53 +886,46 @@ impl<'a> Generator<'a> {
             let mut alias_counter = 0usize;
             let mut decls: Vec<(String, String)> = Vec::new();
 
-            let fixed_overhead = super::cost::decl_boilerplate(options.beautify);
+            let fixed_overhead = super::syntax::decl_boilerplate(options.beautify);
 
-            // `UniqueArena<Type>` deduplicates by the full `Type`
-            // (name included), so the same `TypeInner` can appear under
-            // multiple handles when the source mixes bare types with
-            // named aliases.  Group by inner once so the candidate loop
-            // is O(N) instead of O(N^2):
-            //   * `canonical[h]`           = arena-first handle in h's group.
-            //   * `group_ref_count[head]`  = sum of `ref_counts` over the group.
-            let mut canonical: FxHashMap<naga::Handle<naga::Type>, naga::Handle<naga::Type>> =
-                FxHashMap::with_capacity_and_hasher(module.types.len(), Default::default());
+            // `UniqueArena<Type>` deduplicates by the full `Type` (name
+            // included), so one `TypeInner` can sit under several handles when
+            // the source mixes bare types with named aliases.  Group by inner
+            // once: `canonical[h]` is the arena-first handle of h's group and
+            // `group_ref_count[head]` the group's summed `ref_counts`.
+            let mut canonical: HandleMap<naga::Type, naga::Handle<naga::Type>> = Default::default();
             let mut inner_to_first: FxHashMap<&naga::TypeInner, naga::Handle<naga::Type>> =
-                FxHashMap::with_capacity_and_hasher(module.types.len(), Default::default());
+                Default::default();
             for (h, ty) in module.types.iter() {
                 let first = *inner_to_first.entry(&ty.inner).or_insert(h);
                 canonical.insert(h, first);
             }
-            let mut group_ref_count: FxHashMap<naga::Handle<naga::Type>, usize> =
-                FxHashMap::with_capacity_and_hasher(inner_to_first.len(), Default::default());
+            let mut group_ref_count: HandleMap<naga::Type, usize> = Default::default();
             for (h, _) in module.types.iter() {
                 let first = canonical[&h];
                 *group_ref_count.entry(first).or_insert(0) +=
-                    ref_counts.get(&h).copied().unwrap_or(0);
+                    ref_counts.get(h).copied().unwrap_or(0);
             }
 
             for (h, ty) in module.types.iter() {
-                // Structs already have short names in type_names.
-                if type_names.contains_key(&h) {
+                // Structs already have short names.
+                if type_names.contains_key(h) {
                     continue;
                 }
 
-                // If another handle in the same inner-equality group has
-                // already received an alias, reuse it.
                 let group_head = canonical[&h];
                 if h != group_head
-                    && let Some(existing) = type_names.get(&group_head).cloned()
+                    && let Some(existing) = type_names.get(group_head).cloned()
                 {
                     type_names.insert(h, existing);
                     continue;
                 }
 
-                let count = group_ref_count.get(&group_head).copied().unwrap_or(0);
+                let count = group_ref_count.get(group_head).copied().unwrap_or(0);
                 if count == 0 {
                     continue;
                 }
-                // Compute the type string using current type_names (which may
-                // include previously-created aliases for base types).
+                // Rendered with the aliases minted so far, so aliases nest.
                 let type_str = match super::syntax::type_inner_name(
                     &ty.inner,
                     module,
@@ -998,12 +935,10 @@ impl<'a> Generator<'a> {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
-                // Generate candidate alias name.
                 let alias_name = crate::name_gen::next_name_unique(&mut alias_counter, &alias_used);
                 let alias_len = alias_name.len();
                 let type_len = type_str.len();
 
-                // Net savings = (count * chars_saved_per_use) - declaration_cost
                 let decl_cost = fixed_overhead + alias_len + type_len;
                 let savings_per_use = type_len.saturating_sub(alias_len);
                 let total_savings = count * savings_per_use;
@@ -1032,12 +967,12 @@ impl<'a> Generator<'a> {
             override_names,
             global_names,
             function_names,
-            extracted_literals: FxHashMap::default(),
+            extracted_literals: Default::default(),
             type_alias_decls,
-            expr_to_const: FxHashMap::default(),
+            expr_to_const: Default::default(),
             live_constants,
             live_types,
-            map_visible_structs: FxHashSet::default(),
+            map_visible_structs: Default::default(),
             layouter,
             layouter_complete,
             ref_count_cache: Vec::new(),
@@ -1060,19 +995,12 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// Consume the generator and return the final output string.
     pub(super) fn into_output(self) -> String {
         self.out
     }
 
     // MARK: Output helpers
 
-    // All of the helpers below read their text from the precomputed
-    // `tok_*` fields so the hot path does not branch on `beautify`
-    // for each pushed separator.
-
-    /// Emit indentation for the current depth.  No-op when
-    /// `beautify` is off because `indent_unit` is an empty string.
     #[inline]
     pub(super) fn push_indent(&mut self) {
         for _ in 0..self.indent_depth {
@@ -1080,14 +1008,12 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// Push ` {\n` (beautify) or `{` (compact), then increment depth.
     #[inline]
     pub(super) fn open_brace(&mut self) {
         self.out.push_str(self.tok_open_brace);
         self.indent_depth += 1;
     }
 
-    /// Decrement depth, then push indent + `}`.
     #[inline]
     pub(super) fn close_brace(&mut self) {
         self.indent_depth = self.indent_depth.saturating_sub(1);
@@ -1095,85 +1021,71 @@ impl<'a> Generator<'a> {
         self.out.push('}');
     }
 
-    /// Separator after a comma in output written to `self.out`.
     #[inline]
     pub(super) fn push_separator(&mut self) {
         self.out.push_str(self.tok_separator);
     }
 
-    /// Assignment `=` with optional surrounding spaces.
     #[inline]
     pub(super) fn push_assign(&mut self) {
         self.out.push_str(self.tok_assign);
     }
 
-    /// Colon `:` with optional trailing space (for type annotations).
     #[inline]
     pub(super) fn push_colon(&mut self) {
         self.out.push_str(self.tok_colon);
     }
 
-    /// Return-type arrow `->` with optional surrounding spaces.
     #[inline]
     pub(super) fn push_arrow(&mut self) {
         self.out.push_str(self.tok_arrow);
     }
 
-    /// Push a newline when beautifying, no-op in compact mode.
     #[inline]
     pub(super) fn push_newline(&mut self) {
         self.out.push_str(self.tok_newline);
     }
 
-    /// Return the comma separator string for building expression strings.
     #[inline]
     pub(super) fn comma_sep(&self) -> &'static str {
         self.tok_separator
     }
 
-    /// Return space-around binary operator format for expression strings.
     #[inline]
     pub(super) fn bin_op_sep(&self) -> &'static str {
         self.tok_bin_op_sep
     }
 
-    /// Return the assignment token (` = ` or `=`) for string building.
     #[inline]
     pub(super) fn assign_sep(&self) -> &'static str {
         self.tok_assign
     }
 
-    /// Push `) @binding(` (beautify) or `)@binding(` (compact).
     #[inline]
     pub(super) fn push_binding_sep(&mut self) {
         self.out.push_str(self.tok_binding_sep);
     }
 
-    /// Push `) ` (beautify) or `)` (compact) - attribute closing.
     #[inline]
     pub(super) fn push_attr_end(&mut self) {
         self.out.push_str(self.tok_attr_end);
     }
 
-    /// Push `> ` (beautify) or `>` (compact) - generic close.
     #[inline]
     pub(super) fn push_angle_end(&mut self) {
         self.out.push_str(self.tok_angle_end);
     }
 
-    /// Push ` else` (beautify) or `else` (compact).
     #[inline]
     pub(super) fn push_else(&mut self) {
         self.out.push_str(self.tok_else);
     }
 
-    /// Push `for (` (beautify) or `for(` (compact).
     #[inline]
     pub(super) fn push_for_open(&mut self) {
         self.out.push_str(self.tok_for_open);
     }
 
-    /// Push `; ` (beautify) or `;` (compact) - for-loop clause separator.
     #[inline]
     pub(super) fn push_for_sep(&mut self) {
         self.out.push_str(self.tok_for_sep);

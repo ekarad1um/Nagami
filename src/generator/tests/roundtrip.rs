@@ -1,9 +1,6 @@
-//! Round-trip coverage: assert that the emitted WGSL parses and
-//! validates cleanly across a representative set of shader
-//! constructs (pointer operations, atomics, barriers, struct
-//! layouts, matrices, textures, ray tracing, and the `beautify`
-//! code path).  These tests defend the emitter's single most
-//! important contract: output is always valid WGSL.
+//! Round-trip coverage: emitted WGSL must parse and validate across pointer
+//! operations, atomics, barriers, struct layouts, matrices, textures, ray
+//! tracing, and beautify mode.
 
 use super::helpers::*;
 
@@ -18,7 +15,6 @@ fn generated_output_is_valid_wgsl() {
 #[test]
 fn beautified_output_is_valid_wgsl() {
     let out = compact_beautified(VALIDATION_SRC);
-    // Must contain indentation
     assert!(
         out.contains('\n'),
         "beautified output should have newlines: {out}"
@@ -27,7 +23,6 @@ fn beautified_output_is_valid_wgsl() {
         out.contains("  "),
         "beautified output should have indentation: {out}"
     );
-    // Round-trip parse + validate
     assert_valid_wgsl(&out);
 }
 
@@ -97,7 +92,6 @@ fn pointer_member_access() {
 
 #[test]
 fn pointer_read_modify_write() {
-    // Read through pointer, modify, write back through same pointer.
     let src = r#"
         fn double_val(p: ptr<function, u32>) {
             *p = *p * 2u;
@@ -121,7 +115,6 @@ fn pointer_read_modify_write() {
 
 #[test]
 fn pointer_forward_to_another_function() {
-    // Pointer parameter forwarded to another function taking pointer.
     let src = r#"
         fn inner(p: ptr<function, u32>) -> u32 {
             return *p;
@@ -145,7 +138,6 @@ fn pointer_forward_to_another_function() {
 
 #[test]
 fn call_with_ptr_to_local_roundtrip() {
-    // A function that takes ptr<function, f32> should receive &x in WGSL.
     let src = r#"
             fn mutate(p: ptr<function, f32>) { *p = 42.0; }
             @compute @workgroup_size(1)
@@ -156,7 +148,6 @@ fn call_with_ptr_to_local_roundtrip() {
             }
         "#;
     let out = compact(src);
-    // Must emit `&` before the local variable name.
     assert!(
         out.contains("(&"),
         "call with ptr-to-local must have &: {out}"
@@ -166,8 +157,6 @@ fn call_with_ptr_to_local_roundtrip() {
 
 #[test]
 fn call_with_ptr_to_local_prevents_dead_var() {
-    // A variable only referenced via a Call pointer arg should NOT be
-    // eliminated as dead - the Call uses it.
     let src = r#"
             fn mutate(p: ptr<function, f32>) { *p = 42.0; }
             @compute @workgroup_size(1)
@@ -177,14 +166,12 @@ fn call_with_ptr_to_local_prevents_dead_var() {
             }
         "#;
     let out = compact(src);
-    // Variable must still appear in output.
     assert!(out.contains("var "), "var should not be eliminated: {out}");
     assert_valid_wgsl(&out);
 }
 
 #[test]
 fn call_with_ptr_blocks_deferral() {
-    // Call with &x before a store to x -> x must NOT be deferred.
     let src = r#"
             fn read_ptr(p: ptr<function, f32>) -> f32 { return *p; }
             @compute @workgroup_size(1)
@@ -205,7 +192,6 @@ fn call_with_ptr_blocks_deferral() {
 
 #[test]
 fn ptr_forward_no_double_ref() {
-    // Forwarding a pointer parameter should emit `inner(p)`, not `inner(&p)`.
     let src = r#"
             fn inner(p: ptr<function, f32>) { *p = 1.0; }
             fn outer(p: ptr<function, f32>) { inner(p); }
@@ -217,7 +203,6 @@ fn ptr_forward_no_double_ref() {
             }
         "#;
     let out = compact(src);
-    // Output must NOT contain `(&(&` or similar double-reference.
     assert!(
         !out.contains("(&(&"),
         "double & on forwarded pointer: {out}"
@@ -227,7 +212,6 @@ fn ptr_forward_no_double_ref() {
 
 #[test]
 fn call_with_ptr_to_struct_field() {
-    // Passing a pointer to a struct field: `set_x(&s.x)`.
     let src = r#"
             struct S { x: f32, y: f32 }
             fn set_x(p: ptr<function, f32>) { *p = 1.0; }
@@ -308,9 +292,8 @@ fn workgroup_uniform_load_roundtrip() {
 
 #[test]
 fn subgroup_barrier_does_not_inject_enable_subgroups() {
-    // Regression: auto-injecting `enable subgroups;` made tiny shaders grow
-    // while also tripping naga's known subgroup directive parser limitation
-    // in text-validation paths.
+    // Injecting `enable subgroups;` grows tiny shaders and trips naga's
+    // subgroup-directive limitation in text paths (hence parse-only below).
     let src = r#"
         @compute @workgroup_size(1)
         fn main() {
@@ -322,8 +305,6 @@ fn subgroup_barrier_does_not_inject_enable_subgroups() {
         !out.contains("enable subgroups;"),
         "generator should not synthesize subgroup enable directive: {out}"
     );
-    // Keep this as parse-only because naga does not fully support subgroup
-    // extension directives in WGSL text paths.
     assert!(
         naga::front::wgsl::parse_str(&out).is_ok(),
         "re-parse failed: {out}"
@@ -355,7 +336,6 @@ fn struct_explicit_size_roundtrip() {
 
 #[test]
 fn struct_explicit_align_roundtrip() {
-    // @align(16) on the first member bumps struct alignment.
     let src = r#"
         struct S {
             @align(16) a: f32,
@@ -371,7 +351,6 @@ fn struct_explicit_align_roundtrip() {
 
 #[test]
 fn struct_align_on_second_member_roundtrip() {
-    // @align(16) on the second member shifts its offset.
     let src = r#"
         struct S {
             a: f32,
@@ -403,7 +382,6 @@ fn struct_size_and_align_combined_roundtrip() {
 
 #[test]
 fn struct_nested_with_align_roundtrip() {
-    // Inner struct with alignment bump, used inside outer struct.
     let src = r#"
         struct Inner {
             @align(16) x: f32,
@@ -642,11 +620,8 @@ fn atomic_store_roundtrip() {
 
 #[test]
 fn atomic_store_in_for_update_lowers_to_atomic_store_builtin() {
-    // An `atomicStore` landing in a for-loop update slot must still lower to
-    // the `atomicStore` builtin.  The inline-update Store path previously
-    // emitted a plain `counter = i` assignment, a WGSL type error against
-    // `atomic<T>` that naga accepts (so no fallback) but strict consumers
-    // reject.
+    // The inline for-update Store path must lower to `atomicStore`; a plain
+    // `counter = i` is a type error naga accepts (no fallback) but tint rejects.
     let src = r#"
         @group(0) @binding(0)
         var<storage, read_write> counter: atomic<u32>;
@@ -673,11 +648,9 @@ fn atomic_store_in_for_update_lowers_to_atomic_store_builtin() {
 
 #[test]
 fn atomic_load_emits_atomic_load_builtin() {
-    // The load counterpart of `atomic_store_*`: reading an atomic must lower to
-    // the `atomicLoad` builtin, NOT a bare atomic identifier.  naga lowers both
-    // `atomicLoad(&a)` and a direct read to the SAME `Load`, so it accepts either
-    // (no fallback fires), but emitting the bare atomic is a WGSL spec violation
-    // that strict consumers (tint/Dawn) reject.
+    // naga lowers `atomicLoad(&a)` and a bare read to the same `Load`, so it
+    // accepts either (no fallback), but a bare atomic read is a spec violation
+    // tint/Dawn reject.
     let src = r#"
         @group(0) @binding(0)
         var<storage, read_write> a: atomic<i32>;
@@ -699,9 +672,8 @@ fn atomic_load_emits_atomic_load_builtin() {
 
 #[test]
 fn atomic_load_in_for_condition_emits_atomic_load_builtin() {
-    // An atomic `Load` inlined into a reconstructed `for(...)` condition must
-    // still lower to `atomicLoad(&p)`; the bare-atomic form `i < a` is a spec
-    // violation strict consumers reject (naga accepts it, so no fallback flags it).
+    // A `Load` inlined into a reconstructed for-condition must still render as
+    // `atomicLoad(&p)`; bare `i < a` is naga-accepted but spec-invalid.
     let src = r#"
         @group(0) @binding(0)
         var<storage, read_write> a: atomic<i32>;
@@ -759,11 +731,9 @@ fn ray_hit_stages_emit_incoming_payload_attr() {
 
 #[test]
 fn ray_tracing_pipeline_predeclared_raydesc_not_emitted_as_struct() {
-    // `RayDesc` is a WGSL predeclared type for the wgpu_ray_tracing_pipeline
-    // extension.  The generator must NOT emit a `struct RayDesc { ... }`
-    // declaration - doing so shadows the predeclared type and causes naga's
-    // validator to reject the constructor expression because the user-defined
-    // struct has different type-arena handles than the canonical special type.
+    // `RayDesc` is predeclared by wgpu_ray_tracing_pipeline; a `struct RayDesc`
+    // declaration shadows it and naga then rejects the constructor (its handles
+    // differ from the canonical special type).
     let src = r#"
         enable wgpu_ray_tracing_pipeline;
 
@@ -781,12 +751,10 @@ fn ray_tracing_pipeline_predeclared_raydesc_not_emitted_as_struct() {
     "#;
 
     let out = compact(src);
-    // No `struct RayDesc` should appear - it must use the predeclared type
     assert!(
         !out.contains("struct RayDesc"),
         "RayDesc is a predeclared type and must not be emitted as a struct declaration: {out}"
     );
-    // traceRay must still use RayDesc as a constructor
     assert!(
         out.contains("RayDesc("),
         "RayDesc constructor expression must be preserved: {out}"
@@ -796,9 +764,8 @@ fn ray_tracing_pipeline_predeclared_raydesc_not_emitted_as_struct() {
 
 #[test]
 fn modf_result_members_not_mangled() {
-    // `modf()` returns a WGSL predeclared struct type (`__modf_result_f32` etc.)
-    // whose members `.fract` and `.whole` are canonical names.  If the mangler
-    // renames them (e.g. to `B`, `b`), the field accessor becomes invalid.
+    // `.fract`/`.whole` are canonical members of the predeclared modf result
+    // struct; renaming them breaks the accessor.
     let src = r#"
         @group(0) @binding(0) var<storage, read_write> val: f32;
 
@@ -819,8 +786,7 @@ fn modf_result_members_not_mangled() {
 
 #[test]
 fn frexp_result_members_not_mangled() {
-    // `frexp()` returns a WGSL predeclared struct type whose members `.fract`
-    // and `.exp` are canonical.  They must survive the mangle pass intact.
+    // `.fract`/`.exp` are canonical members of the predeclared frexp result.
     let src = r#"
         @group(0) @binding(0) var<storage, read_write> val: f32;
         @group(0) @binding(1) var<storage, read_write> exp_out: i32;

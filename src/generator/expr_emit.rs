@@ -1,12 +1,10 @@
-//! Expression emitters.
-//!
-//! Every [`naga::Expression`] variant routes through `emit_expr`
-//! and, for the uncommon non-cached path, `emit_expr_uncached`.  The
-//! expression emitters also drive the splat elision, swizzle collapse,
-//! literal extraction, and parenthesis-minimisation logic that gives
-//! the custom generator its size advantage over naga's own emitter.
+//! Expression emitters.  `emit_expr` short-circuits a let-bound expression to
+//! its name; `emit_expr_uncached` renders every [`naga::Expression`] variant
+//! and hosts the size rewrites (splat elision, swizzle collapse, extracted-
+//! literal substitution, parenthesis minimisation) that beat naga's writer.
 
 use crate::error::Error;
+use crate::passes::expr_util::literal_bit_eq;
 
 use super::core::{FunctionCtx, Generator};
 use super::syntax::{
@@ -14,34 +12,38 @@ use super::syntax::{
     type_inner_name, type_resolution_name,
 };
 
-/// `true` when emitting `literal` in its bare (suffix-less) form at a
-/// non-constructor, non-extracted-const position would re-parse as a
-/// different concrete type than the original.
+/// `true` when the bare (suffix-less) spelling of `literal` would re-parse as
+/// a different concrete type.  Every top-level `Literal` in valid naga IR sits
+/// in a pinning position (Binary partner of known type, argument/return/store
+/// slot, constructor) where the abstract value coerces to the local type, and
+/// abstract literals default to i32/f32: `I32`/`U32`/`F32`/`Bool` coerce back
+/// to the original and drop the suffix byte, while `F16`/`F64`/`I64`/`U64` do
+/// not (bare `0.5` defaults f32 and refuses f16/f64 contexts, bare `42`
+/// defaults i32 and conflicts with an i64/u64 target).
 ///
-/// WGSL's abstract-type coercion defaults `AbstractInt` to `i32` and
-/// `AbstractFloat` to `f32` when no enclosing context pins another
-/// type.  Every reachable top-level `Literal` in valid naga IR sits
-/// in a pinning context (Binary partner of known type, function-arg
-/// slot, return slot, Store target, constructor), and the abstract
-/// value coerces into that local `(kind, width)`.  So bare emission
-/// is sound for `I32`/`U32`/`F32`/`Bool` (the coercion target
-/// matches the original) and saves a suffix byte.
-///
-/// For `F16`/`F64`/`I64`/`U64` the abstract default does NOT match:
-/// * `F16` / `F64`: bare `0.5` parses as `AbstractFloat` ->
-///   default-f32, refusing to coerce into f16/f64 contexts.
-/// * `I64` / `U64`: bare `42` parses as `AbstractInt` -> default i32,
-///   not i64/u64; even in-range values conflict with the
-///   i64/u64-typed coercion target.
-///
-/// Counter-example: a NEW non-pinning context (e.g. a switch
-/// selector that is itself a `Literal::U32`) DOES break the safe-bare
-/// assumption for `U32`.  Switch dispatch in [`super::stmt_emit`]
-/// already special-cases literal selectors via [`literal_to_wgsl`]
-/// because the case label carries `u` while a bare selector would
-/// parse as AbstractInt -> i32.  Any new top-level Literal-bearing
-/// position must apply the same special-case OR hint the scalar kind
-/// through [`super::expr_emit::Generator::emit_expr_with_scalar_hint`].
+/// A NON-pinning position breaks the `U32` case: a bare switch selector
+/// re-parses as i32 while its case labels carry `u`, so every new top-level
+/// literal position must force the typed form or hint the scalar through
+/// [`Generator::emit_expr_with_scalar_hint`].
+/// `true` when both operands are `i32` literals whose concrete (wrapping)
+/// result differs from the exact one an AbstractInt evaluation would give -
+/// exactly the cases the checked operation rejects.  `u32` literals keep
+/// their suffix already, and shifts type as their left operand.
+fn i32_binary_widens(op: naga::BinaryOperator, left: naga::Literal, right: naga::Literal) -> bool {
+    use naga::BinaryOperator as B;
+    let (naga::Literal::I32(l), naga::Literal::I32(r)) = (left, right) else {
+        return false;
+    };
+    match op {
+        B::Add => l.checked_add(r).is_none(),
+        B::Subtract => l.checked_sub(r).is_none(),
+        B::Multiply => l.checked_mul(r).is_none(),
+        B::Divide => l.checked_div(r).is_none(),
+        B::Modulo => l.checked_rem(r).is_none(),
+        _ => false,
+    }
+}
+
 fn literal_needs_typed_form_outside_constructor(literal: naga::Literal) -> bool {
     matches!(
         literal,
@@ -80,23 +82,16 @@ pub(super) fn as_operand_keeps_suffix(literal: naga::Literal, convert: Option<u8
     convert.is_none() || differs || convert == Some(2)
 }
 
-/// `true` when `literal`, rendered in the BARE form constructor components
-/// use, re-infers exactly `scalar` as a `vecN(...)` component - i.e. it can
-/// pin the elided constructor's element type.
-///
-/// WGSL's abstract defaults decide: an integer-form token is `AbstractInt`
-/// (defaults i32), a float-form token `AbstractFloat` (defaults f32).  So an
-/// i32 element is pinned by ANY integer literal, and an f32 element by a
-/// literal whose bare rendering keeps a float shape (`.5`, `1e3`, `0x1p2` -
-/// but NOT a whole number, which renders as a bare int and would re-infer
-/// i32).  u32/f16/f64/16-bit elements are never literal-pinned: their
-/// abstract default is a different type.  Mixed abstract components stay
-/// compatible - the constructor's common type keeps the pinned default
-/// (`vec4(.5,1,1,1)` is AbstractFloat throughout -> f32).
-///
-/// The float-form test inspects the same rendering the emitter ships
-/// (per-type precision rounding included), so the decision cannot drift
-/// from the emitted token.
+/// `true` when `literal`, in the bare form constructor components use,
+/// re-infers exactly `scalar` and so can pin an elided `vecN(...)`'s element
+/// type.  An integer-form token is AbstractInt (defaults i32) and a float-form
+/// token AbstractFloat (defaults f32): any integer literal pins i32, and a
+/// literal whose bare rendering keeps a float shape (`.5`, `1e3`, `0x1p2`, not
+/// a whole number, which renders as a bare int) pins f32; u32/f16/f64/16-bit
+/// elements are never literal-pinned.  Mixed abstract components keep the
+/// pinned default (`vec4(.5,1,1,1)` is AbstractFloat throughout -> f32).  The
+/// float-shape test inspects the rendering the emitter ships (precision
+/// rounding included), so the decision cannot drift from the emitted token.
 fn literal_bare_form_pins_scalar(
     literal: naga::Literal,
     scalar: naga::Scalar,
@@ -122,17 +117,13 @@ fn literal_bare_form_pins_scalar(
     }
 }
 
-/// Convert a constant **width-8** literal (`F64` / `U64` / `I64`) to `target`
-/// (one of f32 / i32 / u32 / bool), matching naga's value-conversion
-/// semantics, or `None` for any other source/target (or a non-finite f32).
-///
-/// Mirror of [`super::super::passes::const_fold::cast_width8_to`] (kept in
-/// sync; any divergence is caught by the round-trip tests).  Used only by
-/// [`Generator::try_emit_const_width8_vector_narrow`] to fold a *vector*
-/// width-8 narrowing cast that const_fold cannot (`materialize_vector` would
-/// need the converted component literals to already exist as arena handles).
-/// f64 sources CLAMP on int narrowing; u64/i64 sources WRAP (`as`) - naga only
-/// clamps float sources.
+/// Convert a width-8 literal (`F64`/`U64`/`I64`) to `target` (f32/i32/u32/
+/// bool) with naga's value-conversion semantics - f64 sources CLAMP on int
+/// narrowing, u64/i64 sources WRAP - or `None` for any other pair or a
+/// non-finite f32.  Must agree with `const_fold::cast_width8_to`; it exists
+/// because const_fold cannot fold the VECTOR narrowing (`materialize_vector`
+/// needs the converted component literals as arena handles), which
+/// [`Generator::try_emit_const_width8_vector_narrow`] does at emission.
 fn cast_width8_to_literal(src: naga::Literal, target: naga::Scalar) -> Option<naga::Literal> {
     use naga::Literal as L;
     use naga::ScalarKind as K;
@@ -162,10 +153,9 @@ fn cast_width8_to_literal(src: naga::Literal, target: naga::Scalar) -> Option<na
     }
 }
 
-/// `true` when `l` is a width-8 numeric literal (`f64`/`u64`/`i64`) - the
-/// only literals [`Generator::try_emit_const_width8_vector_narrow`] folds.
-/// `literal_extract`'s narrow-fold pre-pass mirrors this set, so both must
-/// agree or the extraction count diverges from what the emitter prints.
+/// Width-8 numeric literals (`f64`/`u64`/`i64`), the only ones the vector
+/// narrowing fold accepts; `literal_extract`'s pre-pass must mirror this set
+/// or its count diverges from what the emitter prints.
 pub(super) fn literal_is_width8(l: naga::Literal) -> bool {
     matches!(
         l,
@@ -173,9 +163,8 @@ pub(super) fn literal_is_width8(l: naga::Literal) -> bool {
     )
 }
 
-/// `true` when the literal numerically equals zero.  Both `+0.0` and
-/// `-0.0` qualify (IEEE `==` already conflates them; F16 is matched on
-/// bit-pattern because its `==` is not available without `half`).
+/// Numeric zero, `-0.0` included (F16 compares bit patterns: its `==` needs
+/// `half`).
 fn literal_is_zero(lit: naga::Literal) -> bool {
     match lit {
         naga::Literal::F16(v) => v.to_bits() == 0 || v.to_bits() == 0x8000,
@@ -194,18 +183,15 @@ fn literal_is_zero(lit: naga::Literal) -> bool {
 }
 
 impl<'a> Generator<'a> {
-    /// `true` when `handle` resolves to a value that is statically
-    /// provably zero (literal zero, `ZeroValue`, or a constant whose
-    /// init is one of those).  Used by emission paths that must reject
-    /// IR with an unrepresentable non-zero argument - e.g.,
-    /// `textureSampleCompareLevel`, whose WGSL signature has no level
-    /// parameter and therefore can only encode level 0.
+    /// Statically provable zero (literal zero, `ZeroValue`, or a constant
+    /// initialised by one), for emission paths whose WGSL signature can only
+    /// encode zero - `textureSampleCompareLevel` has no level parameter.
     pub(super) fn expression_is_provable_zero(
         &self,
         handle: naga::Handle<naga::Expression>,
         ctx: &super::core::FunctionCtx<'_, '_>,
     ) -> bool {
-        match ctx.func.expressions[handle] {
+        match ctx.exprs[handle] {
             naga::Expression::Literal(lit) => literal_is_zero(lit),
             naga::Expression::ZeroValue(_) => true,
             naga::Expression::Constant(c) => {
@@ -220,27 +206,25 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// `true` when `handle` renders with a bare top-level `<`: an uncached
-    /// `Less` binary, or an uncached `&&`/`||` whose rendered right spine ends
-    /// in one (those operators do not parenthesise a comparison child, so
-    /// `x && a<b` renders `x&&a<b`).  Inside a comma-delimited argument list, a
-    /// later argument's top-level `>` then pairs with it in WGSL's
-    /// template-list scanner (`f(a<b,c>d)` scans as the template `a<b,c>`
-    /// applied to `d`) and strict parsers reject the file - such arguments are
-    /// wrapped in parens.  Only bare `<` opens a candidate (`<=` / `<<` never
-    /// do), a cached expression renders as its let-name, and no other uncached
-    /// root renders a top-level `<`.  The LAST argument of a list never needs
-    /// the wrap: the closing `)` discards the candidate before any `>` can pair
-    /// with it.
+    /// `true` when `handle` renders with a top-level bare `<`: an uncached
+    /// `Less`, or an uncached `&&`/`||` whose right spine ends in one (those
+    /// operators do not parenthesise a comparison child: `x&&a<b`).  In a
+    /// comma-delimited argument list a later argument's top-level `>` pairs
+    /// with it in WGSL's template-list scanner (`f(a<b,c>d)` scans as the
+    /// template `a<b,c>` applied to `d`) and strict parsers reject the file,
+    /// so such arguments are parenthesised.  Only bare `<` opens a candidate
+    /// (`<=`/`<<` never do), a cached expression renders as its name, no other
+    /// uncached root renders a top-level `<`, and the LAST argument never needs
+    /// the wrap because the closing `)` discards the candidate.
     fn renders_as_bare_less(
         &self,
         handle: naga::Handle<naga::Expression>,
         ctx: &FunctionCtx<'a, '_>,
     ) -> bool {
-        if ctx.expr_names.contains_key(&handle) {
+        if ctx.expr_names.contains_key(handle) {
             return false;
         }
-        match &ctx.func.expressions[handle] {
+        match &ctx.exprs[handle] {
             naga::Expression::Binary {
                 op: naga::BinaryOperator::Less,
                 ..
@@ -254,10 +238,10 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// Emit a `Call` expression (`name(arg0, arg1, ...)`).  Inserts an explicit
-    /// `&` before pointer-typed arguments that WGSL would otherwise treat as
-    /// references, skipping the `&` for forwarded function-argument pointers
-    /// which are already pointer values.
+    /// `name(args)`, prefixing `&` to an argument bound to a pointer
+    /// parameter: globals, locals and access chains are WGSL references,
+    /// while a forwarded pointer-typed function argument is already a
+    /// pointer value.
     pub(super) fn emit_call(
         &self,
         function: naga::Handle<naga::Function>,
@@ -273,19 +257,12 @@ impl<'a> Generator<'a> {
             if i > 0 {
                 s.push_str(sep);
             }
-            // If the callee parameter is a pointer type, emit `&` to
-            // convert the WGSL reference into a pointer - UNLESS the
-            // argument is a forwarded function parameter whose declared
-            // type is already a pointer (the only expression kind that
-            // is a pointer value, not a reference, in WGSL text scope).
-            // Globals, locals, and access chains are all references in
-            // WGSL and always need `&`.
             let needs_ref = if let Some(param) = callee.arguments.get(i) {
                 matches!(
                     self.module.types[param.ty].inner,
                     naga::TypeInner::Pointer { .. }
                 ) && !matches!(
-                    ctx.func.expressions[*arg],
+                    ctx.exprs[*arg],
                     naga::Expression::FunctionArgument(idx)
                     if matches!(
                         self.module.types[ctx.func.arguments[idx as usize].ty].inner,
@@ -299,7 +276,6 @@ impl<'a> Generator<'a> {
                 s.push('&');
             }
             let arg_text = self.emit_expr(*arg, ctx)?;
-            // Template-list guard; see `renders_as_bare_less`.
             if i + 1 < arguments.len() && self.renders_as_bare_less(*arg, ctx) {
                 s.push('(');
                 s.push_str(&arg_text);
@@ -312,16 +288,10 @@ impl<'a> Generator<'a> {
         Ok(s)
     }
 
-    /// Emit the logical negation of `condition` in the shortest
-    /// form that still preserves semantics:
-    ///
-    /// 1. For a `Binary` comparison whose operator is safe to flip
-    ///    (`<` becomes `>=`, `==` becomes `!=`, etc.), drop the outer
-    ///    `!`.  Ordered comparisons on floats are NOT flipped because
-    ///    `!(x < y)` diverges from `x >= y` when either operand is
-    ///    NaN; equality is safe for every type.
-    /// 2. For `Unary(LogicalNot, inner)`, emit `inner` directly.
-    /// 3. Otherwise emit `!(expr)`.
+    /// Shortest negation of `cond`: a let-bound condition is `!name`, a
+    /// comparison flips its operator (`<` -> `>=`, `==` -> `!=`) except an
+    /// ordered float comparison, where `!(x<y)` and `x>=y` differ under NaN,
+    /// `!!x` collapses to `x`, and anything else is `!(expr)`.
     pub(super) fn emit_negated_condition(
         &self,
         cond: naga::Handle<naga::Expression>,
@@ -329,18 +299,13 @@ impl<'a> Generator<'a> {
     ) -> Result<String, Error> {
         use naga::Expression as E;
 
-        // If the condition has a let-binding, just negate the name.
-        if let Some(name) = ctx.expr_names.get(&cond) {
+        if let Some(name) = ctx.expr_names.get(cond) {
             return Ok(format!("!{name}"));
         }
 
-        match &ctx.func.expressions[cond] {
-            // Flip comparison operators for shorter output.
+        match &ctx.exprs[cond] {
             E::Binary { op, left, right } => {
                 if let Some(flipped) = flip_comparison(*op) {
-                    // Ordered comparisons on floats are not equivalent
-                    // when negated due to NaN (IEEE 754).  Only
-                    // equality/inequality flips are NaN-safe.
                     let is_ordered = matches!(
                         op,
                         naga::BinaryOperator::Less
@@ -349,19 +314,16 @@ impl<'a> Generator<'a> {
                             | naga::BinaryOperator::GreaterEqual
                     );
                     let is_float = is_ordered
-                        && ctx.info[*left]
-                            .ty
-                            .inner_with(&self.module.types)
-                            .scalar_kind()
+                        && ctx.ty(*left).inner_with(&self.module.types).scalar_kind()
                             == Some(naga::ScalarKind::Float);
                     if !is_float {
                         let left = *left;
                         let right = *right;
                         let op_str = binary_op_str(flipped);
                         let sp = self.bin_op_sep();
-                        let arena = &ctx.func.expressions;
-                        let lc = ctx.expr_names.contains_key(&left);
-                        let rc = ctx.expr_names.contains_key(&right);
+                        let arena = &ctx.exprs;
+                        let lc = ctx.expr_names.contains_key(left);
+                        let rc = ctx.expr_names.contains_key(right);
                         let wrap_l = child_needs_parens(left, arena, flipped, false, lc);
                         let wrap_r = child_needs_parens(right, arena, flipped, true, rc);
                         let ls = self.emit_expr(left, ctx)?;
@@ -370,7 +332,6 @@ impl<'a> Generator<'a> {
                     }
                 }
             }
-            // Double-negation elimination: !(! x) -> x
             E::Unary {
                 op: naga::UnaryOperator::LogicalNot,
                 expr,
@@ -380,24 +341,21 @@ impl<'a> Generator<'a> {
             _ => {}
         }
 
-        // Fallback: wrap in !().
         let mut inner = self.emit_expr(cond, ctx)?;
         inner.insert_str(0, "!(");
         inner.push(')');
         Ok(inner)
     }
 
-    /// Emit `expr` treated as an assignable place: globals and
-    /// locals render by name, accesses cascade through `.field`,
-    /// `.xyz`, or `[index]`, and anything else is dereferenced with
-    /// a leading `*`.
+    /// `expr` as an assignable place; a root that is neither a variable nor
+    /// an access chain renders dereferenced (`*expr`).
     pub(super) fn emit_lvalue(
         &self,
         expr: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
         use naga::Expression as E;
-        Ok(match &ctx.func.expressions[expr] {
+        Ok(match &ctx.exprs[expr] {
             E::GlobalVariable(h) => self.global_names[h.index()].clone(),
             E::LocalVariable(h) => ctx.local_names[h].clone(),
             E::Access { base, index } => {
@@ -431,24 +389,21 @@ impl<'a> Generator<'a> {
         })
     }
 
-    /// Emit `expr` as either an lvalue (when the top-level shape is
-    /// an `Access`/`AccessIndex` chain rooted in a variable) or the
-    /// ordinary value form.  Used when the caller accepts either,
-    /// such as the left operand of a store-through access chain.
+    /// Place form for a variable or access chain, value form otherwise, for
+    /// callers that accept either (the base of a store-through access chain).
     pub(super) fn emit_lvalue_or_value(
         &self,
         expr: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
         use naga::Expression as E;
-        Ok(match &ctx.func.expressions[expr] {
+        Ok(match &ctx.exprs[expr] {
             E::GlobalVariable(h) => self.global_names[h.index()].clone(),
             E::LocalVariable(h) => ctx.local_names[h].clone(),
             E::Access { .. } | E::AccessIndex { .. } => self.emit_lvalue(expr, ctx)?,
-            // A function-argument `ptr<...>` used as the base of an lvalue
-            // access chain (`(*p).field = ..`, `(*p)[i] = ..`) is a pointer
-            // value, not a reference, so it needs the explicit `(*p)` deref;
-            // see `emit_postfix_base` for the value-context counterpart.
+            // A function-argument `ptr<...>` is a pointer value, not a
+            // reference, so as the root of an lvalue chain it needs the
+            // explicit `(*p)`.
             _ if self.pointer_is_ptr_value(expr, ctx) => {
                 format!("(*{})", self.emit_expr(expr, ctx)?)
             }
@@ -456,72 +411,57 @@ impl<'a> Generator<'a> {
         })
     }
 
-    /// Emit `expr` as its WGSL value-text form.  Cached bindings (let
-    /// / var / argument names) short-circuit to the bound identifier;
-    /// otherwise control flows into [`emit_expr_uncached`] which
-    /// handles every expression variant.
+    /// Value text of `expr`; a let/var/argument-bound expression renders as
+    /// its name.
     pub(super) fn emit_expr(
         &self,
         expr: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
-        if let Some(name) = ctx.expr_names.get(&expr) {
+        if let Some(name) = ctx.expr_names.get(expr) {
             return Ok(name.clone());
         }
         self.emit_expr_uncached(expr, ctx)
     }
 
-    /// Render a ray-query builtin's `query` operand.  naga's expression
-    /// validator admits any `ptr<function, ray_query>` here: a `ray_query`
-    /// LOCAL is a WGSL reference and needs `&`, while the only other legal
-    /// producer - a pointer-typed function argument (`ray_query` cannot live
-    /// in composites, so no access chain yields one) - is already a pointer
-    /// value and passes through verbatim.
+    /// A ray-query builtin's `query` operand: naga admits any
+    /// `ptr<function, ray_query>`, so a `ray_query` LOCAL (a reference) takes
+    /// `&`, while the only other legal producer, a pointer-typed function
+    /// argument (`ray_query` cannot live in composites, so no access chain
+    /// yields one), is already a pointer value.
     fn emit_ray_query_arg(
         &self,
         query: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
         let text = self.emit_expr(query, ctx)?;
-        Ok(match ctx.func.expressions[query] {
+        Ok(match ctx.exprs[query] {
             naga::Expression::LocalVariable(_) => format!("&{text}"),
             _ => text,
         })
     }
 
-    /// Emit an expression that appears inside a type constructor
-    /// (`Compose` / `Splat`).  An uncached literal is rendered in the
-    /// suffix-free bare form because the enclosing constructor type
-    /// pins the concrete type.
-    ///
-    /// Bare `<` / `<=` comparisons inside a template-delimited
-    /// constructor (for example `vec3<bool>(a < b, ...)`) are wrapped
-    /// in parentheses to avoid the WGSL parser mistaking the `<` for
-    /// a template-list opener.
+    /// A `Compose`/`Splat` component.  An uncached literal renders bare
+    /// because the constructor pins its type; an argument rendering with a
+    /// top-level `<` is parenthesised (template-list guard).
     pub(super) fn emit_constructor_arg(
         &self,
         arg: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
-        if !ctx.expr_names.contains_key(&arg) {
-            if let naga::Expression::Literal(lit) = &ctx.func.expressions[arg] {
+        if !ctx.expr_names.contains_key(arg) {
+            if let naga::Expression::Literal(lit) = &ctx.exprs[arg] {
                 let bare = literal_to_wgsl_bare(*lit, &self.options.float_precision);
                 let key = literal_extract_key(*lit, &self.options.float_precision);
                 if let Some(name) = self.extracted_literals.get(&key) {
                     return Ok(name.clone());
                 }
-                // Inside a type constructor the enclosing type provides
-                // context, so bare literals (no suffix) are safe and produce
-                // the shortest output when the literal is not extracted.
                 return Ok(bare);
             }
-            // Template-list guard (see `renders_as_bare_less`): wrap an arg that
-            // renders ending in a bare `<` - a root `Less` or an `&&`/`||` whose
-            // right spine ends in one - so a later arg's `>` cannot form a
-            // spurious template.  `<=` is wrapped too (harmless, historical).
+            // Template-list guard; the `<=` wrap is redundant but harmless.
             if self.renders_as_bare_less(arg, ctx)
                 || matches!(
-                    &ctx.func.expressions[arg],
+                    &ctx.exprs[arg],
                     naga::Expression::Binary {
                         op: naga::BinaryOperator::LessEqual,
                         ..
@@ -532,29 +472,21 @@ impl<'a> Generator<'a> {
                 return Ok(format!("({s})"));
             }
             // An identity-swizzle `Compose` (`vecN(b.0,..,b.N-1)`) collapses to
-            // its bare base `b`.  A constructor argument is a complete,
-            // comma-delimited expression with nothing appended, so the base
-            // needs no parentheses here even when it is an operator expression
-            // (`mat3x3(l*m, ..)`, not `mat3x3((l*m), ..)`).  Emitting it through
-            // the general path would route the collapse through
-            // `emit_postfix_base`, which conservatively wraps a Binary/Unary/
-            // Select base for the *postfix* context it cannot rule out - bytes
-            // that are redundant in this loose position.
+            // its bare base.  A constructor argument has nothing appended, so
+            // an operator base needs none of the parens the postfix path adds
+            // (`mat3x3(l*m,..)`, not `mat3x3((l*m),..)`).
             if let Some(base) = self.compose_identity_collapse_base(arg, ctx) {
-                // A pointer-value base collapses to the dereferenced value
-                // `(*p)`, not the bare pointer; see `emit_postfix_base`.
+                // A pointer-value base collapses to `(*p)`, not the bare
+                // pointer.
                 if self.pointer_is_ptr_value(base, ctx) {
                     return Ok(format!("(*{})", self.emit_expr(base, ctx)?));
                 }
                 let s = self.emit_expr(base, ctx)?;
-                // Same template-ambiguity guard as the direct-Binary case
-                // above: a bare leading `<` / `<=` right after a constructor's
-                // `(` can be mis-scanned as a template list.  If the collapsed
-                // base is itself an (uncached) `Less`/`LessEqual` comparison,
-                // wrap it.  Other operator bases (`*`, `+`, ...) stay bare.
-                if !ctx.expr_names.contains_key(&base)
+                // A collapsed `Less`/`LessEqual` base takes the template-list
+                // guard; other operator bases stay bare.
+                if !ctx.expr_names.contains_key(base)
                     && matches!(
-                        ctx.func.expressions[base],
+                        ctx.exprs[base],
                         naga::Expression::Binary {
                             op: naga::BinaryOperator::Less | naga::BinaryOperator::LessEqual,
                             ..
@@ -569,14 +501,10 @@ impl<'a> Generator<'a> {
         self.emit_expr(arg, ctx)
     }
 
-    /// Check whether `handle` is an uncached `Splat` (or splat-like
-    /// `Compose` with all identical components) that can be elided to
-    /// its bare scalar when used as an operand of an arithmetic
-    /// binary expression.  WGSL's scalar-vector broadcasting rules
-    /// make the bare scalar a valid, shorter substitute in that
-    /// context.  Returns the scalar value handle on success; `None`
-    /// when elision is unsafe (for example when both operands are
-    /// scalars, which would change the result type).
+    /// The scalar an uncached `Splat` (or scalar-per-lane splat `Compose`)
+    /// elides to as an arithmetic binary operand, where WGSL's scalar-vector
+    /// overloads make it a shorter equivalent; the caller must keep the other
+    /// operand a vector or the result type changes.
     pub(super) fn try_splat_scalar(
         &self,
         handle: naga::Handle<naga::Expression>,
@@ -589,14 +517,9 @@ impl<'a> Generator<'a> {
         match &arena[handle] {
             naga::Expression::Splat { value, .. } => Some(*value),
             naga::Expression::Compose { ty, components } => {
-                // A real scalar splat has exactly `size` scalar lanes -
-                // `vecN(s, s, .., s)`.  A vector built from SUB-VECTORS
-                // (`vec4(v2, v2)`) can also satisfy `compose_is_splat` when its
-                // parts are identical handles, but then `components[0]` is a
-                // VECTOR, and substituting it into the binary splat-elision
-                // path emits a type-mismatched operand (`v2 * v4`).  Require the
-                // scalar-per-lane shape, mirroring the sibling splat-collapse
-                // guards (`components.len() == size`).
+                // `vec4(v2, v2)` also satisfies `compose_is_splat`, but its
+                // component is a VECTOR and would emit a type-mismatched
+                // operand (`v2 * v4`); require one scalar per lane.
                 let is_splat = matches!(
                     self.module.types[*ty].inner,
                     naga::TypeInner::Vector { size, .. }
@@ -609,48 +532,36 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// Emit an expression that is the base of a postfix operation (`.member`,
-    /// `[index]`, `.xyzw`).  Postfix operators bind tighter than any prefix
-    /// or infix operator, so a Binary or Unary base expression must be
-    /// wrapped in parentheses to preserve evaluation order.
-    ///
-    /// Example: naga IR `AccessIndex(Subtract(a, b), .x)` must emit
-    /// `(a-b).x`, **not** `a-b.x` (which WGSL parses as `a - (b.x)`).
+    /// Base of a postfix `.member` / `[index]` / `.xyzw`: postfix binds
+    /// tighter than any prefix or infix operator, so a Binary/Unary/Select
+    /// base is parenthesised (`(a-b).x`, since `a-b.x` parses as `a-(b.x)`).
     fn emit_postfix_base(
         &self,
         base: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
-        // A pointer VALUE (a function-argument `ptr<...>`) does NOT
-        // auto-deref in WGSL, so a postfix `.field` / `.xyz` / `[i]` on it
-        // - or its use as a collapsed identity value - requires an explicit
-        // `(*base)`.  naga's permissive frontend accepts `p.x` on a pointer,
-        // but strict parsers (tint/Dawn/browsers, nagami's target) reject it.
-        // References (globals, locals, access chains rooted in them)
-        // auto-deref and emit bare.  Checked before the cached path because
-        // a function argument renders by name yet still needs the deref.
+        // A pointer VALUE (function-argument `ptr<...>`) does not auto-deref:
+        // naga accepts `p.x` on it but tint/Dawn reject it, so it renders
+        // `(*p)`; references (globals, locals, chains rooted in them) do
+        // auto-deref.  Checked before the cached path because an argument
+        // renders by name yet still needs the deref.
         if self.pointer_is_ptr_value(base, ctx) {
             return Ok(format!("(*{})", self.emit_expr(base, ctx)?));
         }
-        // Named / cached expressions produce a single identifier token;
-        // no parentheses needed.
-        if ctx.expr_names.contains_key(&base) {
+        if ctx.expr_names.contains_key(base) {
             return self.emit_expr(base, ctx);
         }
         let needs_parens = matches!(
-            ctx.func.expressions[base],
+            ctx.exprs[base],
             naga::Expression::Binary { .. }
                 | naga::Expression::Unary { .. }
                 | naga::Expression::Select { .. }
         );
         let s = self.emit_expr(base, ctx)?;
-        // A base that renders with a leading `*` - a whole-pointee `Load` of a
-        // pointer value (`let _ = (*p)`) inlined into a postfix position, which
-        // emits `*p` via the `E::Load`/`emit_lvalue` deref path - must be
-        // parenthesised: a bare `*p.field` / `*p[i]` parses as `*(p.field)` and
-        // is rejected ("operand of `*` must be a pointer").  Wrap so the deref
-        // binds first: `(*p).field`.  (A let-bound such Load short-circuits via
-        // the cached path above and renders as a bare name, needing no wrap.)
+        // An inlined whole-pointee `Load` of a pointer value renders `*p`, and
+        // a bare `*p.field` parses as `*(p.field)` ("operand of `*` must be a
+        // pointer"), so it is wrapped too; a let-bound one already rendered
+        // as a name.
         if needs_parens || s.starts_with('*') {
             Ok(format!("({s})"))
         } else {
@@ -660,11 +571,8 @@ impl<'a> Generator<'a> {
 
     // MARK: Expression dispatch
 
-    /// Emit an expression that has no cached binding, dispatching on
-    /// the [`naga::Expression`] variant.  Central switch for the
-    /// emitter: every shape-specific rewrite (splat elision, swizzle
-    /// collapse, literal extraction substitution, operator
-    /// parenthesisation, and friends) lives inside the relevant arm.
+    /// Every [`naga::Expression`] variant of an expression with no cached
+    /// binding; each shape rewrite lives in its arm.
     pub(super) fn emit_expr_uncached(
         &self,
         expr: naga::Handle<naga::Expression>,
@@ -672,7 +580,7 @@ impl<'a> Generator<'a> {
     ) -> Result<String, Error> {
         use naga::Expression as E;
 
-        Ok(match &ctx.func.expressions[expr] {
+        Ok(match &ctx.exprs[expr] {
             E::Literal(lit) => {
                 if let Some(concrete) =
                     self.concretize_abstract_literal_for_expr(*lit, expr, ctx)?
@@ -683,12 +591,6 @@ impl<'a> Generator<'a> {
                     if let Some(name) = self.extracted_literals.get(&key) {
                         name.clone()
                     } else if literal_needs_typed_form_outside_constructor(*lit) {
-                        // Bare form would re-parse as the wrong type
-                        // (see `literal_needs_typed_form_outside_constructor`).
-                        // Force the typed form here even though we are
-                        // not strictly inside one of the two sanctioned
-                        // bare-emit positions, because the bare form
-                        // changes the inferred concrete type.
                         literal_to_wgsl(*lit, &self.options.float_precision)
                     } else {
                         key.expr_text
@@ -707,41 +609,33 @@ impl<'a> Generator<'a> {
                         {
                             concrete
                         } else {
-                            // Mirror the Literal arm: an unnamed constant
-                            // whose init is a literal is emitted as the
-                            // literal text at every use site, so the
-                            // same shared-const substitution applies
-                            // here.  Same bare-emit safety gate.
+                            // An unnamed literal-init constant renders as its
+                            // literal at every use: same extraction lookup and
+                            // bare-form gate as the Literal arm, one suffix
+                            // byte cheaper than the typed global-expr path.
                             let key = literal_extract_key(*lit, &self.options.float_precision);
                             if let Some(name) = self.extracted_literals.get(&key) {
                                 name.clone()
                             } else if literal_needs_typed_form_outside_constructor(*lit) {
                                 literal_to_wgsl(*lit, &self.options.float_precision)
                             } else {
-                                // Bare-safe literal: emit the bare token like
-                                // the `Literal` arm does (one suffix byte
-                                // cheaper than the typed `emit_global_expr`).
                                 key.expr_text
                             }
                         }
                     } else {
-                        self.emit_global_expr(c.init)?
+                        self.emit_global_expr(c.init, false)?
                     }
                 }
             }
             E::Override(h) => self.override_names[h.index()].clone(),
             E::ZeroValue(ty) => self.zero_value(*ty)?,
             E::Compose { ty, components } => 'compose: {
-                // All-zero vector / matrix -> zero-value constructor
-                // (`vec2f(0,0)` -> `vec2f()`), but ONLY when this Compose is
-                // INLINED (ref count 1).  A multi-use Compose is `let`-bound, so
-                // folding its decl to `vec2f()` would round-trip badly: naga
-                // re-parses `vec2f()` as a `ZeroValue`, which is non-emittable
-                // and so can NEVER be re-bound, forcing the generator to inline
-                // it at every use (`vec2f()` x N) - a non-idempotent size blow-up.
-                // Leaving the bound case as the splat `vec2f(0)` re-parses to a
-                // bindable `Splat` and stays bound.  Strict `+0` only
-                // (compose_is_all_zero rejects -0.0); never array/struct.
+                // All-zero vector/matrix -> `vec2f()`, but ONLY when inlined
+                // (ref count 1): naga re-parses `vec2f()` as a non-emittable
+                // `ZeroValue` that can never be re-bound, so a let-bound one
+                // would re-inline at every use - a non-idempotent size blow-up
+                // - whereas the splat `vec2f(0)` re-parses bindable.  Strict
+                // `+0` only (`-0.0` is rejected); never array/struct.
                 if ctx.ref_counts[expr.index()] <= 1
                     && matches!(
                         self.module.types[*ty].inner,
@@ -749,14 +643,11 @@ impl<'a> Generator<'a> {
                     )
                     && components
                         .iter()
-                        .all(|&c| compose_is_all_zero(c, &ctx.func.expressions))
+                        .all(|&c| compose_is_all_zero(c, ctx.exprs))
                 {
                     break 'compose self.zero_value(*ty)?;
                 }
 
-                // For vector composes, try to emit as a bare swizzle
-                // (e.g. vec3f(v.x,v.y,v.z) -> v.xyz), eliminating the
-                // type constructor entirely.
                 if matches!(self.module.types[*ty].inner, naga::TypeInner::Vector { .. })
                     && let Some(swizzle) = self.try_compose_as_full_swizzle(components, ctx)?
                 {
@@ -764,27 +655,33 @@ impl<'a> Generator<'a> {
                 }
 
                 let mut s = String::new();
-                let ctor_name = self.vector_ctor_name(*ty, components, ctx)?;
-                match self.array_ctor_name(*ty, components, &ctor_name, &ctx.func.expressions) {
+                // A pinned root must spell its type; both elisions infer it.
+                let pinned = ctx.pinned_root == Some(expr);
+                let ctor_name = if pinned {
+                    self.type_ref(*ty)?
+                } else {
+                    self.vector_ctor_name(*ty, components, ctx)?
+                };
+                let bare = (!pinned && ctx.elide_array_ctor)
+                    .then(|| self.array_ctor_name(*ty, components, &ctor_name, ctx.exprs))
+                    .flatten();
+                match bare {
                     Some(bare) => s.push_str(bare),
                     None => s.push_str(&ctor_name),
                 }
                 s.push('(');
-                // Collapse vector Compose with all-identical scalar components
-                // into splat form: vec3f(x,x,x) -> vec3f(x).
                 let is_splat = matches!(
                     self.module.types[*ty].inner,
                     naga::TypeInner::Vector { size, .. }
                         if components.len() == size as usize
                             && components.len() > 1
-                ) && compose_is_splat(components, &ctx.func.expressions);
+                ) && compose_is_splat(components, ctx.exprs);
                 if is_splat {
                     s.push_str(&self.emit_constructor_arg(components[0], ctx)?);
                 } else if matches!(self.module.types[*ty].inner, naga::TypeInner::Vector { .. })
                     && self.emit_compose_grouped(&mut s, components, ctx)?
                 {
-                    // Partial swizzle grouping applied
-                    // (e.g. vec4f(v.x,v.y,0.,1.) -> vec4f(v.xy,0.,1.))
+                    // Grouped swizzle runs already written to `s`.
                 } else {
                     let sep = self.comma_sep();
                     for (i, c) in components.iter().enumerate() {
@@ -795,17 +692,13 @@ impl<'a> Generator<'a> {
                     }
                 }
                 s.push(')');
-                // A matrix built from explicit scalar columns can also be emitted
-                // in flat all-scalar form: mat2x2f(vec2f(a,b),vec2f(c,d)) ->
-                // mat2x2f(a,b,c,d).  Build it and keep whichever is shorter - the
-                // column form wins when a column is shared/let-bound (emitted as a
-                // short name, e.g. mat3x3f(a,a,a)) or splat-collapses to vecR(x).
-                if let Some(flat) = matrix_flatten_scalars(
-                    *ty,
-                    components,
-                    &self.module.types,
-                    &ctx.func.expressions,
-                ) {
+                // A matrix of explicit scalar columns also has the flat form
+                // `mat2x2f(a,b,c,d)`; keep whichever is shorter - the column
+                // form wins when a column is let-bound (`mat3x3f(a,a,a)`) or
+                // splat-collapses.
+                if let Some(flat) =
+                    matrix_flatten_scalars(*ty, components, &self.module.types, ctx.exprs)
+                {
                     let mut sf = self.vector_ctor_name(*ty, components, ctx)?;
                     sf.push('(');
                     let sep = self.comma_sep();
@@ -820,10 +713,10 @@ impl<'a> Generator<'a> {
                         s = sf;
                     }
                 }
-                // A vector built from scalar runs can collapse runs into
-                // sub-vector splats: vec4f(0,0,0,2) -> vec4f(vec3f(),2).  Kept
-                // only when strictly shorter (the sub-vector type often lacks a
-                // short alias, in which case it loses).
+                // Equal-scalar runs may collapse to sub-vector splats
+                // (`vec4f(0,0,0,2)` -> `vec4f(vec3f(),2)`); kept only when
+                // strictly shorter, since the sub-vector type often lacks a
+                // short alias.
                 if let Some(sub) = self.try_subsplat_compose(*ty, components, ctx)?
                     && sub.len() < s.len()
                 {
@@ -855,13 +748,10 @@ impl<'a> Generator<'a> {
             }
             E::Splat { size: _, value } => 'splat: {
                 let target_ty = self.expr_type_name(expr, ctx)?;
-                // All-zero splat -> zero-value constructor (`vec3f(0)` ->
-                // `vec3f()`), gated on ref count <= 1: a bound `vec3f()`
-                // re-parses to a non-emittable `ZeroValue` that must re-inline
-                // at every use, a non-idempotent size blow-up.
-                if ctx.ref_counts[expr.index()] <= 1
-                    && compose_is_all_zero(*value, &ctx.func.expressions)
-                {
+                // All-zero splat -> `vec3f()`, gated on ref count <= 1: a bound
+                // `vec3f()` re-parses to a non-emittable `ZeroValue` that
+                // re-inlines at every use, a non-idempotent size blow-up.
+                if ctx.ref_counts[expr.index()] <= 1 && compose_is_all_zero(*value, ctx.exprs) {
                     break 'splat format!("{target_ty}()");
                 }
                 let lane = self.emit_constructor_arg(*value, ctx)?;
@@ -879,16 +769,13 @@ impl<'a> Generator<'a> {
                 pattern,
             } => 'swizzle: {
                 let n = *size as u8 as usize;
-                // Identity swizzle: `.xy` on a vec2, `.xyz` on a vec3, `.xyzw`
-                // on a vec4 - selects component `i` at position `i` for all `i`
-                // AND the base vector has exactly `n` lanes (nothing dropped or
-                // reordered) - is a no-op, so emit just the base.  Only elide a
-                // base that `emit_postfix_base` would NOT wrap - i.e. not
-                // `Binary`/`Unary`/`Select` (the operand kinds it parenthesises):
-                // the parent's parenthesisation, computed for a postfix
-                // `Swizzle`, stays valid for the substituted base, AND a kept
-                // swizzle over such a base re-minifies identically (eliding a
-                // `Select` would drift to a parenthesised re-parse).
+                // An identity swizzle over a base of exactly `n` lanes is a
+                // no-op, so emit the base alone - but only a base the postfix
+                // path would not wrap (not Binary/Unary/Select): the parent's
+                // parenthesisation, computed for a postfix `Swizzle`, must
+                // stay valid for the substituted base, and a kept swizzle over
+                // such a base re-minifies identically (eliding a `Select`
+                // would drift to a parenthesised re-parse).
                 let is_identity = pattern[..n].iter().enumerate().all(|(i, c)| {
                     let idx = match c {
                         naga::SwizzleComponent::X => 0,
@@ -898,12 +785,12 @@ impl<'a> Generator<'a> {
                     };
                     idx == i
                 });
-                let base_is_full = match ctx.info[*vector].ty.inner_with(&self.module.types) {
+                let base_is_full = match ctx.ty(*vector).inner_with(&self.module.types) {
                     naga::TypeInner::Vector { size: bs, .. } => *bs as u8 as usize == n,
                     _ => false,
                 };
                 let base_paren_free = !matches!(
-                    ctx.func.expressions[*vector],
+                    ctx.exprs[*vector],
                     naga::Expression::Binary { .. }
                         | naga::Expression::Unary { .. }
                         | naga::Expression::Select { .. }
@@ -928,22 +815,11 @@ impl<'a> Generator<'a> {
             E::GlobalVariable(h) => self.global_names[h.index()].clone(),
             E::LocalVariable(h) => ctx.local_names[h].clone(),
             E::Load { pointer } => {
-                // Reading an atomic requires the `atomicLoad` builtin: a bare
-                // atomic identifier is non-portable - naga lowers `atomicLoad(&p)`
-                // and a direct read to the SAME `Load`, so it accepts either, but
-                // the WGSL spec and strict consumers (tint/Dawn) reject reading
-                // `atomic<T>` directly.  Mirror `emit_atomic_store` exactly.
+                // naga lowers `atomicLoad(&p)` and a direct read to the same
+                // `Load`, but the spec and tint/Dawn reject reading `atomic<T>`
+                // directly.
                 if self.atomic_scalar_for_expr(*pointer, ctx).is_some() {
-                    if self.pointer_is_ptr_value(*pointer, ctx) {
-                        // Already a `ptr<>` value (a pointer parameter): emit it
-                        // BY VALUE - `emit_lvalue` would deref it to `*p`, giving
-                        // `atomicLoad(*p)`.  (Latent today: naga rejects atomic
-                        // pointer parameters, so this branch is unreachable - kept
-                        // correct and consistent with `emit_atomic_store`.)
-                        format!("atomicLoad({})", self.emit_expr(*pointer, ctx)?)
-                    } else {
-                        format!("atomicLoad(&{})", self.emit_lvalue(*pointer, ctx)?)
-                    }
+                    format!("atomicLoad({})", self.emit_pointer_operand(*pointer, ctx)?)
                 } else {
                     self.emit_lvalue(*pointer, ctx)?
                 }
@@ -963,15 +839,14 @@ impl<'a> Generator<'a> {
                 let mut s = String::new();
 
                 if let Some(component) = gather {
-                    // textureGather / textureGatherCompare
                     let suffix = if depth_ref.is_some() { "Compare" } else { "" };
                     s.push_str("textureGather");
                     s.push_str(suffix);
                     s.push('(');
-                    // For non-depth textures, the component index comes first.
+                    // Only a non-depth gather takes the leading component index.
                     if depth_ref.is_none() {
                         let is_depth = matches!(
-                            ctx.info[*image].ty.inner_with(&self.module.types),
+                            ctx.ty(*image).inner_with(&self.module.types),
                             naga::TypeInner::Image {
                                 class: naga::ImageClass::Depth { .. },
                                 ..
@@ -1001,7 +876,6 @@ impl<'a> Generator<'a> {
                     }
                     s.push(')');
                 } else {
-                    // textureSample variants
                     let fn_name = match (depth_ref.is_some(), level, clamp_to_edge) {
                         (false, naga::SampleLevel::Zero, true) => "textureSampleBaseClampToEdge",
                         (false, naga::SampleLevel::Auto, _) => "textureSample",
@@ -1038,9 +912,7 @@ impl<'a> Generator<'a> {
                     match level {
                         naga::SampleLevel::Auto => {}
                         naga::SampleLevel::Zero => {
-                            // textureSampleLevel needs explicit 0;
-                            // textureSampleBaseClampToEdge and
-                            // textureSampleCompareLevel do not.
+                            // Only `textureSampleLevel` takes the explicit `0`.
                             if !clamp_to_edge && depth_ref.is_none() {
                                 s.push_str(sep);
                                 s.push('0');
@@ -1051,13 +923,11 @@ impl<'a> Generator<'a> {
                                 s.push_str(sep);
                                 s.push_str(&self.emit_expr(*h, ctx)?);
                             } else {
-                                // `textureSampleCompareLevel` always
-                                // samples at level 0; the WGSL signature
-                                // has no level slot.  naga's WGSL front
-                                // encodes that as `Exact(Literal(0))`,
-                                // so a provable zero is safe to drop -
-                                // any other value is unrepresentable
-                                // and must defer to the fallback emitter.
+                                // `textureSampleCompareLevel` has no level
+                                // slot (always level 0); naga's frontend
+                                // encodes it as `Exact(Literal(0))`, so a
+                                // provable zero drops and anything else is
+                                // unrepresentable.
                                 if !self.expression_is_provable_zero(*h, ctx) {
                                     return Err(Error::Emit(format!(
                                         "textureSampleCompareLevel cannot represent a \
@@ -1144,32 +1014,27 @@ impl<'a> Generator<'a> {
                 s
             }
             E::Unary { op, expr } => {
-                // Deliberately NO comparison flip here (`!(i<j)` stays
-                // `!(i<j)`, unlike if/break_if conditions): every
-                // parenthesization and template-list guard classifies a
-                // child by its ARENA variant, so a Unary that RENDERS as a
-                // bare comparison ships atom-tight into comparison/bitwise
-                // parents (`a<b==c`, tint-rejected, naga-accepted) and
-                // slips every `renders_as_bare_less` guard.  A flip in
-                // value position is safe only if all those sites learn the
-                // rendered shape.
+                // Deliberately no comparison flip in value position (unlike
+                // if/break_if conditions): every parenthesisation and
+                // template-list guard classifies a child by its ARENA variant,
+                // so a Unary rendering as a bare comparison would ship
+                // atom-tight into comparison/bitwise parents (`a<b==c`,
+                // tint-rejected) and slip every `renders_as_bare_less` guard.
                 let op_str = match op {
                     naga::UnaryOperator::Negate => "-",
                     naga::UnaryOperator::LogicalNot => "!",
                     naga::UnaryOperator::BitwiseNot => "~",
                 };
                 let cached = ctx.expr_names.contains_key(expr);
-                let wrap = unary_child_needs_parens(*expr, &ctx.func.expressions, cached);
+                let wrap = unary_child_needs_parens(*expr, ctx.exprs, cached);
                 let mut s = self.emit_expr(*expr, ctx)?;
                 if wrap {
                     s.insert(0, '(');
                     s.push(')');
                 }
-                // WGSL reserves `--` and `++`, so a `Negate` over a child that
-                // already renders with a leading `-` (a nested `-(-x)`, or a
-                // negative literal) would lex as a forbidden decrement token.
-                // A single space disambiguates and is one byte cheaper than
-                // wrapping in parens.  (`!`/`~` form no reserved adjacency.)
+                // WGSL reserves `--`: a `Negate` over a child rendering with a
+                // leading `-` takes a space, one byte cheaper than parens
+                // (`!`/`~` form no reserved adjacency).
                 if matches!(op, naga::UnaryOperator::Negate) && !wrap && s.starts_with('-') {
                     s.insert(0, ' ');
                 }
@@ -1179,16 +1044,14 @@ impl<'a> Generator<'a> {
             E::Binary { op, left, right } => {
                 let op_str = binary_op_str(*op);
                 let sp = self.bin_op_sep();
-                let arena = &ctx.func.expressions;
+                let arena = &ctx.exprs;
                 let lc = ctx.expr_names.contains_key(left);
                 let rc = ctx.expr_names.contains_key(right);
 
-                // Splat elision: in arithmetic binary ops, replace an uncached
-                // Splat / splat-Compose operand with the bare scalar value.
-                // WGSL defines mixed scalar-vector overloads for +, -, *, /, %.
-                // Elide at most one side to keep the result a vector type.
-                // Guard: the OTHER operand must be a vector; if both sides
-                // are scalar after elision the result type changes.
+                // Splat elision: WGSL's mixed scalar-vector overloads for
+                // + - * / % let an uncached splat operand render as its bare
+                // scalar, on at most one side and only while the other stays
+                // a vector, or the result type changes.
                 let is_arith = is_arithmetic_op(*op);
                 let left_scalar = if is_arith {
                     self.try_splat_scalar(*left, arena, lc)
@@ -1200,35 +1063,31 @@ impl<'a> Generator<'a> {
                 } else {
                     None
                 };
-                // Check whether each operand resolves to a vector type.
                 let left_is_vec = matches!(
-                    ctx.info[*left].ty.inner_with(&self.module.types),
+                    ctx.ty(*left).inner_with(&self.module.types),
                     naga::TypeInner::Vector { .. }
                 );
                 let right_is_vec = matches!(
-                    ctx.info[*right].ty.inner_with(&self.module.types),
+                    ctx.ty(*right).inner_with(&self.module.types),
                     naga::TypeInner::Vector { .. }
                 );
                 let (elide_l, elide_r) = match (left_scalar.is_some(), right_scalar.is_some()) {
-                    // Both splats: elide right; left (also a splat) stays as the
-                    // vector operand so the result type remains a vector.
+                    // Both splats: the left one stays as the vector operand.
                     (true, true) => (false, true),
-                    // Only left is splat: elide only if right is a vector.
                     (true, false) => (right_is_vec, false),
-                    // Only right is splat: elide only if left is a vector.
                     (false, true) => (false, left_is_vec),
                     (false, false) => (false, false),
                 };
 
                 let (eff_l, eff_lc) = if elide_l {
                     let h = left_scalar.unwrap();
-                    (h, ctx.expr_names.contains_key(&h))
+                    (h, ctx.expr_names.contains_key(h))
                 } else {
                     (*left, lc)
                 };
                 let (eff_r, eff_rc) = if elide_r {
                     let h = right_scalar.unwrap();
-                    (h, ctx.expr_names.contains_key(&h))
+                    (h, ctx.expr_names.contains_key(h))
                 } else {
                     (*right, rc)
                 };
@@ -1236,13 +1095,26 @@ impl<'a> Generator<'a> {
                 let wrap_l = child_needs_parens(eff_l, arena, *op, false, eff_lc);
                 let mut wrap_r = child_needs_parens(eff_r, arena, *op, true, eff_rc);
 
-                // A shift types as its left operand (`e2` is always u32),
-                // so a bare literal there stays abstract: tint concretizes
-                // it to i32 (`4294967295>>x` rejected, `100u>>x` retyped)
-                // while naga converts it to the consumer's type. Typed
-                // form, bypassing `extracted_literals` (a hoisted bare
-                // const is abstract too).
-                let ls = if !elide_l
+                // A shift types as its left operand (`e2` is always u32), so a
+                // bare literal there stays abstract: tint concretizes it to
+                // i32 (`4294967295>>x` rejected, `100u>>x` retyped) while naga
+                // takes the consumer's type.  Typed form, bypassing
+                // `extracted_literals` (a hoisted bare const is abstract too).
+                // Two bare literals pin nothing, so the operation evaluates
+                // as AbstractInt: 64-bit and exact where the concrete i32 form
+                // wraps, which both changes the value and turns an overflow
+                // into a shader-creation error.  Typing the left operand pins
+                // the pair back to i32.
+                let widening_left = (!elide_l && !elide_r)
+                    .then(|| {
+                        let l = self.inline_scalar_literal(*left, ctx)?;
+                        let r = self.inline_scalar_literal(*right, ctx)?;
+                        i32_binary_widens(*op, l, r).then_some(l)
+                    })
+                    .flatten();
+                let ls = if let Some(lit) = widening_left {
+                    literal_to_wgsl(lit, &self.options.float_precision)
+                } else if !elide_l
                     && matches!(
                         op,
                         naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight
@@ -1258,8 +1130,7 @@ impl<'a> Generator<'a> {
                 };
                 let rs = if elide_r {
                     let s = self.emit_expr(right_scalar.unwrap(), ctx)?;
-                    // Prevent ambiguous '--' token when subtracting a negative
-                    // scalar in minified (no-space) mode.
+                    // `a--b` would lex as a decrement in no-space mode.
                     if !wrap_r
                         && sp.is_empty()
                         && matches!(op, naga::BinaryOperator::Subtract)
@@ -1281,18 +1152,15 @@ impl<'a> Generator<'a> {
                 let sep = self.comma_sep();
                 let mut s = String::from("select(");
 
-                // For select(reject, accept, condition), both reject and accept must have
-                // the same concrete type.  If either is a literal, we must use a type-suffixed
-                // form (literal_to_wgsl) to ensure type matching with the other argument.
-                let reject_str =
-                    if let naga::Expression::Literal(lit) = &ctx.func.expressions[*reject] {
-                        literal_to_wgsl(*lit, &self.options.float_precision)
-                    } else {
-                        self.emit_expr(*reject, ctx)?
-                    };
-                // Template-list guard for the two non-final arguments; see
-                // `renders_as_bare_less`.  The trailing condition is safe:
-                // the closing `)` discards any candidate it opens.
+                // `select`'s value operands must share one concrete type, so
+                // a literal takes its typed form.
+                let reject_str = if let naga::Expression::Literal(lit) = &ctx.exprs[*reject] {
+                    literal_to_wgsl(*lit, &self.options.float_precision)
+                } else {
+                    self.emit_expr(*reject, ctx)?
+                };
+                // Template-list guard on the two non-final arguments; the
+                // closing `)` covers the condition.
                 if self.renders_as_bare_less(*reject, ctx) {
                     s.push('(');
                     s.push_str(&reject_str);
@@ -1302,12 +1170,11 @@ impl<'a> Generator<'a> {
                 }
                 s.push_str(sep);
 
-                let accept_str =
-                    if let naga::Expression::Literal(lit) = &ctx.func.expressions[*accept] {
-                        literal_to_wgsl(*lit, &self.options.float_precision)
-                    } else {
-                        self.emit_expr(*accept, ctx)?
-                    };
+                let accept_str = if let naga::Expression::Literal(lit) = &ctx.exprs[*accept] {
+                    literal_to_wgsl(*lit, &self.options.float_precision)
+                } else {
+                    self.emit_expr(*accept, ctx)?
+                };
                 if self.renders_as_bare_less(*accept, ctx) {
                     s.push('(');
                     s.push_str(&accept_str);
@@ -1338,12 +1205,9 @@ impl<'a> Generator<'a> {
                 {
                     let mut s = String::from(name);
                     s.push('(');
-                    // Derivative builtins require float input.  If an uncached
-                    // literal reaches here, emit the typed token form (e.g. `1f`)
-                    // instead of the bare shortest form (`1`) to avoid i32
-                    // inference and validation fallback.
+                    // Derivatives take floats only; a bare `1` would infer i32.
                     if !ctx.expr_names.contains_key(expr) {
-                        if let naga::Expression::Literal(lit) = ctx.func.expressions[*expr] {
+                        if let naga::Expression::Literal(lit) = ctx.exprs[*expr] {
                             s.push_str(&literal_to_wgsl(lit, &self.options.float_precision));
                         } else {
                             s.push_str(&self.emit_expr(*expr, ctx)?);
@@ -1359,11 +1223,9 @@ impl<'a> Generator<'a> {
                 let name = match fun {
                     naga::RelationalFunction::All => "all",
                     naga::RelationalFunction::Any => "any",
-                    // `isNan`/`isInf` are not WGSL builtins; naga's WGSL
-                    // front-end never produces these (only `all`/`any`), so
-                    // this is unreachable from a WGSL->IR->WGSL pipeline.
-                    // Refuse rather than emit an identifier no WGSL consumer
-                    // recognises (which would slip past round-trip checks).
+                    // `isNan`/`isInf` have no WGSL spelling and naga's WGSL
+                    // frontend never produces them; refuse rather than emit
+                    // an identifier no consumer recognises.
                     naga::RelationalFunction::IsNan | naga::RelationalFunction::IsInf => {
                         return Err(Error::Emit(format!(
                             "relational function {fun:?} has no WGSL spelling"
@@ -1433,23 +1295,16 @@ impl<'a> Generator<'a> {
                 kind,
                 convert,
             } => {
-                let src_inner = ctx.info[*expr].ty.inner_with(&self.module.types);
-                // Matrix-to-matrix element-type conversion: mat2x2<f16> -> mat2x2<f32>
-                // emits as `matCxR<T>(source)` (type-constructor form).
+                let src_inner = ctx.ty(*expr).inner_with(&self.module.types);
                 if let naga::TypeInner::Matrix {
                     columns,
                     rows,
                     scalar: src_scalar,
                 } = src_inner
                 {
-                    // WGSL forbids `bitcast` on matrices: the
-                    // `bitcast<T>` operator is restricted to numeric
-                    // scalars and vectors of numeric scalars.  Naga
-                    // should never lower a matrix `As` with
-                    // `convert: None`, but if it does, refuse to emit
-                    // invalid WGSL - the pipeline can fall back to
-                    // naga's emitter (which would presumably also
-                    // refuse, but consistently).
+                    // `bitcast<T>` is restricted to numeric scalars and
+                    // vectors, so a matrix `As { convert: None }` has no WGSL
+                    // spelling; refuse and let the pipeline fall back.
                     if convert.is_none() {
                         return Err(Error::Emit(format!(
                             "matrix bitcast (As {{ convert: None }}) is not representable in WGSL \
@@ -1500,11 +1355,9 @@ impl<'a> Generator<'a> {
                         width: target_width,
                     }),
                 };
-                // WGSL (https://www.w3.org/TR/WGSL/#bit-reinterp-builtin-functions)
-                // limits `bitcast<T>` to numeric scalars and their vectors;
-                // `bool` and abstract scalars are explicitly excluded.
-                // Refuse before emission so the pipeline's fallback
-                // emitter handles the cast.
+                // `bitcast<T>` excludes `bool` and abstract scalars
+                // (WGSL #bit-reinterp-builtin-functions); refuse so the
+                // fallback emitter handles the cast.
                 if convert.is_none()
                     && matches!(
                         kind,
@@ -1519,18 +1372,14 @@ impl<'a> Generator<'a> {
                         kind, ctx.display_name,
                     )));
                 }
-                // Narrowing a CONST width-8 vector (`vec2<f32>(vec2<f64>(.5lf,..))`,
-                // `vec2<u32>(vec2<u64>(..lu..))`) is rejected by naga's frontend
-                // on re-parse - and naga's own backend emits the same invalid
-                // token, so the run() fallback can't save it.  const_fold
-                // handles the scalar case but not the vector one
-                // (`materialize_vector` needs the converted component literals
-                // to already exist as arena handles).  When the (inlined,
-                // unnamed) operand is a const Compose/Splat of width-8 literals
-                // and the target is f32/i32/u32/bool, fold it here to a valid
-                // converted constructor.  Everything else - runtime vectors,
-                // named operands, f16/f64/i64/u64 targets, non-finite results -
-                // falls through to the verbatim path below.
+                // Narrowing a CONST width-8 vector (`vec2<f32>(vec2<f64>(.5lf,..))`)
+                // is rejected by naga's frontend on re-parse, and naga's own
+                // backend emits the same token, so the run() fallback cannot
+                // save it; const_fold handles only the scalar case.  Fold an
+                // inlined const Compose/Splat of width-8 literals to an
+                // f32/i32/u32/bool target here; everything else (runtime
+                // vectors, named operands, other targets, non-finite results)
+                // takes the verbatim path.
                 if convert.is_some()
                     && vec_size.is_some()
                     && src_width == 8
@@ -1558,8 +1407,6 @@ impl<'a> Generator<'a> {
                     return Ok(folded);
                 }
                 let target = self.type_name_for_inner(&target_inner)?;
-                // Conversions keep the suffix per
-                // `as_operand_keeps_suffix`; a literal is always scalar.
                 let source = if let Some(lit) = self.inline_scalar_literal(*expr, ctx)
                     && as_operand_keeps_suffix(lit, *convert)
                 {
@@ -1582,7 +1429,7 @@ impl<'a> Generator<'a> {
             }
             E::CallResult(_) => ctx
                 .expr_names
-                .get(&expr)
+                .get(expr)
                 .cloned()
                 .unwrap_or_else(|| format!("_e{}", expr.index())),
             E::AtomicResult { .. }
@@ -1591,15 +1438,14 @@ impl<'a> Generator<'a> {
             | E::SubgroupOperationResult { .. }
             | E::RayQueryProceedResult => ctx
                 .expr_names
-                .get(&expr)
+                .get(expr)
                 .cloned()
                 .unwrap_or_else(|| format!("_e{}", expr.index())),
-            // Free-standing builtin calls with no binding statement (contrast
-            // `RayQueryProceedResult`, which the enclosing
-            // `Statement::RayQuery { fun: Proceed }` binds).  They read the
-            // query's CURRENT traversal state, so `compute_must_bind_loads`
-            // tracks them like loads and force-binds any read that would
-            // otherwise re-evaluate at a use site past a query-mutating
+            // Free-standing builtin calls with no binding statement (unlike
+            // `RayQueryProceedResult`, bound by its `RayQuery` statement) that
+            // read the query's CURRENT traversal state, so
+            // `compute_must_bind_loads` tracks them like loads and force-binds
+            // a read that would otherwise re-evaluate past a query-mutating
             // statement.
             E::RayQueryGetIntersection { query, committed } => {
                 let mut s = String::from(if *committed {
@@ -1621,24 +1467,13 @@ impl<'a> Generator<'a> {
                 s.push(')');
                 s
             }
-            E::ArrayLength(e) => {
-                // A forwarded `ptr<storage, array<T>>` argument is already a
-                // pointer value; prepending `&` would form an invalid
-                // ptr-to-ptr `arrayLength(&p)` (mirrors `emit_ray_query_arg` /
-                // the atomic-load path).
-                let inner = self.emit_expr(*e, ctx)?;
-                if self.pointer_is_ptr_value(*e, ctx) {
-                    format!("arrayLength({inner})")
-                } else {
-                    format!("arrayLength(&{inner})")
-                }
-            }
+            E::ArrayLength(e) => format!("arrayLength({})", self.emit_pointer_operand(*e, ctx)?),
             _ => {
                 return Err(Error::Emit(format!(
                     "unsupported expression in function '{}' (expr {}): {:?}",
                     ctx.display_name,
                     expr.index(),
-                    ctx.func.expressions[expr],
+                    ctx.exprs[expr],
                 )));
             }
         })
@@ -1653,10 +1488,10 @@ impl<'a> Generator<'a> {
         h: naga::Handle<naga::Expression>,
         ctx: &FunctionCtx<'a, '_>,
     ) -> Option<naga::Literal> {
-        if ctx.expr_names.contains_key(&h) {
+        if ctx.expr_names.contains_key(h) {
             return None;
         }
-        let lit = match ctx.func.expressions[h] {
+        let lit = match ctx.exprs[h] {
             naga::Expression::Literal(lit) => lit,
             naga::Expression::Constant(c) if self.module.constants[c].name.is_none() => {
                 match self.module.global_expressions[self.module.constants[c].init] {
@@ -1683,7 +1518,7 @@ impl<'a> Generator<'a> {
         operand: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<(Option<String>, String), Error> {
-        if let naga::Expression::Literal(lit) = ctx.func.expressions[operand]
+        if let naga::Expression::Literal(lit) = ctx.exprs[operand]
             && !matches!(
                 lit,
                 naga::Literal::AbstractInt(_) | naga::Literal::AbstractFloat(_)
@@ -1694,7 +1529,7 @@ impl<'a> Generator<'a> {
                 return Ok((None, literal_to_wgsl(lit, &self.options.float_precision)));
             }
         }
-        let inner = ctx.info[operand].ty.inner_with(&self.module.types);
+        let inner = ctx.ty(operand).inner_with(&self.module.types);
         let abstract_typed = matches!(
             inner.scalar(),
             Some(naga::Scalar {
@@ -1716,19 +1551,12 @@ impl<'a> Generator<'a> {
         expr: naga::Handle<naga::Expression>,
         ctx: &FunctionCtx<'a, '_>,
     ) -> Result<Option<String>, Error> {
-        let inner = ctx.info[expr].ty.inner_with(&self.module.types);
+        let inner = ctx.ty(expr).inner_with(&self.module.types);
         Ok(match concretize_abstract_literal_via_inner(lit, inner) {
-            // The pure projection produced a regular concrete literal.
-            // Both `count_literals` (scan side) and this emission path
-            // key on the *concrete* form via [`literal_extract_key`], so
-            // shared-literal extraction substitutes when the concretized
-            // form was hot enough across the module.
-            //
-            // Falls back to the typed form (`literal_to_wgsl`) rather than
-            // the bare form: a free-standing abstract literal that gets
-            // concretized must keep its type pinned at the use site,
-            // otherwise downstream WGSL coercion could re-derive a
-            // different concrete type.
+            // Scan (`count_literals`) and emission both key on the CONCRETE
+            // form, so a hot concretized literal substitutes its extracted
+            // name; otherwise the typed form keeps the type pinned where
+            // coercion could re-derive a different one.
             Some(ConcretizedAbstract::Lit(concrete)) => {
                 let key = literal_extract_key(concrete, &self.options.float_precision);
                 if let Some(name) = self.extracted_literals.get(&key) {
@@ -1737,448 +1565,62 @@ impl<'a> Generator<'a> {
                     Some(literal_to_wgsl(concrete, &self.options.float_precision))
                 }
             }
-            // Pre-built text form (e.g. `f16(0.5f)`, `i32(<huge>)`) cannot
-            // be substituted via `extracted_literals`.  `count_literals`
-            // mirrors this branch and skips counting these on the scan
-            // side, so the alignment is preserved.
+            // Wrapper text (`f16(0.5f)`, `i32(<huge>)`) cannot be
+            // substituted; the scan side skips counting it too.
             Some(ConcretizedAbstract::Text(text)) => Some(text),
-            // Not an abstract literal (or no projection possible from the
-            // resolved type): caller falls back to its existing
-            // non-abstract path.
             None => None,
         })
     }
 
     // MARK: Global expression emission
 
-    /// Emit a global (module-scope) expression.  Reuses most of the
-    /// [`emit_expr_uncached`] logic but resolves handles through the
-    /// module's global-expression arena and emits `Constant` handles
-    /// as their declared name when mangling is in effect.
+    /// A module-scope expression (constant, override or global initializer)
+    /// through the one emitter, under [`Generator::module_ctx`].  A root
+    /// literal keeps its suffix unless the bare spelling infers the same
+    /// concrete type: nothing pins a declaration's initializer, so `256`
+    /// would turn a `u32` constant abstract and `i32` at its next `let`.
+    /// `self_typed` additionally demands the concrete form of a root literal
+    /// or constructor - the `const` emitter drops `: T` on exactly those
+    /// shapes, and an abstract `7` or `vec2(42,43)` is then a different type
+    /// that naga's front end folds away instead of declaring.
     pub(super) fn emit_global_expr(
         &self,
         expr: naga::Handle<naga::Expression>,
+        self_typed: bool,
     ) -> Result<String, Error> {
-        // If this expression handle is the init of a previously-emitted named
-        // constant, emit the constant's name instead of re-inlining the value.
-        // This is populated incrementally during constant emission (see
-        // module_emit.rs), so only earlier constants are in the map -
-        // preventing self-referential `const X = X;` cycles.
-        if let Some(&ch) = self.expr_to_const.get(&expr) {
-            return Ok(self.constant_names[ch.index()].clone());
-        }
-        use naga::Expression as E;
-        let arena = &self.module.global_expressions;
-        Ok(match &arena[expr] {
-            E::Literal(lit) => literal_to_wgsl(*lit, &self.options.float_precision),
-            E::Constant(h) => {
-                let c = &self.module.constants[*h];
-                if c.name.is_some() {
-                    self.constant_names[h.index()].clone()
-                } else {
-                    self.emit_global_expr(c.init)?
-                }
-            }
-            E::Override(h) => self.override_names[h.index()].clone(),
-            E::ZeroValue(ty) => self.zero_value(*ty)?,
-            E::Splat { size, value } => {
-                // Determine the scalar type from the value expression.
-                let scalar = match &arena[*value] {
-                    E::Literal(lit) => lit.scalar(),
-                    E::Constant(h) => {
-                        match &self.module.types[self.module.constants[*h].ty].inner {
-                            naga::TypeInner::Scalar(s) => *s,
-                            _ => {
-                                return Err(Error::Emit(
-                                    "splat value in global expression must be scalar".into(),
-                                ));
-                            }
-                        }
-                    }
-                    E::Override(h) => {
-                        match &self.module.types[self.module.overrides[*h].ty].inner {
-                            naga::TypeInner::Scalar(s) => *s,
-                            _ => {
-                                return Err(Error::Emit(
-                                    "splat value in global expression must be scalar".into(),
-                                ));
-                            }
-                        }
-                    }
-                    E::ZeroValue(ty) => match &self.module.types[*ty].inner {
-                        naga::TypeInner::Scalar(s) => *s,
-                        _ => {
-                            return Err(Error::Emit(
-                                "splat value in global expression must be scalar".into(),
-                            ));
-                        }
-                    },
-                    other => {
-                        return Err(Error::Emit(format!(
-                            "unsupported splat value in global expression: {other:?}",
-                        )));
-                    }
-                };
-                // Look up the vector type in the arena to pick up any alias.
-                let type_name = self.type_name_for_inner(&naga::TypeInner::Vector {
-                    size: *size,
-                    scalar,
-                })?;
-                // All-zero global splat -> zero-value constructor (emitted once
-                // in a const/var initializer, so no over-inline risk).
-                if compose_is_all_zero(*value, arena) {
-                    format!("{type_name}()")
-                } else {
-                    let mut s = format!("{type_name}(");
-                    if let E::Literal(lit) = &arena[*value] {
-                        s.push_str(&literal_to_wgsl_bare(*lit, &self.options.float_precision));
-                    } else {
-                        s.push_str(&self.emit_global_expr(*value)?);
-                    }
-                    s.push(')');
-                    s
-                }
-            }
-            E::Compose { ty, components } => 'global_compose: {
-                // All-zero vector / matrix -> zero-value constructor.  No
-                // ref-count gate: a global expression is a const/var initializer
-                // emitted exactly ONCE (uses reference the const NAME), so the
-                // re-parse over-inline that gates the function-local arm cannot
-                // occur here.
-                if matches!(
-                    self.module.types[*ty].inner,
-                    naga::TypeInner::Vector { .. } | naga::TypeInner::Matrix { .. }
-                ) && components.iter().all(|&c| compose_is_all_zero(c, arena))
-                {
-                    break 'global_compose self.zero_value(*ty)?;
-                }
-                let emit_scalar =
-                    |this: &Self, c: naga::Handle<naga::Expression>| -> Result<String, Error> {
-                        if let naga::Expression::Literal(lit) = &arena[c] {
-                            Ok(literal_to_wgsl_bare(*lit, &this.options.float_precision))
-                        } else {
-                            this.emit_global_expr(c)
-                        }
-                    };
-                let mut s = String::new();
-                // NB: no `array(...)` elision in the GLOBAL arm.  A global
-                // expression is a const/override/var initializer, which carries
-                // a declared type annotation; naga's text front-end rejects an
-                // elided constructor whose inferred array type must match a
-                // declared annotation that resolves through a type alias
-                // ("expected array<T,N> but got array<T,N>").  Elision is safe
-                // only for the unannotated function-local constructors.
-                s.push_str(&self.type_ref(*ty)?);
-                s.push('(');
-                // Collapse vector Compose with all-identical scalar components
-                // into splat form: vec3f(x,x,x) -> vec3f(x).
-                let is_splat = matches!(
-                    self.module.types[*ty].inner,
-                    naga::TypeInner::Vector { size, .. }
-                        if components.len() == size as usize
-                            && components.len() > 1
-                ) && compose_is_splat(components, arena);
-                if is_splat {
-                    s.push_str(&emit_scalar(self, components[0])?);
-                } else {
-                    let sep = self.comma_sep();
-                    for (i, c) in components.iter().enumerate() {
-                        if i > 0 {
-                            s.push_str(sep);
-                        }
-                        s.push_str(&emit_scalar(self, *c)?);
-                    }
-                }
-                s.push(')');
-                // Matrix built from explicit scalar columns -> flat all-scalar
-                // form, kept only when strictly shorter (a shared / let-bound
-                // column emitted as a short name can beat the flat form).
-                if let Some(flat) =
-                    matrix_flatten_scalars(*ty, components, &self.module.types, arena)
-                {
-                    let mut sf = self.type_ref(*ty)?;
-                    sf.push('(');
-                    let sep = self.comma_sep();
-                    for (i, c) in flat.iter().enumerate() {
-                        if i > 0 {
-                            sf.push_str(sep);
-                        }
-                        sf.push_str(&emit_scalar(self, *c)?);
-                    }
-                    sf.push(')');
-                    if sf.len() < s.len() {
-                        s = sf;
-                    }
-                }
-                s
-            }
-            E::Unary { op, expr } => {
-                let op_str = match op {
-                    naga::UnaryOperator::Negate => "-",
-                    naga::UnaryOperator::LogicalNot => "!",
-                    naga::UnaryOperator::BitwiseNot => "~",
-                };
-                let wrap = unary_child_needs_parens(*expr, arena, false);
-                let mut s = self.emit_global_expr(*expr)?;
-                if wrap {
-                    s.insert(0, '(');
-                    s.push(')');
-                }
-                // Mirror the function-local arm: a `Negate` over a child that
-                // already renders with a leading `-` would lex as the reserved
-                // `--` token; a single space disambiguates (cheaper than parens).
-                if matches!(op, naga::UnaryOperator::Negate) && !wrap && s.starts_with('-') {
-                    s.insert(0, ' ');
-                }
-                s.insert_str(0, op_str);
-                s
-            }
-            E::Binary { op, left, right } => {
-                let op_str = binary_op_str(*op);
-                let sp = self.bin_op_sep();
-                let wrap_l = child_needs_parens(*left, arena, *op, false, false);
-                let wrap_r = child_needs_parens(*right, arena, *op, true, false);
-                let ls = self.emit_global_expr(*left)?;
-                let rs = self.emit_global_expr(*right)?;
-                assemble_binary(&ls, &rs, op_str, sp, wrap_l, wrap_r)
-            }
-            E::Select {
-                condition,
-                accept,
-                reject,
-            } => {
-                let sep = self.comma_sep();
-                let mut s = String::from("select(");
-
-                // For select(reject, accept, condition), both reject and accept must have
-                // the same concrete type.  If either is a literal, we must use a type-suffixed
-                // form (literal_to_wgsl) to ensure type matching with the other argument.
-                let reject_str = if let naga::Expression::Literal(lit) = &arena[*reject] {
-                    literal_to_wgsl(*lit, &self.options.float_precision)
-                } else {
-                    self.emit_global_expr(*reject)?
-                };
-                s.push_str(&reject_str);
-                s.push_str(sep);
-
-                let accept_str = if let naga::Expression::Literal(lit) = &arena[*accept] {
-                    literal_to_wgsl(*lit, &self.options.float_precision)
-                } else {
-                    self.emit_global_expr(*accept)?
-                };
-                s.push_str(&accept_str);
-                s.push_str(sep);
-
-                s.push_str(&self.emit_global_expr(*condition)?);
-                s.push(')');
-                s
-            }
-            E::Math {
-                fun,
-                arg,
-                arg1,
-                arg2,
-                arg3,
-            } => {
-                let sep = self.comma_sep();
-                let mut s = String::new();
-                s.push_str(math_name(*fun));
-                s.push('(');
-                s.push_str(&self.emit_global_expr(*arg)?);
-                if let Some(v) = arg1 {
-                    s.push_str(sep);
-                    s.push_str(&self.emit_global_expr(*v)?);
-                }
-                if let Some(v) = arg2 {
-                    s.push_str(sep);
-                    s.push_str(&self.emit_global_expr(*v)?);
-                }
-                if let Some(v) = arg3 {
-                    s.push_str(sep);
-                    s.push_str(&self.emit_global_expr(*v)?);
-                }
-                s.push(')');
-                s
-            }
-            E::As {
-                expr: inner,
-                kind,
-                convert,
-            } => {
-                let src_inner = self.info[*inner].inner_with(&self.module.types);
-                // Matrix-to-matrix element-type conversion: mat2x2<f16> -> mat2x2<f32>
-                // emits as `matCxR<T>(source)` (type-constructor form).
-                if let naga::TypeInner::Matrix {
-                    columns,
-                    rows,
-                    scalar: src_scalar,
-                } = src_inner
-                {
-                    // WGSL forbids matrix bitcast; the function-local
-                    // arm enforces the same rule.
-                    if convert.is_none() {
-                        return Err(Error::Emit(format!(
-                            "matrix bitcast (As {{ convert: None }}) is not representable in WGSL \
-                             in global expression {}: source type {:?}",
-                            inner.index(),
-                            src_inner,
-                        )));
-                    }
-                    let target_width = convert.unwrap_or(src_scalar.width);
-                    let target_inner = naga::TypeInner::Matrix {
-                        columns: *columns,
-                        rows: *rows,
-                        scalar: naga::Scalar {
-                            kind: *kind,
-                            width: target_width,
-                        },
-                    };
-                    let target = self.type_name_for_inner(&target_inner)?;
-                    let source = self.emit_global_expr(*inner)?;
-                    let mut s = target;
-                    s.push('(');
-                    s.push_str(&source);
-                    s.push(')');
-                    s
-                } else {
-                    let (vec_size, src_width) = match src_inner {
-                        naga::TypeInner::Scalar(s) => (None, s.width),
-                        naga::TypeInner::Vector { size, scalar } => (Some(*size), scalar.width),
-                        _ => {
-                            return Err(Error::Emit(format!(
-                                "unsupported cast source type in global expression {}: {:?}",
-                                inner.index(),
-                                src_inner,
-                            )));
-                        }
-                    };
-                    // Same `bitcast<T>` restriction as the function-local
-                    // arm: T must be a numeric scalar or vector of one.
-                    if convert.is_none()
-                        && matches!(
-                            kind,
-                            naga::ScalarKind::Bool
-                                | naga::ScalarKind::AbstractInt
-                                | naga::ScalarKind::AbstractFloat
-                        )
-                    {
-                        return Err(Error::Emit(format!(
-                            "bitcast (As {{ convert: None }}) is not representable for \
-                             scalar kind {:?} in global expression {}",
-                            kind,
-                            inner.index(),
-                        )));
-                    }
-                    let target_width = convert.unwrap_or(src_width);
-                    let target_inner = match vec_size {
-                        Some(size) => naga::TypeInner::Vector {
-                            size,
-                            scalar: naga::Scalar {
-                                kind: *kind,
-                                width: target_width,
-                            },
-                        },
-                        None => naga::TypeInner::Scalar(naga::Scalar {
-                            kind: *kind,
-                            width: target_width,
-                        }),
-                    };
-                    let target = self.type_name_for_inner(&target_inner)?;
-                    let source = self.emit_global_expr(*inner)?;
-                    let mut s = if convert.is_some() {
-                        target
-                    } else {
-                        let mut s = String::from("bitcast<");
-                        s.push_str(&target);
-                        s.push('>');
-                        s
-                    };
-                    s.push('(');
-                    s.push_str(&source);
-                    s.push(')');
-                    s
-                }
-            }
-            E::Access { base, index } => {
-                let mut s = self.emit_global_postfix_base(*base)?;
-                s.push('[');
-                s.push_str(&self.emit_global_expr(*index)?);
-                s.push(']');
-                s
-            }
-            E::AccessIndex { base, index } => {
-                let mut s = self.emit_global_postfix_base(*base)?;
-                if let Some(name) = self.global_struct_field_name(*base, *index) {
-                    s.push('.');
-                    s.push_str(&name);
-                } else if let Some(c) = self.global_vector_component_name(*base, *index) {
-                    s.push('.');
-                    s.push(c);
-                } else {
-                    s.push('[');
-                    s.push_str(&index.to_string());
-                    s.push(']');
-                }
-                s
-            }
-            E::Swizzle {
-                size,
-                vector,
-                pattern,
-            } => {
-                let mut s = self.emit_global_postfix_base(*vector)?;
-                s.push('.');
-                let n = *size as u8 as usize;
-                for c in &pattern[..n] {
-                    s.push(match c {
-                        naga::SwizzleComponent::X => 'x',
-                        naga::SwizzleComponent::Y => 'y',
-                        naga::SwizzleComponent::Z => 'z',
-                        naga::SwizzleComponent::W => 'w',
-                    });
-                }
-                s
-            }
-            E::Relational { fun, argument } => {
-                let name = match fun {
-                    naga::RelationalFunction::All => "all",
-                    naga::RelationalFunction::Any => "any",
-                    // `isNan`/`isInf` are not WGSL builtins; naga's WGSL
-                    // front-end never produces these (only `all`/`any`), so
-                    // this is unreachable from a WGSL->IR->WGSL pipeline.
-                    // Refuse rather than emit an identifier no WGSL consumer
-                    // recognises (which would slip past round-trip checks).
-                    naga::RelationalFunction::IsNan | naga::RelationalFunction::IsInf => {
-                        return Err(Error::Emit(format!(
-                            "relational function {fun:?} has no WGSL spelling"
-                        )));
-                    }
-                };
-                let mut s = String::from(name);
-                s.push('(');
-                s.push_str(&self.emit_global_expr(*argument)?);
-                s.push(')');
-                s
-            }
-            _ => {
-                return Err(Error::Emit(format!(
-                    "unsupported global expression (expr {}): {:?}",
-                    expr.index(),
-                    arena[expr],
-                )));
-            }
-        })
+        let mut ctx = self.module_ctx();
+        self.emit_global_expr_in(expr, self_typed, &mut ctx)
     }
 
-    /// Fold a narrowing cast of a *const width-8 vector* (`vecN<f64/u64/i64>`)
-    /// into a directly-emitted converted constructor (e.g.
-    /// `vec2<f32>(vec2<f64>(.5lf,1.5lf))` -> `vec2f(.5,1.5)`).  Returns `None`
-    /// (so the caller falls through to the verbatim `target(source)` path)
-    /// when the operand is not a Compose/Splat whose components are *all*
-    /// width-8 literals, or when any component does not convert to a finite,
-    /// representable target literal - the latter keeps the unrepresentable
-    /// f64->f32-overflow case as a diagnosable hard error rather than silently
-    /// emitting an `inf` token.
+    /// [`Generator::emit_global_expr`] against a caller-owned context.  Building
+    /// one costs a clone of every constant name, so the declaration sections
+    /// share a single context and name each constant in it as they go instead
+    /// of rebuilding per declaration.
+    pub(super) fn emit_global_expr_in(
+        &self,
+        expr: naga::Handle<naga::Expression>,
+        self_typed: bool,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<String, Error> {
+        // A shared initializer already declared under a name emits the name.
+        if !ctx.expr_names.contains_key(expr)
+            && let naga::Expression::Literal(lit) = self.module.global_expressions[expr]
+            && (self_typed || literal_bare_form_changes_type(lit))
+        {
+            return Ok(literal_to_wgsl(lit, &self.options.float_precision));
+        }
+        ctx.pinned_root = self_typed.then_some(expr);
+        let text = self.emit_expr(expr, ctx);
+        ctx.pinned_root = None;
+        text
+    }
+
+    /// Fold a narrowing cast of a const width-8 vector into a converted
+    /// constructor (`vec2<f32>(vec2<f64>(.5lf,1.5lf))` -> `vec2f(.5,1.5)`).
+    /// `None` (verbatim `target(source)` path) unless the operand is a
+    /// Compose/Splat of width-8 literals that all convert to finite target
+    /// literals - an f64->f32 overflow stays a diagnosable hard error rather
+    /// than a silent `inf` token.
     fn try_emit_const_width8_vector_narrow(
         &self,
         operand: naga::Handle<naga::Expression>,
@@ -2186,18 +1628,18 @@ impl<'a> Generator<'a> {
         target_inner: &naga::TypeInner,
         ctx: &FunctionCtx<'a, '_>,
     ) -> Result<Option<String>, Error> {
-        let lits: Vec<naga::Literal> = match &ctx.func.expressions[operand] {
+        let lits: Vec<naga::Literal> = match &ctx.exprs[operand] {
             naga::Expression::Compose { components, .. } => {
                 let mut out = Vec::with_capacity(components.len());
                 for &c in components.iter() {
-                    match ctx.func.expressions[c] {
+                    match ctx.exprs[c] {
                         naga::Expression::Literal(l) if literal_is_width8(l) => out.push(l),
                         _ => return Ok(None),
                     }
                 }
                 out
             }
-            naga::Expression::Splat { size, value } => match ctx.func.expressions[*value] {
+            naga::Expression::Splat { size, value } => match ctx.exprs[*value] {
                 naga::Expression::Literal(l) if literal_is_width8(l) => vec![l; *size as usize],
                 _ => return Ok(None),
             },
@@ -2212,9 +1654,8 @@ impl<'a> Generator<'a> {
         }
         let mut s = self.type_name_for_inner(target_inner)?;
         s.push('(');
-        // Collapse to splat form when every converted component is identical
-        // (bit-equal, so `-0` stays distinct from `0`), matching the
-        // generator's normal splat-elision.
+        // Splat form when all components are bit-equal (`-0` stays distinct
+        // from `0`).
         let all_same =
             converted.len() > 1 && converted.iter().all(|l| literal_bit_eq(l, &converted[0]));
         if all_same {
@@ -2237,29 +1678,25 @@ impl<'a> Generator<'a> {
 
     // MARK: Type helpers
 
-    /// Render a [`naga::TypeInner`] to its WGSL type-name string via
-    /// [`super::syntax::type_inner_name`], consulting the generator's
-    /// alias table along the way.
+    /// WGSL name of `inner`, through the alias table.
     pub(super) fn type_name_for_inner(&self, inner: &naga::TypeInner) -> Result<String, Error> {
         let res = naga::proc::TypeResolution::Value(inner.clone());
         type_resolution_name(&res, self.module, &self.type_names, &self.override_names)
     }
 
-    /// Render the declared WGSL type of `expr` using the module's
-    /// cached type-resolution info.
+    /// WGSL name of `expr`'s resolved type.
     pub(super) fn expr_type_name(
         &self,
         expr: naga::Handle<naga::Expression>,
         ctx: &FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
-        let res = &ctx.info[expr].ty;
+        let res = &ctx.ty(expr);
         type_resolution_name(res, self.module, &self.type_names, &self.override_names)
     }
 
-    /// Look up the WGSL type-name string for a type handle,
-    /// honouring alias substitution when enabled.
+    /// WGSL name of a type handle, alias first.
     pub(super) fn type_ref(&self, ty: naga::Handle<naga::Type>) -> Result<String, Error> {
-        if let Some(name) = self.type_names.get(&ty) {
+        if let Some(name) = self.type_names.get(ty) {
             return Ok(name.clone());
         }
         type_inner_name(
@@ -2270,9 +1707,7 @@ impl<'a> Generator<'a> {
         )
     }
 
-    /// Emit the shortest WGSL expression that evaluates to the
-    /// zero value of `ty`.  Prefers scalar literals (`0`, `false`)
-    /// over wrapper syntax (`vec3f()`, `T()`) when both are legal.
+    /// Shortest zero of `ty`: a scalar literal (`0i`, `false`) or `T()`.
     pub(super) fn zero_value(&self, ty: naga::Handle<naga::Type>) -> Result<String, Error> {
         Ok(match &self.module.types[ty].inner {
             naga::TypeInner::Scalar(s) => scalar_zero(s.kind, s.width).to_string(),
@@ -2284,19 +1719,12 @@ impl<'a> Generator<'a> {
         })
     }
 
-    /// Emit the declaration tail of a zero-initialized `var`: either
-    /// `:<type>` (relying on WGSL's guarantee that an uninitialized local
-    /// is zero) or `=<zero-literal>`, whichever is the shorter source
-    /// form.  Callers emit `var <name>` first; this appends the chosen
-    /// tail with no trailing `;`.  Every zero-init `var` emit site routes
-    /// through here so the `:T`-vs-`=0i` choice never drifts between paths.
-    ///
-    /// A scalar's typed-suffix zero literal (`0i`/`0u`/`0f`/`0h`) is one
-    /// byte shorter than its `:i32`/`:u32`/`:f32`/`:f16` annotation, while
-    /// `:bool` beats `=false` and every composite (`:vec3f` vs `=vec3f(0)`)
-    /// favours the annotation.  A short type alias (`alias j=i32;` -> `:j`)
-    /// can undercut even `=0i`, so compare the rendered lengths instead of
-    /// assuming a winner.
+    /// Append `:<type>` (WGSL zero-initialises an uninitialised local) or
+    /// `=<zero-literal>` after `var <name>`, no trailing `;`, whichever
+    /// renders shorter: `=0i` beats `:i32`, `:bool` beats `=false`,
+    /// composites favour the annotation, and a short alias (`:j`) can
+    /// undercut even `=0i`, so lengths are compared rather than assumed.
+    /// Every zero-init `var` routes here so the choice never drifts.
     pub(super) fn emit_zero_init_tail(
         &mut self,
         ty: naga::Handle<naga::Type>,
@@ -2315,33 +1743,19 @@ impl<'a> Generator<'a> {
         Ok(())
     }
 
-    /// The constructor name for a vector `Compose`.  Normally the type's
-    /// rendered name (`vec2u`, `vec3f`, or a type alias), but the bare
-    /// `vecN` form when BOTH (a) it is strictly shorter than the
-    /// suffixed/aliased name, and (b) at least one component is a
-    /// non-literal whose concrete scalar type already equals the element
-    /// type - so WGSL infers the same element type from that component and
-    /// converts the others.
+    /// Constructor name for a vector `Compose`: the rendered type name, or
+    /// bare `vecN` when that is strictly shorter AND a component pins the
+    /// element type - a non-literal whose concrete scalar equals it, or a
+    /// literal whose bare form re-infers it (float-shaped -> f32, any integer
+    /// -> i32, per [`literal_bare_form_pins_scalar`]); `vec2u(4,1)` cannot
+    /// drop its `u`.
     ///
-    /// Literals inside a constructor render in BARE (abstract) form, so most
-    /// cannot pin: `vec2u(4, 1)` cannot lose its `u` - dropping it would
-    /// re-infer `vec2i`.  Two literal shapes DO pin, though (see
-    /// [`literal_bare_form_pins_scalar`]): a float-form token pins f32 and
-    /// any integer literal pins i32, because WGSL's abstract defaults land
-    /// exactly there and mixing with other abstract components can only
-    /// stay abstract-compatible (`vec4f(.5, 1, 1, 1)` -> `vec4(.5,1,1,1)`
-    /// still infers f32).  Otherwise only a typed non-literal component
-    /// (e.g. a `u32` field access in `vec2u(p.k, 4)`) pins the element
-    /// type.
-    ///
-    /// Soundness of the non-literal arm rests on the pin component
-    /// rendering in TYPED form.  An unnamed `Constant` with a literal init
-    /// resolves to the right scalar yet still emits its init's bare token,
-    /// so it cannot be the sole pinner - but it never is: `const_fold` runs
-    /// first and folds away any all-constant `Compose`, so a vector
-    /// reaching the generator always has a runtime (typed) component.
-    /// (`ZeroValue` is fine either way - it emits typed `0f` / `vec2f()`
-    /// forms.)  A future pass that leaves an unnamed const as a Compose's
+    /// The non-literal arm relies on the pinning component rendering TYPED.
+    /// An unnamed literal-init `Constant` resolves to the right scalar yet
+    /// emits its bare token, so it cannot be the sole pinner - and never is,
+    /// because `const_fold` runs first and folds every all-constant
+    /// `Compose`, so a surviving vector has a runtime component (`ZeroValue`
+    /// emits typed either way).  A pass that leaves an unnamed const as the
     /// only non-literal component must revisit this gate.
     fn vector_ctor_name(
         &self,
@@ -2353,13 +1767,12 @@ impl<'a> Generator<'a> {
         if let naga::TypeInner::Vector { size, scalar } = self.module.types[ty].inner {
             let bare = format!("vec{}", super::syntax::vector_size_num(size));
             if bare.len() < type_str.len()
-                && components.iter().any(|&c| match &ctx.func.expressions[c] {
+                && components.iter().any(|&c| match &ctx.exprs[c] {
                     naga::Expression::Literal(lit) => {
                         literal_bare_form_pins_scalar(*lit, scalar, &self.options.float_precision)
                     }
                     _ => {
-                        type_inner_scalar(ctx.info[c].ty.inner_with(&self.module.types))
-                            == Some(scalar)
+                        type_inner_scalar(ctx.ty(c).inner_with(&self.module.types)) == Some(scalar)
                     }
                 })
             {
@@ -2369,21 +1782,13 @@ impl<'a> Generator<'a> {
         Ok(type_str)
     }
 
-    /// Constructor name for an array `Compose`, eliding the template parameters
-    /// to the bare inferring form `array(...)` when provably safe and shorter.
-    ///
-    /// `array(...)` infers its element type from the components, so eliding is
-    /// sound only when inference is GUARANTEED to reproduce the declared element
-    /// type `base`.  A bare abstract literal would re-infer
-    /// (`array<u32,2>(1,2)` -> `array<i32,2>`, `array<f16,2>(1,2)` ->
-    /// `array<f32,2>`) - a silent retype both engines reject/miscompile - so the
-    /// gate requires at least one component that is a `Compose` / `ZeroValue` /
-    /// `Constant` / `Override` whose type is exactly `base`; such a component
-    /// always emits as a concretely-`base`-typed expression and pins inference
-    /// to `base`.  Returns `None` (keep the explicit / aliased `array<T,N>`
-    /// name) otherwise, including when the bare `array` is not shorter than the
-    /// full/aliased name (an aliased short array type must win).  This rewrites
-    /// the CONSTRUCTOR name only; type annotations are never touched.
+    /// `array(...)` for an array `Compose` when shorter than the full/aliased
+    /// `array<T,N>` and inference is guaranteed to reproduce `base`: a bare
+    /// abstract literal would re-infer (`array<u32,2>(1,2)` ->
+    /// `array<i32,2>`, a silent retype), so at least one component must be a
+    /// `Compose`/`ZeroValue`/`Constant`/`Override` of exactly `base`, which
+    /// always emits concretely typed.  Rewrites the constructor name only,
+    /// never a type annotation.
     fn array_ctor_name(
         &self,
         ty: naga::Handle<naga::Type>,
@@ -2407,18 +1812,12 @@ impl<'a> Generator<'a> {
         pins.then_some("array")
     }
 
-    /// Collapse maximal runs of >=2 identical adjacent SCALAR components in a
-    /// vector `Compose` into sub-vector splats - `vec4f(0,0,0,2)` ->
-    /// `vec4f(vec3f(0),2)`, which folds to `vec4f(vec3f(),2)` for the zero run.
-    /// Returns the collapsed text only when at least one run (of length `2..N`)
-    /// was collapsed; the caller keeps it ONLY when it is strictly shorter, so
-    /// this never grows the output (the sub-vector type often has no short
-    /// alias, in which case the collapsed form loses and is discarded).
-    ///
-    /// Value-safe: each run's components compare equal under [`exprs_splat_eq`]
-    /// (literal bit pattern / structural identity), so emitting one shared value
-    /// `vecK(c)` reproduces the same lanes; sub-vector constructors are postfix,
-    /// so there is no parenthesisation hazard.
+    /// Collapse maximal runs of >=2 equal adjacent scalar components into
+    /// sub-vector splats (`vec4f(0,0,0,2)` -> `vec4f(vec3f(),2)`); `None`
+    /// without a run of length `2..N`, and the caller keeps the result only
+    /// when strictly shorter.  Run members are equal under [`exprs_splat_eq`]
+    /// (bit pattern / handle identity), so one shared value reproduces the
+    /// same lanes, and a sub-vector constructor is postfix-safe.
     fn try_subsplat_compose(
         &self,
         ty: naga::Handle<naga::Type>,
@@ -2432,20 +1831,19 @@ impl<'a> Generator<'a> {
         if components.len() != n {
             return Ok(None);
         }
-        // Every component must be a plain scalar so that a run forms a valid
-        // sub-vector `vecK(scalar)`.
+        // A run forms `vecK(scalar)` only from scalar components.
         if !components.iter().all(|&c| {
             matches!(
-                ctx.info[c].ty.inner_with(&self.module.types),
+                ctx.ty(c).inner_with(&self.module.types),
                 naga::TypeInner::Scalar(_)
             )
         }) {
             return Ok(None);
         }
-        // Phase 1 (immutable): split components into maximal equal-value runs,
-        // and note which runs are all-zero.
+        // Runs are found under an immutable borrow before emission needs
+        // `ctx` mutably.
         let (runs, zero): (Vec<(usize, usize)>, Vec<bool>) = {
-            let arena = &ctx.func.expressions;
+            let arena = &ctx.exprs;
             let mut runs = Vec::new();
             let mut i = 0;
             while i < n {
@@ -2465,7 +1863,6 @@ impl<'a> Generator<'a> {
         if !runs.iter().any(|&(_, k)| k >= 2 && k < n) {
             return Ok(None);
         }
-        // Phase 2 (mutable): emit.
         let mut parts: Vec<String> = Vec::with_capacity(n);
         for (ri, &(s, k)) in runs.iter().enumerate() {
             if k >= 2 && k < n {
@@ -2497,45 +1894,8 @@ impl<'a> Generator<'a> {
         Ok(Some(format!("{name}({})", parts.join(sep))))
     }
 
-    /// Emit an expression that is the base of a postfix operation in the
-    /// global expression arena (`.member`, `[index]`, `.xyzw`).
-    fn emit_global_postfix_base(
-        &self,
-        base: naga::Handle<naga::Expression>,
-    ) -> Result<String, Error> {
-        let needs_parens = matches!(
-            self.module.global_expressions[base],
-            naga::Expression::Binary { .. }
-                | naga::Expression::Unary { .. }
-                | naga::Expression::Select { .. }
-        );
-        let s = self.emit_global_expr(base)?;
-        if needs_parens {
-            Ok(format!("({s})"))
-        } else {
-            Ok(s)
-        }
-    }
-
-    fn global_struct_field_name(
-        &self,
-        base: naga::Handle<naga::Expression>,
-        index: u32,
-    ) -> Option<String> {
-        self.field_name_of(&self.info[base], index)
-    }
-
-    fn global_vector_component_name(
-        &self,
-        base: naga::Handle<naga::Expression>,
-        index: u32,
-    ) -> Option<char> {
-        self.component_letter_of(&self.info[base], index)
-    }
-
-    /// The emitted member name at `index` of the struct `resolution` names
-    /// (directly or through a pointer): the mangled name when one was
-    /// assigned, else the source name, else a positional placeholder.
+    /// Member name at `index` of the struct `resolution` names (directly or
+    /// through a pointer): mangled, else source, else positional.
     fn field_name_of(&self, resolution: &naga::proc::TypeResolution, index: u32) -> Option<String> {
         use naga::proc::TypeResolution;
         let (ty_handle, members) = match resolution {
@@ -2595,7 +1955,7 @@ impl<'a> Generator<'a> {
         index: u32,
         ctx: &FunctionCtx<'a, '_>,
     ) -> Option<String> {
-        self.field_name_of(&ctx.info[base].ty, index)
+        self.field_name_of(ctx.ty(base), index)
     }
 
     fn vector_component_name(
@@ -2604,46 +1964,38 @@ impl<'a> Generator<'a> {
         index: u32,
         ctx: &FunctionCtx<'a, '_>,
     ) -> Option<char> {
-        self.component_letter_of(&ctx.info[base].ty, index)
+        self.component_letter_of(ctx.ty(base), index)
     }
 
-    /// WGSL component letters for swizzle patterns.
     const SWIZZLE_LETTERS: [char; 4] = ['x', 'y', 'z', 'w'];
 
-    /// Check if a Compose component can participate in swizzle grouping.
-    ///
-    /// Recognises two patterns:
-    ///   A. `AccessIndex { base: <vector_value>, index }` - function args, etc.
-    ///   B. `Load { pointer: AccessIndex { base: <ptr_to_vector>, index } }` -
-    ///      local/global variables accessed through a pointer.
-    ///
-    /// Returns `(base_handle, component_index)` on success.
+    /// `(base, component)` of a swizzle-groupable Compose component: an
+    /// uncached `AccessIndex` on a vector value, or a `Load` of one on a
+    /// pointer to a vector.
     fn swizzle_component(
         &self,
         handle: naga::Handle<naga::Expression>,
         ctx: &FunctionCtx<'a, '_>,
     ) -> Option<(naga::Handle<naga::Expression>, u32)> {
-        if ctx.expr_names.contains_key(&handle) {
+        if ctx.expr_names.contains_key(handle) {
             return None;
         }
-        let arena = &ctx.func.expressions;
+        let arena = &ctx.exprs;
 
-        // Pattern A: direct AccessIndex on a vector value.
         if let naga::Expression::AccessIndex { base, index } = arena[handle]
             && index <= 3
         {
-            let inner = ctx.info[base].ty.inner_with(&self.module.types);
+            let inner = ctx.ty(base).inner_with(&self.module.types);
             if matches!(inner, naga::TypeInner::Vector { .. }) {
                 return Some((base, index));
             }
         }
 
-        // Pattern B: Load { pointer: AccessIndex { base: ptr_to_vec, index } }
         if let naga::Expression::Load { pointer } = arena[handle]
             && let naga::Expression::AccessIndex { base, index } = arena[pointer]
             && index <= 3
         {
-            let inner = ctx.info[base].ty.inner_with(&self.module.types);
+            let inner = ctx.ty(base).inner_with(&self.module.types);
             let is_ptr_to_vec =
                 matches!(
                     inner,
@@ -2661,26 +2013,20 @@ impl<'a> Generator<'a> {
         None
     }
 
-    /// If `expr` is an uncached vector `Compose` that
-    /// [`try_compose_as_full_swizzle`] would reduce to its *bare* base (the
-    /// identity case `vecN(b.0, .., b.N-1)` -> `b`), return that base handle;
-    /// otherwise `None`.
-    ///
-    /// Callers in a *loose* position (a comma-delimited constructor/call
-    /// argument, where nothing is appended to the result) use this to emit the
-    /// base directly via `emit_expr`, skipping the `emit_postfix_base` wrap
-    /// that the general collapse path applies for the tight postfix context it
-    /// cannot rule out.  Mirrors the identity branch of
-    /// `try_compose_as_full_swizzle` exactly so the two never disagree.
+    /// The base an uncached identity-swizzle `Compose` (`vecN(b.0,..,b.N-1)`)
+    /// collapses to, for loose positions (comma-delimited arguments with
+    /// nothing appended) that emit it without the postfix wrap the general
+    /// collapse applies.  Must agree with the identity branch of
+    /// [`Self::try_compose_as_full_swizzle`].
     fn compose_identity_collapse_base(
         &self,
         expr: naga::Handle<naga::Expression>,
         ctx: &FunctionCtx<'a, '_>,
     ) -> Option<naga::Handle<naga::Expression>> {
-        if ctx.expr_names.contains_key(&expr) {
+        if ctx.expr_names.contains_key(expr) {
             return None;
         }
-        let naga::Expression::Compose { ty, components } = &ctx.func.expressions[expr] else {
+        let naga::Expression::Compose { ty, components } = &ctx.exprs[expr] else {
             return None;
         };
         if !matches!(self.module.types[*ty].inner, naga::TypeInner::Vector { .. }) {
@@ -2701,7 +2047,6 @@ impl<'a> Generator<'a> {
             pattern.push(idx);
         }
         let base = common_base.unwrap();
-        // Identity: pattern is [0,1,..,N-1] over a same-size source vector.
         let src_n = self.vector_size_of(base, ctx)?;
         if pattern.len() == src_n && pattern.iter().enumerate().all(|(i, &idx)| idx == i as u32) {
             Some(base)
@@ -2710,11 +2055,8 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// Try to emit a vector Compose entirely as a bare swizzle expression,
-    /// eliminating the type constructor.
-    ///
-    /// `vec3f(v.x, v.y, v.z)` -> `v.xyz`
-    /// `vec4f(v.x, v.y, v.z, v.w)` -> `v` (identity on same-size vector)
+    /// A vector `Compose` as a bare swizzle: `vec3f(v.x,v.y,v.z)` -> `v.xyz`,
+    /// and the identity over a same-size vector -> `v`.
     fn try_compose_as_full_swizzle(
         &self,
         components: &[naga::Handle<naga::Expression>],
@@ -2742,24 +2084,17 @@ impl<'a> Generator<'a> {
 
         let base = common_base.unwrap();
 
-        // Identity check: pattern is [0, 1, ..., N-1] and source vector
-        // has exactly N components -> emit just the base expression.
         let source_size = self.vector_size_of(base, ctx);
         if let Some(src_n) = source_size
             && pattern.len() == src_n
             && pattern.iter().enumerate().all(|(i, &idx)| idx == i as u32)
         {
-            // Collapsing to the bare base: route through the postfix-aware
-            // path so an uncached Binary/Unary/Select base keeps the parens
-            // its consuming context needs (the substituted text stands in
-            // for the whole Compose node, whose own shape no longer signals
-            // "this is an operator expression" to the parent).
+            // The substituted text replaces the whole Compose, so the parent
+            // cannot see an operator expression; an uncached
+            // Binary/Unary/Select base keeps its parens.
             return Ok(Some(self.emit_postfix_base(base, ctx)?));
         }
 
-        // Emit as `base.xyzw`.  The base carries a `.swizzle` suffix, so it
-        // must be parenthesised when it is a Binary/Unary/Select - otherwise
-        // `(a-b).yx` degrades to `a-b.yx`, which parses as `a-(b.yx)`.
         let mut s = self.emit_postfix_base(base, ctx)?;
         s.push('.');
         for &idx in &pattern {
@@ -2768,21 +2103,15 @@ impl<'a> Generator<'a> {
         Ok(Some(s))
     }
 
-    /// Emit Compose components with swizzle grouping.
-    ///
-    /// Consecutive uncached AccessIndex/Load-of-AccessIndex components that
-    /// share the same vector base are collapsed into a single swizzle argument
-    /// (e.g. `v.x,v.y` -> `v.xy`).
-    ///
-    /// Returns `Ok(true)` if at least one group was formed and the output
-    /// was written to `s`; `Ok(false)` if no grouping was possible.
+    /// Write the components to `s`, collapsing consecutive same-base swizzle
+    /// components into one swizzle (`v.x,v.y` -> `v.xy`); `false`, with
+    /// nothing written, when no group forms.
     fn emit_compose_grouped(
         &self,
         s: &mut String,
         components: &[naga::Handle<naga::Expression>],
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<bool, Error> {
-        // Build groups of consecutive same-base components.
         let mut groups: Vec<ComposeGroup> = Vec::new();
         let mut i = 0;
         while i < components.len() {
@@ -2825,8 +2154,6 @@ impl<'a> Generator<'a> {
             first = false;
             match group {
                 ComposeGroup::Swizzle { base, indices } => {
-                    // Postfix-aware: a Binary/Unary/Select base before the
-                    // `.swizzle` suffix must be parenthesised (`(a-b).xy`).
                     s.push_str(&self.emit_postfix_base(*base, ctx)?);
                     s.push('.');
                     for &idx in indices {
@@ -2842,14 +2169,13 @@ impl<'a> Generator<'a> {
         Ok(true)
     }
 
-    /// Return the number of scalar components in the vector type of `expr`.
-    /// Works for both value vectors and pointer-to-vector expressions.
+    /// Lane count of `expr`'s vector or pointer-to-vector type.
     fn vector_size_of(
         &self,
         expr: naga::Handle<naga::Expression>,
         ctx: &FunctionCtx<'a, '_>,
     ) -> Option<usize> {
-        let inner = ctx.info[expr].ty.inner_with(&self.module.types);
+        let inner = ctx.ty(expr).inner_with(&self.module.types);
         match inner {
             naga::TypeInner::Vector { size, .. } => Some(*size as usize),
             naga::TypeInner::Pointer { base: bty, .. } => {
@@ -2868,46 +2194,43 @@ impl<'a> Generator<'a> {
 
     // MARK: Scalar hinting
 
-    /// Walk a small prefix of `expr`'s definition and return the
-    /// scalar `(kind, width)` the emitter should use when a literal
-    /// child needs to be concretised.  Returns `None` when no hint
-    /// can be inferred without running a full type resolution.
+    /// Scalar of `expr`'s scalar/vector type, for concretising a literal
+    /// child.
     pub(super) fn expr_scalar_hint(
         &self,
         expr: naga::Handle<naga::Expression>,
         ctx: &FunctionCtx<'a, '_>,
     ) -> Option<naga::Scalar> {
-        match ctx.info[expr].ty.inner_with(&self.module.types) {
+        match ctx.ty(expr).inner_with(&self.module.types) {
             naga::TypeInner::Scalar(s) => Some(*s),
             naga::TypeInner::Vector { scalar, .. } => Some(*scalar),
             _ => None,
         }
     }
 
-    /// Emit `expr` while forcing any bare literal it contains to the
-    /// supplied scalar hint's TYPED spelling.  Used where the emitted
-    /// position gets no abstract coercion from naga's lowerer, so a bare
-    /// literal would re-concretize to i32: the `rayQueryGenerateIntersection`
-    /// hit_t slot and subgroup-op operands.
+    /// `expr` with every bare literal in it forced to `hint`'s TYPED
+    /// spelling, for positions naga's lowerer gives no abstract coercion
+    /// (the `rayQueryGenerateIntersection` hit_t slot, subgroup-op operands),
+    /// where a bare literal would re-concretize to i32.
     pub(super) fn emit_expr_with_scalar_hint(
         &self,
         expr: naga::Handle<naga::Expression>,
         hint: Option<naga::Scalar>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
-        if !ctx.expr_names.contains_key(&expr)
+        if !ctx.expr_names.contains_key(expr)
             && let Some(scalar) = hint
         {
-            match ctx.func.expressions[expr] {
+            match ctx.exprs[expr] {
                 naga::Expression::Binary { op, left, right }
                     if matches!(
                         op,
                         naga::BinaryOperator::Add | naga::BinaryOperator::Subtract
                     ) =>
                 {
-                    let arena = &ctx.func.expressions;
-                    let lc = ctx.expr_names.contains_key(&left);
-                    let rc = ctx.expr_names.contains_key(&right);
+                    let arena = &ctx.exprs;
+                    let lc = ctx.expr_names.contains_key(left);
+                    let rc = ctx.expr_names.contains_key(right);
                     let wrap_l = child_needs_parens(left, arena, op, false, lc);
                     let wrap_r = child_needs_parens(right, arena, op, true, rc);
                     let ls = self.emit_expr_with_scalar_hint(left, Some(scalar), ctx)?;
@@ -2967,13 +2290,10 @@ impl<'a> Generator<'a> {
                 (naga::ScalarKind::Uint, 8) => Some(L::U64(v)),
                 _ => None,
             },
-            // Already-concrete floats matching the hint still need the TYPED
-            // spelling: the default emit path renders whole-number floats in
-            // bare-int form (`10.0` -> `10`), which only re-parses as a float
-            // in positions where naga applies abstract coercion.  A hinted
-            // position is by definition one where it does not (the
-            // `rayQueryGenerateIntersection` hit_t slot, subgroup-op
-            // operands), so a bare literal would concretize to i32 there.
+            // A concrete float matching the hint still needs the TYPED
+            // spelling: the default path renders `10.0` as `10`, which
+            // re-parses as a float only under abstract coercion, and a hinted
+            // position has none.
             L::F32(v) if target == naga::Scalar::F32 => Some(L::F32(v)),
             L::F64(v) if target == naga::Scalar::F64 => Some(L::F64(v)),
             L::F16(v) if target == naga::Scalar::F16 => Some(L::F16(v)),
@@ -3004,20 +2324,18 @@ impl<'a> Generator<'a> {
     }
 }
 
-/// Intermediate representation for grouped Compose arguments during emission.
+/// Swizzle-grouped Compose components.
 enum ComposeGroup {
-    /// A run of >=2 AccessIndex/Load-of-AccessIndex components on the same base.
+    /// >=2 consecutive components indexing the same vector base.
     Swizzle {
         base: naga::Handle<naga::Expression>,
         indices: Vec<u32>,
     },
-    /// A single component emitted normally.
     Single(naga::Handle<naga::Expression>),
 }
 
-// WGSL operator precedence definitions, used for determining when to insert parentheses
-// around child expressions of a Binary operator.
-// Source: <https://www.w3.org/TR/WGSL/#operator-precedence>
+// WGSL operator precedence (<https://www.w3.org/TR/WGSL/#operator-precedence>),
+// higher binds tighter.
 
 const PREC_SHIFT: u8 = 8;
 const PREC_ADDITIVE: u8 = 9;
@@ -3026,10 +2344,8 @@ const PREC_UNARY: u8 = 11;
 
 // MARK: Binary-operator rendering
 
-/// WGSL precedence level for a binary operator, higher binds tighter.
-/// Used by the parenthesis minimiser: a child binary is parenthesised
-/// only when its precedence is below the parent's (with ties and
-/// non-associative operators handled explicitly by the caller).
+/// Precedence level, higher binds tighter; ties and the non-associative
+/// grammar levels are the caller's job.
 fn binary_precedence(op: naga::BinaryOperator) -> u8 {
     use naga::BinaryOperator as B;
     match op {
@@ -3046,7 +2362,6 @@ fn binary_precedence(op: naga::BinaryOperator) -> u8 {
     }
 }
 
-/// Map each binary operator to its WGSL token (`+`, `*`, `&&`, etc.).
 fn binary_op_str(op: naga::BinaryOperator) -> &'static str {
     use naga::BinaryOperator as B;
     match op {
@@ -3096,17 +2411,12 @@ fn child_needs_parens(
     };
     let parent_prec = binary_precedence(parent_op);
 
-    // Bitwise operators (`&`/`|`/`^`) require `unary_expression` on
-    // both sides per WGSL's grammar (https://www.w3.org/TR/WGSL/#operator-precedence-associativity)
-    // so ANY binary child (e.g. `a^b-1u`, `a&b*c`, `a|b<<c`) is
-    // grammatically ill-formed even when precedence alone would group it
-    // correctly.  naga's own parser is permissive, but the strict
-    // recursive-descent parsers nagami targets (Tint/Dawn/browsers) reject
-    // it, and naga round-trips the malformed text so no fallback fires.
-    // The one exception is the grammar's left-recursion
-    // (`binary_and_expression '&' unary_expression`): a *left* child that
-    // uses the *same* bitwise operator is legal unparenthesised, so keep it
-    // bare to avoid needless parens on `a&b&c`.
+    // Bitwise `&`/`|`/`^` take `unary_expression` on both sides, so ANY
+    // binary child (`a^b-1u`, `a|b<<c`) is ill-formed even where precedence
+    // alone would group it: naga's permissive parser round-trips it, so no
+    // fallback fires, but Tint/Dawn reject it.  The grammar's left-recursion
+    // (`binary_and_expression '&' unary_expression`) keeps a same-operator
+    // LEFT child bare (`a&b&c`).
     if matches!(
         parent_op,
         naga::BinaryOperator::And
@@ -3128,18 +2438,14 @@ fn child_needs_parens(
         return child_prec < PREC_UNARY;
     }
 
-    // WGSL puts all six comparison operators (`< <= > >= == !=`) at a single
-    // non-associative grammar level whose operands must each be a
-    // `shift_expression` (WGSL https://www.w3.org/TR/WGSL/#operator-precedence-associativity
-    // and https://www.w3.org/TR/WGSL/#syntax-relational_expression),
-    // so any comparison child needs parens here - `a<b==c<d` is the ill-formed
-    // shape Dawn/Tint reject ("mixing '<' and '==' requires parenthesis") even
-    // though naga's permissive frontend round-trips it.  Hence `< PREC_SHIFT`
-    // rather than the more obvious `<= parent_prec`: `==`/`!=` (6) and the
-    // relational quartet (7) differ in this table yet share one grammar level,
-    // so a relational child of an equality parent must still be wrapped.
-    // Always meaning-preserving - the parenthesised grouping is the only
-    // well-typed one.
+    // All six comparison operators share one non-associative grammar level
+    // whose operands are `shift_expression`s, so any comparison child is
+    // wrapped: Dawn/Tint reject `a<b==c<d` ("mixing '<' and '==' requires
+    // parenthesis") though naga round-trips it.  Hence `< PREC_SHIFT` rather
+    // than `<= parent_prec`: `==`/`!=` (6) and the relational quartet (7)
+    // differ in this table yet share the grammar level.  Always
+    // meaning-preserving - the parenthesised grouping is the only well-typed
+    // one.
     if matches!(
         parent_op,
         naga::BinaryOperator::Less
@@ -3149,15 +2455,13 @@ fn child_needs_parens(
             | naga::BinaryOperator::Equal
             | naga::BinaryOperator::NotEqual
     ) {
-        // Template-list guard: a bare `<` opens a template candidate in
-        // WGSL's scanner (`<=` / `<<` never do), and a top-level `>>` to its
-        // right closes it - `a<b>>c` scans as the template `a<b>` plus `>c`
-        // and strict parsers reject the file (naga's self-check then forces
-        // a whole-file fallback).  A `>>` is top-level in the rendered right
-        // operand only when `ShiftRight` is the child's ROOT: at any deeper
-        // spine position the precedence rules above already parenthesise
-        // it.  Greater-family children cannot appear here (their bool
-        // result is untypeable under a comparison).
+        // A bare `<` opens a template candidate in WGSL's scanner (`<=`/`<<`
+        // never do) and a top-level `>>` to its right closes it: `a<b>>c`
+        // scans as the template `a<b>` plus `>c`, rejected by strict parsers
+        // (naga's self-check then forces a whole-file fallback).  `>>` is
+        // top-level in the right operand only as the child's ROOT; deeper it
+        // is already parenthesised.  Greater-family children cannot appear
+        // here (a bool result is untypeable under a comparison).
         if parent_op == naga::BinaryOperator::Less
             && is_right
             && child_op == Some(naga::BinaryOperator::ShiftRight)
@@ -3167,47 +2471,37 @@ fn child_needs_parens(
         return child_prec < PREC_SHIFT;
     }
 
-    // A `&&` / `||` parent's operands are each a `relational_expression`
-    // (WGSL https://www.w3.org/TR/WGSL/#syntax-expression): the grammar
-    // admits comparisons, shifts and arithmetic bare but NOT another
-    // logical or a bitwise expression.  naga's permissive frontend
-    // round-trips the bare forms, but Tint/Dawn (and browsers) reject them,
-    // so wrap exactly the children the grammar forbids:
+    // `&&`/`||` operands are each a `relational_expression`: comparisons,
+    // shifts and arithmetic are bare, another logical or a bitwise expression
+    // is not; naga round-trips the bare forms, Tint/Dawn reject them.
     if matches!(
         parent_op,
         naga::BinaryOperator::LogicalAnd | naga::BinaryOperator::LogicalOr
     ) {
         return match child_op {
-            // Mixing `&&` and `||` is illegal bare ("mixing '&&' and '||'
-            // requires parenthesis").  The grammar's own left-recursion
-            // (`a && b && c`) keeps a SAME-operator LEFT child bare; a
-            // same-operator RIGHT child is wrapped to preserve the IR's tree
-            // shape (associativity makes the value identical either way, but
-            // re-grouping a right-leaning chain would perturb idempotence).
+            // Mixing `&&` and `||` bare is illegal; left-recursion keeps a
+            // same-operator LEFT child bare, while a same-operator RIGHT child
+            // stays wrapped to preserve the IR's tree shape (re-grouping a
+            // right-leaning chain would perturb idempotence).
             Some(naga::BinaryOperator::LogicalAnd | naga::BinaryOperator::LogicalOr) => {
                 child_op != Some(parent_op) || is_right
             }
-            // A bitwise expression (`|` / `^` / `&`) is not a
-            // `relational_expression`, so it can never be a bare `&&` / `||`
-            // operand (Tint rejects "mixing '|' and '&&' requires
-            // parenthesis").  `bool | bool` / `bool & bool` are legal and
-            // the short-circuit re-sugar now collapses `(a | b) && c` into a
-            // single logical Binary, so this child shape is reachable and
-            // MUST be wrapped.  (`bool ^ bool` is itself invalid WGSL, so
-            // `^` never reaches here, but listing it is harmless.)
+            // A bitwise expression is not a `relational_expression` (Tint:
+            // "mixing '|' and '&&' requires parenthesis"); `bool | bool` is
+            // legal and the short-circuit re-sugar collapses `(a | b) && c`
+            // into one logical Binary, so this shape is reachable.  (`bool ^
+            // bool` is invalid WGSL and never arrives; listing it is harmless.)
             Some(
                 naga::BinaryOperator::InclusiveOr
                 | naga::BinaryOperator::ExclusiveOr
                 | naga::BinaryOperator::And,
             ) => true,
-            // Comparisons, shifts, arithmetic, unary and atoms are all valid
-            // `relational_expression` operands - keep them bare.
             _ => false,
         };
     }
 
-    // Left-associative: left child needs parens if strictly lower,
-    // right child if lower-or-equal (to preserve tree structure).
+    // Left-associative: a left child needs parens below the parent, a right
+    // child at or below it (preserving the tree shape).
     if is_right {
         child_prec <= parent_prec
     } else {
@@ -3215,9 +2509,8 @@ fn child_needs_parens(
     }
 }
 
-/// `true` only when the operand is an uncached Binary expression: every
-/// Binary precedence is below Unary, so it must be parenthesised; a cached
-/// operand (emitted as a name), atom, call, or nested unary never is.
+/// Every Binary precedence is below Unary, so only an uncached Binary
+/// operand is wrapped.
 fn unary_child_needs_parens(
     child: naga::Handle<naga::Expression>,
     arena: &naga::Arena<naga::Expression>,
@@ -3226,9 +2519,8 @@ fn unary_child_needs_parens(
     !is_cached && matches!(arena[child], naga::Expression::Binary { .. })
 }
 
-/// Assemble `left op right` from pre-computed operand strings with the
-/// correct parenthesisation and operator spacing for the current beautify
-/// mode.  All binary emission paths funnel through here.
+/// `left op right` with the requested wraps and beautify spacing; every
+/// binary emission funnels through here.
 fn assemble_binary(
     ls: &str,
     rs: &str,
@@ -3250,13 +2542,10 @@ fn assemble_binary(
     if !sp.is_empty() {
         s.push_str(sp);
     } else if !wrap_r {
-        // Disambiguate against three WGSL trigraphs the WGSL lexer would
-        // otherwise misread:
-        //   `--`  -> decrement (e.g. `a - -b` minified to `a--b`)
-        //   `//`  -> line comment start (impossible from valid IR but
-        //            guarded for symmetry)
-        //   `/*`  -> block comment start (e.g. `a / *p` where `*p` is a
-        //            pointer dereference rendered by `emit_lvalue`).
+        // No-space mode: keep the lexer from fusing `-` and `-b` into the
+        // reserved decrement, `/` and `/` into a line comment (impossible
+        // from valid IR, guarded for symmetry) or `/` and `*p` (a pointer
+        // deref) into a block-comment opener.
         if let (Some(&oc), Some(&rc)) = (op_str.as_bytes().last(), rs.as_bytes().first())
             && ((oc == rc && (oc == b'-' || oc == b'/')) || (oc == b'/' && rc == b'*'))
         {
@@ -3275,50 +2564,27 @@ fn assemble_binary(
 
 // MARK: Abstract literal concretisation
 
-/// Outcome of projecting an *abstract* literal (`AbstractInt` /
-/// `AbstractFloat`) to its concrete form given the resolved type at
-/// the use site.
-///
-/// Single source of truth shared by two consumers:
-///
-/// - `expr_emit::Generator::concretize_abstract_literal_for_expr`
-///   on the emission side, producing the textual literal.
-/// - `literal_extract::scan_and_extract_literals::count_literals`
-///   on the scan side, counting textual emissions to decide which
-///   literals to extract into a shared `const`.
-///
-/// Both sides MUST agree on the projection so the
-/// [`literal_extract_key`] computed during the scan matches the key
-/// looked up during emission.  Splitting the two would re-introduce
-/// the historical drift where a hot abstract literal was extracted
-/// under its abstract key but the emission path bypassed the lookup
-/// by computing the typed-form text directly, leaving the extracted
+/// Projection of an abstract literal to its concrete form at a use site.  The
+/// emitter and the extraction scan (`literal_extract`'s `count_literals`)
+/// MUST share it so the [`literal_extract_key`] computed during the scan
+/// matches the key looked up at emission; otherwise a hot literal is
+/// extracted under one key while emission bypasses the lookup, leaving the
 /// `const` unreferenced.
 pub(super) enum ConcretizedAbstract {
-    /// The concrete `naga::Literal` form.  Callers should consult their
-    /// `extracted_literals` map keyed via [`literal_extract_key`] before
-    /// falling back to [`literal_to_wgsl`] for the typed text.
+    /// Consult `extracted_literals` by [`literal_extract_key`] before falling
+    /// back to [`literal_to_wgsl`].
     Lit(naga::Literal),
-    /// A pre-built text wrapper that bypasses extraction (`f16(...)`
-    /// constructor calls; `i32(...)` / `u32(...)` / `u64(...)` casts
-    /// for out-of-range `AbstractInt`s).  Both sides must skip
-    /// extraction here: the emission text is not a single literal
-    /// token, and the matching `LiteralExtractKey` cannot be
-    /// reconstructed.
+    /// Wrapper text (`f16(...)`; `i32(...)`/`u32(...)`/`u64(...)` casts for
+    /// out-of-range `AbstractInt`s) that both sides must skip for extraction:
+    /// it is not one literal token and no `LiteralExtractKey` reconstructs it.
     Text(String),
 }
 
-/// Pure projection of an abstract literal to its concrete form,
-/// given the resolved type at the use site.  Returns `None` for
-/// non-abstract literals or when the type does not pin a
-/// scalar/vector kind+width.
-///
-/// Mirrors WGSL's abstract-numeric coercion rules for the cases naga
-/// actually emits in `Expression::Literal` (vector/scalar contexts).
-/// Out-of-range `AbstractInt` projections fall back to an explicit
-/// cast wrapper text.  `AbstractInt` / `AbstractFloat` at `f16` always
-/// wraps in `f16(...)f` since WGSL has no `AbstractInt -> f16`
-/// coercion shorthand.
+/// Pure projection of an abstract literal through the resolved scalar/vector
+/// type at its use site; `None` for a concrete literal or a type that pins
+/// no scalar.  An out-of-range `AbstractInt` becomes explicit cast text, and
+/// any abstract at `f16` becomes `f16(...f)` because WGSL has no abstract ->
+/// f16 literal shorthand.
 pub(super) fn concretize_abstract_literal_via_inner(
     lit: naga::Literal,
     inner: &naga::TypeInner,
@@ -3376,48 +2642,33 @@ pub(super) fn concretize_abstract_literal_via_inner(
 
 // MARK: Splat detection
 
-/// Return `true` when every component in a vector `Compose` resolves
-/// to the same value, so the constructor can be emitted in single-arg
-/// splat form (e.g. `vec3f(x)` instead of `vec3f(x,x,x)`).
-///
-/// Only considers cases guaranteed correct:
-///
-/// - all component handles are identical
-/// - all components are the same `Literal` / `Constant` / `Override`
-///   / `ZeroValue`.
+/// Every component of a vector `Compose` is provably the same value
+/// (identical handles, or equal under [`exprs_splat_eq`]), so it can render
+/// as the splat `vec3f(x)`.
 pub(super) fn compose_is_splat(
     components: &[naga::Handle<naga::Expression>],
     arena: &naga::Arena<naga::Expression>,
 ) -> bool {
     debug_assert!(components.len() > 1);
     let first = components[0];
-    // Fast path: all handles point to the same expression.
     if components[1..].iter().all(|&c| c == first) {
         return true;
     }
-    // Slow path: compare underlying expression values.
     let first_expr = &arena[first];
     components[1..]
         .iter()
         .all(|&c| exprs_splat_eq(first_expr, &arena[c]))
 }
 
-/// When a matrix `Compose` is built from one explicit scalar-column `Compose`
-/// per column (`mat2x2f(vec2f(a,b), vec2f(c,d))`), return the flattened scalar
-/// component handles in column-major order so the matrix can be emitted in the
-/// shorter all-scalar form `mat2x2f(a,b,c,d)`.
-///
-/// Returns `None` (keep column form) unless EVERY column is an
-/// `Expression::Compose` of a `Vector` type whose component count equals the
-/// matrix row count.  A `vecR` built from exactly `R` Compose-components is
-/// necessarily `R` scalars - any vector sub-component (`vec3(v.xy, z)`) would
-/// lower the count below `R` - so this structural test alone guarantees scalar
-/// columns with no per-component type lookup, and it works for both the
-/// function-local and global-constant arenas.  Splat columns (`Splat`) and
-/// variable / let-bound / swizzle columns are deliberately excluded (not a
-/// scalar `Compose`), keeping the rewrite a strict value-preserving regroup of
-/// the same scalar leaves the column form already emits.  Both forms lower to
-/// byte-identical naga IR (incl. f16 and negative leaves).
+/// Column-major scalar handles of a matrix `Compose` whose every column is a
+/// vector `Compose` of exactly `rows` components, for the flat form
+/// `mat2x2f(a,b,c,d)`; `None` keeps the column form.  A `vecR` built from
+/// `R` components is necessarily `R` scalars (a vector sub-component would
+/// lower the count), so the structural test needs no per-component type
+/// lookup and works for both function and global arenas.  Splat, variable,
+/// let-bound and swizzle columns are excluded, keeping the rewrite a regroup
+/// of the scalar leaves the column form already emits; both forms lower to
+/// byte-identical IR (f16 and negative leaves included).
 pub(super) fn matrix_flatten_scalars(
     ty: naga::Handle<naga::Type>,
     components: &[naga::Handle<naga::Expression>],
@@ -3451,11 +2702,10 @@ pub(super) fn matrix_flatten_scalars(
     Some(flat)
 }
 
-/// `true` only for a literal whose bit pattern is exactly `+0` (or integer
-/// `0`).  STRICTER than `literal_is_zero`: `-0.0` (bits `0x8000_0000` / `0x8000`)
-/// returns `false`, because folding it to a zero-value constructor (`vec2f()`)
-/// would silently flip the sign bit (`1.0/-0.0 == -inf` vs `+inf`).  `Bool`
-/// excluded so the fold never removes a `false` literal a constructor needs.
+/// Bit-exact `+0` (or integer `0`), stricter than `literal_is_zero`: folding
+/// `-0.0` into a zero-value constructor would flip the sign bit
+/// (`1.0/-0.0 == -inf`), and `Bool` is excluded so the fold never removes a
+/// `false` a constructor needs.
 fn literal_is_strict_numeric_zero(l: naga::Literal) -> bool {
     use naga::Literal as L;
     match l {
@@ -3474,9 +2724,8 @@ fn literal_is_strict_numeric_zero(l: naga::Literal) -> bool {
     }
 }
 
-/// `true` when `h` is a vector/matrix component tree that is provably all `+0`
-/// (strict-zero `Literal`, `ZeroValue`, or `Splat` / `Compose` of those).
-/// Drives the zero-value-constructor fold `vec2f(0,0)` -> `vec2f()`.
+/// Provably all `+0` (strict-zero `Literal`, `ZeroValue`, or `Splat`/`Compose`
+/// of those); drives the `vec2f(0,0)` -> `vec2f()` fold.
 fn compose_is_all_zero(
     h: naga::Handle<naga::Expression>,
     arena: &naga::Arena<naga::Expression>,
@@ -3491,13 +2740,11 @@ fn compose_is_all_zero(
     }
 }
 
-/// Value-equality of two expressions for splat/run-collapse purposes.
-/// Deliberately conservative: `true` ONLY for two `Literal`s with identical
-/// bit patterns (so `-0.0` and `+0.0` differ) or two `Constant`/`Override`/
-/// `ZeroValue`s with the same handle/type.  EVERY other pair - `Load`,
-/// `CallResult`, `Binary`, `FunctionArgument`, ... - returns `false`, so
-/// impure or reorder-sensitive components can never be collapsed into a single
-/// shared value.
+/// Conservative value equality for splat/run collapse: two `Literal`s with
+/// identical bit patterns (`-0.0` differs from `+0.0`) or the same
+/// `Constant`/`Override`/`ZeroValue` handle; every other pair (`Load`,
+/// `CallResult`, `Binary`, ...) is `false`, so impure or reorder-sensitive
+/// components never share one value.
 fn exprs_splat_eq(a: &naga::Expression, b: &naga::Expression) -> bool {
     use naga::Expression as E;
     match (a, b) {
@@ -3509,27 +2756,7 @@ fn exprs_splat_eq(a: &naga::Expression, b: &naga::Expression) -> bool {
     }
 }
 
-/// Bit-exact literal comparison.  Standard `PartialEq` for floats treats
-/// `-0.0 == 0.0`, but they produce different textual output, so we compare
-/// via `to_bits()` for float variants.
-/// Bit-pattern equality for literals.  Unlike `PartialEq`, treats
-/// `+0.0` and `-0.0` as distinct and NaN values as equal when their
-/// bits match.
-fn literal_bit_eq(a: &naga::Literal, b: &naga::Literal) -> bool {
-    use naga::Literal as L;
-    match (a, b) {
-        (L::F64(x), L::F64(y)) | (L::AbstractFloat(x), L::AbstractFloat(y)) => {
-            x.to_bits() == y.to_bits()
-        }
-        (L::F32(x), L::F32(y)) => x.to_bits() == y.to_bits(),
-        (L::F16(x), L::F16(y)) => x.to_bits() == y.to_bits(),
-        _ => a == b,
-    }
-}
-
-/// The scalar element of a scalar or vector type, or `None` for any
-/// other type.  Used by [`Generator::vector_ctor_name`] to test whether
-/// a component's concrete scalar pins a vector constructor's element type.
+/// Scalar of a scalar or vector type.
 fn type_inner_scalar(inner: &naga::TypeInner) -> Option<naga::Scalar> {
     match inner {
         naga::TypeInner::Scalar(s) => Some(*s),
@@ -3538,10 +2765,8 @@ fn type_inner_scalar(inner: &naga::TypeInner) -> Option<naga::Scalar> {
     }
 }
 
-/// Map a comparison operator to the equivalent negated operator when
-/// negation is semantically safe (equality and inequality are safe for
-/// every scalar type; ordered comparisons are deferred to the caller,
-/// which checks for float operands).
+/// Negated comparison operator; an ordered one is NaN-unsafe on floats,
+/// which the caller must check.
 fn flip_comparison(op: naga::BinaryOperator) -> Option<naga::BinaryOperator> {
     use naga::BinaryOperator as B;
     match op {
@@ -3555,12 +2780,8 @@ fn flip_comparison(op: naga::BinaryOperator) -> Option<naga::BinaryOperator> {
     }
 }
 
-/// Returns `true` for arithmetic binary operators where WGSL defines
-/// mixed scalar-vector overloads (`scalar OP vector` and `vector OP scalar`).
-/// `true` when the binary operator is one of the arithmetic operators
-/// that participate in scalar-vector broadcasting (`+`, `-`, `*`,
-/// `/`, `%`).  Used by splat elision to decide whether a vector-typed
-/// operand can safely collapse to its bare scalar.
+/// Operators with WGSL scalar-vector overloads (`+ - * / %`), where a splat
+/// operand may collapse to its scalar.
 pub(super) fn is_arithmetic_op(op: naga::BinaryOperator) -> bool {
     use naga::BinaryOperator as B;
     matches!(
@@ -3629,8 +2850,6 @@ mod tests {
 
     #[test]
     fn concretize_returns_none_for_non_abstract_literal() {
-        // Concrete literals already carry their typed form; the emission
-        // path skips the helper and counts them under their own key.
         let inner = scalar_inner(naga::ScalarKind::Sint, 4);
         assert!(concretize_abstract_literal_via_inner(L::I32(5), &inner).is_none());
         assert!(concretize_abstract_literal_via_inner(L::F32(0.5), &inner).is_none());
@@ -3639,9 +2858,6 @@ mod tests {
 
     #[test]
     fn concretize_returns_none_for_unsupported_inner() {
-        // No projection target (matrix, array, struct, etc.).  Caller
-        // falls back to its non-abstract path; emission re-enters the
-        // tree via the constructor, which pins types per slot.
         let mat_inner = naga::TypeInner::Matrix {
             columns: naga::VectorSize::Bi,
             rows: naga::VectorSize::Bi,
@@ -3680,10 +2896,8 @@ mod tests {
 
     #[test]
     fn concretize_abstract_int_overflow_falls_back_to_text() {
-        // Out-of-range AbstractInts cannot survive `try_from` to the
-        // narrower concrete type, so the helper emits an explicit cast
-        // wrapper.  Both sides skip extraction here; pin the exact text
-        // so any future drift in the formatting fails this test.
+        // Both sides skip extraction for cast text, so the exact spelling is
+        // pinned.
         let i32_inner = scalar_inner(naga::ScalarKind::Sint, 4);
         let u32_inner = scalar_inner(naga::ScalarKind::Uint, 4);
         let u64_inner = scalar_inner(naga::ScalarKind::Uint, 8);
@@ -3748,9 +2962,7 @@ mod tests {
 
     #[test]
     fn concretize_uses_vector_scalar_when_inner_is_vector() {
-        // `Expression::Literal` resolves to a vector type when used as
-        // a `Compose` arg; the helper must extract scalar kind/width
-        // from the vector's `scalar` field, not bail.
+        // A `Compose` argument literal resolves to the vector type.
         let vec3f_inner = vector_inner(naga::VectorSize::Tri, naga::ScalarKind::Float, 4);
         assert_lit(
             concretize_abstract_literal_via_inner(L::AbstractFloat(0.25), &vec3f_inner),

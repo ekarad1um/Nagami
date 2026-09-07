@@ -1,28 +1,19 @@
-//! Function inlining for expression-only helpers (no side-effecting
-//! statements; global/texture reads are allowed and keep their call-time
-//! timing because the body is re-emitted at the call site).
-//!
-//! The pass only touches functions whose body is a clean
-//! `[Emit*, Return { value }]` sequence with no locals, stores, calls,
-//! or other side-effecting statements.  Bodies matching that shape are
-//! captured as `InlineTemplate` expression DAGs and cloned into each
-//! call site, where the call expression is replaced with the cloned
-//! return expression.
-//!
-//! Two budgets keep output size from regressing: `max_node_count`
-//! caps a single template's DAG size, and `max_call_sites` caps how
-//! many times a template may be reused.  Above those thresholds, or
-//! when duplicating a non-trivial body across multiple sites would
-//! exceed `MAX_MULTI_SITE_EXPANSION` net added nodes, the function
-//! is left alone.
-
-use rustc_hash::{FxHashMap, FxHashSet};
+//! Function inlining for expression-only helpers: a body of the shape
+//! `[Emit*, Return { value }]` with no locals, stores, calls, or other
+//! side-effecting statements becomes an `InlineTemplate` expression DAG
+//! cloned into each call site in place of the call.  Global / texture reads
+//! in the body are fine; re-emission at the call site keeps their call-time
+//! timing.  `max_node_count` caps a template's DAG, `max_call_sites` its
+//! reuse, and `MAX_MULTI_SITE_EXPANSION` the nodes added by duplicating a
+//! body across sites.
 
 use crate::error::Error;
+use crate::handle_set::{HandleMap, HandleSet};
 use crate::pipeline::{Pass, PassContext};
 
 use super::expr_util::{
-    expression_needs_emit, is_disallowed_inline_expression, nested_blocks_mut,
+    const_index_value, expression_needs_emit, has_negative_zero_leaf,
+    is_disallowed_inline_expression, nested_blocks_mut, rebuild_function_expressions,
     remap_statement_handles, try_map_expression_handles_in_place, visit_expression_children,
 };
 
@@ -35,26 +26,16 @@ pub const MAX_PROFILE_MAX_INLINE_NODE_COUNT: usize = 48;
 /// Widened call-site budget when running under [`super::Profile::Max`].
 pub const MAX_PROFILE_MAX_INLINE_CALL_SITES: usize = 6;
 
-/// Maximum additional expression nodes tolerated when duplicating a
-/// template across several call sites, equal to
-/// `node_count * (call_sites - 1)`.
-///
-/// After minification, call syntax is already 1-2 characters, so
-/// cloning a non-trivial body over multiple sites is almost always a
-/// net size regression.  Single-site inlining is unaffected (the
-/// expansion term is zero).
-///
-/// Deliberately hard-coded rather than promoted to `Config`: the
-/// value is a function of the post-mangle call-site length (~ 2-3
-/// chars including `(` `)`), not a profile knob.  The pipeline runs
-/// inlining ONCE per sweep, sandwiched between const_fold and
-/// dead_branch on both sides (see `passes/mod.rs`); multi-sweep
-/// convergence catches single-site cases that mature only after later
-/// simplification rather than re-running inlining mid-sweep.
+/// Cap on `node_count * (call_sites - 1)`, the nodes added by duplicating a
+/// template across call sites: post-mangle call syntax is 1-2 characters,
+/// so cloning a non-trivial body over several sites is almost always a net
+/// regression (single-site inlining adds zero).  Hard-coded rather than a
+/// `Config` knob because it follows from the mangled call-site length, not
+/// a profile choice; multi-sweep convergence catches single-site cases that
+/// mature only after later simplification.
 const MAX_MULTI_SITE_EXPANSION: usize = 6;
 
-/// Inlining pass parameterised on the per-run node and call-site
-/// budgets.
+/// Inlining pass with per-run node and call-site budgets.
 #[derive(Debug)]
 pub struct InliningPass {
     max_node_count: usize,
@@ -71,9 +52,8 @@ impl Default for InliningPass {
 }
 
 impl InliningPass {
-    /// Construct a pass with explicit budgets; the defaults live in
-    /// `DEFAULT_*` and `MAX_PROFILE_*` constants above and are
-    /// selected by [`super::build_ir_passes`] based on the profile.
+    /// A pass with explicit budgets; the profile picks among the
+    /// `DEFAULT_*` / `MAX_PROFILE_*` constants.
     pub fn new(max_node_count: usize, max_call_sites: usize) -> Self {
         Self {
             max_node_count,
@@ -82,12 +62,10 @@ impl InliningPass {
     }
 }
 
-/// Snapshot of an inlinable function: the expression arena alongside
-/// the handle that delivers the return value.  Cloned into each
-/// caller's arena when the call is replaced.  `argument_types` carries the
-/// callee's declared parameter types so the pre-clone OOB gate can size an
-/// `Access` base type-derivedly, independent of the caller argument's
-/// expression shape.
+/// An inlinable function's expression arena and return handle, cloned into
+/// each caller.  `argument_types` lets the pre-clone OOB gate size an
+/// `Access` base from the callee's declared parameter type, independent of
+/// the caller argument's shape.
 #[derive(Clone)]
 struct InlineTemplate {
     argument_types: Vec<naga::Handle<naga::Type>>,
@@ -101,15 +79,11 @@ impl Pass for InliningPass {
     }
 
     fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
-        // A call to a function with an empty body is a no-op statement: the
-        // callee cannot observe or affect anything, and argument expressions
-        // are pure evaluations that die with the call (compact culls them).
-        // The expression-template machinery below excludes ALL void
-        // functions, so without this, `fn e(){} ... e();` survives every
-        // pass and the empty callee is pinned alive by its own call sites.
-        // Calls to preserve-listed functions are kept: their declarations
-        // are an external contract and an intact call site is the cheapest
-        // proof the declaration stays live.
+        // A call to an empty function is a no-op, but the template machinery
+        // excludes every void function, so without this `fn e(){} ... e();`
+        // survives every pass, pinned alive by its own call sites.  Calls to
+        // preserve-listed functions stay: an intact call site is the
+        // cheapest proof their external-contract declaration stays live.
         let mut changed = delete_calls_to_empty_functions(module, &ctx.config.preserve_symbols);
 
         let templates = collect_inline_templates(
@@ -136,10 +110,9 @@ impl Pass for InliningPass {
 }
 
 /// Remove every `Call` to a function whose body is empty (or a lone bare
-/// `return;`).  Such calls have no observable effect; deleting them lets the
-/// next compaction drop the callee itself.  Returns whether anything changed.
+/// `return;`), so the next compaction can drop the callee itself.
 fn delete_calls_to_empty_functions(module: &mut naga::Module, preserve: &[String]) -> bool {
-    let empty: FxHashSet<naga::Handle<naga::Function>> = module
+    let empty: HandleSet<naga::Function> = module
         .functions
         .iter()
         .filter(|(_, f)| {
@@ -170,11 +143,7 @@ fn delete_calls_to_empty_functions(module: &mut naga::Module, preserve: &[String
     changed
 }
 
-/// Recursively drop `Call`s to `empty` functions from `block`.
-fn drop_empty_calls_in_block(
-    block: &mut naga::Block,
-    empty: &FxHashSet<naga::Handle<naga::Function>>,
-) -> bool {
+fn drop_empty_calls_in_block(block: &mut naga::Block, empty: &HandleSet<naga::Function>) -> bool {
     let original = std::mem::take(block);
     let mut rebuilt = naga::Block::with_capacity(original.len());
     let mut changed = false;
@@ -200,33 +169,33 @@ fn drop_empty_calls_in_block(
 
 // MARK: Template collection
 
-/// Collect every function eligible for inlining and build its
-/// [`InlineTemplate`].
-///
-/// Safety invariant: only expression-only functions with no side-effecting
-/// STATEMENTS are eligible.  The body must be `[Emit*, Return { value }]`
-/// with no locals, no stores, no calls, and no other side-effecting
-/// statements, which guarantees the template's expression DAG can be cloned
-/// into the caller's arena without invalidating any assumptions about stores
-/// or control flow between statements.  (Global/texture READS in the body are
-/// fine - re-emitting at the call site preserves their call-time timing.)
+/// Build an [`InlineTemplate`] for every eligible function.  Eligibility is
+/// the soundness invariant: a body of exactly `[Emit*, Return { value }]`
+/// with no locals, stores, calls, or other side-effecting statements, so the
+/// expression DAG clones into a caller without disturbing any assumption
+/// about stores or control flow between statements.
 fn collect_inline_templates(
     module: &naga::Module,
     max_node_count: usize,
     max_call_sites: usize,
     preserve: &[String],
-) -> FxHashMap<naga::Handle<naga::Function>, InlineTemplate> {
+) -> HandleMap<naga::Function, InlineTemplate> {
+    let mut templates = Default::default();
+    // A library module (no entry points) keeps every function (compact runs
+    // with `KeepUnused::Yes`), so inlining only trades a call for a second
+    // copy of the body.
+    if module.entry_points.is_empty() {
+        return templates;
+    }
     let call_counts = collect_call_counts(module);
-    let mut templates = FxHashMap::default();
 
     for (function_handle, function) in module.functions.iter() {
-        // Preserved functions are an external contract, never templates: a
-        // `--preamble` input carries only a STUB body whose real definition
-        // arrives when the consumer concatenates the preamble, so baking the
-        // stub's expression tree into callers silently bypasses that
-        // definition.  Plain `--preserve-symbol` declarations also survive
-        // only through intact call sites (`naga::compact` culls call-less
-        // functions whenever entry points exist).
+        // Preserved functions are never templates: a `--preamble` input
+        // carries only a STUB body whose real definition arrives when the
+        // consumer concatenates the preamble, so baking the stub into callers
+        // bypasses that definition, and a plain `--preserve-symbol`
+        // declaration survives only through intact call sites once entry
+        // points exist.
         if function
             .name
             .as_deref()
@@ -234,7 +203,7 @@ fn collect_inline_templates(
         {
             continue;
         }
-        let call_sites = call_counts.get(&function_handle).copied().unwrap_or(0);
+        let call_sites = call_counts.get(function_handle).copied().unwrap_or(0);
         if call_sites == 0 || call_sites > max_call_sites {
             continue;
         }
@@ -246,11 +215,8 @@ fn collect_inline_templates(
             continue;
         };
 
-        // `visited` is dense over the callee's expression arena and
-        // re-checked at every node in the recursive walk; back it
-        // with a `Vec<bool>` indexed by `handle.index()` instead of
-        // a hashed `HashSet`.  Pre-sized to `function.expressions.len()`
-        // so no growth occurs during the analysis.
+        // Dense over the callee's arena and re-checked at every node, so a
+        // `Vec<bool>` beats a hash set.
         let mut visited = vec![false; function.expressions.len()];
         let Some(node_count) = analyze_inline_expression(
             return_expr,
@@ -265,23 +231,16 @@ fn collect_inline_templates(
             continue;
         }
 
-        // For multi-site functions, bound the extra nodes introduced by
-        // body duplication.  Each additional call site beyond the first
-        // copies the entire expression tree, while removing only the
-        // single function declaration.
         if call_sites > 1 {
             let expansion = node_count * (call_sites - 1);
             if expansion > MAX_MULTI_SITE_EXPANSION {
                 continue;
             }
             // Node counts undercount TEXT: a `Math` node renders its full
-            // builtin name (`faceForward(` is 12 characters counted as one
-            // node), so duplicating a Math-bearing body across sites grows
-            // bytes even inside the node budget - the corpus faceForward /
-            // reflect class regressed ~+10 B per extra site this way.
-            // Image accessors share the long-spelling problem.  Keeping the
-            // helper is the better equilibrium; single-site inlining is
-            // unaffected.
+            // builtin name (`faceForward(` is 12 characters for one node),
+            // so duplicating one across sites grows bytes inside the node
+            // budget (the corpus faceForward / reflect class loses ~10 B per
+            // extra site); image accessors share the long spelling.
             let has_char_heavy_node = function.expressions.iter().any(|(h, e)| {
                 visited[h.index()]
                     && matches!(
@@ -310,10 +269,8 @@ fn collect_inline_templates(
     templates
 }
 
-/// Count call-site references to each function across every function
-/// body and entry point; used to gate the `max_call_sites` budget.
-fn collect_call_counts(module: &naga::Module) -> FxHashMap<naga::Handle<naga::Function>, usize> {
-    let mut counts = FxHashMap::default();
+fn collect_call_counts(module: &naga::Module) -> HandleMap<naga::Function, usize> {
+    let mut counts = Default::default();
 
     for (_, function) in module.functions.iter() {
         collect_call_counts_in_block(&function.body, &mut counts);
@@ -327,7 +284,7 @@ fn collect_call_counts(module: &naga::Module) -> FxHashMap<naga::Handle<naga::Fu
 
 fn collect_call_counts_in_block(
     block: &naga::Block,
-    counts: &mut FxHashMap<naga::Handle<naga::Function>, usize>,
+    counts: &mut HandleMap<naga::Function, usize>,
 ) {
     super::expr_util::for_each_statement(block, &mut |statement| {
         if let naga::Statement::Call { function, .. } = statement {
@@ -336,10 +293,8 @@ fn collect_call_counts_in_block(
     });
 }
 
-/// Return the expression handle delivered by a body of the form
-/// `[Emit*, Return { value }]`, or `None` if the block contains
-/// anything else (loops, stores, multi-return, etc.).  Single gate
-/// for the pass's purity requirement.
+/// The value handle of a body shaped exactly `[Emit*, Return { value }]`,
+/// `None` for anything else: the pass's single purity gate.
 fn extract_inline_return_expression(block: &naga::Block) -> Option<naga::Handle<naga::Expression>> {
     let mut return_value = None;
     let mut seen_return = false;
@@ -358,11 +313,8 @@ fn extract_inline_return_expression(block: &naga::Block) -> Option<naga::Handle<
     return_value
 }
 
-/// Count expression nodes reachable from `handle` and ensure every
-/// `FunctionArgument` index fits inside the advertised argument list.
-/// Returns `None` when the DAG contains an inline-disallowed
-/// expression (statement-attached results, local variables, and so
-/// on) or an out-of-range argument index.
+/// Node count of the DAG under `handle`, or `None` when it holds an
+/// inline-disallowed expression or an out-of-range `FunctionArgument`.
 fn analyze_inline_expression(
     handle: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
@@ -384,11 +336,8 @@ fn analyze_inline_expression(
         return ((*index as usize) < argument_count).then_some(1);
     }
 
-    // Sum the node counts of every child sub-expression.  Read-only walk
-    // (no clone of the node just to traverse it); `ok` propagates a child's
-    // `None` (disallowed / out-of-range argument) and stops descending
-    // siblings, so the per-template `visited` marks match an early-return
-    // walk exactly.
+    // `ok` stops descending siblings after a failure, so the `visited` marks
+    // match an early-return walk exactly.
     let mut total = 1usize;
     let mut ok = true;
     visit_expression_children(expr, |child| {
@@ -405,13 +354,11 @@ fn analyze_inline_expression(
 
 // MARK: Call-site rewriting
 
-/// Walk `function`'s body, replacing every eligible call with the
-/// template's cloned return expression.  Returns the number of call
-/// sites rewritten.  The entry-point driver calls this with the same
-/// `templates` map so every caller sees the same inlinable set.
+/// Replace every eligible call in `function` with its template's cloned
+/// return expression; returns the number of call sites rewritten.
 fn inline_in_function(
     function: &mut naga::Function,
-    templates: &FxHashMap<naga::Handle<naga::Function>, InlineTemplate>,
+    templates: &HandleMap<naga::Function, InlineTemplate>,
     types: &naga::UniqueArena<naga::Type>,
 ) -> usize {
     let arena_len = function.expressions.len();
@@ -420,15 +367,16 @@ fn inline_in_function(
         &mut function.expressions,
         templates,
         types,
-        &FxHashMap::default(),
+        &mut Default::default(),
     );
 
     if changed > 0 {
         rebuild_function_expressions(function);
         function.named_expressions.clear();
     } else if function.expressions.len() > arena_len {
-        // Only declined clones appended anything: a pass that changes nothing
-        // must leave the arena as it found it (the driver replays on that).
+        // Only declined clones appended anything; a pass that changes
+        // nothing must leave the arena as it found it (the driver replays
+        // on that).
         truncate_expressions(&mut function.expressions, arena_len);
     }
 
@@ -448,35 +396,30 @@ fn truncate_expressions(arena: &mut naga::Arena<naga::Expression>, len: usize) {
     }
 }
 
-/// Inline eligible calls in `block`, returning the change count AND the
-/// expression-replacement map this scope accumulated (inherited entries plus
-/// every `CallResult -> inlined-root` mapping recorded here).  The returned
-/// map lets a loop thread its `body`'s replacements into its `continuing`
-/// block and `break_if`, which naga permits to reference body-defined
-/// expressions; without it, inlining a body call leaves the continuing /
-/// break_if references pointing at an orphaned `CallResult` (invalid IR that
-/// forces a whole-module rollback).
+/// Inline eligible calls in `block`, returning the change count and the
+/// `CallResult` keys this scope added to the shared `replacements` map.  A
+/// `CallResult` belongs to one call in one block, so a scope's keys are new
+/// and its caller restores the map by removing exactly them - cheaper than
+/// handing every nested block its own copy.  naga lets a loop's `continuing`
+/// block and `break_if` reference body-defined expressions, so the loop
+/// keeps its body's keys live until both are rewritten; otherwise a
+/// body-inlined call leaves them pointing at an orphaned `CallResult`
+/// (invalid IR, a whole-module rollback).
 fn inline_in_block(
     block: &mut naga::Block,
     expressions: &mut naga::Arena<naga::Expression>,
-    templates: &FxHashMap<naga::Handle<naga::Function>, InlineTemplate>,
+    templates: &HandleMap<naga::Function, InlineTemplate>,
     types: &naga::UniqueArena<naga::Type>,
-    inherited_replacements: &FxHashMap<
-        naga::Handle<naga::Expression>,
-        naga::Handle<naga::Expression>,
-    >,
-) -> (
-    usize,
-    FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
-) {
+    replacements: &mut HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
+) -> (usize, Vec<naga::Handle<naga::Expression>>) {
     let mut changed = 0usize;
-    let mut replacements = inherited_replacements.clone();
+    let mut added = Vec::new();
 
     let original = std::mem::take(block);
     let mut rebuilt = naga::Block::with_capacity(original.len());
 
     for (mut statement, span) in original.span_into_iter() {
-        apply_replacements_to_statement(&mut statement, expressions, &replacements);
+        apply_replacements_to_statement(&mut statement, expressions, replacements);
 
         match statement {
             naga::Statement::Call {
@@ -484,19 +427,16 @@ fn inline_in_block(
                 arguments,
                 result: Some(result_handle),
             } => {
-                if let Some(template) = templates.get(&function)
+                if let Some(template) = templates.get(function)
                     && template.argument_types.len() == arguments.len()
+                    && !arguments
+                        .iter()
+                        .any(|&a| has_negative_zero_leaf(expressions, a))
                 {
                     let old_len = expressions.len();
-                    // Memo backed by `Vec<Option<Handle>>` indexed by
-                    // template-arena `handle.index()` instead of a
-                    // HashMap.  The template expression arena is the
-                    // densest possible address space (one slot per
-                    // expression) and `clone_inline_expression` may
-                    // re-visit handles many times when the same
-                    // sub-expression is shared - the memo lookup is
-                    // the hot spot.  Direct indexing removes the
-                    // SipHash cost from the inner traversal.
+                    // Indexed by template handle: the template arena is the
+                    // densest address space and the memo lookup is the hot
+                    // spot of the clone.
                     let mut memo: Vec<Option<naga::Handle<naga::Expression>>> =
                         vec![None; template.expressions.len()];
                     if let Some(root_handle) = clone_inline_expression(
@@ -514,7 +454,9 @@ fn inline_in_block(
                             span,
                         );
 
-                        replacements.insert(result_handle, root_handle);
+                        let shadowed = replacements.insert(result_handle, root_handle);
+                        debug_assert!(shadowed.is_none(), "call results are unique per block");
+                        added.push(result_handle);
                         changed += 1;
                         continue;
                     }
@@ -534,30 +476,20 @@ fn inline_in_block(
                 mut continuing,
                 mut break_if,
             } => {
-                // naga lets the `continuing` block and `break_if` reference
-                // expressions defined in `body`, so the continuing recursion
-                // (and the break_if handle) must see the replacements `body`
-                // produced - otherwise a body-inlined call leaves them
-                // referencing an orphaned `CallResult`.
-                let (cb, body_replacements) =
-                    inline_in_block(&mut body, expressions, templates, types, &replacements);
+                let (cb, body_added) =
+                    inline_in_block(&mut body, expressions, templates, types, replacements);
                 changed += cb;
-                // `break_if` may reference a `CallResult` defined in the
-                // `continuing` block itself (naga allows it), so resolve it
-                // against the map the continuing recursion returned - which is
-                // seeded from `body_replacements`, hence a superset.  Using
-                // only `body_replacements` would leave a continuing-inlined
-                // call's result orphaned in `break_if` -> invalid IR -> rollback.
-                let (cc, continuing_replacements) = inline_in_block(
-                    &mut continuing,
-                    expressions,
-                    templates,
-                    types,
-                    &body_replacements,
-                );
+                // `break_if` may also reference a `CallResult` defined in
+                // `continuing` itself, so both scopes stay in the map until it
+                // is rewritten.
+                let (cc, continuing_added) =
+                    inline_in_block(&mut continuing, expressions, templates, types, replacements);
                 changed += cc;
                 if let Some(handle) = break_if {
-                    break_if = Some(resolve_replacement(handle, &continuing_replacements));
+                    break_if = Some(resolve_replacement(handle, replacements));
+                }
+                for key in body_added.into_iter().chain(continuing_added) {
+                    replacements.remove(key);
                 }
                 rebuilt.push(
                     naga::Statement::Loop {
@@ -568,14 +500,16 @@ fn inline_in_block(
                     span,
                 );
             }
-            // If / Switch / Block sub-blocks recurse against the CURRENT
-            // scope map and their returned maps are dropped: unlike a
-            // loop's continuing block, nothing after them may reference
-            // their interior expressions.
+            // Nothing after an If / Switch / Block may reference its interior
+            // expressions, so their maps are dropped.
             mut other => {
                 for nested in nested_blocks_mut(&mut other) {
-                    changed +=
-                        inline_in_block(nested, expressions, templates, types, &replacements).0;
+                    let (c, nested_added) =
+                        inline_in_block(nested, expressions, templates, types, replacements);
+                    changed += c;
+                    for key in nested_added {
+                        replacements.remove(key);
+                    }
                 }
                 rebuilt.push(other, span);
             }
@@ -583,12 +517,11 @@ fn inline_in_block(
     }
 
     *block = rebuilt;
-    (changed, replacements)
+    (changed, added)
 }
 
-/// Emit `Emit` statements covering every expression appended to
-/// `expressions` after `old_len` that requires an emit range, split
-/// around declarative expressions so the ranges remain contiguous.
+/// `Emit` statements covering every expression appended after `old_len`
+/// that needs one, split around declarative expressions.
 fn push_emit_ranges_for_new_expressions(
     block: &mut naga::Block,
     expressions: &naga::Arena<naga::Expression>,
@@ -624,22 +557,12 @@ fn push_emit_ranges_for_new_expressions(
     }
 }
 
-/// Recursively clone `handle` from `template.expressions` into
-/// `caller_expressions`, replacing `FunctionArgument` references with
-/// the caller-supplied `arguments`.  `memo` guarantees each template
-/// handle produces exactly one caller handle so shared sub-DAGs stay
-/// shared after cloning.
-///
-/// `memo` is pre-sized to `template.expressions.len()` by the caller
-/// (see `inline_in_block`).  Every `handle` reached through the
-/// recursion below comes from `template.expressions` (the recursion
-/// only traverses children of the just-cloned expression, which is
-/// itself a clone of an entry in the template's arena), so
-/// `handle.index() < memo.len()` is an invariant; both the read and
-/// write use direct indexing in lockstep, so an invariant violation
-/// panics loudly at the offending site rather than silently
-/// returning `None` on the read and then panicking on the write
-/// (inconsistent diagnostics).
+/// Clone `handle` from the template into `caller_expressions`, substituting
+/// `arguments` for `FunctionArgument`s; `memo` maps each template handle to
+/// exactly one caller handle so shared sub-DAGs stay shared.  Every handle
+/// reached comes from the template arena, so `handle.index() < memo.len()`
+/// holds and both memo accesses index directly, panicking at the offending
+/// site on a violation.
 fn clone_inline_expression(
     handle: naga::Handle<naga::Expression>,
     template: &InlineTemplate,
@@ -661,16 +584,13 @@ fn clone_inline_expression(
         naga::Expression::FunctionArgument(index) => arguments.get(*index as usize).copied()?,
         _ => {
             // Substitution can MANUFACTURE a statically out-of-bounds index
-            // the template never had: the template's `v[i]` is a runtime
-            // access, but a call site like `f(vec4(...), 6)` maps `i` to a
-            // literal, and naga's validator rejects a known-OOB constant
-            // index into a fixed-size composite - and a NEGATIVE constant
-            // index regardless of base type - either of which used to roll
+            // the template never had (`v[i]` called as `f(vec4(...), 6)`),
+            // and naga rejects a known-OOB constant index into a fixed-size
+            // composite, or a NEGATIVE one regardless of base type, rolling
             // the whole pass back.  Checked BEFORE cloning children so the
             // decline strands nothing: the index resolves through the
             // argument list, the base length through the callee's declared
-            // parameter type (covering every caller argument shape) or a
-            // structural template composite.
+            // parameter type or a structural template composite.
             if let naga::Expression::Access { base, index } = expr
                 && let Some(i) =
                     substituted_index_value(*index, template, arguments, caller_expressions)
@@ -684,10 +604,10 @@ fn clone_inline_expression(
             try_map_expression_handles_in_place(&mut cloned, &mut |child| {
                 clone_inline_expression(child, template, arguments, caller_expressions, types, memo)
             })?;
-            // Backstop for composed shapes the pre-clone gate cannot size
-            // (base or index produced by nested template expressions).  The
-            // already-cloned children stay behind as dead entries; the
-            // function-level rebuild / truncation removes them.
+            // Backstop for shapes the pre-clone gate cannot size (base or
+            // index built from nested template expressions); the cloned
+            // children stay behind as dead entries for the rebuild /
+            // truncation to remove.
             if let naga::Expression::Access { base, index } = cloned
                 && let Some(i) = const_index_value(index, caller_expressions)
                 && (i < 0
@@ -704,9 +624,8 @@ fn clone_inline_expression(
     Some(mapped)
 }
 
-/// Statically-known element count of `ty`: vector size, matrix column
-/// count, or fixed array length.  `None` = not indexable with a static
-/// bound (the OOB gates then stay out of the way).
+/// Static element count of `ty` (vector size, matrix columns, fixed array
+/// length); `None` means no static bound and the OOB gates stand aside.
 fn type_element_count(
     ty: naga::Handle<naga::Type>,
     types: &naga::UniqueArena<naga::Type>,
@@ -722,9 +641,9 @@ fn type_element_count(
     }
 }
 
-/// Statically-known element count of the composite VALUE produced by
-/// `handle`, derived structurally (no typifier): `Compose`/`ZeroValue`
-/// carry their type, `Splat`/`Swizzle` carry their size directly.
+/// Static element count of the composite VALUE at `handle`, read
+/// structurally (no typifier): `Compose` / `ZeroValue` carry their type,
+/// `Splat` / `Swizzle` their size.
 fn static_composite_len(
     handle: naga::Handle<naga::Expression>,
     arena: &naga::Arena<naga::Expression>,
@@ -741,9 +660,9 @@ fn static_composite_len(
 }
 
 /// Post-substitution constant value of a template `Access` index, resolved
-/// WITHOUT cloning: a template-arena literal directly, or the caller
-/// argument a `FunctionArgument` maps to.  (`Expression::Constant` indices
-/// stay unresolvable here - no module access - and fall to the rollback.)
+/// WITHOUT cloning: a template literal, or the caller argument a
+/// `FunctionArgument` maps to.  (`Constant` indices need module access and
+/// stay unresolvable here.)
 fn substituted_index_value(
     index: naga::Handle<naga::Expression>,
     template: &InlineTemplate,
@@ -760,8 +679,8 @@ fn substituted_index_value(
 }
 
 /// Static element count of a template `Access` base: the callee's declared
-/// parameter type when the base is an argument (independent of the caller
-/// argument's expression shape), else a structural template composite.
+/// parameter type for an argument (whatever the caller passes), else a
+/// structural template composite.
 fn substituted_base_len(
     base: naga::Handle<naga::Expression>,
     template: &InlineTemplate,
@@ -775,32 +694,12 @@ fn substituted_base_len(
     }
 }
 
-/// The compile-time value of an integer-literal index expression, or
-/// `None` when the index is not a literal (a genuine runtime access).
-fn const_index_value(
-    handle: naga::Handle<naga::Expression>,
-    arena: &naga::Arena<naga::Expression>,
-) -> Option<i64> {
-    match arena[handle] {
-        naga::Expression::Literal(naga::Literal::I32(v)) => Some(v as i64),
-        naga::Expression::Literal(naga::Literal::U32(v)) => Some(v as i64),
-        naga::Expression::Literal(naga::Literal::I64(v)) => Some(v),
-        // Saturate: a u64 index beyond i64::MAX is OOB for any composite.
-        naga::Expression::Literal(naga::Literal::U64(v)) => {
-            Some(i64::try_from(v).unwrap_or(i64::MAX))
-        }
-        naga::Expression::Literal(naga::Literal::AbstractInt(v)) => Some(v),
-        _ => None,
-    }
-}
-
 /// Remap the handles `statement` references (its Emit'd expressions'
-/// operands and its own fields) through `replacements`; nested blocks are
-/// the caller's.
+/// operands and its own fields); nested blocks are the caller's.
 fn apply_replacements_to_statement(
     statement: &mut naga::Statement,
     expressions: &mut naga::Arena<naga::Expression>,
-    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
 ) {
     let mut remap =
         |handle: naga::Handle<naga::Expression>| resolve_replacement(handle, replacements);
@@ -814,177 +713,19 @@ fn apply_replacements_to_statement(
     remap_statement_handles(statement, &mut remap);
 }
 
-/// Follow `replacements` transitively and return the terminal target.
-/// Self-loops terminate early; the callers guarantee the map is
-/// acyclic by construction, so a well-formed map always halts.
+/// Terminal target of `handle` through `replacements`; self-loops stop, and
+/// callers build acyclic maps, so it halts.
 fn resolve_replacement(
     mut handle: naga::Handle<naga::Expression>,
-    replacements: &FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
+    replacements: &HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
 ) -> naga::Handle<naga::Expression> {
-    while let Some(next) = replacements.get(&handle).copied() {
+    while let Some(next) = replacements.get(handle).copied() {
         if next == handle {
             break;
         }
         handle = next;
     }
     handle
-}
-
-// MARK: Arena compaction
-
-/// Rebuild `function.expressions` after inlining so only reachable
-/// expressions survive, remapping every handle referenced by the body,
-/// locals, named expressions, and result.  The walk mirrors naga's
-/// `compact` pass shape but is scoped to a single function.
-fn rebuild_function_expressions(function: &mut naga::Function) {
-    let old_expressions = std::mem::take(&mut function.expressions);
-    let mut new_expressions = naga::Arena::new();
-    let mut handle_map = FxHashMap::default();
-
-    rebuild_block_expressions(
-        &mut function.body,
-        &old_expressions,
-        &mut new_expressions,
-        &mut handle_map,
-    );
-
-    // Remap local variable init handles into the new expression arena.
-    for (_, local) in function.local_variables.iter_mut() {
-        if let Some(init) = &mut local.init {
-            *init = clone_expression_handle(
-                *init,
-                &old_expressions,
-                &mut new_expressions,
-                &mut handle_map,
-            );
-        }
-    }
-
-    function.expressions = new_expressions;
-}
-
-fn rebuild_block_expressions(
-    block: &mut naga::Block,
-    old_expressions: &naga::Arena<naga::Expression>,
-    new_expressions: &mut naga::Arena<naga::Expression>,
-    handle_map: &mut FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
-) {
-    let original = std::mem::take(block);
-    let mut rebuilt = naga::Block::with_capacity(original.len());
-
-    for (mut statement, span) in original.span_into_iter() {
-        // Handle Emit specially: clone expressions and split into contiguous
-        // sub-ranges to avoid including interleaved non-emittable dependencies.
-        if let naga::Statement::Emit(ref range) = statement {
-            let mut mapped_handles = Vec::new();
-            for handle in range.clone() {
-                let mut expression = old_expressions[handle].clone();
-                let _ = try_map_expression_handles_in_place(&mut expression, &mut |child| {
-                    Some(clone_expression_handle(
-                        child,
-                        old_expressions,
-                        new_expressions,
-                        handle_map,
-                    ))
-                });
-                let mapped = new_expressions.append(expression, old_expressions.get_span(handle));
-                handle_map.insert(handle, mapped);
-                mapped_handles.push(mapped);
-            }
-
-            if !mapped_handles.is_empty() {
-                let mut start = mapped_handles[0];
-                let mut end = mapped_handles[0];
-                for &h in &mapped_handles[1..] {
-                    if h.index() == end.index() + 1 {
-                        end = h;
-                    } else {
-                        rebuilt.push(
-                            naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
-                            span,
-                        );
-                        start = h;
-                        end = h;
-                    }
-                }
-                rebuilt.push(
-                    naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
-                    span,
-                );
-            }
-            continue;
-        }
-
-        // Handle `Loop` BEFORE the generic remap.  A loop's `break_if`
-        // expression is emitted inside `body`/`continuing`, so those blocks
-        // must be rebuilt first; then `clone_expression_handle(break_if)`
-        // memo-hits the copy its owning Emit just produced.  If we instead let
-        // the generic remap below clone break_if first, it appends an
-        // un-emitted duplicate and leaves break_if pointing at an expression
-        // that is in no Emit range - invalid IR.
-        if matches!(statement, naga::Statement::Loop { .. }) {
-            if let naga::Statement::Loop {
-                body,
-                continuing,
-                break_if,
-            } = &mut statement
-            {
-                rebuild_block_expressions(body, old_expressions, new_expressions, handle_map);
-                rebuild_block_expressions(continuing, old_expressions, new_expressions, handle_map);
-                if let Some(handle) = break_if {
-                    *handle = clone_expression_handle(
-                        *handle,
-                        old_expressions,
-                        new_expressions,
-                        handle_map,
-                    );
-                }
-            }
-            rebuilt.push(statement, span);
-            continue;
-        }
-
-        remap_statement_handles(&mut statement, &mut |h| {
-            clone_expression_handle(h, old_expressions, new_expressions, handle_map)
-        });
-
-        // The early Loop path above must have consumed every Loop: reaching
-        // the generic remap with one would clone `break_if` BEFORE its owning
-        // block is rebuilt, appending an un-emitted duplicate (invalid IR).
-        debug_assert!(!matches!(statement, naga::Statement::Loop { .. }));
-        for nested in nested_blocks_mut(&mut statement) {
-            rebuild_block_expressions(nested, old_expressions, new_expressions, handle_map);
-        }
-
-        rebuilt.push(statement, span);
-    }
-
-    *block = rebuilt;
-}
-
-fn clone_expression_handle(
-    handle: naga::Handle<naga::Expression>,
-    old_expressions: &naga::Arena<naga::Expression>,
-    new_expressions: &mut naga::Arena<naga::Expression>,
-    handle_map: &mut FxHashMap<naga::Handle<naga::Expression>, naga::Handle<naga::Expression>>,
-) -> naga::Handle<naga::Expression> {
-    if let Some(mapped) = handle_map.get(&handle).copied() {
-        return mapped;
-    }
-
-    let mut expression = old_expressions[handle].clone();
-    let _ = try_map_expression_handles_in_place(&mut expression, &mut |child| {
-        Some(clone_expression_handle(
-            child,
-            old_expressions,
-            new_expressions,
-            handle_map,
-        ))
-    });
-
-    let mapped = new_expressions.append(expression, old_expressions.get_span(handle));
-    handle_map.insert(handle, mapped);
-    mapped
 }
 
 // MARK: Tests
@@ -1067,13 +808,31 @@ fn fs_main() -> @location(0) vec4f {
         );
     }
 
-    /// Substituting a call-site literal into a template's runtime `v[i]`
-    /// manufactures a statically out-of-bounds constant index that naga's
-    /// validator rejects - the clone must decline (call kept) instead of
-    /// poisoning the pass into a module-wide rollback.  `run_pass`
-    /// validates the post-pass module, so this test fails if the gate is
-    /// removed.  The in-bounds call proves the gate is value-sensitive,
-    /// not a blanket refusal.
+    #[test]
+    fn library_module_keeps_call_sites_intact() {
+        // No entry point: every function survives compaction, so inlining
+        // would leave two copies of the body.
+        let src = r#"
+fn helper() -> vec4f { return vec4f(0.1, 0.2, 0.3, 1.0); }
+fn main_color() -> vec4f { return helper(); }
+"#;
+        let (changed, after) = run_pass(src);
+        assert!(!changed, "a library module must not inline");
+        let helper = find_function_handle_by_name(&after, "helper");
+        let caller = after
+            .functions
+            .iter()
+            .find(|(_, f)| f.name.as_deref() == Some("main_color"))
+            .map(|(_, f)| f)
+            .expect("main_color survives");
+        assert_eq!(count_calls_to_function(&caller.body, helper), 1);
+    }
+
+    /// A call-site literal substituted into a template's runtime `v[i]` can
+    /// manufacture a statically out-of-bounds index naga rejects; the clone
+    /// must decline (call kept) instead of rolling the whole pass back.
+    /// `run_pass` validates, and the in-bounds call proves the gate is
+    /// value-sensitive.
     #[test]
     fn declines_call_site_whose_literal_index_is_out_of_bounds() {
         let source = r#"
@@ -1098,12 +857,29 @@ fn main() {
         );
     }
 
-    /// The pre-clone gate must also size the base from the callee's
-    /// DECLARED parameter type (the caller forwards its own argument, so no
-    /// structural composite exists in the caller arena) and must reject a
-    /// negative index outright - naga flags negative constant indices
-    /// regardless of base-length knowledge.  `run_pass` validates, so this
-    /// test fails with the gate removed.
+    /// The pre-clone gate must size the base from the callee's DECLARED
+    /// parameter type (a forwarded argument has no structural composite in
+    /// the caller arena) and reject a negative index outright.
+    /// Dawn on Metal flushes a negative-zero LITERAL to +0 but keeps the
+    /// sign of a runtime negation, so `-(x*x)` must not be inlined with
+    /// `x = -0.0` substituted; the other site still inlines.
+    #[test]
+    fn declines_call_site_passing_a_negative_zero_literal() {
+        let source = "fn sq(x: f32) -> f32 { return -(x * x); }\n\
+                      @group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+                      @compute @workgroup_size(1) fn main() {\n\
+                        out[0] = bitcast<u32>(sq(-0.0));\n\
+                        out[1] = bitcast<u32>(sq(2.0));\n\
+                      }";
+        let (changed, module) = run_pass(source);
+        assert!(changed);
+        let sq = find_function_handle_by_name(&module, "sq");
+        assert_eq!(
+            count_calls_to_function(&module.entry_points[0].function.body, sq),
+            1
+        );
+    }
+
     #[test]
     fn declines_forwarded_argument_base_and_negative_index() {
         let source = r#"
@@ -1209,10 +985,6 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn inlining_with_local_init_preserves_valid_handles() {
-        // Construct a module where the caller has a local with init: Some(...)
-        // and inline a simple helper into it.  After inlining, the local's init
-        // handle must still be valid in the rebuilt expression arena.
-
         let source = r#"
 fn helper(x: f32) -> f32 {
     return x + 1.0;
@@ -1229,7 +1001,6 @@ fn fs_main() -> @location(0) vec4f {
         let mut module = naga::front::wgsl::parse_str(source).expect("source should parse");
         let ep_fn = &mut module.entry_points[0].function;
 
-        // Manually set init on the local variable to exercise the code path.
         let init_lit = ep_fn.expressions.append(
             naga::Expression::Literal(naga::Literal::F32(0.0)),
             naga::Span::UNDEFINED,
@@ -1242,7 +1013,6 @@ fn fs_main() -> @location(0) vec4f {
             .expect("expected a local variable");
         ep_fn.local_variables[local_handle].init = Some(init_lit);
 
-        // Run inlining pass
         let mut pass = InliningPass::default();
         let config = Config::default();
         let ctx = PassContext {
@@ -1252,19 +1022,16 @@ fn fs_main() -> @location(0) vec4f {
         let changed = pass.run(&mut module, &ctx).expect("inlining should run");
         assert!(changed, "helper should be inlined");
 
-        // After inlining, the local's init handle must be valid.
         let ep_fn = &module.entry_points[0].function;
         let local = &ep_fn.local_variables[local_handle];
         assert!(local.init.is_some(), "local init should still be present");
         let init_handle = local.init.unwrap();
-        // The init handle must be within range of the (rebuilt) expression arena.
         assert!(
             init_handle.index() < ep_fn.expressions.len(),
             "local init handle ({}) should be within rebuilt expression arena (len={})",
             init_handle.index(),
             ep_fn.expressions.len(),
         );
-        // Verify it's still a literal 0.0
         match ep_fn.expressions[init_handle] {
             naga::Expression::Literal(naga::Literal::F32(v)) => {
                 assert!(
@@ -1278,8 +1045,7 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn expansion_budget_rejects_large_multi_site_function() {
-        // A helper with many expression nodes called from 2 sites should be
-        // rejected: node_count=9, call_sites=2, expansion=9*(2-1)=9 > 6.
+        // node_count 9, two sites: expansion 9 > 6.
         let source = r#"
 fn helper(x: f32) -> f32 {
     return x + 1.0 + 2.0 + 3.0 + 4.0;
@@ -1313,8 +1079,7 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn expansion_budget_allows_small_multi_site_function() {
-        // A tiny helper (node_count=3) called from 2 sites should be allowed:
-        // expansion=3*(2-1)=3 <= 6.
+        // node_count 3, two sites: expansion 3 <= 6.
         let source = r#"
 fn helper(x: f32) -> f32 {
     return x + 1.0;
@@ -1348,11 +1113,8 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn inlines_call_in_loop_body_used_in_continuing() {
-        // A call in the loop BODY whose result is consumed in the CONTINUING
-        // block.  naga lets `continuing` reference body-defined expressions,
-        // so the continuing recursion must receive the body's inlining
-        // replacements; otherwise it references an orphaned `CallResult`
-        // (invalid IR), which `run_pass`'s post-pass validation would reject.
+        // naga lets `continuing` reference body-defined expressions; a stale
+        // `CallResult` there fails `run_pass`'s validation.
         let source = r#"
 fn helper(x: i32) -> i32 {
     return x + 1;
@@ -1382,8 +1144,7 @@ fn cs_main() {
 
     #[test]
     fn inlines_call_in_loop_body_used_in_break_if() {
-        // Same hazard via `break_if`, which can also reference body-defined
-        // expressions.
+        // Same hazard via `break_if`.
         let source = r#"
 fn limit(x: i32) -> i32 {
     return x + 5;

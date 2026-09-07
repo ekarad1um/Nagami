@@ -8,10 +8,8 @@ use std::ops::Range;
 /// Rewrite lone `\r` to `\n`; leave `\r\n` intact (`str::lines`
 /// handles it).  Borrows the input when no lone `\r` exists.
 //
-// UTF-8 safety: `0x0D` cannot appear inside a multi-byte sequence
-// (continuation bytes are `0x80..=0xBF`, valid lead bytes `0xC2..=0xF4`),
-// so byte-level `\r` matches always land on character boundaries -
-// the slicing below is guaranteed valid UTF-8.
+// UTF-8 safety: `0x0D` never occurs inside a multi-byte sequence, so
+// byte-level `\r` matches are char boundaries and the slicing is valid.
 pub(crate) fn normalize_line_endings(source: &str) -> Cow<'_, str> {
     let bytes = source.as_bytes();
     let lone_cr_at = |i: usize| bytes[i] == b'\r' && bytes.get(i + 1) != Some(&b'\n');
@@ -35,8 +33,6 @@ pub(crate) fn normalize_line_endings(source: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// `true` when `b` can appear inside a WGSL identifier (ASCII alphanumeric
-/// or underscore).
 fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -54,10 +50,8 @@ fn wgsl_line_break_at(bytes: &[u8], i: usize) -> bool {
     }
 }
 
-/// Replace WGSL line and block comments with spaces while preserving
-/// byte offsets and line breaks, so subsequent lexical scans see only
-/// real code but any positional diagnostics stay accurate.  Borrows
-/// comment-free input.
+/// Blanks comments to spaces, preserving byte offsets and line breaks so
+/// positional diagnostics stay accurate; borrows comment-free input.
 pub(crate) fn strip_wgsl_comments(source: &str) -> Cow<'_, str> {
     if !source.contains("//") && !source.contains("/*") {
         return Cow::Borrowed(source);
@@ -66,7 +60,6 @@ pub(crate) fn strip_wgsl_comments(source: &str) -> Cow<'_, str> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        // Code up to the next `/` is copied whole.
         let slash = bytes[i..]
             .iter()
             .position(|&b| b == b'/')
@@ -77,19 +70,17 @@ pub(crate) fn strip_wgsl_comments(source: &str) -> Cow<'_, str> {
             break;
         }
         if bytes.get(i + 1) == Some(&b'/') {
-            // Line comment.  WGSL ends it at ANY line-break code point
-            // (https://www.w3.org/TR/WGSL/#line-break), not just `\n`: stopping
-            // early would blank a live statement that follows e.g. a lone `\r`
-            // on the same `str::lines` line - the bailout paths ship this text.
+            // WGSL ends a line comment at any line-break code point, not just
+            // `\n`; ending it at `\n` alone would blank a live statement after
+            // a lone `\r`, and the bailout paths ship this text.
             while i < bytes.len() && !wgsl_line_break_at(bytes, i) {
                 out.push(b' ');
                 i += 1;
             }
         } else if bytes.get(i + 1) == Some(&b'*') {
-            // Block comment.  WGSL (https://www.w3.org/TR/WGSL/#comments)
-            // permits nesting; a non-nesting scrub would close at the
-            // inner `*/` and expose outer-comment `f16`/`enable` content
-            // to token scans.  Track depth.
+            // WGSL block comments nest; a non-nesting scrub would close at the
+            // inner `*/` and expose outer-comment `f16`/`enable` text to token
+            // scans.
             out.extend_from_slice(b"  ");
             i += 2;
             let mut depth: u32 = 1;
@@ -125,10 +116,8 @@ pub(crate) fn strip_wgsl_comments(source: &str) -> Cow<'_, str> {
     Cow::Owned(String::from_utf8(out).expect("comment stripping preserves UTF-8"))
 }
 
-/// `true` when an identifier token names a 16-bit-float type: the scalar
-/// `f16`, or a predeclared half-precision vector / matrix alias
-/// (`vec2h`..`vec4h`, `mat2x2h`..`mat4x4h`).  Every one of these requires
-/// `enable f16;` yet only `f16` itself contains the substring "f16".
+/// Every one of these requires `enable f16;` yet only `f16` itself contains
+/// the substring `f16`.
 fn is_f16_type_token(tok: &[u8]) -> bool {
     matches!(
         tok,
@@ -148,16 +137,15 @@ fn is_f16_type_token(tok: &[u8]) -> bool {
     )
 }
 
-/// `true` when `source` uses any construct that requires `enable f16;`:
-/// the `f16` keyword, a predeclared half-precision type alias
-/// (`vec2h`/.../`mat4x4h`), or a numeric literal carrying the `h`
-/// f16 suffix (`1.0h`, `0h`, `1.5e2h`, `0x1p2h`).  Scans the
-/// comment-stripped text token by token so a longer identifier
-/// (`myf16var`, `mesh`) and a comment never trigger a false match.
-///
-/// A spurious positive is harmless: naga tolerates a redundant
-/// `enable f16;`, and the emitter drops the directive from the output
-/// whenever the final module uses no f16 - so detection errs broad.
+/// `true` when `source` needs `enable f16;`: the `f16` keyword, a
+/// half-precision alias (`vec2h`..`mat4x4h`) or an `h`-suffixed literal
+/// (`1.0h`, `0x1p2h`), matched token-wise on comment-stripped text so
+/// `myf16var`, `mesh` and comments never trigger.  A spurious positive is
+/// harmless: naga tolerates a redundant `enable f16;` and the emitter drops
+/// the directive when the final module uses no f16, so detection errs broad.
+/// Production strips comments once and calls the `cleaned_` form; this
+/// wrapper keeps the comment handling under test.
+#[cfg(test)]
 pub(crate) fn references_f16_token(source: &str) -> bool {
     cleaned_references_f16_token(&strip_wgsl_comments(source))
 }
@@ -170,9 +158,6 @@ pub(crate) fn cleaned_references_f16_token(cleaned: &str) -> bool {
     while i < len {
         let b = bytes[i];
         if is_ident_char(b) && !b.is_ascii_digit() {
-            // Identifier / keyword token: letters, digits, `_`, not
-            // leading with a digit.  Match the whole token so a longer
-            // identifier that merely contains `f16`/`...h` is excluded.
             let start = i;
             while i < len && is_ident_char(bytes[i]) {
                 i += 1;
@@ -182,11 +167,9 @@ pub(crate) fn cleaned_references_f16_token(cleaned: &str) -> bool {
             }
         } else if b.is_ascii_digit() || (b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit())
         {
-            // Numeric literal: consume mantissa, hex digits, the
-            // `e`/`E`/`p`/`P` exponent (with its optional sign), and the
-            // trailing type-suffix letters.  A literal whose suffix is
-            // `h` is an f16 value; any letters inside belong to the
-            // literal, so only the final byte can be that suffix.
+            // Whole numeric literal (mantissa, hex digits, signed exponent,
+            // type suffix): letters inside belong to the literal, so only the
+            // final byte can be the `h` suffix.
             let start = i;
             i += 1;
             while i < len {
@@ -212,34 +195,49 @@ pub(crate) fn cleaned_references_f16_token(cleaned: &str) -> bool {
 }
 
 /// [`has_enable_directive`] for `f16`.
+#[cfg(test)]
 pub(crate) fn has_enable_f16_directive(source: &str) -> bool {
     has_enable_directive(source, "f16")
 }
 
-/// `true` when `source` declares `enable <ext>;`, including as one entry of a
-/// comma-separated list (`enable f16, clip_distances;`) and regardless of how
-/// the directives are split across lines.  A false negative is not harmless:
-/// the preamble guard in [`crate::run`] turns it into a hard error on valid input, so
-/// EVERY directive is scanned, not just the first on a line.
+/// `true` when `source` declares `enable <ext>;`, also as one entry of a
+/// comma-separated list and however the directives are split across lines.
+/// A false negative becomes a hard error on valid input at the preamble
+/// guard, so every directive is scanned, not just the first on a line.
+#[cfg(test)]
 fn has_enable_directive(source: &str, ext: &str) -> bool {
     cleaned_has_enable_directive(&strip_wgsl_comments(source), ext)
 }
 
+/// WGSL blankspace: the ASCII set plus NEL / LS / PS / LRM / RLM.  Rust's
+/// `is_ascii_whitespace` omits VT, which WGSL accepts wherever a space goes,
+/// so a keyword boundary tested with it rejects `enable<VT>f16;` that tint
+/// takes.
+pub(crate) fn is_wgsl_blankspace(c: char) -> bool {
+    matches!(c, '\u{20}' | '\u{09}'..='\u{0D}')
+        || matches!(
+            c,
+            '\u{85}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}'
+        )
+}
+
+/// [`is_wgsl_blankspace`] restricted to one byte, for scans that must stay on
+/// a UTF-8 char boundary.
+fn is_ascii_blankspace(b: u8) -> bool {
+    b == b' ' || (0x09..=0x0D).contains(&b)
+}
+
 /// [`has_enable_directive`] over already comment-stripped text.
 pub(crate) fn cleaned_has_enable_directive(cleaned: &str, ext: &str) -> bool {
-    // Each `;`-terminated segment is one directive; a directive lists one or
-    // more comma-separated extensions.  Scanning all segments handles several
-    // directives on one line (`enable a; enable f16;`) - the callers include
-    // arbitrary user-authored preamble text.
+    // One `;`-terminated segment per directive, however many share a line.
     for segment in cleaned.split(';') {
         let Some(list) = segment.trim_start().strip_prefix("enable") else {
             continue;
         };
-        // `enable` must be followed by whitespace to be the keyword, not an
-        // identifier prefix like `enablef16` / `enable_x`.  Line breaks count
-        // (`enable\nf16;` is valid WGSL), matching `split_directives`; omitting
-        // them makes the f16 preamble guard reject a preamble that DOES enable f16.
-        if !list.starts_with([' ', '\t', '\n', '\r']) {
+        // Whitespace after `enable` separates the keyword from identifiers
+        // like `enablef16`; line breaks count (`enable\nf16;` is valid WGSL),
+        // or the f16 preamble guard rejects a preamble that does enable f16.
+        if !list.starts_with(is_wgsl_blankspace) {
             continue;
         }
         if list.split(',').any(|e| e.trim() == ext) {
@@ -266,7 +264,7 @@ pub(crate) fn requires_entry_spans(cleaned: &str, ext: &str) -> Vec<Range<usize>
         let Some(list) = segment.trim_start().strip_prefix("requires") else {
             continue;
         };
-        if !list.starts_with([' ', '\t', '\n', '\r']) {
+        if !list.starts_with(is_wgsl_blankspace) {
             continue;
         }
         // Trimmed bounds of each entry; an empty one is a trailing comma.
@@ -285,8 +283,8 @@ pub(crate) fn requires_entry_spans(cleaned: &str, ext: &str) -> Vec<Range<usize>
             spans.push(keyword..semi + 1);
             continue;
         }
-        // Some entry is not `ext` (else the directive went above), so a last
-        // `ext` entry always has a predecessor.
+        // Some entry is not `ext` (else the whole directive was blanked), so
+        // a last `ext` entry always has a predecessor.
         for (k, entry) in entries.iter().enumerate().filter(|(_, e)| is_ext(e)) {
             spans.push(match entries.get(k + 1) {
                 Some(&(next, _)) => entry.0..next,
@@ -297,29 +295,23 @@ pub(crate) fn requires_entry_spans(cleaned: &str, ext: &str) -> Vec<Range<usize>
     spans
 }
 
-/// Lexically compact WGSL text that never goes through the generator: strip
-/// comments, then collapse every whitespace run, keeping a single space only
-/// where joining would merge tokens.  Used on the bailout paths (input naga
-/// cannot parse or validate) and on the naga-emitter fallback, which
-/// otherwise ship fully un-minified text.
-///
-/// Grammar-agnostic and token-safe by construction, so it needs no parser:
-/// * a space survives between two identifier-ish chars (WGSL identifiers are
-///   XID; approximated by ASCII alphanumeric, `_`, and EVERY non-ASCII char -
-///   XID's exotic members like U+2118 fail `is_alphanumeric`, and the
-///   over-approximation only ever keeps a redundant space), covering
-///   `enable f16`, `else if`, `let x`;
+/// Lexically compact WGSL text that never goes through the generator (the
+/// bailout paths and the naga-emitter fallback): strip comments, then
+/// collapse every whitespace run, keeping a single space only where joining
+/// would merge tokens.  Grammar-agnostic and token-safe without a parser:
+/// * a space survives between two identifier-ish chars (XID approximated by
+///   ASCII alphanumeric, `_` and EVERY non-ASCII char - exotic XID members
+///   like U+2118 fail `is_alphanumeric`, and the over-approximation only
+///   keeps a redundant space), covering `enable f16`, `else if`, `let x`;
 /// * a space survives where maximal munch would fuse two tokens of valid
-///   WGSL into one: `- -x` (`--` is reserved), `+ +` (likewise), `& &x` /
-///   `| |` (would form `&&`/`||`), and `x / *p` (would open a `/*` comment);
-///   `> >` joins deliberately - WGSL's template-list disambiguation reads
-///   nested `>>` correctly;
+///   WGSL into one: `- -x` and `+ +` (`--`/`++` are reserved), `& &x` /
+///   `| |` (`&&`/`||`), and `x / *p` (a `/*` comment); `> >` joins
+///   deliberately, WGSL's template-list disambiguation reads nested `>>`;
 /// * everything else joins.
 ///
 /// Idempotent: re-running splits at exactly the kept spaces and re-keeps
 /// them.  Whole non-whitespace chunks are copied verbatim, so multi-byte
-/// characters pass through untouched (ASCII whitespace never splits a
-/// UTF-8 sequence).
+/// characters pass through untouched.
 pub(crate) fn compact_wgsl_text(source: &str) -> String {
     let stripped = strip_wgsl_comments(source);
     let ident_ish = |c: char| c.is_ascii_alphanumeric() || c == '_' || !c.is_ascii();
@@ -340,9 +332,8 @@ pub(crate) fn compact_wgsl_text(source: &str) -> String {
     out
 }
 
-/// `true` when comment-stripped `cleaned` uses `token` as a whole identifier
-/// token (so a longer identifier like `my_binding_array` never triggers for
-/// `binding_array`).
+/// Whole-token match on comment-stripped text, so `my_binding_array` never
+/// triggers for `binding_array`.
 pub(crate) fn cleaned_references_whole_token(cleaned: &str, token: &str) -> bool {
     let bytes = cleaned.as_bytes();
     let mut i = 0;
@@ -359,18 +350,15 @@ pub(crate) fn cleaned_references_whole_token(cleaned: &str, token: &str) -> bool
     false
 }
 
-/// If `bytes[i..]` begins a `//` line comment or a (nesting-aware) `/* */`
-/// block comment, return the byte index just past it; otherwise `None`.  An
-/// unterminated block comment returns `len`.  Shared by [`split_directives`]'
-/// leading-trivia skip and its `;`-terminator scan so both treat comments
-/// identically - a `;` inside a comment must never terminate a directive.
+/// Index just past the `//` or nesting `/* */` comment starting at `i`
+/// (`len` when unterminated), else `None`.  Shared by the leading-trivia
+/// skip and the `;`-terminator scan so a `;` inside a comment never
+/// terminates a directive.
 fn skip_comment(bytes: &[u8], i: usize, len: usize) -> Option<usize> {
     if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-        // WGSL ends a line comment at ANY line break, not just `\n`; stopping at
-        // `\n` alone would swallow a directive that follows a `\r`/VT-terminated
-        // comment into the "comment", so `split_directives` would misplace it
-        // (matches `strip_wgsl_comments`; a directive lost here ships past a
-        // preamble's declarations - invalid, exit 0).
+        // Any WGSL line break ends the comment, not just `\n`: otherwise a
+        // directive after a `\r`/VT-terminated comment is swallowed and ships
+        // past a preamble's declarations (invalid output, exit 0).
         let mut j = i + 2;
         while j < len && !wgsl_line_break_at(bytes, j) {
             j += 1;
@@ -403,28 +391,20 @@ fn skip_comment(bytes: &[u8], i: usize, len: usize) -> Option<usize> {
 pub(crate) fn split_directives(source: &str) -> (&str, &str) {
     let bytes = source.as_bytes();
     let len = bytes.len();
-    // `boundary` is the committed end of the leading directive region; it
-    // advances only past a fully `;`-terminated directive (plus any trailing
-    // blank lines).  Scanning by `;` rather than by line is what makes this
-    // correct on *compact* generator output, where the whole module is one
-    // physical line (`enable f16;@fragment ...`) - a line-based scan would
-    // misclassify the entire module as one directive and drop the body,
-    // mis-ordering a prepended preamble's directives after declarations.
+    // `boundary` advances only past a fully `;`-terminated directive (plus
+    // trailing blank lines).  Scanning by `;` rather than by line keeps this
+    // correct on compact generator output, where the whole module is one
+    // physical line (`enable f16;@fragment ...`) that a line scan would
+    // classify as one directive, dropping the body.
     let mut boundary = 0usize;
     let mut pos = 0usize;
     loop {
-        // Skip whitespace and `//` / `/* */` comments WITHOUT committing the
-        // boundary, so leading trivia before a NON-directive is not hoisted.
-        // Only ASCII blankspace is skipped (directives are ASCII); a UTF-8
-        // lead byte (>= 0xC2) is never ASCII blankspace, so the byte cursor
-        // can never land inside a multi-byte sequence - `&source[scan..]`
-        // below is always on a char boundary.  VT (0x0B) is WGSL blankspace
-        // but `is_ascii_whitespace` omits it, so a `//` comment ended by a VT
-        // (see `skip_comment`) would otherwise leave the VT unskipped and the
-        // following directive unrecognised.
+        // Trivia is skipped without committing the boundary, so trivia before
+        // a non-directive is not hoisted.  Only ASCII blankspace is skipped
+        // and a UTF-8 lead byte never is, so `scan` stays on a char boundary.
         let mut scan = pos;
         loop {
-            while scan < len && (bytes[scan].is_ascii_whitespace() || bytes[scan] == 0x0B) {
+            while scan < len && is_ascii_blankspace(bytes[scan]) {
                 scan += 1;
             }
             if let Some(next) = skip_comment(bytes, scan, len) {
@@ -434,31 +414,26 @@ pub(crate) fn split_directives(source: &str) -> (&str, &str) {
             break;
         }
         if scan >= len {
-            // Only trivia remains - preserve the old contract of treating a
-            // trivia-only prefix as "all directives" (harmless: no decls).
+            // Trivia-only source counts as all directives (harmless: no decls).
             boundary = len;
             break;
         }
-        // A directive keyword must end on a word boundary so user identifiers
-        // like `requires_foo` / `diagnostic_counter` / `enablef16` are not
-        // hoisted.  `diagnostic` may also be followed immediately by `(`
-        // (the canonical `diagnostic(severity, rule);` form).
+        // A keyword must end on a word boundary so `requires_foo` / `enablef16`
+        // are not hoisted; `diagnostic(` is the canonical form.
         let rest = &source[scan..];
         let is_directive = if let Some(a) = rest.strip_prefix("enable") {
-            a.starts_with([' ', '\t', '\n', '\r'])
+            a.starts_with(is_wgsl_blankspace)
         } else if let Some(a) = rest.strip_prefix("requires") {
-            a.starts_with([' ', '\t', '\n', '\r'])
+            a.starts_with(is_wgsl_blankspace)
         } else if let Some(a) = rest.strip_prefix("diagnostic") {
-            a.starts_with(['(', ' ', '\t', '\n', '\r'])
+            a.starts_with(|c| c == '(' || is_wgsl_blankspace(c))
         } else {
             false
         };
         if !is_directive {
             break;
         }
-        // Consume through the terminating `;`, skipping comments so a `;`
-        // inside a `//` or `/* */` comment between the directive keyword and
-        // its real terminator does not split the directive mid-comment.
+        // Through the terminating `;`; a `;` inside a comment does not count.
         let mut j = scan;
         while j < len && bytes[j] != b';' {
             if let Some(next) = skip_comment(bytes, j, len) {
@@ -472,8 +447,8 @@ pub(crate) fn split_directives(source: &str) -> (&str, &str) {
             boundary = len;
             break;
         }
-        // Swallow one trailing line break plus any following blank lines so
-        // the directive block ends cleanly (mirrors the old line-based form).
+        // One trailing line break plus following blank lines belong to the
+        // directive block.
         let mut k = j + 1;
         while k < len && (bytes[k] == b' ' || bytes[k] == b'\t') {
             k += 1;

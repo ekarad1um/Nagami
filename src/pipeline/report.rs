@@ -1,9 +1,7 @@
-//! Structured diagnostics returned alongside every minification run.
-//!
-//! [`Report`] is the aggregate result; [`PassReport`] is its per-pass
-//! leaf.  Both are plain-data and meant for downstream consumption
-//! (CLI summaries, wasm callers, test assertions) so every field is
-//! public and populated even when tracing is off.
+//! Structured diagnostics returned alongside every minification run:
+//! [`Report`] aggregates per-pass [`PassReport`]s.  Both are plain data
+//! for downstream consumers, so every field is public and populated even
+//! when tracing is off.
 
 /// Diagnostics for a single optimization pass execution.
 #[derive(Debug, Clone)]
@@ -13,8 +11,7 @@ pub struct PassReport {
     /// Emitted WGSL byte size before the pass ran.  `None` when tracing
     /// is off (no text is emitted on the hot path).
     pub before_bytes: Option<usize>,
-    /// Emitted WGSL byte size after the pass ran.  `None` under the
-    /// same condition as [`before_bytes`](PassReport::before_bytes).
+    /// Emitted WGSL byte size after the pass ran; `None` when tracing is off.
     pub after_bytes: Option<usize>,
     /// `true` when the pass modified the module (either declared a
     /// change or produced different output text).
@@ -53,18 +50,14 @@ pub struct Report {
 }
 
 impl Report {
-    /// Initialise a report with `input_bytes` as both the recorded input
-    /// size and the initial output size.  Seeding `output_bytes` with the
-    /// input length gives a sensible value if the pipeline short-circuits
-    /// before emitting anything; the driver then overwrites it with the true
-    /// emitted size.
+    /// Seeds `output_bytes` with `input_bytes` so a pipeline that
+    /// short-circuits before emitting still reports a size; the driver
+    /// overwrites it with the true emitted size.
     ///
-    /// `output_bytes <= input_bytes` is NOT an enforced invariant: in the
-    /// source-to-source [`crate::run`] path `input_bytes` is the raw user
-    /// source length while `output_bytes` is the generator's complete,
-    /// validity-required emission, which can exceed it for an already-minified
-    /// input.  Callers must guard `input_bytes - output_bytes` against
-    /// unsigned underflow (as the CLI's `print_summary` does).
+    /// `output_bytes <= input_bytes` is not an invariant: [`crate::run`]
+    /// records the raw source length while the output is the generator's
+    /// complete emission, which can exceed it for already-minified input,
+    /// so callers must guard `input_bytes - output_bytes` against underflow.
     pub fn new(input_bytes: usize) -> Self {
         Self {
             input_bytes,

@@ -1,26 +1,20 @@
-//! Centralised classifiers and walkers for [`naga::Expression`] and
-//! [`naga::Statement`] shapes, shared by the passes and the generator.
-//! Every helper uses an exhaustive `match` with no `_` arm so a future
-//! naga variant trips the build here, forcing a deliberate
-//! classification decision at the single point of truth rather than
-//! letting consumers drift on private deny-lists.  (One deliberate
-//! holdout: `coalescing` keeps its own hand-rolled exhaustive statement
+//! Classifiers and walkers for [`naga::Expression`] and [`naga::Statement`]
+//! shapes, shared by the passes and the generator.  Every match here is
+//! exhaustive with no `_` arm, so a new naga variant fails the build at this
+//! single point of truth instead of drifting silently through consumers'
+//! private deny-lists.  (`coalescing` keeps its own exhaustive statement
 //! walker.)
+
+use crate::handle_set::{HandleMap, HandleSet};
 
 // MARK: Expression classifiers
 
-/// `true` when `expression` must appear inside an `Emit` range for the
-/// surrounding function to type-check.
-///
-/// Declarative expressions (`Literal`, `Constant`, `FunctionArgument`,
-/// `GlobalVariable`, `LocalVariable`, and so on) and statement-attached
-/// result expressions (`CallResult`, `AtomicResult`,
-/// `WorkGroupUniformLoadResult`, subgroup and ray-query results) are
-/// produced implicitly and need no `Emit`; every other expression does.
+/// Whether `expression` must sit inside an `Emit` range: declarative
+/// references and statement-attached results are produced implicitly, every
+/// computation is not.
 pub fn expression_needs_emit(expression: &naga::Expression) -> bool {
     use naga::Expression as E;
     match expression {
-        // Declarative references.
         E::Literal(_)
         | E::Constant(_)
         | E::Override(_)
@@ -28,16 +22,12 @@ pub fn expression_needs_emit(expression: &naga::Expression) -> bool {
         | E::FunctionArgument(_)
         | E::GlobalVariable(_)
         | E::LocalVariable(_) => false,
-        // Results produced by their originating statement; they come
-        // into existence when the statement runs, so no separate `Emit`
-        // is needed.
         E::CallResult(_)
         | E::AtomicResult { .. }
         | E::WorkGroupUniformLoadResult { .. }
         | E::RayQueryProceedResult
         | E::SubgroupBallotResult
         | E::SubgroupOperationResult { .. } => false,
-        // Computational expressions; all must appear in an `Emit` range.
         E::Access { .. }
         | E::AccessIndex { .. }
         | E::Splat { .. }
@@ -62,48 +52,27 @@ pub fn expression_needs_emit(expression: &naga::Expression) -> bool {
     }
 }
 
-/// `true` when `expression` cannot be cloned into a caller during
-/// function inlining because it refers to per-invocation state that
-/// does not round-trip across function boundaries.
-///
-/// `LocalVariable` names a function-scoped slot.  The remaining disallowed
-/// variants fall into two sub-classes (mirroring
-/// [`crate::passes::const_fold`]'s `is_pure_to_clone`):
-///
-/// * Truly statement-attached results that exist only at their originating
-///   statement and carry no operand handles: `CallResult`, `AtomicResult`,
-///   `WorkGroupUniformLoadResult`, `RayQueryProceedResult`,
-///   `SubgroupBallotResult`, `SubgroupOperationResult`.
-/// * Emit'd computed expressions (they DO take operand handles and need an
-///   `Emit` range) whose value depends on mutable per-invocation state -
-///   a ray-query cursor or cooperative-matrix lane state - and so cannot be
-///   relocated into a caller: `RayQueryVertexPositions`,
-///   `RayQueryGetIntersection`, `CooperativeLoad`, `CooperativeMultiplyAdd`.
-///   These are NOT statement results; keep them disallowed for the
-///   mutable-state reason, not because they are statement-bound.
-///
-/// NOTE: `GlobalVariable` and `FunctionArgument` are explicitly
-/// allowed; globals remap 1-to-1, and arguments are substituted from
-/// the caller's actual argument handles during inlining.
+/// Whether `expression` cannot be cloned into a caller during inlining.
+/// `LocalVariable` names a function-scoped slot; statement-attached results
+/// (`CallResult`, `AtomicResult`, ...) exist only at their statement; and
+/// the ray-query / cooperative-matrix reads, although Emit'd, depend on a
+/// mutable cursor or lane state that does not relocate.  `GlobalVariable`
+/// remaps 1-to-1 and `FunctionArgument` is substituted from the call site,
+/// so both are allowed.
 pub fn is_disallowed_inline_expression(expression: &naga::Expression) -> bool {
     use naga::Expression as E;
     match expression {
-        // Function-local state: cannot be re-rooted in the caller.
         E::LocalVariable(_) => true,
-        // Statement-attached results (exist only at their statement).
         E::CallResult(_)
         | E::AtomicResult { .. }
         | E::WorkGroupUniformLoadResult { .. }
         | E::RayQueryProceedResult
         | E::SubgroupBallotResult
         | E::SubgroupOperationResult { .. }
-        // Emit'd but coupled to mutable cursor / lane state (see doc above).
         | E::RayQueryVertexPositions { .. }
         | E::RayQueryGetIntersection { .. }
         | E::CooperativeLoad { .. }
         | E::CooperativeMultiplyAdd { .. } => true,
-        // Everything else is safe to clone into a caller (subject to the
-        // usual recursive analysis of its children).
         E::Literal(_)
         | E::Constant(_)
         | E::Override(_)
@@ -132,16 +101,10 @@ pub fn is_disallowed_inline_expression(expression: &naga::Expression) -> bool {
 
 // MARK: Handle remapping
 
-/// Read-only counterpart to [`try_map_expression_handles_in_place`]:
-/// invoke `visit` for every child-expression handle of `expression`
-/// in naga's IR-exposure order.  Declarative and result variants
-/// have no children and are skipped.
-///
-/// Exhaustive match - load-bearing for downstream ref-counting
-/// (`const_fold`'s identity gate) and liveness (`dead_param`'s root
-/// collector).  A missed variant would understate counts, letting
-/// the identity gate green-light an unsafe clone or dead-param
-/// elimination drop a live argument.
+/// Invoke `visit` for every child handle of `expression` in naga's IR order.
+/// Reference counting and liveness rely on it being complete: a missed child
+/// understates a count and green-lights an unsafe clone or a live-argument
+/// drop.
 #[inline]
 pub fn visit_expression_children(
     expression: &naga::Expression,
@@ -150,8 +113,8 @@ pub fn visit_expression_children(
     visit_expression_children_dyn(expression, &mut visit)
 }
 
-/// The one compiled body behind [`visit_expression_children`]: a `dyn`
-/// callback keeps this match from being instantiated per call-site closure.
+/// A `dyn` callback keeps this match from being instantiated per call-site
+/// closure.
 fn visit_expression_children_dyn(
     expression: &naga::Expression,
     visit: &mut dyn FnMut(naga::Handle<naga::Expression>),
@@ -294,14 +257,9 @@ fn visit_expression_children_dyn(
     }
 }
 
-/// Remap every child-expression handle inside `expression` through
-/// `remap`.  Returns `None` if `remap` returns `None` for any handle,
-/// leaving `expression` in a partially-remapped state (callers are
-/// expected to abandon the expression on that outcome).
-///
-/// Declarative and result expressions carry no child handles and are
-/// skipped.  Like the classifiers above, this walker is exhaustive so
-/// new naga variants fail the build instead of silently short-circuiting.
+/// Remap every child handle of `expression` through `remap`, or `None` as
+/// soon as `remap` declines, leaving `expression` partially remapped
+/// (callers abandon it).
 pub fn try_map_expression_handles_in_place(
     expression: &mut naga::Expression,
     remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> Option<naga::Handle<naga::Expression>>,
@@ -395,11 +353,6 @@ pub fn try_map_expression_handles_in_place(
         }
         naga::Expression::ImageQuery { image, query } => {
             *image = remap(*image)?;
-            // Exhaustive match over ImageQuery variants so a future
-            // naga release that adds a handle-bearing variant breaks
-            // the build here instead of silently bypassing the
-            // remap walk (matches the contract documented in this
-            // file's module header).
             match query {
                 naga::ImageQuery::Size { level: Some(level) } => {
                     *level = remap(*level)?;
@@ -476,16 +429,8 @@ pub fn try_map_expression_handles_in_place(
     Some(())
 }
 
-/// Remap the optional compare-exchange operand inside an
-/// [`naga::AtomicFunction`].  Every other variant is handle-free.
-///
-/// Written as an EXHAUSTIVE match (no `_` arm) so a future naga release
-/// that adds a handle-bearing `AtomicFunction` variant breaks the build
-/// here instead of silently leaving the new operand un-remapped (a
-/// dangling handle after an arena renumber == miscompile).  This mirrors
-/// the sibling `map_gather_mode_handles` / `map_ray_*_function_handles`
-/// contract.  The read-only [`visit_atomic_function_handles`] shares the
-/// same exhaustiveness so all atomic-handle walkers break together.
+/// Remap the compare-exchange operand, the only handle an
+/// [`naga::AtomicFunction`] carries.
 pub fn map_atomic_function_handles(
     fun: &mut naga::AtomicFunction,
     remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
@@ -507,10 +452,7 @@ pub fn map_atomic_function_handles(
     }
 }
 
-/// Read-only counterpart of [`map_atomic_function_handles`]: visit the
-/// optional compare-exchange operand without mutating it.  Exhaustive for
-/// the same build-breaks-on-drift reason, so every read-only atomic-handle
-/// walk visits exactly the operand the mutable remap would touch.
+/// Read-only [`map_atomic_function_handles`].
 pub fn visit_atomic_function_handles(
     fun: &naga::AtomicFunction,
     visit: &mut dyn FnMut(naga::Handle<naga::Expression>),
@@ -530,8 +472,7 @@ pub fn visit_atomic_function_handles(
     }
 }
 
-/// Remap the per-lane operand carried by subgroup gather modes.
-/// `BroadcastFirst` and `QuadSwap` carry no handle and are skipped.
+/// Remap the per-lane operand of a subgroup gather mode.
 pub fn map_gather_mode_handles(
     mode: &mut naga::GatherMode,
     remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
@@ -549,9 +490,7 @@ pub fn map_gather_mode_handles(
     }
 }
 
-/// Remap every operand handle reachable through an
-/// [`naga::RayQueryFunction`].  Control-only variants
-/// (`ConfirmIntersection`, `Terminate`) are skipped.
+/// Remap every operand handle of a [`naga::RayQueryFunction`].
 pub fn map_ray_query_function_handles(
     fun: &mut naga::RayQueryFunction,
     remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
@@ -574,8 +513,7 @@ pub fn map_ray_query_function_handles(
     }
 }
 
-/// Remap every operand handle reachable through an
-/// [`naga::RayPipelineFunction`] (currently `TraceRay`).
+/// Remap every operand handle of a [`naga::RayPipelineFunction`].
 pub fn map_ray_pipeline_function_handles(
     fun: &mut naga::RayPipelineFunction,
     remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
@@ -593,8 +531,8 @@ pub fn map_ray_pipeline_function_handles(
     }
 }
 
-/// Remap the `pointer` and `stride` operands of a cooperative-matrix
-/// load/store descriptor.
+/// Remap the `pointer` and `stride` operands of a cooperative-matrix load /
+/// store.
 pub fn map_cooperative_data_handles(
     data: &mut naga::CooperativeData,
     remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
@@ -605,23 +543,11 @@ pub fn map_cooperative_data_handles(
 
 // MARK: Statement walkers
 
-/// Remap every expression handle referenced *directly* by `statement`'s
-/// own fields.  Exhaustive match - a future naga variant breaks the build
-/// here.
-///
-/// EXCEPTIONS (both deliberately no-ops): `Block` carries only a nested
-/// block (walked by the caller), and `Emit` carries an expression `Range`
-/// whose member handles are NOT remapped here - callers that renumber the
-/// arena rebuild Emit ranges themselves (`inlining` via
-/// `rebuild_block_expressions`; `cse` / `load_dedup` filter in place
-/// without renumbering).  This is the inverse of
-/// [`visit_statement_expression_handles`], whose `include_emit_handles`
-/// flag *can* iterate the Emit range for read-only liveness walks.
-///
-/// Per-statement only: callers walk nested blocks themselves.
-/// Read-only counterpart is [`visit_statement_expression_handles`]
-/// (the per-statement visitor kept in lockstep with this fn); any new
-/// handle-bearing `Statement` variant must be added to both.
+/// Remap the expression handles in `statement`'s own fields; nested blocks
+/// are the caller's.  `Emit` is deliberately a no-op: its range members are
+/// not remapped, because callers that renumber the arena rebuild Emit ranges
+/// themselves and callers that filter in place never renumber.  Kept in
+/// lockstep with [`visit_statement_expression_handles`].
 pub fn remap_statement_handles(
     statement: &mut naga::Statement,
     remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
@@ -741,7 +667,7 @@ pub fn remap_statement_handles(
 }
 
 /// Every expression handle `block` references, nested blocks included:
-/// statement operands and results, plus each `Emit` range handle when
+/// operands and results, plus each `Emit` range handle when
 /// `include_emit_handles` (semantics on [`visit_statement_operands`]).
 pub fn visit_block_expression_handles(
     block: &naga::Block,
@@ -766,14 +692,12 @@ pub fn visit_statement_expression_handles(
     }
 }
 
-/// The handles `stmt` reads directly: its operands, not the results it
-/// defines nor its nested blocks.  Every "which operands does this statement
-/// carry" question routes here, so a new handle-bearing variant is
-/// classified once.  `include_emit_handles` also visits each `Emit` range
-/// handle: right for liveness (an Emit'd expression is a reachable
-/// let-bound name), wrong for reference counting (Emit is sequencing, not
-/// a use; counting it would give every Emit'd expression a refcount >= 1
-/// and defeat unique-owner gates).
+/// The handles `stmt` reads directly: operands, not the results it defines
+/// or its nested blocks.  `include_emit_handles` also visits each `Emit`
+/// range handle: right for liveness (an Emit'd expression is a reachable
+/// let-bound name), wrong for reference counting (Emit is sequencing, not a
+/// use; counting it gives every emitted expression a count >= 1 and defeats
+/// unique-owner gates).
 pub fn visit_statement_operands(
     stmt: &naga::Statement,
     include_emit_handles: bool,
@@ -782,9 +706,8 @@ pub fn visit_statement_operands(
     visit_statement_fields(stmt, include_emit_handles, false, visit);
 }
 
-/// Exhaustive field walk (no `_` arm) in lockstep with
-/// [`remap_statement_handles`]; `include_results` adds the results a
-/// statement defines, which only whole-function reference counts want.
+/// `include_results` adds the results a statement defines, which only
+/// whole-function reference counts want.
 fn visit_statement_fields(
     stmt: &naga::Statement,
     include_emit_handles: bool,
@@ -945,7 +868,6 @@ fn visit_statement_fields(
             visit(data.pointer);
             visit(data.stride);
         }
-        // Nested blocks are the caller's; terminators / barriers carry nothing.
         naga::Statement::Block(_)
         | naga::Statement::Break
         | naga::Statement::Continue
@@ -955,12 +877,10 @@ fn visit_statement_fields(
     }
 }
 
-/// Pointer operands `stmt` may WRITE through: the `Store` / `Atomic`
-/// pointer, every `Call` argument (a `ptr<function>` parameter lets the
-/// callee write the pointee), `traceRay`'s payload, a cooperative store's
-/// destination, and the ray-query object.  Every "which locals might this
-/// statement mutate" analysis routes here; the no-op variants never write
-/// through a function-local pointer.
+/// Pointer operands `stmt` may WRITE through: `Store` / `Atomic` pointers,
+/// every `Call` argument (a `ptr<function>` parameter lets the callee write
+/// the pointee), `traceRay`'s payload, a cooperative store's destination,
+/// and the ray-query object.
 pub fn visit_statement_write_pointers(
     stmt: &naga::Statement,
     visit: &mut dyn FnMut(naga::Handle<naga::Expression>),
@@ -1000,8 +920,7 @@ pub fn visit_statement_write_pointers(
     }
 }
 
-/// Pre-order, syntactic-order walk of `block` and its nested blocks; the
-/// shared recursion behind every read-only whole-body scan.
+/// Pre-order, syntactic-order walk of `block` and its nested blocks.
 pub fn for_each_statement(block: &naga::Block, f: &mut dyn FnMut(&naga::Statement)) {
     for stmt in block.iter() {
         f(stmt);
@@ -1013,10 +932,10 @@ pub fn for_each_statement(block: &naga::Block, f: &mut dyn FnMut(&naga::Statemen
 
 // MARK: Nested-block traversal
 
-/// Iterator over the blocks nested directly inside one statement, in
-/// syntactic order.  Construct via [`nested_blocks`].
+/// The blocks nested directly inside one statement, in syntactic order;
+/// from [`nested_blocks`].
 pub enum NestedBlocks<'a> {
-    /// Block-free statement: yields nothing.
+    /// Block-free statement.
     None,
     /// Up to two fixed blocks (`Block` yields one; `If` / `Loop` two).
     Pair(Option<&'a naga::Block>, Option<&'a naga::Block>),
@@ -1036,9 +955,9 @@ impl<'a> Iterator for NestedBlocks<'a> {
     }
 }
 
-/// Mutable twin of [`NestedBlocks`].  Construct via [`nested_blocks_mut`].
+/// Mutable [`NestedBlocks`]; from [`nested_blocks_mut`].
 pub enum NestedBlocksMut<'a> {
-    /// Block-free statement: yields nothing.
+    /// Block-free statement.
     None,
     /// Up to two fixed blocks (`Block` yields one; `If` / `Loop` two).
     Pair(Option<&'a mut naga::Block>, Option<&'a mut naga::Block>),
@@ -1059,20 +978,17 @@ impl<'a> Iterator for NestedBlocksMut<'a> {
 }
 
 /// Every block nested directly inside `stmt`, in syntactic order (`If`:
-/// accept then reject; `Switch`: case bodies in declaration order; `Loop`:
-/// body then continuing).  The order is part of the contract: callers with
-/// order-sensitive accumulation (naming, first-appearance ranking) rely
-/// on it matching source order.
+/// accept then reject; `Switch`: cases in declaration order; `Loop`: body
+/// then continuing).  The order is part of the contract: order-sensitive
+/// accumulation (naming, first-appearance ranking) relies on it matching
+/// source order.
 ///
-/// This pair of functions is THE crate-wide answer to "which statement
-/// variants carry blocks": recursive statement walkers delegate their
-/// descent here instead of matching block-carrying variants themselves.
-/// A future naga `Statement` variant then fails the build in this one
-/// match (naga's IR enums are not `#[non_exhaustive]`) rather than being
-/// silently treated as a leaf by dozens of hand-written walkers --
-/// historically this crate's #1 miscompile mechanism.  Walker-local `_`
-/// arms stay safe for RECURSION once the descent is delegated; variants
-/// needing per-walker special treatment still need their own arm.
+/// This match is THE crate-wide answer to which statement variants carry
+/// blocks: recursive walkers delegate their descent here, so a new naga
+/// variant fails the build once instead of being silently treated as a leaf
+/// by hand-written walkers, a miscompile.  A walker-local `_` arm is then
+/// safe for recursion; a variant needing special treatment still needs its
+/// own arm.
 pub fn nested_blocks(stmt: &naga::Statement) -> NestedBlocks<'_> {
     match stmt {
         naga::Statement::Block(inner) => NestedBlocks::Pair(Some(inner), None),
@@ -1105,9 +1021,7 @@ pub fn nested_blocks(stmt: &naga::Statement) -> NestedBlocks<'_> {
     }
 }
 
-/// Mutable [`nested_blocks`]; same order and exhaustiveness contract.
-/// Kept in lockstep -- a variant added to one match must be added to the
-/// other, which the shared block-free arm makes a one-line diff.
+/// Mutable [`nested_blocks`]; same order contract, kept in lockstep.
 pub fn nested_blocks_mut(stmt: &mut naga::Statement) -> NestedBlocksMut<'_> {
     match stmt {
         naga::Statement::Block(inner) => NestedBlocksMut::Pair(Some(inner), None),
@@ -1142,49 +1056,54 @@ pub fn nested_blocks_mut(stmt: &mut naga::Statement) -> NestedBlocksMut<'_> {
 
 // MARK: Emit-range surgery
 
-/// Drop every handle in `removed` from every `Emit` range inside
-/// `block`, rebuilding contiguous sub-ranges around the survivors and
-/// discarding `Emit` statements that become empty.  Walks nested
-/// control flow recursively.
-///
-/// Shared by passes that rewrite expression handles in place (CSE,
-/// constant folding to `Literal`, and so on).  In all cases some
-/// handles must drop out of their old `Emit` range, either because a
-/// canonical replacement took over (CSE) or because the new expression
-/// shape is no longer allowed inside `Emit` (folded literals).  One
-/// implementation here prevents drift between per-pass copies when
-/// new control-flow statements are introduced upstream.
-pub fn rebuild_emit_ranges_after_removal<S: std::hash::BuildHasher>(
+/// Push `surviving` as `Emit` statements, one per contiguous run.  Shared by
+/// every pass that drops handles out of a range, so the run-splitting exists
+/// once.
+pub(crate) fn push_emit_runs(
     block: &mut naga::Block,
-    removed: &std::collections::HashSet<naga::Handle<naga::Expression>, S>,
+    surviving: &[naga::Handle<naga::Expression>],
+    span: naga::Span,
+) {
+    let Some(&first) = surviving.first() else {
+        return;
+    };
+    let mut start = first;
+    let mut end = first;
+    for &h in &surviving[1..] {
+        if h.index() == end.index() + 1 {
+            end = h;
+        } else {
+            block.push(
+                naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
+                span,
+            );
+            start = h;
+            end = h;
+        }
+    }
+    block.push(
+        naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
+        span,
+    );
+}
+
+/// Drop every handle in `removed` from every `Emit` range in `block`
+/// (nested control flow included), rebuilding contiguous sub-ranges around
+/// the survivors and discarding `Emit` statements left empty.  One
+/// implementation for every pass that rewrites handles in place (CSE's
+/// canonical replacements, folded literals), so a new control-flow
+/// statement is handled once.  Crate-private: `HandleSet` is.
+pub(crate) fn rebuild_emit_ranges_after_removal(
+    block: &mut naga::Block,
+    removed: &HandleSet<naga::Expression>,
 ) {
     let original = std::mem::replace(block, naga::Block::new());
     for (mut statement, span) in original.span_into_iter() {
         match &mut statement {
             naga::Statement::Emit(range) => {
+                // An emit that lost every handle disappears.
                 let surviving: Vec<_> = range.clone().filter(|h| !removed.contains(h)).collect();
-                if surviving.is_empty() {
-                    continue; // Drop an emit that lost every handle.
-                }
-                // Rebuild contiguous sub-ranges around survivors.
-                let mut start = surviving[0];
-                let mut end = surviving[0];
-                for &h in &surviving[1..] {
-                    if h.index() == end.index() + 1 {
-                        end = h;
-                    } else {
-                        block.push(
-                            naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
-                            span,
-                        );
-                        start = h;
-                        end = h;
-                    }
-                }
-                block.push(
-                    naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
-                    span,
-                );
+                push_emit_runs(block, &surviving, span);
                 continue;
             }
             _ => {
@@ -1197,42 +1116,116 @@ pub fn rebuild_emit_ranges_after_removal<S: std::hash::BuildHasher>(
     }
 }
 
+// MARK: Literal predicates
+
+pub(crate) fn is_bool_true(
+    arena: &naga::Arena<naga::Expression>,
+    h: naga::Handle<naga::Expression>,
+) -> bool {
+    matches!(
+        arena[h],
+        naga::Expression::Literal(naga::Literal::Bool(true))
+    )
+}
+
+pub(crate) fn is_bool_false(
+    arena: &naga::Arena<naga::Expression>,
+    h: naga::Handle<naga::Expression>,
+) -> bool {
+    matches!(
+        arena[h],
+        naga::Expression::Literal(naga::Literal::Bool(false))
+    )
+}
+
+/// `true` when `h` may carry a `-0.0` that only a const-evaluator sees: a
+/// literal, a splat / compose of one, or a module-scope value this arena
+/// cannot resolve.  WGSL leaves the sign of a zero to the implementation,
+/// and Dawn on Metal exercises that licence one way for a CONSTANT and the
+/// other for a runtime negation, so substituting such a value for a runtime
+/// read (forwarding, inlining) flips the sign the input shipped; the passes
+/// leave those reads in place.  `Constant` / `Override` leaves resolve
+/// through `module.global_expressions`, which the mutating passes do not
+/// hold, and an override has no fixed value at all - both are declined.
+pub fn has_negative_zero_leaf(
+    arena: &naga::Arena<naga::Expression>,
+    h: naga::Handle<naga::Expression>,
+) -> bool {
+    match &arena[h] {
+        naga::Expression::Literal(lit) => match *lit {
+            naga::Literal::F32(v) => v == 0.0 && v.is_sign_negative(),
+            naga::Literal::F64(v) | naga::Literal::AbstractFloat(v) => {
+                v == 0.0 && v.is_sign_negative()
+            }
+            naga::Literal::F16(v) => v.to_bits() == 0x8000,
+            _ => false,
+        },
+        naga::Expression::Constant(_) | naga::Expression::Override(_) => true,
+        naga::Expression::Splat { value, .. } => has_negative_zero_leaf(arena, *value),
+        naga::Expression::Compose { components, .. } => {
+            components.iter().any(|&c| has_negative_zero_leaf(arena, c))
+        }
+        _ => false,
+    }
+}
+
+/// Bitwise literal equality: `-0.0 != 0.0` and NaN equals itself, so a
+/// fold that treats two literals as the same value never merges IEEE
+/// values a shader can tell apart.
+pub fn literal_bit_eq(a: &naga::Literal, b: &naga::Literal) -> bool {
+    use naga::Literal as L;
+    match (a, b) {
+        (L::F64(x), L::F64(y)) | (L::AbstractFloat(x), L::AbstractFloat(y)) => {
+            x.to_bits() == y.to_bits()
+        }
+        (L::F32(x), L::F32(y)) => x.to_bits() == y.to_bits(),
+        (L::F16(x), L::F16(y)) => x.to_bits() == y.to_bits(),
+        _ => a == b,
+    }
+}
+
+/// The value of an integer `Literal` index; a `u64` past `i64::MAX`
+/// saturates, which is out of bounds for any composite.
+pub fn const_index_value(
+    handle: naga::Handle<naga::Expression>,
+    arena: &naga::Arena<naga::Expression>,
+) -> Option<i64> {
+    match arena[handle] {
+        naga::Expression::Literal(naga::Literal::I32(v)) => Some(v as i64),
+        naga::Expression::Literal(naga::Literal::U32(v)) => Some(v as i64),
+        naga::Expression::Literal(naga::Literal::I64(v)) => Some(v),
+        naga::Expression::Literal(naga::Literal::U64(v)) => {
+            Some(i64::try_from(v).unwrap_or(i64::MAX))
+        }
+        naga::Expression::Literal(naga::Literal::AbstractInt(v)) => Some(v),
+        _ => None,
+    }
+}
+
 // MARK: Replacement chain flattening
 
-/// Collapse transitive chains in a replacement map so every key points
-/// directly at its terminal target.
+/// Collapse transitive chains in a replacement map so every key points at
+/// its terminal target.  Passes accumulate `A -> B` entries and can produce
+/// `A -> B -> C` (CSE picks `B` canonical before `C` supplants it;
+/// load_dedup forwards a load to a load that was itself forwarded), and one
+/// [`try_map_expression_handles_in_place`] walk resolves a single level, so
+/// callers MUST flatten before applying the map or dangling references
+/// survive.
 ///
-/// Passes that accumulate `HashMap<H, H>` entries of the form "replace
-/// handle A with handle B" can produce chains like `A -> B -> C` when
-/// `B` was picked as canonical before `C` supplanted it (CSE) or when
-/// a load was store-forwarded to an earlier load that was itself
-/// forwarded elsewhere (`load_dedup`).  A single
-/// [`try_map_expression_handles_in_place`] walk only resolves one
-/// level, so callers MUST flatten before applying the map to the arena,
-/// otherwise dangling references survive.
-///
-/// # Cycles
-///
-/// Every current caller produces an acyclic map by construction.  As a
-/// defence in depth against a future caller that violates that
-/// invariant, the inner walk is bounded by the map size: at most `N`
-/// hops can occur in an acyclic chain over `N` entries, so a longer walk
-/// proves a cycle.  On detection the function debug-asserts and exits
-/// the chain at the entry where the cycle was reached, leaving the rest
-/// of the map untouched - a debug build fails loudly, release builds
-/// degrade to a single-level resolution rather than hanging the
-/// pipeline.
-pub fn flatten_replacement_chains<H, S>(replacements: &mut std::collections::HashMap<H, H, S>)
-where
-    H: Copy + Eq + std::hash::Hash,
-    S: std::hash::BuildHasher,
-{
-    let keys: Vec<H> = replacements.keys().copied().collect();
+/// Every caller builds an acyclic map; as defence in depth the walk is
+/// bounded by the map size (an acyclic chain over `N` entries has at most
+/// `N` hops) and a longer one debug-asserts and stops at that entry, so a
+/// debug build fails loudly and a release build degrades to single-level
+/// resolution instead of hanging.
+pub(crate) fn flatten_replacement_chains(
+    replacements: &mut HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
+) {
+    let keys: Vec<_> = replacements.keys().copied().collect();
     let max_hops = replacements.len();
     for key in keys {
         let mut target = replacements[&key];
         let mut hops = 0usize;
-        while let Some(&next) = replacements.get(&target) {
+        while let Some(&next) = replacements.get(target) {
             if hops >= max_hops {
                 debug_assert!(
                     false,
@@ -1249,28 +1242,204 @@ where
     }
 }
 
+// MARK: Arena rebuild
+
+/// Rebuild `function.expressions` in emission order: only expressions
+/// reachable from the body survive, each appended after its operands and
+/// after everything emitted before it, with the body, the locals' inits,
+/// and the named expressions remapped (names of dropped expressions go
+/// too).  Callers rely on the ORDER as much as on the garbage collection: a
+/// pass that appends a synthesized expression puts it at the END of the
+/// arena, behind consumers that already exist, and a later pass forwarding
+/// it into one of them would create a forward reference naga rejects.
+pub fn rebuild_function_expressions(function: &mut naga::Function) {
+    let old_expressions = std::mem::take(&mut function.expressions);
+    let mut new_expressions = naga::Arena::new();
+    let mut handle_map = HandleMap::default();
+
+    // A declarative init (`var c = BG;`) sits in no `Emit` range, so the
+    // body walk never reaches it; cloned after the body it would land
+    // BEHIND every consumer of the local, and a later store-to-load forward
+    // of the init value would read as a forward reference and be declined.
+    // An emitted init (`var x = OV * 3.0;`) is cloned by the body walk at
+    // its own `Emit`, ahead of the local's loads; cloning it here would
+    // leave the init on an un-emitted duplicate, which a forward then hands
+    // to a statement and naga rejects as out of scope.
+    let mut emitted_inits = Vec::new();
+    for (lh, local) in function.local_variables.iter_mut() {
+        if let Some(init) = &mut local.init {
+            if expression_needs_emit(&old_expressions[*init]) {
+                emitted_inits.push(lh);
+            } else {
+                *init = clone_expression_handle(
+                    *init,
+                    &old_expressions,
+                    &mut new_expressions,
+                    &mut handle_map,
+                );
+            }
+        }
+    }
+
+    rebuild_block_expressions(
+        &mut function.body,
+        &old_expressions,
+        &mut new_expressions,
+        &mut handle_map,
+    );
+
+    for lh in emitted_inits {
+        if let Some(init) = &mut function.local_variables[lh].init {
+            *init = clone_expression_handle(
+                *init,
+                &old_expressions,
+                &mut new_expressions,
+                &mut handle_map,
+            );
+        }
+    }
+
+    let named = std::mem::take(&mut function.named_expressions);
+    function.named_expressions = named
+        .into_iter()
+        .filter_map(|(h, name)| handle_map.get(h).map(|&m| (m, name)))
+        .collect();
+
+    function.expressions = new_expressions;
+}
+
+fn rebuild_block_expressions(
+    block: &mut naga::Block,
+    old_expressions: &naga::Arena<naga::Expression>,
+    new_expressions: &mut naga::Arena<naga::Expression>,
+    handle_map: &mut HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
+) {
+    let original = std::mem::take(block);
+    let mut rebuilt = naga::Block::with_capacity(original.len());
+
+    for (mut statement, span) in original.span_into_iter() {
+        // Cloning a child may append a non-emittable dependency between two
+        // emitted handles, so the range is split around it.
+        if let naga::Statement::Emit(ref range) = statement {
+            let mut mapped_handles = Vec::new();
+            for handle in range.clone() {
+                // A clone from an earlier walk would leave this copy dead
+                // and the map on the wrong one.
+                debug_assert!(!handle_map.contains_key(handle));
+                let mut expression = old_expressions[handle].clone();
+                let _ = try_map_expression_handles_in_place(&mut expression, &mut |child| {
+                    Some(clone_expression_handle(
+                        child,
+                        old_expressions,
+                        new_expressions,
+                        handle_map,
+                    ))
+                });
+                let mapped = new_expressions.append(expression, old_expressions.get_span(handle));
+                handle_map.insert(handle, mapped);
+                mapped_handles.push(mapped);
+            }
+
+            if !mapped_handles.is_empty() {
+                let mut start = mapped_handles[0];
+                let mut end = mapped_handles[0];
+                for &h in &mapped_handles[1..] {
+                    if h.index() == end.index() + 1 {
+                        end = h;
+                    } else {
+                        rebuilt.push(
+                            naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
+                            span,
+                        );
+                        start = h;
+                        end = h;
+                    }
+                }
+                rebuilt.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
+                    span,
+                );
+            }
+            continue;
+        }
+
+        // A loop's `break_if` is emitted inside `body` / `continuing`, so
+        // those are rebuilt first and the `break_if` clone memo-hits the copy
+        // its owning Emit produced; the generic remap would clone it first,
+        // appending an un-emitted duplicate that sits in no Emit range.
+        if matches!(statement, naga::Statement::Loop { .. }) {
+            if let naga::Statement::Loop {
+                body,
+                continuing,
+                break_if,
+            } = &mut statement
+            {
+                rebuild_block_expressions(body, old_expressions, new_expressions, handle_map);
+                rebuild_block_expressions(continuing, old_expressions, new_expressions, handle_map);
+                if let Some(handle) = break_if {
+                    *handle = clone_expression_handle(
+                        *handle,
+                        old_expressions,
+                        new_expressions,
+                        handle_map,
+                    );
+                }
+            }
+            rebuilt.push(statement, span);
+            continue;
+        }
+
+        remap_statement_handles(&mut statement, &mut |h| {
+            clone_expression_handle(h, old_expressions, new_expressions, handle_map)
+        });
+
+        debug_assert!(!matches!(statement, naga::Statement::Loop { .. }));
+        for nested in nested_blocks_mut(&mut statement) {
+            rebuild_block_expressions(nested, old_expressions, new_expressions, handle_map);
+        }
+
+        rebuilt.push(statement, span);
+    }
+
+    *block = rebuilt;
+}
+
+fn clone_expression_handle(
+    handle: naga::Handle<naga::Expression>,
+    old_expressions: &naga::Arena<naga::Expression>,
+    new_expressions: &mut naga::Arena<naga::Expression>,
+    handle_map: &mut HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
+) -> naga::Handle<naga::Expression> {
+    if let Some(mapped) = handle_map.get(handle).copied() {
+        return mapped;
+    }
+
+    let mut expression = old_expressions[handle].clone();
+    let _ = try_map_expression_handles_in_place(&mut expression, &mut |child| {
+        Some(clone_expression_handle(
+            child,
+            old_expressions,
+            new_expressions,
+            handle_map,
+        ))
+    });
+
+    let mapped = new_expressions.append(expression, old_expressions.get_span(handle));
+    handle_map.insert(handle, mapped);
+    mapped
+}
+
 // MARK: naga variant tripwire
 
-/// Compile-time tripwire against silently-skipped naga variants.
-///
-/// The recurring historical miscompile class in this codebase is a naga
-/// upgrade adding a `Statement`/`Expression` variant that existing walkers'
-/// `_ => {}` arms swallow - the new construct becomes invisible to liveness /
-/// effect analysis (e.g. `CooperativeLoad` was invisible to `load_dedup` and
-/// `coalescing` for a whole release).  None of naga's IR enums are
-/// `#[non_exhaustive]`, so a wildcard-free match makes any new variant a
-/// COMPILE ERROR at this single location.
-///
-/// When this function breaks on a naga upgrade:
-/// 1. Add the new variant(s) here to restore the build.
-/// 2. Audit every walker with a wildcard arm for whether the new variant
-///    carries handles / effects / nested blocks it must handle - grep
-///    `src/passes` + `src/generator` for `_ =>` near `Statement`/`Expression`
-///    matches, and review the shared walkers in this file first.
-/// 3. Extend the generator (`stmt_emit`/`expr_emit`/`syntax`) or its
-///    baseline-skip / directive scans if the variant reaches emission.
-///
-/// Never called; exists purely for the exhaustiveness check.
+/// Compile-time tripwire: none of naga's IR enums are `#[non_exhaustive]`,
+/// so a wildcard-free match makes any new variant a build error HERE instead
+/// of a construct that existing walkers' `_ => {}` arms swallow and liveness
+/// / effect analysis never sees (a miscompile).  When it breaks on a naga
+/// upgrade: add the variant here, audit every walker with a wildcard arm
+/// (`_ =>` near `Statement` / `Expression` matches in `src/passes` and
+/// `src/generator`, the shared walkers in this file first) for handles,
+/// effects, or nested blocks it must handle, and extend the generator if the
+/// variant reaches emission.  Never called.
 #[allow(dead_code)]
 fn naga_variant_tripwire(
     statement: &naga::Statement,
@@ -1328,11 +1497,8 @@ fn naga_variant_tripwire(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustc_hash::FxHashMap;
 
-    /// Build a minimal arena and return a real `Handle<Expression>`
-    /// usable as a placeholder inside variants whose body fields the
-    /// classifiers never inspect.
+    /// A real handle for variants whose fields the classifiers never inspect.
     fn dummy_handles() -> (
         naga::Arena<naga::Expression>,
         naga::Handle<naga::Expression>,
@@ -1358,7 +1524,6 @@ mod tests {
 
     fn dummy_const_handle() -> naga::Handle<naga::Constant> {
         let mut a = naga::Arena::<naga::Constant>::new();
-        // Reuse a placeholder type handle; the classifier never dereferences it.
         let ty = dummy_type_handle();
         a.append(
             naga::Constant {
@@ -1446,9 +1611,6 @@ mod tests {
 
     #[test]
     fn disallowed_inline_declarative_false() {
-        // `FunctionArgument` and `GlobalVariable` are explicitly allowed
-        // because they map 1-to-1 into the caller's context during
-        // inlining; only per-invocation state is forbidden.
         assert!(!is_disallowed_inline_expression(
             &naga::Expression::Literal(naga::Literal::I32(0))
         ));
@@ -1485,70 +1647,59 @@ mod tests {
         }));
     }
 
+    /// `n` expression handles, so replacement maps in tests use real keys.
+    fn expr_handles(n: usize) -> Vec<naga::Handle<naga::Expression>> {
+        let mut arena = naga::Arena::new();
+        (0..n)
+            .map(|i| {
+                arena.append(
+                    naga::Expression::Literal(naga::Literal::U32(i as u32)),
+                    naga::Span::UNDEFINED,
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn flatten_replacement_chains_collapses_transitive_edges() {
-        let mut m: FxHashMap<u32, u32> = FxHashMap::default();
-        // Build the chain `1 -> 2 -> 3 -> 4` and a standalone edge `5 -> 6`.
-        m.insert(1, 2);
-        m.insert(2, 3);
-        m.insert(3, 4);
-        m.insert(5, 6);
+        let h = expr_handles(7);
+        let mut m = HandleMap::default();
+        m.insert(h[1], h[2]);
+        m.insert(h[2], h[3]);
+        m.insert(h[3], h[4]);
+        m.insert(h[5], h[6]);
         flatten_replacement_chains(&mut m);
-        assert_eq!(m[&1], 4);
-        assert_eq!(m[&2], 4);
-        assert_eq!(m[&3], 4);
-        assert_eq!(m[&5], 6);
+        assert_eq!(m[h[1]], h[4]);
+        assert_eq!(m[h[2]], h[4]);
+        assert_eq!(m[h[3]], h[4]);
+        assert_eq!(m[h[5]], h[6]);
     }
 
     #[test]
     fn flatten_replacement_chains_is_noop_on_direct_edges() {
-        let mut m: FxHashMap<u32, u32> = FxHashMap::default();
-        m.insert(1, 10);
-        m.insert(2, 20);
+        let h = expr_handles(4);
+        let mut m = HandleMap::default();
+        m.insert(h[0], h[2]);
+        m.insert(h[1], h[3]);
         flatten_replacement_chains(&mut m);
-        assert_eq!(m[&1], 10);
-        assert_eq!(m[&2], 20);
+        assert_eq!(m[h[0]], h[2]);
+        assert_eq!(m[h[1]], h[3]);
     }
 
+    /// Every caller builds an acyclic map; a cyclic one must still
+    /// terminate (debug builds may assert, release builds return).
     #[test]
     fn flatten_replacement_chains_terminates_on_cycles() {
-        // Defensive guard: every current caller produces an acyclic
-        // map by construction, but if a future caller violates that
-        // invariant the pipeline must not hang.  In debug builds the
-        // bounded walk also debug-asserts; we use the release branch
-        // semantics here so the test passes in both profiles.
-        //
-        // The map below encodes the cycle `1 -> 2 -> 1`.  Without the
-        // bound the inner `while let Some(&next) = ...` would loop
-        // forever; with it, the function returns in at most `len`
-        // iterations per key and leaves the map in a consistent state.
-        let mut m: FxHashMap<u32, u32> = FxHashMap::default();
-        m.insert(1, 2);
-        m.insert(2, 1);
-
-        // Release builds skip the debug_assert; in debug builds the
-        // assert triggers a panic.  Both outcomes are acceptable, but
-        // the function must NOT hang.  Catch any debug panic so the
-        // test passes in both profiles.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            flatten_replacement_chains(&mut m);
-        }));
-        let _ = result;
-    }
-
-    #[test]
-    fn flatten_replacement_chains_terminates_on_three_node_cycle() {
-        // Same defence in depth as the two-node cycle above, but with
-        // `1 -> 2 -> 3 -> 1` so the hop count must reach 3 before the
-        // guard kicks in.
-        let mut m: FxHashMap<u32, u32> = FxHashMap::default();
-        m.insert(1, 2);
-        m.insert(2, 3);
-        m.insert(3, 1);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            flatten_replacement_chains(&mut m);
-        }));
-        let _ = result;
+        for cycle in [2usize, 3] {
+            let h = expr_handles(cycle);
+            let mut m = HandleMap::default();
+            for i in 0..cycle {
+                m.insert(h[i], h[(i + 1) % cycle]);
+            }
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                flatten_replacement_chains(&mut m);
+            }));
+        }
     }
 
     /// A block holding `n` `Break` statements, so nested-block iteration
@@ -1632,5 +1783,70 @@ mod tests {
         }
         let lens: Vec<usize> = nested_blocks(&stmt).map(|b| b.len()).collect();
         assert_eq!(lens, [2, 1]);
+    }
+
+    #[test]
+    fn rebuild_keeps_one_copy_of_an_emitted_initializer() {
+        // `x`'s init is emitted by the body, `c`'s is a declarative reference
+        // no `Emit` covers: `x` must keep the emitted copy (an un-emitted
+        // second one is what a later init forward hands to statements naga
+        // rejects) and `c`'s must precede the local's loads so that forward
+        // is not declined.
+        let src = r#"
+const BG: f32 = 2.0;
+override OV: f32 = 3.0;
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+@compute @workgroup_size(1) fn main() {
+    var x = OV * 3.0;
+    var c = BG;
+    out[0] = x + c;
+}
+"#;
+        let mut module = naga::front::wgsl::parse_str(src).expect("source should parse");
+        rebuild_function_expressions(&mut module.entry_points[0].function);
+        let function = &module.entry_points[0].function;
+        let products = function
+            .expressions
+            .iter()
+            .filter(|(_, e)| {
+                matches!(
+                    e,
+                    naga::Expression::Binary {
+                        op: naga::BinaryOperator::Multiply,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(products, 1, "an emitted init is cloned once");
+        let init_of = |name: &str| {
+            function
+                .local_variables
+                .iter()
+                .find(|(_, l)| l.name.as_deref() == Some(name))
+                .and_then(|(_, l)| l.init)
+                .expect("local keeps its init")
+        };
+        let x_init = init_of("x");
+        let emitted = function.body.iter().any(
+            |s| matches!(s, naga::Statement::Emit(range) if range.clone().any(|h| h == x_init)),
+        );
+        assert!(emitted, "the init is the copy an `Emit` covers");
+        let first_load = function
+            .expressions
+            .iter()
+            .find(|(_, e)| matches!(e, naga::Expression::Load { .. }))
+            .map(|(h, _)| h)
+            .expect("the body loads its locals");
+        assert!(
+            init_of("c").index() < first_load.index(),
+            "a declarative init precedes the loads"
+        );
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("module stays valid after the rebuild");
     }
 }

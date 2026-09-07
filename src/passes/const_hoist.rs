@@ -1,30 +1,24 @@
-//! Repeated-vector-constant hoisting.
+//! Repeated-vector-constant hoisting: an all-literal vector constant built
+//! at many sites (`vec4f(0, 2, 0, 0)` six times) becomes one shared module
+//! `const`, so the rename pass can give the now-frequent constant a short
+//! name by its usual frequency model.
 //!
-//! A WGSL shader that constructs the same all-literal vector constant in many
-//! places (`vec4f(0, 2, 0, 0)` appearing six times, etc.) pays the full
-//! constructor text at every site.  This pass finds such constants, creates one
-//! shared module `const`, and rewrites each occurrence to a reference to it, so
-//! the later [`crate::passes::rename`] pass can give the (now frequent) constant
-//! a short name by the same frequency model it uses for everything else.
+//! Done in the IR rather than as a post-rename text substitution so the
+//! result is idempotent: the constant takes part in renaming exactly as it
+//! would on any re-minification.  Safe by construction: the relocated
+//! `Compose` is bit-identical, so sharing it changes no value (per-pass
+//! re-validation only rejects malformed IR, not wrong values).
 //!
-//! Doing this in the IR - rather than as a post-rename text substitution -
-//! is what makes it IDEMPOTENT: the constant participates in renaming on the
-//! first pass exactly as it would on any re-minification, so re-minifying the
-//! output reproduces the same names.  It is also SAFE by construction: the
-//! relocated `Compose` is bit-identical, so sharing it changes no value; the
-//! per-pass re-validation is only a structural backstop (it rejects malformed
-//! IR, not wrong values).
-//!
-//! Scope is deliberately narrow: only `Compose` expressions that are a full
-//! vector built entirely from plain `Literal` components are hoisted (no
-//! nesting, no `Splat`, no non-literal operands), and only when the estimated
-//! byte saving is positive at a conservative 2-character bound name.  Global
-//! expressions are never scanned (the hoisted constant's own initializer lives
-//! there) so the pass reaches a fixed point after one application.
+//! Scope is deliberately narrow: only full vectors built entirely from
+//! plain `Literal` components (no nesting, no `Splat`), and only when the
+//! estimated saving is positive at a conservative 2-character bound name.
+//! Global expressions are never scanned (the hoisted initializer lives
+//! there), so the pass reaches a fixed point after one application.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::error::Error;
+use crate::handle_set::{HandleMap, HandleSet};
 use crate::pipeline::{Pass, PassContext};
 
 /// A hashable, value-exact key for one literal (floats keyed by bit pattern so
@@ -49,13 +43,12 @@ fn lit_key(l: naga::Literal) -> LitKey {
     }
 }
 
-/// Rough minified length of a literal's bare token.  It slightly
-/// OVER-estimates the float forms (the emitter may render `.5` for `0.5`),
-/// and since the savings model scales the per-use term by `count` while the
-/// declaration pays once, an over-estimate biases toward MORE hoists - a
-/// marginal hoist can grow output by the (small, float-form-bounded) delta.
-/// Pass-local by design: it prices un-rendered IR, unlike the rendered-text
-/// pricing sites inventoried in `crate::generator::cost`.
+/// Rough minified length of a literal's bare token.  Over-estimates the
+/// float forms (the emitter may render `.5` for `0.5`); since the per-use
+/// term scales by `count` while the declaration pays once, that biases
+/// toward more hoists, and a marginal hoist can grow output by the small
+/// float-form-bounded delta.  Prices un-rendered IR, unlike the
+/// rendered-text pricing in `crate::generator::cost`.
 fn est_lit_len(l: naga::Literal) -> usize {
     use naga::Literal as L;
     let s = match l {
@@ -77,18 +70,14 @@ fn est_lit_len(l: naga::Literal) -> usize {
     s.len().max(1)
 }
 
-/// Identifies where a hoistable `Compose` lives so the rewrite phase can reach
-/// it after the immutable collection phase.
 #[derive(Clone, Copy)]
 enum FuncRef {
     Function(naga::Handle<naga::Function>),
     EntryPoint(usize),
 }
 
-/// One hoistable vector `Compose`: where it lives (`loc`), its expression
-/// handle (Phase 4 overwrites that slot in place and records its Emit-range
-/// removal), its vector type, and its component literals - which form both the
-/// grouping key and the hoisted initializer.
+/// One hoistable vector `Compose`; the rewrite overwrites `handle`'s slot in
+/// place, and `lits` is both the grouping key and the hoisted initializer.
 struct Candidate {
     loc: FuncRef,
     handle: naga::Handle<naga::Expression>,
@@ -96,19 +85,14 @@ struct Candidate {
     lits: Vec<naga::Literal>,
 }
 
-/// If `expr` is a full-width vector `Compose` worth hoisting - every component a
-/// plain `Literal`, a standard concrete element type, and NOT a splat - return
-/// the literal values; else `None`.
-///
-/// Restrictions, each closing a measured corpus regression:
-/// - element type limited to `f32` / `i32` / `u32` (the standard WGSL vector
-///   scalars).  A `vec4<f64>` is valid only inside naga's internal expression
-///   space; emitting it as a standalone `const`/alias is tint-rejected
-///   ("unresolved type 'f64'").  `f16` / 64-bit / bool are excluded
-///   conservatively (their decls/suffixes break the simple cost model).
-/// - splat composes (all lanes equal) are excluded: they emit in the short
-///   `vecNf(x)` splat form, which the generic-length cost model over-prices, so
-///   hoisting a `vec2i(1)` used twice would GROW the output.
+/// The literal lanes of a full-width vector `Compose` worth hoisting.
+/// Restrictions, each closing a measured corpus regression: element type
+/// limited to `f32` / `i32` / `u32` (a standalone `const` of `vec4<f64>` is
+/// tint-rejected, "unresolved type 'f64'"; `f16` / 64-bit / bool
+/// declarations and suffixes break the simple cost model); splats (all
+/// lanes equal) excluded, since their short `vecNf(x)` form is over-priced
+/// by the generic-length model and hoisting a `vec2i(1)` used twice would
+/// grow the output.
 fn full_literal_vector(
     expr: &naga::Expression,
     types: &naga::UniqueArena<naga::Type>,
@@ -135,21 +119,17 @@ fn full_literal_vector(
             _ => return None,
         }
     }
-    // Exclude splats (all lanes equal by bit pattern).
     if lits[1..].iter().all(|&l| lit_key(l) == lit_key(lits[0])) {
         return None;
     }
     Some((*ty, lits))
 }
 
-/// Collect every expression handle that appears in an `Emit` range anywhere in
-/// `block` (recursing into nested control flow).  A vector `Compose` is live -
-/// and so worth hoisting - exactly when it is emitted, i.e. present in some
-/// Emit range; composes left dead in the arena (e.g. the initializer of a
-/// DCE'd `var` in an empty function) are NOT, and hoisting them would emit a
-/// `const` no statement references, growing the output.  Each handle is emitted
-/// at most once, so a plain `Vec` collects the live set without deduplication
-/// and lets the caller scan only those handles rather than the whole arena.
+/// Every handle in an `Emit` range under `block`: a `Compose` is live, and
+/// worth hoisting, exactly when emitted; composes left dead in the arena
+/// (the initializer of a DCE'd `var`) would hoist a `const` no statement
+/// references, growing the output.  Each handle is emitted at most once, so
+/// a plain `Vec` needs no deduplication.
 fn collect_emitted(block: &naga::Block, out: &mut Vec<naga::Handle<naga::Expression>>) {
     super::expr_util::for_each_statement(block, &mut |stmt| {
         if let naga::Statement::Emit(range) = stmt {
@@ -158,8 +138,7 @@ fn collect_emitted(block: &naga::Block, out: &mut Vec<naga::Handle<naga::Express
     });
 }
 
-/// Pass entry point; the algorithm and its scope limits are the
-/// module-level docs.
+/// Hoists repeated all-literal vector constants into shared module constants.
 pub struct ConstHoistPass;
 
 impl Pass for ConstHoistPass {
@@ -168,8 +147,6 @@ impl Pass for ConstHoistPass {
     }
 
     fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
-        // Phase 1: collect every hoistable vector-literal Compose in every
-        // function and entry-point body (global expressions are skipped).
         let mut candidates: Vec<Candidate> = Vec::new();
         let collect = |loc: FuncRef,
                        func: &naga::Function,
@@ -205,32 +182,26 @@ impl Pass for ConstHoistPass {
             return Ok(false);
         }
 
-        // Phase 2: group by (type, literal bits) and keep the profitable groups.
-        // Profit is modelled at a conservative 2-char bound name: a hoist that
-        // is not clearly worthwhile is left inline (the rename pass may give the
-        // constant a 1-char name, so this only ever UNDER-hoists - never grows).
-        // Key = (vector type index, per-lane literal bits).
+        // Profit at a conservative 2-char bound name: rename may hand out a
+        // 1-char name, so this only ever under-hoists.
         type GroupKey = (usize, Vec<LitKey>);
-        let mut groups: FxHashMap<GroupKey, Vec<usize>> = FxHashMap::default();
+        let mut groups: FxHashMap<GroupKey, Vec<usize>> = Default::default();
         for (idx, c) in candidates.iter().enumerate() {
             let key = (c.ty.index(), c.lits.iter().map(|&l| lit_key(l)).collect());
             groups.entry(key).or_default().push(idx);
         }
 
-        // Deterministic order: sort group keys so const creation (and thus the
-        // names rename later assigns) does not depend on HashMap iteration order.
+        // Sorted so const creation, hence the names rename assigns, does not
+        // depend on hash order.
         let mut group_list: Vec<(GroupKey, Vec<usize>)> = groups.into_iter().collect();
         group_list.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // Names the placeholder must avoid.  The load-bearing case is a
-        // preserve-listed (preamble) name: rename keeps such a name verbatim, and
-        // if it matches a preamble symbol the generator suppresses the hoisted
-        // declaration as preamble-owned, silently rebinding every use to the
-        // preamble's (different) value.  The raw `_hoist{constants.len()}` scheme
-        // can hit this because preamble consts count in `constants.len()`.  The
-        // remaining module-level names are belt-and-suspenders (rename mangles a
-        // non-preserved placeholder to a fresh unique name anyway).  Seed the
-        // avoid-set once and record each minted name so repeated hoists differ.
+        // The placeholder must avoid preserve-listed (preamble) names: rename
+        // keeps those verbatim, and a match makes the generator suppress the
+        // hoisted declaration as preamble-owned, silently rebinding every use
+        // to the preamble's value; preamble consts count in `constants.len()`,
+        // so the raw `_hoist{n}` scheme can hit one.  Other module names are
+        // belt-and-suspenders (rename mangles any non-preserved placeholder).
         let mut reserved_names: std::collections::HashSet<String> =
             ctx.config.preserve_symbols.iter().cloned().collect();
         reserved_names.extend(
@@ -243,25 +214,21 @@ impl Pass for ConstHoistPass {
         let mut changed = false;
         // Per-function set of handles converted Compose -> Constant, so their
         // Emit ranges can be rebuilt afterwards (a `Constant` is not emittable).
-        type ExprSet = FxHashSet<naga::Handle<naga::Expression>>;
-        let mut hoisted_fn: FxHashMap<naga::Handle<naga::Function>, ExprSet> = FxHashMap::default();
-        let mut hoisted_ep: FxHashMap<usize, ExprSet> = FxHashMap::default();
+        type ExprSet = HandleSet<naga::Expression>;
+        let mut hoisted_fn: HandleMap<naga::Function, ExprSet> = Default::default();
+        let mut hoisted_ep: FxHashMap<usize, ExprSet> = Default::default();
 
         for (_key, members) in group_list {
             let count = members.len();
-            // Require >=3 IR occurrences: a group of exactly 2 can be cut to a
-            // single emitted use by downstream CSE / copy-prop, leaving the
-            // hoisted `const` referenced once - pure overhead that grows the
-            // output.
+            // A group of exactly 2 can be cut to one emitted use by downstream
+            // CSE / copy-prop, leaving a `const` referenced once: pure overhead.
             if count < 3 {
                 continue;
             }
             let rep = &candidates[members[0]];
-            // Estimated inline length: aliased type name (~2) + parens + literal
-            // tokens + separators.  vecN constructors that would collapse to a
-            // splat / zero form are already excluded upstream by
-            // `full_literal_vector`'s all-same-value guard, so `rep.lits` is a
-            // genuine multi-value vector priced by its full token list.
+            // Inline length: aliased type name (~2) + parens + literal tokens +
+            // separators; splat / zero forms are excluded upstream, so the full
+            // token list is the right price.
             let lit_len: usize = rep.lits.iter().map(|&l| est_lit_len(l)).sum();
             let inline_len = 2 + 2 + lit_len + rep.lits.len().saturating_sub(1);
             // savings = count*(inline - name) - (decl boilerplate + name + decl body)
@@ -271,10 +238,8 @@ impl Pass for ConstHoistPass {
                 continue;
             }
 
-            // Phase 3: materialise the shared constant.  Re-create the literal
-            // components and the Compose in `global_expressions` (const-exprs
-            // must live there), then a named `Constant` over them.  `name` is a
-            // throwaway placeholder; the rename pass replaces it.
+            // Const-exprs must live in `global_expressions`; the name is a
+            // placeholder rename replaces.
             let ty = rep.ty;
             let comp_handles: Vec<naga::Handle<naga::Expression>> = rep
                 .lits
@@ -292,9 +257,8 @@ impl Pass for ConstHoistPass {
                 },
                 naga::Span::UNDEFINED,
             );
-            // Mint a collision-free placeholder: start at the arena length and
-            // walk forward until the name is fresh in `reserved_names` (which
-            // also records it, keeping later hoists in this loop distinct).
+            // `reserved_names` records each minted name, keeping later hoists
+            // distinct.
             let mut suffix = module.constants.len();
             let hoist_name = loop {
                 let cand = format!("_hoist{}", suffix);
@@ -312,9 +276,8 @@ impl Pass for ConstHoistPass {
                 naga::Span::UNDEFINED,
             );
 
-            // Phase 4: rewrite every occurrence's Compose to reference the const.
-            // The orphaned literal components in each function arena become dead
-            // and are removed by the later compaction/DCE pass.
+            // The orphaned literal components become dead for the next
+            // compaction.
             for &m in &members {
                 let cand = &candidates[m];
                 let expr_slot = match cand.loc {
@@ -332,10 +295,8 @@ impl Pass for ConstHoistPass {
             changed = true;
         }
 
-        // A `Constant` is not emittable, so every converted handle must be
-        // dropped from its `Emit` range (the expression itself stays in the
-        // arena at the same index, preserving topological order; only the Emit
-        // bookkeeping changes).
+        // The expression keeps its arena slot (topological order preserved);
+        // only the Emit bookkeeping changes.
         for (fh, removed) in &hoisted_fn {
             crate::passes::expr_util::rebuild_emit_ranges_after_removal(
                 &mut module.functions[*fh].body,

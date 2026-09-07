@@ -1,25 +1,15 @@
-//! Dead-parameter elimination.  Strips function arguments that are
-//! never read inside the callee and updates every call site to drop
-//! the corresponding argument expression.  Entry points are skipped
-//! because their signatures are part of the pipeline contract.
-//!
-//! The pass runs in three phases per sweep:
-//!
-//! 1. Identify unused parameters via expression liveness analysis.
-//! 2. Remove the arguments from the function signatures and rewrite
-//!    stray `FunctionArgument` references (live or dead) so the IR
-//!    stays well-typed.
-//! 3. Drop the corresponding argument expressions at every call site
-//!    across both functions and entry points.
+//! Dead-parameter elimination: arguments never read inside the callee are
+//! stripped from the signature and from every call site.  Entry points are
+//! skipped because their signatures are part of the pipeline contract.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::Error;
+use crate::handle_set::{HandleMap, HandleSet};
 use crate::pipeline::{Pass, PassContext};
 
-/// Remove unused parameters from ordinary functions and their call
-/// sites.  Entry points and preserve-listed functions are left untouched
-/// (both export a fixed signature).
+/// Removes unused parameters from ordinary functions and their call sites;
+/// entry points and preserve-listed functions export a fixed signature.
 #[derive(Debug, Default)]
 pub struct DeadParamPass;
 
@@ -29,11 +19,9 @@ impl Pass for DeadParamPass {
     }
 
     fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
-        // Phase 1: identify every unused parameter.  A parameter is
-        // unused when its `FunctionArgument` expression handle is not
-        // transitively reachable from any statement root.
-        let mut removals: FxHashMap<naga::Handle<naga::Function>, Vec<usize>> =
-            FxHashMap::default();
+        // Unused: the `FunctionArgument` handle is unreachable from every
+        // statement root.
+        let mut removals: HandleMap<naga::Function, Vec<usize>> = Default::default();
 
         for (fh, func) in module.functions.iter() {
             if func.arguments.is_empty() {
@@ -41,10 +29,8 @@ impl Pass for DeadParamPass {
             }
 
             // A preserved function's signature is an external contract:
-            // `--preserve-symbol` callers and stripped-then-re-prepended
-            // `--preamble` definitions (auto-added to `preserve_symbols`)
-            // pass the ORIGINAL arity, so stripping a parameter here would
-            // fail re-validation or silently break those unseen callers.
+            // `--preserve-symbol` callers and re-prepended `--preamble`
+            // definitions pass the original arity.
             if func
                 .name
                 .as_deref()
@@ -55,13 +41,12 @@ impl Pass for DeadParamPass {
 
             let live = compute_live_expr_set(func);
 
-            // One-pass collection so the unused-arg filter is O(1)
-            // per parameter instead of O(arena) per parameter.
+            // One arena pass, so the filter is O(1) per parameter.
             let mut live_arg_indices: FxHashSet<u32> =
                 FxHashSet::with_capacity_and_hasher(func.arguments.len(), Default::default());
             for (h, e) in func.expressions.iter() {
                 if let naga::Expression::FunctionArgument(idx) = e
-                    && live.contains(&h)
+                    && live.contains(h)
                 {
                     live_arg_indices.insert(*idx);
                 }
@@ -69,10 +54,7 @@ impl Pass for DeadParamPass {
 
             let unused: Vec<usize> = (0..func.arguments.len())
                 .filter(|&i| {
-                    // Non-constructible types would survive the
-                    // arg -> ZeroValue rewrite below as invalid IR
-                    // (`ZeroValue` is rejected for opaque/resource
-                    // types).  Keep them.
+                    // No valid `ZeroValue` to rewrite the dead uses to.
                     if is_non_constructible_type(func.arguments[i].ty, &module.types) {
                         return false;
                     }
@@ -89,16 +71,10 @@ impl Pass for DeadParamPass {
             return Ok(false);
         }
 
-        // Phase 2: rewrite the callee signatures and patch any
-        // surviving `FunctionArgument` expressions so dead indices
-        // collapse to `ZeroValue` and live indices shift to close the
-        // gap.
         for (&fh, indices) in &removals {
             let func = &mut module.functions[fh];
 
-            // Snapshot types keyed by original index so the expression
-            // rewrite below can resolve a removed slot's type after
-            // `func.arguments` has shrunk.
+            // Removed slots' types, needed after `func.arguments` has shrunk.
             let removed_types: FxHashMap<usize, naga::Handle<naga::Type>> =
                 indices.iter().map(|&i| (i, func.arguments[i].ty)).collect();
 
@@ -107,11 +83,9 @@ impl Pass for DeadParamPass {
                 func.arguments.remove(idx);
             }
 
-            // Expression arena fixup: dead args become `ZeroValue`
-            // (typed, validator-acceptable); live args shift down by
-            // the count of removed slots below them.  `indices` is
-            // small (typically <= 5 dead args), so linear `contains`
-            // beats hash-set allocation overhead.
+            // Dead args become a typed `ZeroValue`, live args shift down past
+            // removed slots; `indices` is tiny, so linear `contains` beats a
+            // hash set.
             for (_, expr) in func.expressions.iter_mut() {
                 if let naga::Expression::FunctionArgument(arg_idx) = expr {
                     let old = *arg_idx as usize;
@@ -125,8 +99,6 @@ impl Pass for DeadParamPass {
             }
         }
 
-        // Phase 3: drop the corresponding actual arguments at every
-        // call site across regular functions and entry points.
         for (_, func) in module.functions.iter_mut() {
             remove_call_args_in_block(&mut func.body, &removals)?;
         }
@@ -140,13 +112,10 @@ impl Pass for DeadParamPass {
 
 // MARK: Call-site surgery
 
-/// Walk `block` recursively, dropping argument expressions from every
-/// `Call` targeting a function whose parameters were stripped in
-/// phase 1.  Indices are consumed in reverse order so earlier
-/// positions stay valid across removals.
+/// Indices are consumed in reverse so earlier positions stay valid.
 fn remove_call_args_in_block(
     block: &mut naga::Block,
-    removals: &FxHashMap<naga::Handle<naga::Function>, Vec<usize>>,
+    removals: &HandleMap<naga::Function, Vec<usize>>,
 ) -> Result<(), Error> {
     for stmt in block.iter_mut() {
         if let naga::Statement::Call {
@@ -157,10 +126,9 @@ fn remove_call_args_in_block(
             && let Some(indices) = removals.get(function)
         {
             for &idx in indices.iter().rev() {
-                // Surface caller/callee arity drift as a
-                // structured error attributed to dead_param,
-                // not as a downstream validation crash under
-                // some sibling pass's name.
+                // Arity drift surfaces as an error attributed to this pass,
+                // not a downstream validation failure under another pass's
+                // name.
                 if idx >= arguments.len() {
                     return Err(Error::Validation(format!(
                         "dead_param: removal index {idx} out of bounds for call \
@@ -180,25 +148,19 @@ fn remove_call_args_in_block(
 
 // MARK: Liveness analysis
 
-/// Return the set of expression handles transitively reachable from
-/// any statement root.  A parameter whose `FunctionArgument` handle
-/// is absent from this set has no live read and is eligible for
-/// removal.
-fn compute_live_expr_set(func: &naga::Function) -> FxHashSet<naga::Handle<naga::Expression>> {
-    let mut live = FxHashSet::default();
+/// Expression handles transitively reachable from any statement root.
+fn compute_live_expr_set(func: &naga::Function) -> HandleSet<naga::Expression> {
+    let mut live = HandleSet::default();
     let mut worklist: Vec<naga::Handle<naga::Expression>> = Vec::new();
 
-    // Seed the worklist with every handle reached directly from a
-    // statement.
     collect_stmt_expr_roots(&func.body, &mut worklist);
 
-    // Standard worklist traversal through expression dependencies.
     while let Some(handle) = worklist.pop() {
         if !live.insert(handle) {
             continue;
         }
         super::expr_util::visit_expression_children(&func.expressions[handle], |child| {
-            if !live.contains(&child) {
+            if !live.contains(child) {
                 worklist.push(child);
             }
         });
@@ -207,12 +169,10 @@ fn compute_live_expr_set(func: &naga::Function) -> FxHashSet<naga::Handle<naga::
     live
 }
 
-/// Collect the roots of the liveness graph: every expression handle
-/// a statement directly references, including Emit'd handles (those
-/// are let-bound names reachable from elsewhere in the function).
-/// A missed statement variant would under-track liveness and let the
-/// pass remove a live parameter - the shared walker's exhaustive
-/// match defends against that.
+/// Every handle a statement directly references, Emit'd ones included
+/// (let-bound names reachable from elsewhere); a missed statement variant
+/// would under-track liveness and remove a live parameter, which the shared
+/// walker's exhaustive match defends against.
 fn collect_stmt_expr_roots(block: &naga::Block, roots: &mut Vec<naga::Handle<naga::Expression>>) {
     super::expr_util::visit_block_expression_handles(
         block,
@@ -223,21 +183,15 @@ fn collect_stmt_expr_roots(block: &naga::Block, roots: &mut Vec<naga::Handle<nag
 
 // MARK: Constructibility gating
 
-/// `true` when the type at `ty_handle` has no valid `ZeroValue`, and
-/// therefore must not be removed by this pass.
-///
-/// The rewrite turns each removed `FunctionArgument(ty)` into
-/// `ZeroValue(ty)` to keep surviving uses well-typed, and the validator
-/// rejects `ZeroValue` of any type lacking the `CONSTRUCTIBLE` flag.  We
-/// defer to naga's own [`TypeInner::is_constructible`], which exactly mirrors
-/// that flag: it rejects the opaque leaves (pointers, samplers, images,
-/// atomics, acceleration structures, binding arrays) AND, crucially,
-/// recurses into aggregates - so an override- or runtime-sized array
-/// (`ArraySize::Pending` / `Dynamic`), or a struct containing one, is
-/// correctly rejected.  Such arrays carry the `ARGUMENT` flag (naga accepts
-/// them as parameters) but NOT `CONSTRUCTIBLE`, so a hand-rolled flat
-/// deny-list that treats every `Array` as constructible would emit an
-/// invalid `ZeroValue` and force a whole-pass rollback.
+/// Dead uses are rewritten to `ZeroValue(ty)`, which the validator rejects
+/// for any type without the `CONSTRUCTIBLE` flag.  naga's own
+/// `is_constructible` mirrors that flag exactly: it rejects the opaque
+/// leaves (pointers, samplers, images, atomics, acceleration structures,
+/// binding arrays) and recurses into aggregates, so an override- or
+/// runtime-sized array, or a struct containing one, is rejected too - such
+/// arrays carry `ARGUMENT` but not `CONSTRUCTIBLE`, and a flat deny-list
+/// treating every `Array` as constructible would force a whole-pass
+/// rollback.
 fn is_non_constructible_type(
     ty_handle: naga::Handle<naga::Type>,
     types: &naga::UniqueArena<naga::Type>,
@@ -324,7 +278,6 @@ fn helper(a: f32, b: f32) -> f32 {
 
     #[test]
     fn preserves_entry_point_params() {
-        // Entry points cannot have params removed.
         let src = r#"
 @fragment fn fs(@location(0) unused: f32) -> @location(0) vec4f {
     return vec4f(1.0);
@@ -368,9 +321,8 @@ fn helper() -> f32 {
 
     #[test]
     fn removes_first_param_remaps_second() {
-        // Removing the first param must shift `FunctionArgument(1)`
-        // down to `FunctionArgument(0)`; a validation failure below
-        // signals the remap went wrong.
+        // A wrong `FunctionArgument(1)` -> `FunctionArgument(0)` shift fails
+        // validation.
         let src = r#"
 fn helper(unused: f32, used: f32) -> f32 {
     return used;
@@ -383,17 +335,10 @@ fn helper(unused: f32, used: f32) -> f32 {
         assert!(changed);
         let func = &module.functions.iter().next().unwrap().1;
         assert_eq!(func.arguments.len(), 1);
-        // Verify the function still returns the correct (remapped) param.
-        // Validation passing confirms the remapping is correct.
     }
 
-    // Regression: non-constructible-typed parameters must be left
-    // alone.  Substituting `ZeroValue(ty)` for them fails naga
-    // validation and would break the module.
     #[test]
     fn preserves_unused_sampler_param() {
-        // An unused sampler parameter must not be removed: a ZeroValue of
-        // `sampler` is not constructible.
         let src = r#"
 @group(0) @binding(0) var s: sampler;
 fn helper(unused: sampler, v: f32) -> f32 {
@@ -404,7 +349,6 @@ fn helper(unused: sampler, v: f32) -> f32 {
 }
 "#;
         let (_changed, module) = run_pass(src);
-        // The helper function must retain both params (no sampler removal).
         let func = &module.functions.iter().next().unwrap().1;
         assert_eq!(
             func.arguments.len(),
@@ -435,7 +379,6 @@ fn helper(unused: texture_2d<f32>, v: f32) -> f32 {
 
     #[test]
     fn preserves_unused_pointer_param() {
-        // Pre-existing pointer case (was already covered by the old guard).
         let src = r#"
 fn helper(unused: ptr<function, f32>, v: f32) -> f32 {
     return v;
@@ -456,11 +399,7 @@ fn helper(unused: ptr<function, f32>, v: f32) -> f32 {
 
     #[test]
     fn preserves_unused_override_sized_array_param() {
-        // An override-sized array (`ArraySize::Pending`) carries naga's
-        // ARGUMENT flag (accepted as a parameter) but NOT CONSTRUCTIBLE, so
-        // `ZeroValue` of it is invalid.  The pass must KEEP such a dead param
-        // rather than rewrite its refs to an invalid `ZeroValue` (which
-        // `run_pass`'s post-pass validation would reject).
+        // `ArraySize::Pending` carries `ARGUMENT` but not `CONSTRUCTIBLE`.
         let src = r#"
 override N: u32 = 4u;
 var<workgroup> wg: array<f32, N>;

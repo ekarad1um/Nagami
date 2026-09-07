@@ -1,24 +1,12 @@
-//! Short-identifier generator used by the rename and mangling passes.
-//!
-//! Produces compact, unique names via bijective numeration while
-//! avoiding every WGSL keyword, reserved word, predeclared type, and
-//! built-in function.  The source-of-truth tables live in this module;
-//! the binary-search lookup and const-sort are the performance-critical
-//! machinery that keeps [`next_name`] cheap in the inner rename loop.
+//! Short-identifier generator for the rename and mangling passes: bijective
+//! numeration over a const-sorted table of every WGSL keyword, reserved
+//! word, predeclared type and built-in function.
 
 use std::collections::HashSet;
 
-/// Length of [`RESERVED_SORTED`], equal to the sum of both source tables.
-///
-/// Exposed as a named constant so the fixed-size array binding and the
-/// merge loop below share a single length expression.  The actual table
-/// is built and sorted at compile time; see [`RESERVED_SORTED`] for the
-/// design rationale.
 const RESERVED_SORTED_LEN: usize = WGSL_RESERVED.len() + WGSL_PREDECLARED.len();
 
-/// `&str` lexicographic less-than usable in a `const` context.
-/// `<str as Ord>` is not yet const-callable, so we open-code a byte-wise
-/// comparison that short-circuits on the first differing byte.
+/// `<str as Ord>` is not const-callable.
 const fn const_str_lt(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
@@ -33,28 +21,14 @@ const fn const_str_lt(a: &str, b: &str) -> bool {
     a.len() < b.len()
 }
 
-/// Merged and sorted reserved-word table, built entirely in const-eval
-/// so [`is_reserved`] reduces to a pure `slice::binary_search` with no
-/// runtime initialisation cost.
-///
-/// Design choices:
-///
-/// - **Binary search over `HashSet`** - the hot caller [`next_name`]
-///   probes 1-3 character identifiers; hashing such tiny strings still
-///   pays the `SipHash` setup, whereas binary search short-circuits on the
-///   first byte and resolves in ~9 compares for `N < 400`.  The sorted
-///   contiguous `[&'static str; N]` also lives in `.rodata`.
-/// - **No `LazyLock`** - both source arrays are `const`, so const-eval
-///   performs the merge and sort during `rustc` compilation.  The result
-///   skips atomic loads, first-call init branches, and heap allocation.
-///
-/// The `WGSL_RESERVED` and `WGSL_PREDECLARED` source arrays stay in
-/// human-curated, categorised order for review-friendliness; the
-/// sort/uniqueness invariant of the merged table is enforced at compile time
-/// by the `const _` assertion below and additionally exercised at runtime by
-/// `reserved_table_is_sorted_and_unique`.
+/// Both source tables merged and sorted in const-eval, so [`is_reserved`]
+/// is a `binary_search` over a `.rodata` array with no runtime init.
+/// Binary search beats a `HashSet` here: the hot caller probes 1-3
+/// character identifiers, where SipHash setup dwarfs the ~9 compares that
+/// short-circuit on the first byte.  The source arrays stay in curated,
+/// categorised order; the sorted, duplicate-free invariant is enforced at
+/// compile time by the `const _` assertion.
 const RESERVED_SORTED: [&str; RESERVED_SORTED_LEN] = {
-    // Concatenate both source slices into a fixed-size array.
     let mut arr: [&str; RESERVED_SORTED_LEN] = [""; RESERVED_SORTED_LEN];
     let mut i = 0;
     while i < WGSL_RESERVED.len() {
@@ -66,11 +40,8 @@ const RESERVED_SORTED: [&str; RESERVED_SORTED_LEN] = {
         arr[WGSL_RESERVED.len() + j] = WGSL_PREDECLARED[j];
         j += 1;
     }
-    // Const-eval-friendly insertion sort.  N < 400 so worst-case
-    // ~125k byte-compares at compile time is negligible for `rustc` and
-    // amortised exactly once across the whole binary.  Stable ordering
-    // is irrelevant here because duplicates are forbidden and locked by
-    // `reserved_table_is_sorted_and_unique`.
+    // Insertion sort: N < 400, so ~125k byte-compares at compile time is
+    // negligible.
     let mut k = 1;
     while k < RESERVED_SORTED_LEN {
         let mut m = k;
@@ -85,13 +56,9 @@ const RESERVED_SORTED: [&str; RESERVED_SORTED_LEN] = {
     arr
 };
 
-/// Compile-time guard for [`RESERVED_SORTED`]'s binary-search precondition:
-/// every adjacent pair must be strictly ascending, which simultaneously
-/// proves the table is sorted AND duplicate-free.  A violation (a mis-ordered
-/// or duplicate entry added to either source array) fails the build here
-/// instead of silently degrading `binary_search` at run time.  This is
-/// strictly stronger than the test [`reserved_table_is_sorted_and_unique`]
-/// and costs nothing at run time.
+/// Strictly ascending adjacent pairs prove sorted and duplicate-free; a
+/// duplicate in either source array fails the build instead of degrading
+/// `binary_search`.
 const _: () = {
     let mut i = 1;
     while i < RESERVED_SORTED_LEN {
@@ -118,9 +85,7 @@ const NEXT_LETTERS: [char; 63] = [
 
 // MARK: Reserved and predeclared tables
 
-/// WGSL keywords and reserved words that must never be used as identifiers.
-///
-/// Source: <https://www.w3.org/TR/WGSL/#keyword-summary> and
+/// <https://www.w3.org/TR/WGSL/#keyword-summary> and
 /// <https://www.w3.org/TR/WGSL/#reserved-words>.
 const WGSL_RESERVED: &[&str] = &[
     // Keywords
@@ -302,10 +267,8 @@ const WGSL_RESERVED: &[&str] = &[
     "yield",
 ];
 
-/// WGSL predeclared type names and built-in function names that generated
-/// identifiers must never collide with to avoid shadowing visible scopes.
-///
-/// Source: <https://www.w3.org/TR/WGSL/#predeclared-types> and
+/// Predeclared types and built-in functions a generated identifier must not
+/// shadow: <https://www.w3.org/TR/WGSL/#predeclared-types> and
 /// <https://www.w3.org/TR/WGSL/#builtin-functions>.
 const WGSL_PREDECLARED: &[&str] = &[
     // Scalar types
@@ -568,10 +531,8 @@ const WGSL_PREDECLARED: &[&str] = &[
 
 // MARK: Module name census
 
-/// Every named module-scope declaration the rename pass owns: constants,
-/// overrides, globals, functions, and entry points.  Types and struct
-/// members are the generator's namespace; see [`type_names`] and
-/// [`struct_member_names`].
+/// Every named module-scope declaration the rename pass owns; types and
+/// struct members are the generator's namespace.
 pub(crate) fn module_scope_names(module: &naga::Module) -> impl Iterator<Item = &str> {
     module
         .constants
@@ -628,11 +589,8 @@ pub(crate) fn function_local_names(func: &naga::Function) -> impl Iterator<Item 
 
 // MARK: Name generation
 
-/// Encode `counter` as a short identifier via bijective numeration.
-/// The first character is drawn from 52 letters (A-Z and a-z interleaved)
-/// and each subsequent character from 63 symbols (letters, digits, and
-/// underscore).  The encoding is a bijection, so distinct counters always
-/// produce distinct strings without collisions.
+/// Bijective numeration (first char from 52 letters, later chars from 63
+/// symbols), so distinct counters give distinct names.
 fn name_from_counter(counter: usize) -> String {
     let mut id = counter;
     let mut name = String::from(FIRST_LETTERS[id % FIRST_LETTERS.len()]);
@@ -645,19 +603,12 @@ fn name_from_counter(counter: usize) -> String {
     name
 }
 
-/// Return `true` when `name` appears in [`RESERVED_SORTED`].  Binary
-/// search is safe because the table's ascending, duplicate-free ordering
-/// is built and then enforced at compile time by the `const _` assertion
-/// next to [`RESERVED_SORTED`] (and additionally exercised by the test
-/// `reserved_table_is_sorted_and_unique`).
 fn is_reserved(name: &str) -> bool {
     RESERVED_SORTED.binary_search(&name).is_ok()
 }
 
-/// Advance `counter` and return the next non-reserved short identifier.
-/// Counter values that encode a WGSL reserved or predeclared name are
-/// skipped; the returned string is guaranteed safe to use as an
-/// unqualified WGSL identifier.
+/// Advance `counter` to the next identifier that is neither a WGSL
+/// reserved nor a predeclared name.
 pub fn next_name(counter: &mut usize) -> String {
     loop {
         let name = name_from_counter(*counter);
@@ -668,9 +619,7 @@ pub fn next_name(counter: &mut usize) -> String {
     }
 }
 
-/// Like [`next_name`] but additionally skips any name present in `used`.
-/// The chosen name is NOT inserted into `used`; the caller decides
-/// whether to claim it (see [`next_name_insert`] for the claim variant).
+/// [`next_name`] skipping `used` as well; the result is not inserted.
 pub fn next_name_unique(counter: &mut usize, used: &HashSet<String>) -> String {
     loop {
         let name = next_name(counter);
@@ -680,9 +629,7 @@ pub fn next_name_unique(counter: &mut usize, used: &HashSet<String>) -> String {
     }
 }
 
-/// Like [`next_name_unique`] but atomically inserts the chosen name into
-/// `used` before returning, so back-to-back callers never pick the same
-/// identifier.
+/// [`next_name_unique`] that also claims the name in `used`.
 pub fn next_name_insert(counter: &mut usize, used: &mut HashSet<String>) -> String {
     loop {
         let name = next_name(counter);
@@ -763,11 +710,7 @@ mod tests {
         }
     }
 
-    /// Regression guard: atomic, subgroup, quad, ray-query, and
-    /// texture-barrier builtins must all be reserved so short-name
-    /// generation cannot collide with them.  Every pass that treats
-    /// [`is_reserved`] as the sole "cannot shadow" oracle relies on
-    /// this coverage staying complete.
+    /// Every pass treats [`is_reserved`] as the sole cannot-shadow oracle.
     #[test]
     fn extended_builtin_names_are_reserved() {
         for name in &[
@@ -849,9 +792,7 @@ mod tests {
         }
     }
 
-    /// Guard against accidental duplicates in [`WGSL_PREDECLARED`].
-    /// The list is hand-maintained, and duplicates typically signal a
-    /// copy-paste mistake that may mask a real omission elsewhere.
+    /// A duplicate in the hand-maintained list usually masks an omission.
     #[test]
     fn predeclared_list_has_no_duplicates() {
         let mut seen = HashSet::new();
@@ -863,7 +804,6 @@ mod tests {
         }
     }
 
-    /// Sibling of `predeclared_list_has_no_duplicates` for [`WGSL_RESERVED`].
     #[test]
     fn reserved_list_has_no_duplicates() {
         let mut seen = HashSet::new();
@@ -875,10 +815,8 @@ mod tests {
         }
     }
 
-    /// [`is_reserved`] relies on [`RESERVED_SORTED`] being strictly
-    /// ascending and duplicate-free.  The sort runs in const-eval, but
-    /// we re-verify at runtime so any future tweak to the const-sort
-    /// that breaks ordering or introduces a duplicate fails fast here.
+    /// Checks the const sort against `str`'s own `Ord`, which the `const _`
+    /// assertion (built on `const_str_lt`) cannot.
     #[test]
     fn reserved_table_is_sorted_and_unique() {
         let table: &[&str] = &RESERVED_SORTED;
@@ -897,11 +835,6 @@ mod tests {
         }
     }
 
-    /// Equivalence check spanning both source lists: every entry must
-    /// resolve as reserved, and a handful of obvious non-reserved
-    /// identifiers (including the first generated names) must not.
-    /// Locks the behavioural contract for future refactors of the
-    /// merged lookup table.
     #[test]
     fn is_reserved_matches_source_lists() {
         for &name in WGSL_RESERVED.iter().chain(WGSL_PREDECLARED.iter()) {

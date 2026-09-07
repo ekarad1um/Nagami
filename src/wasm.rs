@@ -1,9 +1,7 @@
 //! `wasm-bindgen` binding: decodes a JS config object into [`Config`], runs
-//! [`crate::run`], and returns the parsed [`crate::json`] document.  The TS
-//! wire types live in `TS_TYPES` at the bottom.
-//!
-//! Gated on wasm32 as well as the `wasm` feature: the wasm-bindgen ABI is a
-//! linker error on native.
+//! [`crate::run`], and returns the parsed [`crate::json`] document; the TS
+//! wire types live in `TS_TYPES`.  Gated on wasm32 as well as the `wasm`
+//! feature because the wasm-bindgen ABI is a linker error on native.
 #![cfg(target_arch = "wasm32")]
 
 use wasm_bindgen::prelude::*;
@@ -267,8 +265,7 @@ pub fn run(source: &str, config: JsValue) -> Result<JsValue, JsValue> {
     let config = parse_config(config)?;
     let output = crate::run(source, &config).map_err(|e| JsError::new(&e.to_string()))?;
 
-    // The CLI prints this string and the binding parses it, so the TS
-    // interfaces cannot drift from `--format json`.
+    // Shared with the CLI's `--format json`, so the TS interfaces cannot drift.
     js_sys::JSON::parse(&crate::json::render_output(&output))
 }
 

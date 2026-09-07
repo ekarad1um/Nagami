@@ -1,10 +1,6 @@
-//! Tests for the emitter's type-annotation elision paths.
-//!
-//! WGSL infers most declaration types from the initialiser, so the
-//! generator can drop `: T` annotations on `const`, `var`, function
-//! returns, and storage-access modes whenever the inferred type
-//! matches the declared one.  Each MARK section below locks in one
-//! elision flavour.
+//! Annotation elision: `: T` on `const`/`var` when the initializer pins the
+//! type, the default storage access mode, default `@interpolate`, and the
+//! trailing void `return`.
 
 use super::helpers::*;
 
@@ -13,7 +9,6 @@ use super::helpers::*;
 #[test]
 fn const_elides_type_for_compose_init() {
     let out = compact("const C: vec3<f32> = vec3<f32>(1.0, 2.0, 3.0);");
-    // Type annotation must be gone; bare literals inside Compose.
     assert!(out.contains("const C=vec3f(1,2,3)"), "got: {out}");
     assert!(
         !out.contains("const C:"),
@@ -23,17 +18,14 @@ fn const_elides_type_for_compose_init() {
 
 #[test]
 fn const_keeps_type_for_abstract_literal_init() {
-    // AbstractFloat literal - cannot elide because text has no suffix.
-    // naga parses `0.5` in const init as AbstractFloat.
+    // `0.5` in a const init is AbstractFloat; whether naga concretizes it or
+    // the `:f32` stays, the output must validate.
     let out = compact("const C: f32 = 0.5;");
-    // The generator must keep `:f32` since the literal is abstract.
-    // (naga may or may not concretize this; either way the output must be valid)
     assert_valid_wgsl(&out);
 }
 
 #[test]
 fn const_zero_value_elides_type() {
-    // const with ZeroValue init should elide type annotation.
     let out = compact(
         r#"
             const ZERO: f32 = 0.0;
@@ -42,7 +34,6 @@ fn const_zero_value_elides_type() {
             }
         "#,
     );
-    // Should NOT have "const ZERO:f32=0" - type is elided
     assert!(
         !out.contains("ZERO:f32") && !out.contains("ZERO: f32"),
         "const with zero value should elide type: {out}"
@@ -54,7 +45,6 @@ fn const_zero_value_elides_type() {
 #[test]
 fn var_elides_type_with_concrete_literal_init() {
     let out = compact("fn f() { var x: f32 = 1.0; _ = x; }");
-    // var should use typed suffix and elide `:f32`.
     assert!(
         out.contains("var x=1f;") || out.contains("var x=1.f;"),
         "got: {out}"
@@ -68,8 +58,6 @@ fn var_elides_type_with_concrete_literal_init() {
 #[test]
 fn var_defers_declaration_to_first_store() {
     let out = compact("fn f() { var x: f32; x = 1.0; _ = x; }");
-    // Deferred var should merge declaration with the first store and
-    // use a typed suffix so that the type annotation can be elided.
     assert!(
         out.contains("var x=1f;") || out.contains("var x=1.f;"),
         "got: {out}"
@@ -86,10 +74,7 @@ fn var_keeps_type_when_first_use_in_nested_block() {
         "fn f(c: bool) -> f32 { var x: f32; if c { x = 1.0; } else { x = 2.0; } return x; }",
     );
     assert_valid_wgsl(&out);
-    // var first used inside the if-block cannot be deferred into a branch
-    // (it would fall out of scope before `return x`), so it keeps a
-    // standalone declaration.  The zero-init now renders as the shorter
-    // `=0f` form; the branch stores must stay plain assignments.
+    // Deferring into a branch would scope `x` out before `return x`.
     assert!(
         out.contains("var x=0f;") || out.contains("var x:f32;"),
         "should keep a standalone declaration: {out}"
@@ -102,10 +87,7 @@ fn var_keeps_type_when_first_use_in_nested_block() {
 
 #[test]
 fn var_elides_type_with_zero_value_init() {
-    // var x: f32 = f32() (zero value) should elide the type annotation.
     let out = compact("fn f() -> f32 { var x: f32 = f32(); return x; }");
-    // f32() provides explicit type, so `:f32` annotation can be elided.
-    // Output should have `var x=0f` or similar - no `:f32`.
     assert_valid_wgsl(&out);
 }
 
@@ -113,8 +95,6 @@ fn var_elides_type_with_zero_value_init() {
 
 #[test]
 fn default_interpolate_elided_on_fragment_input() {
-    // @interpolate(perspective,center) is the WGSL default for float
-    // location bindings and must be omitted to save bytes.
     let src = r#"
         @fragment fn main(@location(0) uv: vec2f) -> @location(0) vec4f {
             return vec4f(uv, 0.0, 1.0);
@@ -192,7 +172,6 @@ fn non_default_interpolate_preserved_flat() {
 
 #[test]
 fn non_default_sampling_preserved_centroid() {
-    // perspective + centroid is NOT the default (center is), so must keep.
     let src = r#"
         struct VSOut {
             @builtin(position) pos: vec4f,
@@ -224,7 +203,6 @@ fn storage_read_access_mode_elided() {
         }
     "#;
     let out = compact(src);
-    // Should emit var<storage> not var<storage,read>.
     assert!(
         out.contains("var<storage>"),
         "read-only storage should elide access mode: {out}"
@@ -263,7 +241,6 @@ fn trailing_void_return_elided() {
         }
     "#;
     let out = compact(src);
-    // Should NOT end the function body with "return;".
     assert!(
         !out.contains("return;"),
         "trailing void return should be elided: {out}"
@@ -288,7 +265,6 @@ fn non_void_return_preserved() {
 
 #[test]
 fn mid_function_return_preserved_in_void() {
-    // A void function with an early return inside an `if` must keep it.
     let src = r#"
         @group(0) @binding(0) var<storage, read_write> buf: array<f32>;
         @compute @workgroup_size(1) fn cs(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -299,7 +275,6 @@ fn mid_function_return_preserved_in_void() {
         }
     "#;
     let out = compact(src);
-    // The early return inside the if must be preserved.
     assert!(
         out.contains("return;"),
         "early return inside if must be preserved: {out}"
@@ -311,7 +286,6 @@ fn mid_function_return_preserved_in_void() {
 
 #[test]
 fn global_splat_elides_const_type_annotation() {
-    // Splat RHS has explicit type, so const type annotation can be elided.
     let src = r#"
         const a: vec3<f32> = vec3f(1.0);
         @fragment fn main() -> @location(0) vec4f {
@@ -319,7 +293,6 @@ fn global_splat_elides_const_type_annotation() {
         }
     "#;
     let out = compact(src);
-    // Should NOT have `:vec3<f32>` type annotation after `a`.
     assert!(
         !out.contains("a:vec3") && !out.contains("a: vec3"),
         "const with Splat RHS should elide type annotation: {out}"
@@ -331,9 +304,8 @@ fn global_splat_elides_const_type_annotation() {
 
 #[test]
 fn for_counter_and_scalar_use_literal_zero_init_end_to_end() {
-    // Full pipeline strips zero inits, so the for-counter reaches the
-    // bare-declaration path.  An un-aliased i32 must render the cheaper
-    // `= 0i` instead of `: i32`, and the update clause must use `++`.
+    // The full pipeline strips zero inits, so the counter reaches the
+    // bare-declaration path.
     let out = compact_with_passes(
         r#"
         @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
@@ -361,9 +333,8 @@ fn for_counter_and_scalar_use_literal_zero_init_end_to_end() {
 
 #[test]
 fn deferred_zero_accumulator_uses_type_form_end_to_end() {
-    // A deferred var whose first store writes the zero value drops the
-    // store and relies on zero-init: `var acc = vec3f(0)` -> `var acc: vec3f`
-    // (the annotation is shorter than the explicit zero construct).
+    // A first store of the zero value is dropped in favour of zero-init, and
+    // `: vec3f` beats `= vec3f(0)`.
     let out = compact_with_passes(
         r#"
         @group(0) @binding(0) var<storage, read_write> buf: array<f32>;

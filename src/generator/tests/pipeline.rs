@@ -1,8 +1,6 @@
-//! End-to-end IR-pass integration tests.  Each case runs the full
-//! `parse -> validate -> IR passes -> generate` chain through
-//! [`super::helpers::compact_with_passes`] and asserts on properties
-//! of the emitted WGSL that would regress if a pass's invariants
-//! drifted out of sync with the emitter.
+//! End-to-end IR-pass integration: each case runs the full pipeline through
+//! [`super::helpers::compact_with_passes`] and pins emitted-text properties
+//! that regress when a pass's invariants drift from the emitter.
 
 use super::helpers::*;
 
@@ -10,8 +8,6 @@ use super::helpers::*;
 
 #[test]
 fn const_fold_negate_i32_min_no_panic() {
-    // Negating i32::MIN must not panic (overflow).  The fold should be skipped,
-    // leaving the runtime negation intact.
     let src = r#"
         @group(0) @binding(0) var<storage, read_write> out: array<i32, 1>;
         @compute @workgroup_size(1)
@@ -22,8 +18,6 @@ fn const_fold_negate_i32_min_no_panic() {
     "#;
     let out = compact_with_passes(src, Profile::Aggressive);
     println!("const_fold_negate_i32_min: {out}");
-    // The output must NOT have folded away the negation - it should still
-    // contain a negation operator or the original expression, not a bare literal.
     assert!(
         out.contains("-i32(") || out.contains("= -"),
         "negate of i32::MIN should not be folded: {out}"
@@ -32,7 +26,6 @@ fn const_fold_negate_i32_min_no_panic() {
 
 #[test]
 fn const_fold_negate_normal_i32_folds() {
-    // Normal i32 negation should still fold fine.
     let src = r#"
         @group(0) @binding(0) var<storage, read_write> out: array<i32, 1>;
         @compute @workgroup_size(1)
@@ -43,7 +36,6 @@ fn const_fold_negate_normal_i32_folds() {
     "#;
     let out = compact_with_passes(src, Profile::Aggressive);
     println!("const_fold_negate_normal_i32: {out}");
-    // Should fold to -42
     assert!(
         out.contains("-42"),
         "normal i32 negation should fold: {out}"
@@ -52,8 +44,6 @@ fn const_fold_negate_normal_i32_folds() {
 
 #[test]
 fn load_dedup_invalidates_cache_on_call_with_pointer() {
-    // A function call that takes a pointer to a local must invalidate the
-    // load cache for that local - subsequent loads must NOT reuse stale values.
     let src = r#"
         @group(0) @binding(0) var<storage, read_write> out: array<f32, 2>;
 
@@ -71,8 +61,6 @@ fn load_dedup_invalidates_cache_on_call_with_pointer() {
     "#;
     let out = compact_with_passes(src, Profile::Aggressive);
     println!("load_dedup_call_invalidation: {out}");
-    // After modify(&x), the second store must load x fresh.
-    // It must NOT be the literal 10.0 (stale cached value).
     assert!(
         !out.contains("out[1] = 10") && !out.contains("out[1]=10"),
         "load after call through pointer must not use stale cached value: {out}"
@@ -81,7 +69,6 @@ fn load_dedup_invalidates_cache_on_call_with_pointer() {
 
 #[test]
 fn load_dedup_no_pointer_arg_still_deduplicates() {
-    // When no pointer to the local is passed, loads should still be deduplicated.
     let src = r#"
         @group(0) @binding(0) var<storage, read_write> out: array<f32, 2>;
 
@@ -99,8 +86,6 @@ fn load_dedup_no_pointer_arg_still_deduplicates() {
 
 #[test]
 fn dead_branch_strips_code_after_return_from_folded_if_true() {
-    // `if (true) { return 1.0; }` folds to `return 1.0;`, making the
-    // subsequent store dead.  The dead-branch pass must strip it.
     let src = r#"
         @group(0) @binding(0) var<storage, read_write> out: array<f32, 2>;
         fn test_fn() -> f32 {
@@ -115,7 +100,6 @@ fn dead_branch_strips_code_after_return_from_folded_if_true() {
     "#;
     let out = compact_with_passes(src, Profile::Aggressive);
     println!("dead_branch_strip_after_return: {out}");
-    // The folded function should just return 1.0, with no trace of dead code.
     assert!(
         !out.contains("2.0") && !out.contains("0.0"),
         "dead code after folded-if return must be stripped: {out}"
@@ -125,7 +109,6 @@ fn dead_branch_strips_code_after_return_from_folded_if_true() {
 
 #[test]
 fn dead_branch_strips_code_after_both_branches_terminate() {
-    // When both branches of a non-constant if terminate, subsequent code is dead.
     let src = r#"
         @group(0) @binding(0) var<storage, read_write> out: array<f32, 2>;
         fn test_fn(c: bool) -> f32 {
@@ -149,9 +132,8 @@ fn dead_branch_strips_code_after_both_branches_terminate() {
 
 #[test]
 fn or_chain_redundant_true_stores_eliminated() {
-    // `a || b || c` lowers to two ifs with separate locals.  After
-    // coalescing merges them, the reject branches `else { d = true; }`
-    // become redundant and should be cleared by the dead-branch pass.
+    // `a || b || c` lowers to two ifs with separate locals; once coalescing
+    // merges them the `else { d = true; }` arms are redundant.
     let src = r#"
         fn or3(a: bool, b: bool, c: bool) -> bool {
             return a || b || c;
@@ -162,9 +144,7 @@ fn or_chain_redundant_true_stores_eliminated() {
     "#;
     let out = compact_with_passes(src, Profile::Aggressive);
     println!("or_chain: {out}");
-    // After optimization the redundant `else { d = true; }` branches
-    // should be gone.  Count occurrences of "=true" or "= true" stores
-    // inside if-else - at most one should remain (the first if's else).
+    // At most the first if's else survives.
     let true_stores = out.matches("=true").count() + out.matches("= true").count();
     assert!(
         true_stores <= 1,
@@ -303,12 +283,10 @@ fn workgroup_uniform_load_can_appear_in_for_header() {
 
 #[test]
 fn workgroup_uniform_load_reused_in_condition_not_duplicated() {
-    // The for-loop reconstruction binds a guard WorkGroupUniformLoad to inline
-    // `workgroupUniformLoad(&p)` text and re-emits it at every occurrence.  A
-    // result reused in the condition (`w*w < n`) would execute the barrier /
-    // uniform load twice per iteration - a semantic change re-validation does
-    // not catch.  The generator must fall back to plain `loop` emission, which
-    // binds the load to a single `let`.
+    // For-reconstruction re-emits a guard preload's `workgroupUniformLoad(&p)`
+    // at every occurrence; a result reused in the condition would run the
+    // barrier twice per iteration, which re-validation cannot catch, so
+    // emission must fall back to a plain `loop` with one `let`.
     let src = r#"
         var<workgroup> a: u32;
         @group(0) @binding(0) var<storage, read_write> outv: array<u32, 64>;
@@ -333,13 +311,9 @@ fn workgroup_uniform_load_reused_in_condition_not_duplicated() {
     assert_valid_wgsl(&out);
 }
 
-/// A `workgroupUniformLoad` preload whose result is NEVER used by the loop
-/// condition or update (a barrier kept purely for its side effect) must not be
-/// dropped by for-loop reconstruction.  A preload is materialised only where
-/// its `result` is emitted; with zero uses in the for-header it would vanish
-/// entirely, silently deleting the workgroup barrier.  The preload-safety
-/// predicate requires EXACTLY one emission, so this stays a plain loop where
-/// the preload keeps its own statement.
+/// A preload is materialised only where its result is emitted, so a barrier
+/// kept purely for its side effect would vanish from a for-header; the
+/// preload-safety predicate requires exactly one emission.
 #[test]
 fn workgroup_uniform_load_dead_preload_barrier_not_dropped() {
     let src = r#"
@@ -368,10 +342,8 @@ fn workgroup_uniform_load_dead_preload_barrier_not_dropped() {
     assert_valid_wgsl(&out);
 }
 
-/// Companion: a `continuing` block holding a `workgroupUniformLoad` whose
-/// result is unused must also keep the barrier.  With no core update statement
-/// the preload has no for-update clause to be emitted into, so for-conversion
-/// must be refused.
+/// With no core update statement a continuing preload has no for-update
+/// clause to land in, so conversion must be refused.
 #[test]
 fn workgroup_uniform_load_dead_continuing_preload_not_dropped() {
     let src = r#"
@@ -400,11 +372,9 @@ fn workgroup_uniform_load_dead_continuing_preload_not_dropped() {
 
 #[test]
 fn for_loop_preload_used_via_expression_in_tail_not_dropped() {
-    // A body WorkGroupUniformLoad result used in the tail INSIDE an expression
-    // (`outv[i] = w + 1u`) must block for-reconstruction.  The tail-use oracle
-    // must recurse into emitted expression children; a flat operand-equality
-    // check would miss it, drop the preload's `let`, and emit an undeclared
-    // `_e<n>` - invalid WGSL.
+    // The tail-use oracle must recurse into expression children; a flat
+    // operand check would drop the preload's `let` and emit an undeclared
+    // `_e<n>`.
     let src = r#"
         var<workgroup> wg: u32;
         @group(0) @binding(0) var<storage, read_write> outv: array<u32, 64>;
@@ -425,9 +395,8 @@ fn for_loop_preload_used_via_expression_in_tail_not_dropped() {
 
 #[test]
 fn for_loop_preload_used_as_atomic_compare_in_tail_not_dropped() {
-    // `w` used as the `compare` operand of atomicCompareExchangeWeak - a
-    // statement-operand position the old oracle's `_ => false` / partial Atomic
-    // arm missed entirely.
+    // The `compare` operand of `atomicCompareExchangeWeak` is a
+    // statement-operand position the tail-use oracle must cover.
     let src = r#"
         var<workgroup> wg: u32;
         @group(0) @binding(0) var<storage, read_write> a: atomic<u32>;
@@ -450,11 +419,8 @@ fn for_loop_preload_used_as_atomic_compare_in_tail_not_dropped() {
 
 #[test]
 fn for_loop_counter_declared_when_preload_used_after_guard() {
-    // When a body WorkGroupUniformLoad preload result is used AFTER the guard,
-    // `try_emit_for_loop` bails to plain `loop` emission.  The counter-var
-    // suppression decision (`is_for_loop_candidate`) must agree, or the
-    // counter is left undeclared - invalid WGSL.  Assert the generator output
-    // re-validates (it would not if `i` were undeclared).
+    // `try_emit_for_loop` bails to a plain loop here; `is_for_loop_candidate`
+    // must agree or the counter's `var` is suppressed and left undeclared.
     let src = r#"
         var<workgroup> wg_limit: u32;
         @group(0) @binding(0) var<storage, read_write> sink: array<u32, 64>;
@@ -470,15 +436,13 @@ fn for_loop_counter_declared_when_preload_used_after_guard() {
         }
     "#;
     let out = compact(src);
-    // The counter `i` must be declared (the generator must not have suppressed
-    // its `var` while emitting a plain `loop`).
     assert_valid_wgsl(&out);
 }
 
 #[test]
 fn workgroup_uniform_load_reused_in_update_not_duplicated() {
-    // Same hazard for a continuing-block update preload reused across the
-    // update statement (`outv[w] = w` materialises `w` twice).
+    // An update preload reused within its statement (`outv[w] = w`) would
+    // materialise the barrier twice.
     let src = r#"
         var<workgroup> b: u32;
         @group(0) @binding(0) var<storage, read_write> outv: array<u32, 64>;
@@ -504,13 +468,10 @@ fn workgroup_uniform_load_reused_in_update_not_duplicated() {
     assert_valid_wgsl(&out);
 }
 
-/// A counter whose `var` is BOTH absorbed into a reconstructed `for` init AND
-/// still flagged deferred must have its deferred flag cleared when the for-init
-/// declares it.  Otherwise its in-body update re-declares it -
-/// `for(var b=0u;b<2;){...var b=b+1;}` - and the body `var b` SHADOWS the
-/// for-init counter, so the counter never advances: an infinite loop.  The
-/// output is valid WGSL (shadowing is legal), so re-validation alone cannot
-/// catch it; assert the for-init counter is not re-declared inside the loop.
+/// A counter both absorbed into the for-init and still flagged deferred is
+/// re-declared by its in-body update; the body `var b` shadows the for-init
+/// counter (valid WGSL) and freezes it, an infinite loop re-validation cannot
+/// catch.
 #[test]
 fn nested_loop_counter_not_redeclared_in_for_body() {
     let src = r#"
@@ -531,8 +492,7 @@ fn nested_loop_counter_not_redeclared_in_for_body() {
             buf[0] = acc;
         }
     "#;
-    // `compact_with_passes` beautifies (`for (var b = 0u; ...)`), so split on the
-    // spaced form and check for a spaced re-declaration `var <counter> =`.
+    // Beautified output, so match the spaced forms.
     let out = compact_with_passes(src, Profile::Max);
     assert_valid_wgsl(&out);
     let after = out
@@ -553,10 +513,9 @@ fn nested_loop_counter_not_redeclared_in_for_body() {
 
 // MARK: Mutated-load binding
 
-/// Global array swap: after passes collapse the temporaries, the IR is
-/// `let _a = A[0]; let _b = A[1]; A[0] = _b; A[1] = _a;`.  `_a` is read at
-/// `A[1] = _a` AFTER `A[0]` was overwritten, so it must be bound; inlining it
-/// produced the miscompile `A[0] = A[1]; A[1] = A[0]` (both = old A[1]).
+/// After passes the IR is `let _a = A[0]; let _b = A[1]; A[0] = _b; A[1] = _a;`;
+/// `_a` is read after `A[0]` was overwritten, so inlining it yields
+/// `A[1] = A[0]`.
 #[test]
 fn global_swap_load_not_inlined_across_store() {
     let src = r#"
@@ -579,12 +538,9 @@ fn global_swap_load_not_inlined_across_store() {
     assert_valid_wgsl(&out);
 }
 
-/// A loop whose `continuing` update reads a body-local snapshot of a value the
-/// body mutates must NOT be reconstructed as a `for(...)` loop: the update
-/// clause is emitted into the for-header BEFORE the body binding, so it would
-/// inline the snapshot as the post-write place.  The conversion must bail to a
-/// plain `loop { ... continuing { ... } }` where the body binding precedes the
-/// continuing use.
+/// The for-update clause is emitted into the header, before the body binding,
+/// so a continuing update reading a body snapshot of a body-mutated place
+/// would inline the post-write place; conversion must bail to a plain `loop`.
 #[test]
 fn for_loop_update_must_not_inline_mutated_load() {
     let src = r#"
@@ -602,8 +558,6 @@ fn for_loop_update_must_not_inline_mutated_load() {
         }
     "#;
     let out = compact_with_passes(src, Profile::Max);
-    // Broken for-conversion emits `for(...; i += A[0]) {...}`, reading the
-    // post-increment A[0].  The fix bails to a plain loop with `continuing`.
     assert!(
         !out.contains("+= A[0]"),
         "the counter update must use the bound pre-write snapshot, not re-read A[0]: {out}"
@@ -615,9 +569,8 @@ fn for_loop_update_must_not_inline_mutated_load() {
     assert_valid_wgsl(&out);
 }
 
-/// A load taken BEFORE a loop and used AFTER it, where the loop body writes the
-/// loaded place, must be bound: the back-edge means a later iteration's write
-/// reaches the post-loop use, so inlining would read the mutated value.
+/// The back-edge lets a later iteration's write reach the post-loop use, so
+/// the pre-loop snapshot must bind.
 #[test]
 fn load_before_loop_used_after_must_bind() {
     let src = r#"
@@ -630,8 +583,6 @@ fn load_before_loop_used_after_must_bind() {
         }
     "#;
     let out = compact_with_passes(src, Profile::Max);
-    // The snapshot of `g` must be let-bound before the loop; otherwise both
-    // stores read the post-loop `g`.
     let let_pos = out
         .find("let ")
         .expect("the pre-loop snapshot must be let-bound");
@@ -646,8 +597,7 @@ fn load_before_loop_used_after_must_bind() {
     assert_valid_wgsl(&out);
 }
 
-/// Non-regression: an ordinary counted loop whose update does NOT reference a
-/// must-bind load still reconstructs as a `for(...)` loop.
+/// The must-bind bail must not block ordinary counted loops.
 #[test]
 fn counted_loop_still_reconstructs_for() {
     let src = r#"
@@ -664,11 +614,9 @@ fn counted_loop_still_reconstructs_for() {
     assert_valid_wgsl(&out);
 }
 
-/// A `continuing` `workgroupUniformLoad` whose POINTER indexes by a body-local
-/// must-bind load must also block for-conversion: the preload pointer is
-/// relocated into the for-update slot (emitted before the body binding), so
-/// `&W[snap]` would inline `snap` as its post-write place.  The fix bails to a
-/// plain loop where the body binding precedes the preload.
+/// The preload pointer is relocated into the for-update slot ahead of the
+/// body binding, so `&W[snap]` would inline `snap` as its post-write place;
+/// conversion must bail.
 #[test]
 fn for_loop_update_preload_pointer_must_not_inline_mutated_load() {
     let src = r#"
@@ -689,9 +637,6 @@ fn for_loop_update_preload_pointer_must_not_inline_mutated_load() {
         }
     "#;
     let out = compact_with_passes(src, Profile::Max);
-    // Broken for-conversion hoists the preload into the header:
-    // `for(...; B += workgroupUniformLoad(&W[a[0]])) {...}`, indexing by the
-    // post-swap a[0].  The fix bails to a plain loop with `continuing`.
     assert!(
         !out.contains("+= workgroupUniformLoad"),
         "the preload pointer must use the bound pre-write snapshot, not be relocated \
@@ -704,13 +649,10 @@ fn for_loop_update_preload_pointer_must_not_inline_mutated_load() {
     assert_valid_wgsl(&out);
 }
 
-/// A `workgroupUniformLoad` GUARD PRELOAD relocated into the for-condition is a
-/// barrier evaluated at iteration top.  A must-bind load defined before it -
-/// here `A[0]`, snapshotted pre-barrier in the source and read by both the guard
-/// and the body - would, after for-conversion, be re-read POST-barrier (the
-/// header runs before the body), yielding a different cross-invocation value.
-/// The conversion must bail to a plain loop where the snapshot precedes the
-/// barrier.
+/// A guard preload relocated into the for-condition runs the barrier at
+/// iteration top, so a must-bind load defined before it (`A[0]`, read by guard
+/// and body) would be re-read post-barrier with a different cross-invocation
+/// value; conversion must bail.
 #[test]
 fn for_loop_guard_preload_must_not_read_must_bind_load_post_barrier() {
     let src = r#"
@@ -746,11 +688,8 @@ fn for_loop_guard_preload_must_not_read_must_bind_load_post_barrier() {
     assert_valid_wgsl(&out);
 }
 
-/// Companion to [`for_loop_guard_preload_must_not_read_must_bind_load_post_barrier`]:
-/// the must-bind load `A[0]` is NOT referenced by the guard condition (only by the
-/// body tail), so checking the condition's operand cone alone would miss it.  The
-/// hazard is the load being DEFINED in the pre-guard region (ahead of the relocated
-/// barrier), so the bail keys on that region, not the condition.
+/// `A[0]` is read only by the body tail, so the bail must key on loads defined
+/// in the pre-guard region, not on the condition's operand cone.
 #[test]
 fn for_loop_guard_preload_body_only_must_bind_load_snapshotted_before_barrier() {
     let src = r#"
@@ -788,12 +727,8 @@ fn for_loop_guard_preload_body_only_must_bind_load_snapshotted_before_barrier() 
 
 // MARK: Call-result inlining (reads_locals)
 
-/// A single-use `Call` whose argument reads a function-local BY VALUE
-/// (`f(arr[i])`) is inlined at its use site when no statement between the call
-/// and the use writes a local the argument read.  This exercises the
-/// `reads_locals` path in `find_inlineable_calls`, dormant until
-/// `arg_has_pointer_to_local` stopped over-counting by-value reads as
-/// pointers-to-local; a regression there leaves the call `let`-bound.
+/// Exercises the `reads_locals` path of `find_inlineable_calls`; counting a
+/// by-value read as a pointer-to-local leaves the call `let`-bound.
 #[test]
 fn by_value_local_arg_call_inlined_when_no_intervening_write() {
     let src = r#"
@@ -815,12 +750,9 @@ fn by_value_local_arg_call_inlined_when_no_intervening_write() {
     assert_valid_wgsl(&out);
 }
 
-/// Soundness companion: when a `Store` to a local the argument read sits between
-/// the call and its use, the call must NOT be inlined past it - inlining would
-/// re-read the post-store value.  `reads_locals` keeps the call bound, so its
-/// argument is evaluated before the store and the use reads the snapshot.  (The
-/// array element + runtime store value keep the store genuinely live and block
-/// the SSA splitting that would make a scalar case safe to inline.)
+/// Inlining past the store would re-read the post-store element.  The array
+/// element and runtime store value keep the store live and block the SSA
+/// splitting that would make a scalar case safe to inline.
 #[test]
 fn by_value_local_arg_call_bound_across_write_to_read_local() {
     let src = r#"
@@ -836,9 +768,7 @@ fn by_value_local_arg_call_bound_across_write_to_read_local() {
         }
     "#;
     let out = compact_with_passes(src, Profile::Max);
-    // `O` is mangled, so recover its emitted name from the storage declaration
-    // rather than guessing the mangler's lettering (the previous `A[0]` anchor
-    // only worked by coincidence).
+    // `O` is mangled; recover its name from the declaration.
     let decl_tail = out
         .split("read_write>")
         .nth(1)
@@ -849,9 +779,7 @@ fn by_value_local_arg_call_bound_across_write_to_read_local() {
         .take_while(|&c| c.is_ascii_alphanumeric() || c == '_')
         .collect();
     assert!(!arr_name.is_empty(), "storage array name expected: {out}");
-    // The snapshot use must reference the BOUND result by name, not re-invoke the
-    // call: an unsound inline would relocate `f(arr[i])` past the store, so the
-    // first storage-array store's RHS (`<arr>[0] = ...`) would contain a call `(`.
+    // An unsound inline puts a call `(` in the first store's RHS.
     let after_o0 = out
         .split(&format!("{arr_name}[0]"))
         .nth(1)
@@ -909,11 +837,9 @@ fn not_notequal_folds_to_equal_operator() {
 
 #[test]
 fn negated_equality_folds_under_outer_comparison() {
-    // The folded `a != b` becomes an operand of an outer comparison.  WGSL
-    // forbids mixing `==`/`!=` without parentheses, so the emitter must
-    // parenthesise the folded Binary (an emit-time fold could not, having
-    // lost the comparison shape).  `compact_with_passes` re-validates the
-    // output, and the fold must still fire.
+    // The folded `a != b` becomes an operand of an outer comparison, which WGSL
+    // forbids bare; an emit-time fold could not parenthesise it, having lost
+    // the comparison shape.
     let out = compact_with_passes(
         r#"
         @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
@@ -956,9 +882,6 @@ fn negated_vector_equality_folds_componentwise() {
 
 #[test]
 fn short_circuit_guard_chain_fully_collapses_and_is_idempotent() {
-    // A 3-condition guard collapses to a single `if (a && b && c) { .. }`
-    // with the bool temp eliminated (no `var`/store, no `else { = false }`),
-    // and re-minifying the result does not grow it (a stable fixed point).
     let src = r#"
         @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
         @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) g: vec3u) {
@@ -993,9 +916,8 @@ fn short_circuit_guard_chain_fully_collapses_and_is_idempotent() {
 
 #[test]
 fn short_circuit_value_position_left_lowered_and_idempotent() {
-    // A value-position `&&` whose result feeds an EXPRESSION (`select`/`|`)
-    // is left lowered (folding it would create a non-idempotent `&&` store
-    // the forwarder cannot collapse), so re-minifying does not grow.
+    // Folding a value-position `&&` that feeds an expression would create an
+    // `&&` store the forwarder cannot collapse, so it stays lowered.
     let src = r#"
         @group(0) @binding(0) var<storage, read_write> buf: array<i32>;
         @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) g: vec3u) {
@@ -1019,10 +941,8 @@ fn short_circuit_value_position_left_lowered_and_idempotent() {
 
 #[test]
 fn forward_copy_chain_preserves_value_not_zero_init() {
-    // Regression: forwarding a chain where one local copies another
-    // (`var b = a;`) must not resolve redirects non-transitively and orphan
-    // the intermediate load (which would read the removed local's zero-init).
-    // The write must stay `g[k] + 1`, never a bare 0.
+    // Redirects must resolve transitively; otherwise the intermediate load is
+    // orphaned and reads the removed local's zero-init.
     let out = compact_with_passes(
         r#"
         @group(0) @binding(0) var<storage, read_write> g: array<i32>;
@@ -1043,10 +963,9 @@ fn forward_copy_chain_preserves_value_not_zero_init() {
 
 #[test]
 fn short_circuit_value_used_in_if_keeps_body_reachable() {
-    // Regression: `var ok = a && b; if ok {..}` lowers to an
-    // inner && temp PLUS the `ok` copy; forwarding both must fold to
-    // `if (a && b) {..}`, never collapse to a never-assigned `var ok: bool;
-    // if ok {..}` (which reads false and makes the body dead).
+    // `var ok = a && b; if ok {..}` lowers to an inner `&&` temp plus the `ok`
+    // copy; forwarding both must not leave a never-assigned `var ok: bool`
+    // that reads false.
     let out = compact_with_passes(
         r#"
         @group(0) @binding(0) var<storage, read_write> g: i32;
@@ -1069,9 +988,8 @@ fn short_circuit_value_used_in_if_keeps_body_reachable() {
 
 #[test]
 fn mixed_and_or_logical_is_parenthesized() {
-    // Regression: WGSL gives `&&`/`||` no relative precedence, so a
-    // collapsed `a || (b && c)` guard must keep explicit parens (naga is
-    // permissive and would accept the bare form, so check the text).
+    // WGSL gives `&&`/`||` no relative precedence; naga accepts the bare form,
+    // so check the text.
     let out = compact_with_passes(
         r#"
         @group(0) @binding(0) var<storage, read_write> g: f32;
@@ -1090,15 +1008,10 @@ fn mixed_and_or_logical_is_parenthesized() {
 
 #[test]
 fn bitwise_operand_of_logical_is_parenthesized() {
-    // Regression: WGSL's `&&`/`||` operands
-    // are `relational_expression`s, which cannot contain a bitwise
-    // expression, so a `bool`-typed `|`/`&` operand of `&&`/`||` must be
-    // parenthesized.  naga's frontend is permissive and round-trips the bare
-    // form, but Tint/Dawn reject "mixing '|' and '&&' requires parenthesis".
-    // The short-circuit re-sugar newly collapses such guards into a single
-    // logical `Binary` with a bitwise child, so the emitter must wrap it.
-    // The `fn` operands are bool atoms, so the only `)&&` / `)||` in the
-    // output is the bitwise wrap; the bare bug would emit `b&&C` / `d||E`.
+    // `&&`/`||` operands are `relational_expression`s, which cannot contain a
+    // bitwise expression; naga round-trips the bare form but Tint rejects
+    // "mixing '|' and '&&' requires parenthesis".  The `fn` operands are bool
+    // atoms, so `)&&` / `)||` can only come from the bitwise wrap.
     let out = compact_with_passes(
         r#"
         @group(0) @binding(0) var<storage, read_write> g: i32;
@@ -1111,9 +1024,7 @@ fn bitwise_operand_of_logical_is_parenthesized() {
         "#,
         Profile::Max,
     );
-    // Whitespace-normalize so the check is independent of beautify mode:
-    // the wrapped bitwise produces `)&&` / `)||`; the bare bug emits a bare
-    // identifier (`b&&` / `d||`) instead.
+    // Whitespace-normalised so beautify mode does not matter.
     let compact: String = out.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
         compact.contains(")&&"),
@@ -1127,13 +1038,10 @@ fn bitwise_operand_of_logical_is_parenthesized() {
 
 #[test]
 fn loop_invariant_not_forwarded_into_nested_loop_guard() {
-    // Regression: `forward_single_store_locals` must only forward a local
-    // whose store and load are in the SAME block.  A single-store local set
-    // in an outer block and read in an INNER loop's guard must NOT be
-    // forwarded - folding the invariant into the guard (`1 < 10` -> `true`)
-    // would let dead-branch strip the loop's only exit, leaving a bare
-    // `loop {}` that Tint rejects ("loop does not exit").  The guard `1 < n`
-    // (a comparison against the still-live variable) must survive.
+    // `forward_single_store_locals` must only forward within one block:
+    // folding the outer-block invariant into the inner guard (`1 < 10` ->
+    // `true`) lets dead-branch strip the loop's only exit, leaving a bare
+    // `loop {}` Tint rejects ("loop does not exit").
     let out = compact_with_passes(
         r#"
         @fragment fn main() -> @location(0) vec4f {
@@ -1166,13 +1074,10 @@ fn loop_invariant_not_forwarded_into_nested_loop_guard() {
 
 #[test]
 fn read_before_write_local_not_forwarded() {
-    // Regression: forward_single_store_locals must key a forward on the
-    // load's MATERIALISATION (its `Emit`), not on a later consuming
-    // statement.  In `let snap = t; t = E; return snap;` the `Load(t)` is
-    // emitted BEFORE the store, so `snap` holds t's zero-init value;
-    // forwarding it to `E` would silently miscompile the stale read.  The
-    // distinctive stored literal is dead (t is unread after `snap`) and must
-    // never reach the output - its presence would mean `snap` was forwarded.
+    // A forward must key on the load's materialisation (`Emit`), not a later
+    // consumer: `Load(t)` is emitted before the store, so `snap` holds the
+    // zero-init.  The stored literal is dead; reaching the output means `snap`
+    // was forwarded.
     let out = compact_with_passes(
         r#"
         @group(0) @binding(0) var<storage, read_write> out: u32;

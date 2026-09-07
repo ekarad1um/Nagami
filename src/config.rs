@@ -1,60 +1,44 @@
-//! Public configuration surface for the minification pipeline.
-//!
-//! [`Profile`] selects the pass bundle, [`TraceConfig`] gates diagnostic
-//! instrumentation, [`PrecisionMode`] and [`FloatPrecision`] control
-//! float-literal trimming, and [`Config`] composes them with the
-//! user-visible output options for [`crate::run`] / [`crate::run_module`].
+//! Configuration for [`crate::run`] / [`crate::run_module`]: [`Profile`]
+//! selects the pass bundle, [`TraceConfig`] gates diagnostics,
+//! [`FloatPrecision`] controls lossy float-literal trimming.
 
 use std::path::PathBuf;
 
-/// Strategy for trimming a float literal's printed precision at emission
-/// time.  All variants except [`Self::Full`] are **lossy** and must be
-/// opted into explicitly per type via [`FloatPrecision`].
+/// Float-literal precision trim applied at emission; every variant but
+/// [`Self::Full`] is lossy and opted into per type via [`FloatPrecision`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PrecisionMode {
     /// Preserve the full IR value; emit the shortest round-trip text.
     #[default]
     Full,
-    /// Round to at most `N` digits after the decimal point before
-    /// formatting.  `0` rounds every literal to an integer-valued
-    /// float.  Best for fractional-precision tuning (e.g. `0.123456 -> 0.12`).
+    /// Round to at most `N` digits after the decimal point (`0` yields an
+    /// integer-valued float), e.g. `0.123456 -> 0.12`.
     DecimalPlaces(u8),
-    /// Round to at most `N` significant figures.  `0` is treated as `1`
-    /// (zero sig figs would always round to zero, which is rarely useful).
-    /// Best for magnitude-aware quantization (e.g. `1234567.89 -> 1230000`,
-    /// `0.0012345 -> 0.0012`).
+    /// Round to at most `N` significant figures (`0` is treated as `1`),
+    /// e.g. `1234567.89 -> 1230000`, `0.0012345 -> 0.0012`.
     SignificantFigures(u8),
 }
 
-/// Per-type precision caps applied to float literals at emission time.
-///
-/// Each float kind in the IR (`f16`, `f32`, `f64`, and the untyped
-/// `AbstractFloat`) gets its own [`PrecisionMode`] slot so callers can
-/// pair a lossy `f32` budget with full-precision `f64`, or trim `f16`
-/// to its native precision without affecting other types.
-///
-/// Defaults to `Full` on every slot - i.e. no rounding anywhere.
+/// Per-type precision caps for float literals; each IR float kind has its
+/// own [`PrecisionMode`] so a lossy `f32` budget can pair with a
+/// full-precision `f64`.  Defaults to `Full` everywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FloatPrecision {
-    /// Precision applied to `f16` literals (and the `f32`-converted
-    /// value the emitter goes through, which is value-equivalent at
-    /// f16's 10-bit mantissa).
+    /// Precision applied to `f16` literals (rounded via their exact `f32`
+    /// widening).
     pub f16: PrecisionMode,
     /// Precision applied to `f32` literals.
     pub f32: PrecisionMode,
     /// Precision applied to `f64` literals.
     pub f64: PrecisionMode,
-    /// Precision applied to literals whose IR form is still
-    /// `AbstractFloat` at emission (typically extracted-`const` decls
-    /// and standalone module-scope abstract literals).  Naga widens
-    /// these to f64 internally.
+    /// Precision applied to literals still `AbstractFloat` at emission
+    /// (extracted `const` decls, module-scope abstract literals); naga
+    /// holds these as f64.
     pub abstract_float: PrecisionMode,
 }
 
 impl FloatPrecision {
-    /// Convenience constructor: apply the same `mode` to every float
-    /// kind.  Equivalent to building [`FloatPrecision`] field-by-field
-    /// with the same value in each slot.
+    /// Apply `mode` to every float kind.
     pub fn all(mode: PrecisionMode) -> Self {
         Self {
             f16: mode,
@@ -72,9 +56,8 @@ pub enum Profile {
     /// Minimal DCE-driven pipeline: compact, const fold, dead-branch,
     /// dead-param, emit merge, rename.  No inlining, CSE, or load dedup.
     Baseline,
-    /// Full pipeline including inlining, load dedup, and coalescing,
-    /// but without mangling unless explicitly requested via
-    /// [`Config::mangle`].
+    /// Full pipeline (inlining, load dedup, coalescing) without mangling
+    /// unless [`Config::mangle`] requests it.
     Aggressive,
     /// [`Profile::Aggressive`] plus CSE, higher inlining budgets, and
     /// identifier mangling on by default.
@@ -82,20 +65,17 @@ pub enum Profile {
     Max,
 }
 
-/// Configuration for per-pass diagnostic tracing.
-///
-/// Tracing is opt-in and off the hot path: when `enabled` is `false` the
-/// pipeline never emits intermediate text, validates only after accepted
-/// changes, and skips trace directory allocation.
+/// Per-pass diagnostic tracing, opt-in and off the hot path: with `enabled`
+/// false the pipeline emits no intermediate text, validates only after
+/// declared changes and allocates no trace directory.
 #[derive(Debug, Clone, Default)]
 pub struct TraceConfig {
     /// Master switch for per-pass before/after dumps to disk.
     pub enabled: bool,
     /// Base directory for trace output; defaults to `./trace` when `None`.
     pub dump_dir: Option<PathBuf>,
-    /// Re-validate the WGSL text after every pass and escalate any
-    /// failure to a hard error instead of silently rolling back.  Intended
-    /// for CI regressions, not day-to-day minification.
+    /// Re-validate the WGSL text after every pass and escalate failures to
+    /// hard errors instead of rolling back; meant for CI, not daily use.
     pub validate_each_pass: bool,
 }
 
@@ -115,25 +95,20 @@ pub struct Config {
     pub beautify: bool,
     /// Spaces per indentation level; honoured only when `beautify` is set.
     pub indent: u8,
-    /// Per-type precision caps for float literals.  Defaults to
-    /// [`PrecisionMode::Full`] on every kind - opt in per-type as
-    /// needed.  Any non-`Full` mode is lossy.
+    /// Per-type float-literal precision caps; any non-`Full` mode is lossy.
     pub float_precision: FloatPrecision,
-    /// Override the per-function expression-node ceiling used to gate
-    /// inlining.  `None` selects the profile default.
+    /// Per-function expression-node ceiling for inlining; `None` selects
+    /// the profile default.
     pub max_inline_node_count: Option<usize>,
-    /// Override the call-site ceiling used to gate inlining.  `None`
-    /// selects the profile default.
+    /// Call-site ceiling for inlining; `None` selects the profile default.
     pub max_inline_call_sites: Option<usize>,
     /// Per-pass tracing and diagnostic settings.
     pub trace: TraceConfig,
-    /// Optional WGSL preamble providing external declarations (e.g. uniform
-    /// bindings from a shader playground).  The preamble is
-    /// prepended for parsing and optimization, its symbol names are added
-    /// to `preserve_symbols` automatically, and its declarations are
-    /// stripped from the final output.  Leading directives in both the
-    /// preamble and the user source are hoisted so the combined text
-    /// remains spec-compliant.
+    /// WGSL preamble of external declarations (e.g. a playground's
+    /// bindings): prepended for parsing and optimization, its names
+    /// auto-preserved, its declarations stripped from the output; leading
+    /// directives of both texts are hoisted so the combination stays
+    /// spec-compliant.
     pub preamble: Option<String>,
 }
 
@@ -155,9 +130,8 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Resolve the effective mangle setting: an explicit `Some(v)` wins
-    /// over the profile default, otherwise [`Profile::Max`] enables it
-    /// and every other profile leaves it off.
+    /// Effective mangle setting: the explicit override, else on only for
+    /// [`Profile::Max`].
     pub fn mangle(&self) -> bool {
         self.mangle.unwrap_or(self.profile == Profile::Max)
     }

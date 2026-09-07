@@ -143,7 +143,6 @@ mod tests {
         assert_eq!(out, "\"a\\\"b\\\\c\\u000a\\u0009\\u0001\u{2028}\"");
     }
 
-    /// Nested `report`, matching the wasm `Output` interface.
     #[test]
     fn output_document_has_the_wasm_shape() {
         let output = crate::run(

@@ -1,42 +1,25 @@
-//! Thin wrappers around naga's WGSL front-end and validator.  Every
-//! helper here converts naga errors into [`Error`] variants carrying
-//! codespan-formatted diagnostics so consumers never deal with raw
-//! naga error types.
+//! Thin wrappers around naga's WGSL front-end and validator that render
+//! naga errors into [`Error`] diagnostics.
 
 use crate::error::Error;
 
-/// Parse a WGSL source string into a naga IR module.
-///
-/// # Errors
-///
-/// Returns [`Error::Parse`] with a source-annotated diagnostic produced
-/// by naga's `ParseError::emit_to_string` when the front-end rejects
-/// `source`.
 pub fn parse_wgsl(source: &str) -> Result<naga::Module, Error> {
     naga::front::wgsl::parse_str(source).map_err(|e| Error::Parse(e.emit_to_string(source)))
 }
 
-/// Parse WGSL with a custom path label for diagnostics (e.g. `<preamble>`).
-/// Identical semantics to [`parse_wgsl`] but the rendered error points at
-/// `path` instead of the default `wgsl` label.
+/// `path` replaces the default `wgsl` label in diagnostics (e.g. `<preamble>`).
 pub fn parse_wgsl_with_path(source: &str, path: &str) -> Result<naga::Module, Error> {
     naga::front::wgsl::parse_str(source)
         .map_err(|e| Error::Parse(e.emit_to_string_with_path(source, path)))
 }
 
-/// Validate `module` with all validation flags and capabilities enabled.
-/// Use this when the caller has no original source text to annotate;
-/// the returned error carries naga's default string rendering.
-///
-/// `Capabilities::all()` is permissive on purpose: this validator
-/// runs after every pass to confirm IR-level structural soundness,
-/// not to certify backend compatibility.  A module that uses, e.g.,
-/// ray-query types validates here but may still be rejected by a
-/// downstream backend that lacks the matching capability bit.  The
-/// minifier's job is to preserve the IR's expressive surface; the
-/// caller is responsible for matching backend capabilities to the
-/// shader's actual feature use.
+/// `Capabilities::all()` on purpose: this checks IR-level soundness after
+/// every pass, not backend compatibility, which is the caller's concern.
 pub fn validate_module(module: &naga::Module) -> Result<naga::valid::ModuleInfo, Error> {
+    // Pointer parameters naga rejects but WGSL admits validate through a
+    // handle-preserving stand-in, whose info indexes `module` itself.
+    let stand_in = crate::passes::specialize_ptr_params::validation_stand_in(module);
+    let module = stand_in.as_ref().unwrap_or(module);
     fn fresh_validator() -> naga::valid::Validator {
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -44,10 +27,9 @@ pub fn validate_module(module: &naga::Module) -> Result<naga::valid::ModuleInfo,
         )
     }
     thread_local! {
-        /// One `Validator` per thread: the pipeline validates after every
-        /// pass, and reuse keeps container capacity across calls (`validate`
-        /// resets MOST per-module state itself - not the ray-pipeline pins,
-        /// hence the fresh-retry below).
+        /// Reused across the per-pass validations to keep container
+        /// capacity; `validate` resets all per-module state except the
+        /// ray-pipeline pins.
         static VALIDATOR: std::cell::RefCell<naga::valid::Validator> =
             std::cell::RefCell::new(fresh_validator());
     }
@@ -55,15 +37,13 @@ pub fn validate_module(module: &naga::Module) -> Result<naga::valid::ModuleInfo,
         let result = validator.borrow_mut().validate(module);
         match result {
             Ok(info) => Ok(info),
-            // naga 30's internal `reset` misses the ray-pipeline pins
-            // (`trace_rays_*`): a payload-type HANDLE pinned by a previously
-            // validated module can false-reject a valid one (handles shift
-            // across compact_dce and across playground keystrokes).  A
-            // failure is therefore re-checked on a fresh validator, which
-            // then replaces the cached one so ray-heavy sessions do not
-            // re-pay the double validation.  A stale pin only ever ADDS a
-            // mismatch constraint, so false ACCEPTS are impossible and a
-            // fresh-validator reject is genuine.
+            // naga's `reset` misses the ray-pipeline pins (`trace_rays_*`):
+            // a payload-type handle pinned by an earlier module can
+            // false-reject a valid one whose handles shifted.  A failure is
+            // re-checked on a fresh validator, which then replaces the cached
+            // one so ray-heavy sessions pay the double validation once.  A
+            // stale pin only adds a constraint, so false accepts are
+            // impossible and a fresh reject is genuine.
             Err(_) => {
                 let mut fresh = fresh_validator();
                 let info = fresh
@@ -89,16 +69,14 @@ fn render_error_chain(e: &dyn std::error::Error) -> String {
     msg
 }
 
-/// Validate a naga module and render failures against `source`.
-///
-/// Only safe when `source` still corresponds to the module's spans;
-/// once IR passes have mutated the module the spans are stale and the
-/// annotation may point at the wrong line.  Prefer [`validate_module`]
-/// after any IR transform.
+/// Renders failures against `source`, so only valid while the module's
+/// spans still match it, i.e. before any IR pass.
 pub fn validate_module_with_source(
     module: &naga::Module,
     source: &str,
 ) -> Result<naga::valid::ModuleInfo, Error> {
+    let stand_in = crate::passes::specialize_ptr_params::validation_stand_in(module);
+    let module = stand_in.as_ref().unwrap_or(module);
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::all(),
@@ -107,8 +85,6 @@ pub fn validate_module_with_source(
     .map_err(|e| Error::Validation(e.emit_to_string(source)))
 }
 
-/// Round-trip a WGSL string through the front-end: parse, validate, drop.
-/// Used to confirm that emitted output still round-trips through naga.
 pub fn validate_wgsl_text(source: &str) -> Result<(), Error> {
     let module = parse_wgsl(source)?;
     let _ = validate_module_with_source(&module, source)?;
@@ -120,12 +96,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pointer_parameters_naga_rejects_validate_through_the_stand_in() {
+        let src = "fn touch(p: ptr<workgroup, f32>) { *p = 1.0; }";
+        let module = parse_wgsl(src).expect("parses");
+        validate_module(&module).expect("stand-in");
+        validate_module_with_source(&module, src).expect("stand-in with source");
+        validate_wgsl_text(src).expect("text round trip");
+    }
+
+    #[test]
     fn parse_error_contains_source_annotation() {
         let bad = "fn bad { }";
         let err = parse_wgsl(bad).unwrap_err();
         let msg = err.to_string();
-        // Codespan annotation must round-trip: both the `wgsl:LINE` label
-        // and the offending source line are part of the stable format.
+        // The `wgsl:LINE` label and the quoted source line are stable format.
         assert!(
             msg.contains("wgsl:1"),
             "parse error should contain source location: {msg}"
@@ -152,7 +136,6 @@ mod tests {
         let src = "fn good() {}\nfn bad { }";
         let err = parse_wgsl(src).unwrap_err();
         let msg = err.to_string();
-        // Annotation must point at line 2, not line 1.
         assert!(
             msg.contains("wgsl:2"),
             "parse error should point to line 2: {msg}"
@@ -161,11 +144,9 @@ mod tests {
 
     #[test]
     fn validate_module_error_is_descriptive() {
-        // NOTE: naga's front-end does most semantic checking inline, so
-        // producing a module that parses yet fails validation requires
-        // IR-level construction the tests here do not cover.  This test
-        // degenerates into a positive round-trip check; the negative
-        // path is exercised from higher-level pipeline tests.
+        // naga's front-end checks most semantics inline, so a module that
+        // parses yet fails validation needs IR-level construction; the
+        // negative path is covered by pipeline tests.
         let valid = "@vertex fn main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0,0.0,0.0,1.0); }";
         assert!(validate_wgsl_text(valid).is_ok());
     }

@@ -1,18 +1,14 @@
-//! Coalesce consecutive [`naga::Statement::Emit`] statements whose
-//! expression ranges are contiguous.  Back-to-back emits block naga's
-//! WGSL writer from inlining single-use expressions at their use sites
-//! (each `Emit` becomes a separate `let` binding).  Merging them into
-//! one `Emit` over the union range restores the inliner's ability to
-//! fold the expressions back into their consumers.
+//! Coalesce consecutive [`naga::Statement::Emit`] statements with
+//! contiguous expression ranges: each separate `Emit` becomes its own `let`
+//! binding in the WGSL writer, blocking single-use inlining at the use
+//! site; one `Emit` over the union range restores it.
 
 use super::expr_util::nested_blocks_mut;
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
 
-/// Merge adjacent `Emit` statements with contiguous ranges so the WGSL
-/// writer can inline the underlying expressions at their uses.
-/// Recurses into every nested block so branches, loops, and switch
-/// cases are handled uniformly.
+/// Merges adjacent contiguous `Emit` statements, recursing into every
+/// nested block.
 #[derive(Debug, Default)]
 pub struct EmitMergePass;
 
@@ -33,15 +29,10 @@ impl Pass for EmitMergePass {
     }
 }
 
-/// Merge contiguous `Emit` ranges in `block` and recurse into nested
-/// blocks.  Returns `true` if any merge or nested change occurred.
-///
-/// Two-pass: the scan detects whether this level needs a rebuild
-/// (contiguous-Emit pair or empty Emit to drop) and recurses into
-/// nested blocks unconditionally; if nothing here changed, the
-/// `mem::take` + `Block::with_capacity` rebuild is skipped.  On
-/// already-converged IR this saves the allocator pressure across
-/// the pipeline's ~16-sweep fixed-point.
+/// The scan recurses into nested blocks and decides whether this level
+/// needs a rebuild (a contiguous pair or an empty Emit to drop), so
+/// converged IR skips the `mem::take` + `with_capacity` rebuild on every
+/// sweep.
 fn merge_emits_in_block(block: &mut naga::Block) -> bool {
     let mut nested_changed = false;
     let mut has_work = false;
@@ -50,11 +41,9 @@ fn merge_emits_in_block(block: &mut naga::Block) -> bool {
         if let naga::Statement::Emit(range) = stmt {
             let mut iter = range.clone();
             let Some(first) = iter.next() else {
-                // Empty Emit ranges are dropped by the slow path; mark
-                // work so the rebuild runs.  Don't touch
-                // `prev_emit_last` so two non-empty Emits separated
-                // only by empty ones (from prior passes that emptied
-                // a range) still register as mergeable.
+                // An empty Emit needs the rebuild; `prev_emit_last` is kept so
+                // two non-empty Emits separated only by empty ones still
+                // register as mergeable.
                 has_work = true;
                 continue;
             };
@@ -77,16 +66,12 @@ fn merge_emits_in_block(block: &mut naga::Block) -> bool {
         return nested_changed;
     }
 
-    // Rebuild this level - nested recursion already happened above,
-    // so the rebuild only merges adjacent Emits and drops empties.
     let mut changed = nested_changed;
     let original = std::mem::take(block);
     let mut rebuilt = naga::Block::with_capacity(original.len());
 
-    // Currently-accumulating merged range stored as
-    // `(first_handle, last_handle, span, emit_count)`.  `emit_count`
-    // tracks how many source emits feed this run so the flusher only
-    // reports `changed` when two or more emits actually merged.
+    // `(first, last, span, emit_count)`; `changed` is reported only when two
+    // or more emits merged.
     let mut pending: Option<(
         naga::Handle<naga::Expression>,
         naga::Handle<naga::Expression>,
@@ -96,16 +81,11 @@ fn merge_emits_in_block(block: &mut naga::Block) -> bool {
 
     for (statement, span) in original.span_into_iter() {
         if let naga::Statement::Emit(ref range) = statement {
-            // Range::Iterator: `next()` consumes first, `last()`
-            // walks the tail and returns the last - one pass, no
-            // intermediate allocation.
             let mut iter = range.clone();
             let Some(first) = iter.next() else {
-                // Dropping an empty Emit shrinks the block.  Without
-                // this flip, a block whose only "work" is empty-Emit
-                // removal would `mem::take` itself into a shorter
-                // block but report `changed = false`, defeating the
-                // pipeline's convergence signal.
+                // Dropping an empty Emit is a change: otherwise the block
+                // shrinks while reporting `false`, defeating the convergence
+                // signal.
                 changed = true;
                 continue;
             };
@@ -115,7 +95,6 @@ fn merge_emits_in_block(block: &mut naga::Block) -> bool {
                 if first.index() == pl.index() + 1 {
                     pending = Some((pf, last, ps, pc + 1));
                 } else {
-                    // Non-contiguous: flush pending, start new run.
                     if pc > 1 {
                         changed = true;
                     }
@@ -131,8 +110,6 @@ fn merge_emits_in_block(block: &mut naga::Block) -> bool {
             continue;
         }
 
-        // Non-Emit statement: flush the pending run and recurse into
-        // any nested blocks the statement carries.
         if let Some((pf, pl, ps, pc)) = pending.take() {
             if pc > 1 {
                 changed = true;
@@ -143,12 +120,9 @@ fn merge_emits_in_block(block: &mut naga::Block) -> bool {
             );
         }
 
-        // Nested blocks already recursed above - pass through.
         rebuilt.push(statement, span);
     }
 
-    // Flush any run that reached end-of-block without a follow-up
-    // non-Emit statement.
     if let Some((pf, pl, ps, pc)) = pending {
         if pc > 1 {
             changed = true;
@@ -195,7 +169,6 @@ mod tests {
         let changed = pass.run(&mut module, &ctx).unwrap();
         assert!(changed, "should merge consecutive emits");
 
-        // Validate the result.
         let info = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),
@@ -252,15 +225,11 @@ mod tests {
         );
     }
 
-    /// Fast-path regression: on already-merged IR the pass must
-    /// return `changed = false`, signalling pipeline convergence.
-    /// The allocator-skip behind that flag is not directly observable
-    /// in safe Rust, so we test the load-bearing surface.
+    /// The allocator skip is not observable; its `changed = false` signal is.
     #[test]
     fn fast_path_reports_no_change_on_already_merged_nested_blocks() {
-        // Control flow forces nested-block recursion; every inner
-        // block holds a single Emit or none, so no merge is possible
-        // and the second run must report `false`.
+        // Control flow forces nested recursion; every inner block holds at
+        // most one Emit.
         let src = r#"
             fn f(a: f32, c: bool) -> f32 {
                 if c {
@@ -278,9 +247,6 @@ mod tests {
         };
         let mut pass = EmitMergePass;
 
-        // First run: real work may happen if naga emits non-merged
-        // emits.  Second run must converge to no-change because IR
-        // is now at fixed point.
         let _ = pass.run(&mut module, &ctx).unwrap();
         let changed2 = pass.run(&mut module, &ctx).unwrap();
         assert!(
@@ -289,18 +255,14 @@ mod tests {
         );
     }
 
-    /// Regression: a block whose rebuild only drops empty Emit ranges
-    /// (and never merges contiguous pairs) shrinks but used to return
-    /// `changed = false`, hiding the mutation from the pipeline's
-    /// convergence detector.
+    /// A rebuild that only drops empty Emits still mutates the block and
+    /// must say so.
     #[test]
     fn dropping_only_empty_emits_reports_changed() {
         use naga::{Span, Statement};
 
-        // Hand-build a function body of two empty Emit ranges.  naga's
-        // WGSL frontend won't produce these directly, but upstream
-        // passes (e.g. const_fold removing every expression in a run)
-        // can leave them behind.
+        // naga's front-end never produces empty Emits; upstream passes
+        // (const_fold emptying a run) can.
         let mut module = naga::Module::default();
         let mut function = naga::Function::default();
         let empty = naga::Range::from_index_range(0..0, &function.expressions);

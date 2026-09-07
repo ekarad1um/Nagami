@@ -1,11 +1,5 @@
-//! Generator unit-test suite.
-//!
-//! Shared fixtures live in [`helpers`]; every other sub-module groups
-//! tests by the emitter feature under test (type elision, compound
-//! assignment folding, splat collapsing, and so on).  The suite is
-//! oriented around output-text assertions: most tests parse a WGSL
-//! snippet, run it through [`super::generate`], and compare the
-//! emitted source to the expected shape.
+//! Generator unit-test suite: shared fixtures in [`helpers`], one sub-module
+//! per emitter feature, assertions on the emitted text.
 
 mod helpers;
 

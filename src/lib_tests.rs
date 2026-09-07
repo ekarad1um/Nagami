@@ -1,13 +1,9 @@
-//! Child module of the file that declares it (via `#[path]`), so
-//! `use super::*` keeps private items reachable; relocated out of the
-//! declaring file purely for size.
+//! `#[path]` child of `lib.rs`, so `use super::*` reaches private items.
 
 use super::*;
 
-/// Run `f` on a large stack (as the CLI runs minification on its big-stack
-/// worker) so a deep-chain test does not overflow the default test-thread
-/// stack in the debug profile.  A failed assertion still fails the test - its
-/// panic is re-raised via `resume_unwind`.
+/// The CLI minifies on a big-stack worker; a deep-chain test overflows the
+/// default test-thread stack in debug.  A panic inside `f` is re-raised.
 fn on_big_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
     match std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
@@ -41,9 +37,7 @@ fn run_module_report_bytes_nonzero() {
 
 #[test]
 fn non_const_initializer_predicate_flags_binary_override_init() {
-    // `2.0 * d` (d is an override) cannot be const-folded, so it stays a
-    // `Binary` in the override's init - the variant naga's wgsl-out aborts
-    // on.  Must be flagged so the naga baseline is skipped.
+    // `2.0 * d` stays a `Binary` init, the variant naga's wgsl-out aborts on.
     let m = io::parse_wgsl(
         "override d: f32;\
              override h = 2.0 * d;\
@@ -56,9 +50,7 @@ fn non_const_initializer_predicate_flags_binary_override_init() {
 
 #[test]
 fn ray_query_predicate_flags_module() {
-    // naga's WGSL writer aborts on `Statement::RayQuery`
-    // (`unreachable!()`), so any module holding a `ray_query` type must
-    // skip the naga baseline/fallback emit.
+    // naga's WGSL writer has `Statement::RayQuery => unreachable!()`.
     let m = io::parse_wgsl(
             "enable wgpu_ray_query;\
              @group(0)@binding(0) var acc: acceleration_structure;\
@@ -74,10 +66,8 @@ fn ray_query_predicate_flags_module() {
 
 #[test]
 fn ray_tracing_pipeline_without_query_keeps_naga_baseline() {
-    // A ray-tracing-*pipeline* module without ray queries stays on the
-    // naga baseline: the writer handles its stages, payloads, and
-    // builtins fine, and skipping needlessly would forgo the byte
-    // comparison.
+    // The writer handles pipeline stages, payloads, and builtins; skipping
+    // needlessly forgoes the byte comparison.
     let m = io::parse_wgsl(
         "enable wgpu_ray_tracing_pipeline;\
              struct P { hit: u32 }\
@@ -102,9 +92,8 @@ fn non_const_initializer_predicate_flags_binary_global_var_init() {
 
 #[test]
 fn non_const_initializer_predicate_ignores_const_foldable_inits() {
-    // `2.0 * 3.0` is folded to a `Literal` by the front-end, and `c`
-    // resolves to a `Constant` - both are in naga's writable set, so the
-    // module must NOT be flagged (the naga baseline stays available).
+    // The front-end folds `2.0 * 3.0` to a `Literal` and `c` is a `Constant`,
+    // both in naga's writable set.
     let m = io::parse_wgsl(
         "const c = 2.0 * 3.0;\
              var<private> g: f32 = c;\
@@ -164,7 +153,6 @@ fn validate_each_pass_reports_after_bytes() {
         ..Default::default()
     };
     let output = run(TRIVIAL_SHADER, &config).unwrap();
-    // IR passes should all have after_bytes when validate_each_pass is on
     for pr in output
         .report
         .pass_reports
@@ -181,7 +169,6 @@ fn validate_each_pass_reports_after_bytes() {
 
 #[test]
 fn generator_emit_report_consistency() {
-    // Verify the generator_emit pass report fields are internally consistent.
     let config = Config::default();
     let output = run(TRIVIAL_SHADER, &config).unwrap();
     let gen_report = output
@@ -191,7 +178,6 @@ fn generator_emit_report_consistency() {
         .find(|p| p.pass_name == "generator_emit")
         .expect("generator_emit pass must exist");
 
-    // If not rolled back, final source should equal output
     if !gen_report.rolled_back {
         assert_eq!(
             gen_report.after_bytes,
@@ -201,10 +187,8 @@ fn generator_emit_report_consistency() {
         assert!(gen_report.validation_ok);
         assert_eq!(gen_report.text_validation_ok, Some(true));
     }
-    // Whether rolled back or not, before_bytes must be present
     assert!(gen_report.before_bytes.is_some());
     assert!(gen_report.after_bytes.is_some());
-    // changed must be false when rolled_back
     if gen_report.rolled_back {
         assert!(!gen_report.changed);
     }
@@ -212,19 +196,11 @@ fn generator_emit_report_consistency() {
 
 // MARK: End-to-end preserve_symbols tests
 
-/// Regression guard for [`literal_to_wgsl_bare`].  Bare literal
-/// emission is safe only at its two sanctioned call sites:
-///
-///   1. inside a type constructor, where the enclosing type pins
-///      the component type, and
-///   2. as the RHS of an extracted `const NAME = ...;` declaration,
-///      where every use of `NAME` re-binds via abstract coercion.
-///
-/// The shader below stresses concrete-typed whole-number literals
-/// (`F32(1.0)`, `F32(2.0)`, `F32(3.0)`) in positions that would
-/// break if the emitter ever used the bare form outside those two
-/// patterns, e.g. as a standalone `let` initialiser or as an
-/// overload-resolution argument to `atan2`.
+/// Bare literal emission is safe only inside a type constructor (the type
+/// pins the component) and as the RHS of an extracted `const` (every use
+/// re-binds via abstract coercion); this stresses concrete whole-number
+/// literals in positions that break if the bare form leaks elsewhere (a
+/// standalone `let`, an `atan2` overload argument).
 #[test]
 fn e2e_concrete_float_literals_round_trip_after_minification() {
     let src = r#"
@@ -246,8 +222,6 @@ fn e2e_concrete_float_literals_round_trip_after_minification() {
         "#;
     let config = Config::default();
     let output = run(src, &config).expect("pipeline should succeed");
-    // The emitted WGSL must re-parse - this is the whole point of the
-    // bare-literal invariant.
     io::parse_wgsl(&output.source).expect("minified output must round-trip");
 }
 
@@ -276,8 +250,71 @@ fn e2e_preserve_symbols_struct_type_survives_mangle() {
         "preserved struct type name must survive full pipeline: {}",
         output.source
     );
-    // Validate the output is valid WGSL.
     io::validate_wgsl_text(&output.source).expect("output must be valid WGSL");
+}
+
+#[test]
+fn e2e_later_declarations_see_earlier_constant_names() {
+    // The declaration sections share one emission context and name each
+    // constant in it as it is emitted, so a global initializer that reuses a
+    // constant's tree prints the name instead of re-rendering it.
+    let src = "const K: vec2<i32> = vec2<i32>(42, 43);\n\
+               var<private> P: vec2<i32> = K;\n\
+               @group(0) @binding(0) var<storage, read_write> out: array<i32>;\n\
+               @compute @workgroup_size(1) fn main() { out[0] = P.x + P.y; }";
+    let config = Config {
+        preserve_symbols: vec!["K".to_string()],
+        ..Default::default()
+    };
+    let out = run(src, &config).expect("minifies").source;
+    assert!(
+        out.contains("=K;") && out.matches("vec2i(42,43)").count() == 1,
+        "the global initializer must reuse the constant's name: {out}"
+    );
+    io::validate_wgsl_text(&out).expect("output must be valid WGSL");
+}
+
+#[test]
+fn e2e_library_constants_keep_their_concrete_type() {
+    // `const NAME = <init>` prints no `: T`, so the init text must spell the
+    // type: an abstract `1` or `vec2(42,43)` is a different constant that
+    // naga's front end folds away instead of declaring.
+    let src = "const PI: f32 = 3.1415927;\n\
+               const IX: i32 = 7;\n\
+               const CF: f32 = 1.0;\n\
+               const VI: vec2<i32> = vec2<i32>(42, 43);\n\
+               fn use_them(x: f32) -> f32 { return x * PI + f32(IX) + CF + f32(VI.x); }";
+    let config = Config {
+        profile: config::Profile::Max,
+        preserve_symbols: ["PI", "IX", "CF", "VI"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        ..Default::default()
+    };
+    let once = run(src, &config).expect("library module minifies").source;
+    let twice = run(&once, &config).expect("output re-minifies").source;
+    assert_eq!(once, twice, "constants must survive a second pass");
+
+    let module = io::parse_wgsl(&once).expect("output parses");
+    let info = io::validate_module(&module).expect("output validates");
+    for (name, expected) in [
+        ("PI", naga::ScalarKind::Float),
+        ("IX", naga::ScalarKind::Sint),
+        ("CF", naga::ScalarKind::Float),
+    ] {
+        let (_, c) = module
+            .constants
+            .iter()
+            .find(|(_, c)| c.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("`{name}` must survive as a constant: {once}"));
+        assert_eq!(
+            module.types[c.ty].inner.scalar_kind(),
+            Some(expected),
+            "`{name}` changed type: {once}"
+        );
+    }
+    let _ = info;
 }
 
 #[test]
@@ -310,7 +347,6 @@ fn e2e_preserve_symbols_struct_member_survives_mangle() {
 
 #[test]
 fn e2e_preserve_symbols_multiple_categories() {
-    // Preserve a struct type, a member, and a constant through the full pipeline.
     let src = r#"
             const MY_CONST: f32 = 3.14;
             struct Material {
@@ -348,7 +384,6 @@ fn e2e_preserve_symbols_multiple_categories() {
         "preserved constant must survive: {}",
         output.source
     );
-    // Non-preserved member should be mangled.
     assert!(
         !output.source.contains("roughness"),
         "non-preserved member should be mangled: {}",
@@ -357,12 +392,10 @@ fn e2e_preserve_symbols_multiple_categories() {
     io::validate_wgsl_text(&output.source).expect("output must be valid WGSL");
 }
 
-/// A flat reassignment chain must not become one unboundedly-deep
-/// expression tree: store-to-load forwarding is depth-capped
-/// (`SUBSTITUTION_DEPTH_CAP`), because the deep tree overflows recursive
-/// consumers (render_depth's measurement, naga's writer, wasm's ~1 MB
-/// stack that the CLI's big-stack worker does not cover) and ships in the
-/// output, re-charging every re-minification.
+/// Store-to-load forwarding is depth-capped (`SUBSTITUTION_DEPTH_CAP`): an
+/// unbounded reassignment tree overflows recursive consumers (render_depth,
+/// naga's writer, wasm's ~1 MB stack the big-stack worker does not cover)
+/// and ships in the output, re-charging every re-minification.
 #[test]
 fn e2e_flat_reassignment_chain_stays_depth_bounded() {
     let mut src = String::from(
@@ -395,10 +428,8 @@ fn e2e_flat_reassignment_chain_stays_depth_bounded() {
 
 /// naga materialises a dynamically-indexed function-scope `const` array as
 /// a full `Compose` at the use site; once load_dedup forwards the index
-/// variable's literal, const_fold must pick the element so the composite
-/// dies - round one used to ship the whole array inline
-/// (`array<u32,2310>(...)[0]`, the corpus large_array 4749-vs-100-byte
-/// idempotence gap).
+/// literal, const_fold must pick the element so the composite dies instead
+/// of shipping inline.
 #[test]
 fn e2e_const_array_with_forwarded_index_folds_to_element() {
     let src = r#"
@@ -423,11 +454,10 @@ fn e2e_const_array_with_forwarded_index_folds_to_element() {
     );
 }
 
-/// A preserved function must keep BOTH its definition and its call sites.
-/// Template inlining used to bake the body into callers, after which
-/// `naga::compact` culled the now call-less declaration - for a `--preamble`
-/// input that body is only a STUB, so the consumer's real definition was
-/// silently bypassed.
+/// A preserved function keeps both definition and call sites: inlining the
+/// body lets `naga::compact` cull the call-less declaration, and for a
+/// `--preamble` input that body is only a stub, so the consumer's real
+/// definition would be bypassed.
 #[test]
 fn e2e_preserve_symbols_function_keeps_definition_and_call_site() {
     let src = r#"
@@ -458,15 +488,10 @@ fn e2e_preserve_symbols_function_keeps_definition_and_call_site() {
 
 #[test]
 fn e2e_struct_name_does_not_collide_with_function_params() {
-    // Regression: the rename pass assigns short names to function
-    // parameters and locals.  The generator must not pick the same
-    // names for struct types/members, because in WGSL function-scope
-    // names shadow module-scope type names, making the struct
-    // unusable as a type inside that function.
-    //
-    // This shader has enough globals + function params that the
-    // rename pass will consume early short names, creating a
-    // collision opportunity for the generator's struct mangling.
+    // Function-scope names shadow module-scope type names in WGSL, so the
+    // generator's struct names must avoid the rename pass's short
+    // parameter/local names; enough globals and params here consume the
+    // early names.
     let src = r#"
             struct Data { value: f32, extra: f32 }
             @group(0) @binding(0) var<uniform> d: Data;
@@ -487,7 +512,6 @@ fn e2e_struct_name_does_not_collide_with_function_params() {
         ..Default::default()
     };
     let output = run(src, &config).unwrap();
-    // The generator must not roll back.
     let gen_report = output
         .report
         .pass_reports
@@ -505,8 +529,6 @@ fn e2e_struct_name_does_not_collide_with_function_params() {
 
 #[test]
 fn e2e_struct_name_does_not_collide_with_local_variables() {
-    // Similar to the above, but the collision is with local variables
-    // rather than function parameters.
     let src = r#"
             struct Result { x: f32, y: f32 }
             @group(0) @binding(0) var<uniform> input: Result;
@@ -573,7 +595,7 @@ fn preamble_declarations_excluded_from_output() {
         "entry point must still appear in output: {}",
         output.source
     );
-    // Output alone is incomplete; validate with preamble re-prepended.
+    // The output alone is incomplete; re-prepend the preamble to validate.
     let (emit_dirs, emit_body) = split_directives(&output.source);
     let (pre_dirs, pre_body) = split_directives(preamble);
     let combined = join_with_newline(&[emit_dirs, pre_dirs, pre_body, emit_body]);
@@ -597,8 +619,6 @@ fn preamble_names_preserved_from_renaming() {
         ..Default::default()
     };
     let output = run(source, &config).unwrap();
-    // The preamble member names must survive mangling so that access
-    // expressions (inputs.time, inputs.size) remain correct.
     assert!(
         output.source.contains("time"),
         "preamble member 'time' must survive mangling: {}",
@@ -655,12 +675,10 @@ fn parse_error_contains_source_annotation() {
     };
     let msg = err.to_string();
     assert_eq!(err.kind(), "parse");
-    // Must contain the annotated source line.
     assert!(
         msg.contains("bad_func"),
         "parse error should reference the problematic identifier: {msg}"
     );
-    // Must contain line/column info from codespan.
     assert!(
         msg.contains("wgsl:"),
         "parse error should have source location: {msg}"
@@ -696,7 +714,6 @@ fn error_kind_and_message_accessors() {
         Ok(_) => panic!("expected parse error"),
     };
     assert_eq!(err.kind(), "parse");
-    // message() should contain the codespan diagnostic.
     assert!(!err.message().is_empty(), "error message must not be empty");
 }
 
@@ -738,31 +755,40 @@ fn atomic_compare_exchange_members_do_not_trigger_generator_rollback() {
 }
 
 #[test]
-fn run_strips_naga_only_binding_array_enable_from_output() {
-    // naga 30 requires `enable wgpu_binding_array;` to parse a binding_array,
-    // but tint/Dawn reject the naga-specific directive and support binding
-    // arrays natively, so the shipped tint-facing output must NOT carry it -
-    // yet the minified binding_array itself must survive.
-    let src = r#"
-            enable wgpu_binding_array;
-            @group(0) @binding(0)
-            var arr: binding_array<texture_2d<f32>>;
-
-            @fragment
-            fn main() -> @location(0) vec4<f32> {
-                return textureLoad(arr[0], vec2<i32>(0, 0), 0);
-            }
-        "#;
-    let output = run(src, &Config::default()).expect("run should succeed");
+fn run_keeps_the_binding_array_enable_the_output_still_needs() {
+    // A source that opts into the wgpu extension is wgpu-facing: naga cannot
+    // parse the output without the directive, and tint rejects this shape
+    // (`binding_array` there takes two template arguments and a
+    // sampled-texture element), so stripping would serve neither.
+    let body = |enable: &str| {
+        format!(
+            "{enable}\n\
+             @group(0) @binding(0) var arr: binding_array<texture_2d<f32>>;\n\
+             @fragment fn main() -> @location(0) vec4<f32> {{\n\
+               return textureLoad(arr[0], vec2<i32>(0, 0), 0);\n\
+             }}"
+        )
+    };
+    let output =
+        run(&body("enable wgpu_binding_array;"), &Config::default()).expect("run should succeed");
     assert!(
-        !output.source.contains("enable wgpu_binding_array;"),
-        "naga-only enable directive must be stripped from tint-facing output: {}",
+        output.source.contains("enable wgpu_binding_array;"),
+        "an opted-in extension the output still uses must survive: {}",
         output.source
     );
     assert!(
         output.source.contains("binding_array<"),
         "the binding_array type itself must survive minification: {}",
         output.source
+    );
+    io::validate_wgsl_text(&output.source).expect("output must re-parse");
+
+    // Without the opt-in the shader targets tint, which needs no directive.
+    let implicit = run(&body(""), &Config::default()).expect("run should succeed");
+    assert!(
+        !implicit.source.contains("enable wgpu_binding_array;"),
+        "a tint-facing source must not gain a naga-only directive: {}",
+        implicit.source
     );
 }
 
@@ -845,11 +871,10 @@ fn preamble_plus_validation_bailout_with_directives_hard_errors() {
 
 // MARK: Pointer-parameter recovery
 //
-// naga's validator rejects pointer arguments into workgroup / storage /
-// uniform space that tint accepts (unrestricted_pointer_parameters);
-// `specialize_ptr_params` recovers whole-variable call sites so these
-// shaders run the FULL pipeline.  The element-root case stays out of
-// scope and must keep bailing.
+// naga's validator rejects workgroup/storage/uniform pointer arguments tint
+// accepts (unrestricted_pointer_parameters); `specialize_ptr_params` recovers
+// whole-variable call sites and the validation stand-in carries every other
+// shape, so all run the full pipeline.
 
 /// No bailout, the pass on the report, and the helper name mangled away
 /// (a surviving name would prove the pipeline was skipped).
@@ -936,34 +961,116 @@ fn ptr_param_clone_keeps_the_original_name() {
 }
 
 #[test]
-fn ptr_param_element_chain_root_takes_validation_bailout() {
-    // A pointer rooted at an ELEMENT (`&a[i]`) carries a call-site-dependent
-    // index into the callee, which whole-var specialization cannot express;
-    // this case is expected to keep bailing even after whole-var roots are
-    // lifted.
+fn ptr_param_element_chain_root_runs_the_full_pipeline() {
+    // An element-rooted pointer (`&a[i]`) carries a call-site-dependent index
+    // whole-var specialization cannot express, so the parameter survives and
+    // the stand-in validates it.
     let src = "var<workgroup> a: array<f32, 64>;\n\
                fn setf(p: ptr<workgroup, f32>) { *p = 1.0; }\n\
                @compute @workgroup_size(64) fn m(@builtin(local_invocation_id) lid: vec3u) {\n\
                  setf(&a[lid.x]);\n\
                }";
-    let output = run(src, &Config::default()).expect("bailout returns Ok");
-    let reason = output
-        .report
-        .bailout
-        .as_deref()
-        .expect("element-rooted ptr<workgroup> argument must take the validation bailout");
+    let output = run(src, &Config::default()).expect("runs");
     assert!(
-        reason.contains("is a pointer of space") && reason.contains("whole-variable"),
-        "the reason must carry naga's error and the recovery-scope note: {reason}"
+        output.report.bailout.is_none(),
+        "{:?}",
+        output.report.bailout
     );
-    assert!(output.source.contains("setf"));
+    assert!(
+        !output.source.contains("setf") && output.source.contains("ptr<workgroup,f32>"),
+        "mangled helper keeps its pointer parameter: {}",
+        output.source
+    );
+    assert!(
+        output.source.contains("(&") && output.source.contains("*"),
+        "call passes the element address, the callee derefs: {}",
+        output.source
+    );
+    assert!(output.name_map.is_some());
+}
+
+#[test]
+fn library_module_pointer_helper_runs_the_full_pipeline() {
+    // No entry point, so nothing can be specialized: the stand-in is the only
+    // way in.  Shape of vgpu's fft-core module.
+    let src = "const N: u32 = 8u;\n\
+               fn cmul(a: vec2f, b: vec2f) -> vec2f {\n\
+                 return vec2f(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);\n\
+               }\n\
+               fn stage(a: ptr<workgroup, array<vec2f, 256>>, b: ptr<workgroup, array<vec2f, 256>>, lid: u32) {\n\
+                 for (var s: u32 = 0u; s < N; s = s + 1u) {\n\
+                   let half = 1u << s;\n\
+                   if (lid < 128u) {\n\
+                     let i0 = ((lid >> s) << (s + 1u)) + (lid & (half - 1u));\n\
+                     let i1 = i0 + half;\n\
+                     let w = vec2f(cos(f32(i0)), sin(f32(i0)));\n\
+                     let a0 = (*a)[i0];\n\
+                     let a1 = cmul(w, (*a)[i1]);\n\
+                     (*a)[i0] = a0 + a1;\n\
+                     (*a)[i1] = a0 - a1;\n\
+                     (*b)[i0] = (*b)[i0] + cmul(w, (*b)[i1]);\n\
+                   }\n\
+                   workgroupBarrier();\n\
+                 }\n\
+               }";
+    let output = run(src, &Config::default()).expect("runs");
+    assert!(
+        output.report.bailout.is_none(),
+        "{:?}",
+        output.report.bailout
+    );
+    assert!(
+        output.source.contains("ptr<workgroup,") && output.source.contains("(*"),
+        "pointer parameters and their explicit derefs survive: {}",
+        output.source
+    );
+    assert!(
+        !output.source.contains("stage("),
+        "mangled: {}",
+        output.source
+    );
+    assert!(
+        output.report.pass_reports.iter().all(|p| !p.rolled_back),
+        "every pass must handle the pointer-parameter shape"
+    );
+    let again = run(&output.source, &Config::default()).expect("re-runs");
+    assert!(again.report.bailout.is_none());
+    assert!(again.source.len() <= output.source.len());
+}
+
+#[test]
+fn storage_pointer_parameter_keeps_its_access_mode_and_array_length() {
+    let src = "struct Buf { data: array<f32> }\n\
+               @group(0) @binding(0) var<storage, read_write> buf: Buf;\n\
+               fn bump(p: ptr<storage, array<f32>, read_write>, i: u32) {\n\
+                 if (i < arrayLength(p)) { (*p)[i] += 1.0; }\n\
+               }\n\
+               @compute @workgroup_size(1) fn m(@builtin(global_invocation_id) g: vec3u) {\n\
+                 bump(&buf.data, g.x);\n\
+               }";
+    let output = run(src, &Config::default()).expect("runs");
+    assert!(
+        output.report.bailout.is_none(),
+        "{:?}",
+        output.report.bailout
+    );
+    assert!(
+        output.source.contains(",read_write>"),
+        "a writable storage pointer spells its access mode: {}",
+        output.source
+    );
+    assert!(
+        output.source.contains("arrayLength(") && !output.source.contains("arrayLength(&"),
+        "a pointer parameter is already the pointer operand: {}",
+        output.source
+    );
 }
 
 #[test]
 fn line_comments_end_at_every_wgsl_line_break() {
-    // WGSL ends a `//` comment at any of LF/VT/FF/CR/NEL/LS/PS; ending only
-    // at `\n` swallowed the statement after a lone `\r` INTO the comment on
-    // the bailout paths (silent statement loss with exit 0).
+    // A `//` comment ends at any of LF/VT/FF/CR/NEL/LS/PS; ending only at `\n`
+    // swallows the statement after a lone `\r` on the bailout paths (silent
+    // loss, exit 0).
     for brk in [
         '\u{000B}', '\u{000C}', '\r', '\u{0085}', '\u{2028}', '\u{2029}',
     ] {
@@ -978,9 +1085,8 @@ fn line_comments_end_at_every_wgsl_line_break() {
 
 #[test]
 fn compact_keeps_space_before_non_ascii_identifier() {
-    // U+2118 is XID_Start but fails `is_alphanumeric`; fusing the keyword
-    // and identifier into one token shipped tint-invalid text on the
-    // bailout paths.
+    // U+2118 is XID_Start but fails `is_alphanumeric`; fusing keyword and
+    // identifier ships tint-invalid text on the bailout paths.
     let compacted = compact_wgsl_text("let \u{2118} = subgroupAdd(1.0);");
     assert!(
         compacted.starts_with("let \u{2118}"),
@@ -1018,10 +1124,10 @@ fn preamble_declared_unknown_directive_bails_out_with_body_compacted() {
 
 #[test]
 fn preamble_plus_bailout_with_directives_hard_errors() {
-    // The unsupported-extension bailout ships the body verbatim-compacted,
-    // keeping its leading `enable subgroups;`; the consumer's
-    // [preamble, body] order would misplace it, so preamble mode must
-    // refuse loudly instead of shipping a poisoned document with exit 0.
+    // The bailout ships the body compacted with its leading `enable
+    // subgroups;`, misplaced in the consumer's [preamble, body] order, so
+    // preamble mode must refuse rather than ship a poisoned document with
+    // exit 0.
     let body = "enable subgroups;\n@compute @workgroup_size(64)\n\
         fn m(@builtin(subgroup_invocation_id) sid: u32) { _ = subgroupAdd(f32(sid)); }";
     let config = Config {
@@ -1043,11 +1149,9 @@ fn preamble_plus_bailout_with_directives_hard_errors() {
 
 #[test]
 fn int16_fallback_keeps_enable_and_compacted_text_validates() {
-    // The generator has no i16/u16 spelling, so int16 modules always ship
-    // via the naga fallback; its text genuinely uses 16-bit tokens, so
-    // `strip_naga_only_enables` must KEEP `enable wgpu_int16;` (stripping
-    // shipped naga-invalid text), and the fallback compaction must
-    // round-trip.
+    // The generator has no i16/u16 spelling, so int16 modules ship via the
+    // naga fallback, whose text genuinely uses 16-bit tokens:
+    // `strip_naga_only_enables` must keep `enable wgpu_int16;`.
     let src = "enable wgpu_int16;\n\
                    @group(0) @binding(0) var<storage, read_write> o: u32;\n\
                    @compute @workgroup_size(1) fn m() {\n  var x: i16;\n  o = u32(x);\n}\n";
@@ -1109,20 +1213,11 @@ fn run_auto_enables_f16_when_used() {
     );
 }
 
-// Regression: WGSL (https://www.w3.org/TR/WGSL/#comments) permits
-// nested block comments.  A non-nesting comment scrubber would close
-// at the inner `*/` and expose the trailing `f16` content to the
-// token scan; the depth-tracking implementation must absorb the inner
-// pair and treat the whole region as commented.
-// Regression: classic-Mac (lone `\r`) line endings must be
-// normalised before any `.lines()` scan, otherwise the
-// `wgpu_*` directive strip and `enable f16;` detection fold the
-// entire source into one line and silently fail.
 #[test]
 fn preprocess_preserves_wgpu_directive_with_cr_only_endings() {
-    // naga 30 implements (and requires) `wgpu_binding_array`, so it is no
-    // longer stripped; the lone-CR line ending is still normalised to LF so
-    // the downstream per-line scans see the break.
+    // Lone `\r` endings must be normalised before any `.lines()` scan, or the
+    // directive strip and `enable f16;` detection see one line; naga
+    // implements `wgpu_binding_array`, so the directive itself is kept.
     let src =
         "enable wgpu_binding_array;\r@fragment fn m() -> @location(0) vec4f { return vec4f(0); }";
     let out = preprocess_source_for_naga(src);
@@ -1138,7 +1233,6 @@ fn preprocess_preserves_wgpu_directive_with_cr_only_endings() {
 
 #[test]
 fn preprocess_does_not_inject_for_identifier_only() {
-    // Source references `f16` only as part of identifiers -> no injection.
     let src = "var myf16_var: i32 = 0;\n";
     let out = preprocess_source_for_naga(src);
     assert!(
@@ -1190,11 +1284,8 @@ fn preprocess_blanks_requires_unrestricted_pointer_parameters() {
 fn preprocess_does_not_duplicate_enable_f16_with_extra_whitespace() {
     let src = "enable  f16;\nfn f() -> f16 { return 0h; }\n";
     let out = preprocess_source_for_naga(src);
-    // The output must carry exactly the directive that was already
-    // present in the source: one occurrence of `enable...f16;` plus
-    // one occurrence of the `f16` return type in the function
-    // signature.  The `enable` count locks against accidental
-    // injection of a second normalised `enable f16;`.
+    // The `enable` count locks against injecting a second normalised
+    // `enable f16;` beside the source's own spelling.
     assert_eq!(
         out.matches("enable").count(),
         1,
@@ -1208,14 +1299,13 @@ fn preprocess_does_not_duplicate_enable_f16_with_extra_whitespace() {
 
 // MARK: Naga error-message coupling tests
 
-// These tests fail if `UNSUPPORTED_EXTENSION_PATTERNS` or
-// `KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS` drift out of sync with
-// the naga error phrasings they target.
+// Fail when `UNSUPPORTED_EXTENSION_PATTERNS` or
+// `KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS` drift from naga's phrasings.
 
 /// Real parses, so a naga rewording fails here instead of silently turning
-/// a bailout into a hard error.  `EnableExtensionNotSupported` is
-/// unreachable through `parse_str` (every capability granted) and shares
-/// the `extension is not` key by construction.
+/// a bailout into a hard error.  `EnableExtensionNotSupported` is unreachable
+/// through `parse_str` (every capability granted) and shares the
+/// `extension is not` key by construction.
 #[test]
 fn unsupported_extension_patterns_track_naga_phrasings() {
     let declined = [
@@ -1235,11 +1325,9 @@ fn unsupported_extension_patterns_track_naga_phrasings() {
     assert!(!is_unsupported_extension_parse_error(&err), "{err}");
 }
 
-/// Regression: a parse error whose codespan snippet quotes a user
-/// comment containing the unsupported-extension phrasing must NOT
-/// trigger the bailout.  Pre-fix, substring matching against the
-/// entire rendered message swallowed real failures whenever the
-/// user happened to comment-mention an unsupported extension.
+/// A codespan snippet quoting a user comment that contains the phrasing must
+/// not trigger the bailout; matching the whole rendered message swallows
+/// real failures.
 #[test]
 fn unsupported_extension_patterns_ignore_quoted_source_lines() {
     let rendered = "error: expected identifier, found `{`\n  \
@@ -1251,10 +1339,7 @@ fn unsupported_extension_patterns_ignore_quoted_source_lines() {
         "pattern in a quoted source line must NOT trigger the bailout"
     );
 
-    // Same shape for the subgroups text-validation limitation: a
-    // shader quoting the phrase in a comment, surfaced as context
-    // around an unrelated parse error, must not opt into the
-    // validation-bypass.
+    // Same for the subgroups text-validation limitation.
     let rendered = "error: expected `;`\n  \
                         ┌─ wgsl:3:1\n  │\n3 │ // subgroups enable-extension is not yet supported\n";
     let err = Error::Parse(rendered.into());
@@ -1266,12 +1351,8 @@ fn unsupported_extension_patterns_ignore_quoted_source_lines() {
 
 #[test]
 fn unsupported_extension_patterns_only_match_parse_errors() {
-    // Regression: substring patterns must not match against the
-    // rendered message of a non-`Parse` error variant, since a
-    // validator/emit failure quoting the same phrasing (or even an
-    // I/O error path containing the offending source) would
-    // previously short-circuit `run` into the "return input
-    // unchanged" branch and silently swallow a real failure.
+    // A validator/emit/IO error quoting the phrasing must not short-circuit
+    // `run` into the return-input branch and swallow a real failure.
     for ctor in [
         Error::Validation as fn(String) -> Error,
         Error::Emit as fn(String) -> Error,
@@ -1288,10 +1369,7 @@ fn unsupported_extension_patterns_only_match_parse_errors() {
 
 #[test]
 fn known_text_validation_limitation_only_matches_parse_or_validation() {
-    // Same defensive policy as above for the subgroups-limitation
-    // matcher: only `Parse` and `Validation` may opt into the
-    // round-trip-validation bypass; `Emit` and `Io` errors quoting
-    // the same phrasing must be reported normally.
+    // Only `Parse` and `Validation` may opt into the round-trip bypass.
     for ctor in [
         Error::Emit as fn(String) -> Error,
         Error::Io as fn(String) -> Error,
@@ -1314,13 +1392,10 @@ fn known_text_validation_limitation_matches_subgroup_phrasing() {
 
 #[test]
 fn known_text_validation_limitation_matches_validation_variant_too() {
-    // The matcher is intentionally scoped to `Parse | Validation`
-    // because `io::validate_wgsl_text` internally calls both
-    // `parse_wgsl` (Parse errors) and `validate_module_with_source`
-    // (Validation errors); naga can report a not-yet-supported
-    // `enable` directive through either path.  This regression pins
-    // the Validation branch so a future tightening to "Parse only"
-    // fails loudly here.
+    // `io::validate_wgsl_text` reports a not-yet-supported `enable` through
+    // either `parse_wgsl` (Parse) or `validate_module_with_source`
+    // (Validation); pins the Validation branch against a "Parse only"
+    // tightening.
     let err = Error::Validation("error: `subgroups` enable-extension is not yet supported".into());
     assert!(
         is_known_text_validation_limitation(&err),
@@ -1336,19 +1411,10 @@ fn known_text_validation_limitation_rejects_unrelated_errors() {
 
 #[test]
 fn preamble_with_enable_f16_shader() {
-    // A preamble that carries its OWN `enable f16;` directive, combined with
-    // a source that genuinely USES f16, minified in COMPACT mode (the whole
-    // module is one physical line).  Two contracts are verified:
-    //
-    //   1. The output body is directive-FREE.  With a preamble active the
-    //      consumer prepends the preamble in front of this output, so a
-    //      directive left in the body would land AFTER the preamble's global
-    //      declarations - illegal WGSL ("directives must come before all
-    //      global declarations").  The preamble owns the directive.
-    //   2. The shipped artifact `[preamble, output]` is valid WGSL.  This is
-    //      what exercises the `;`-aware `split_directives`: a line-based
-    //      splitter would misclassify the compact one-line output as one big
-    //      directive and mis-order the splice.
+    // A preamble owning `enable f16;` plus an f16 body in compact mode: the
+    // body must be directive-free (a directive after the preamble's globals
+    // is illegal WGSL), and the shipped `[preamble, output]` must validate,
+    // which exercises the `;`-aware `split_directives` on one-line output.
     let preamble = "\
             enable f16;\n\
             @group(0) @binding(0) var<uniform> bias: f16;\
@@ -1365,17 +1431,13 @@ fn preamble_with_enable_f16_shader() {
         preamble: Some(preamble.to_string()),
         ..Default::default()
     };
-    // Default config => compact mode.
     let output = run(source, &config)
         .expect("enable f16; in preamble + f16 source must minify in compact mode");
-    // Contract 1: the preamble owns the directive; the body must not carry a
-    // copy (it would be mis-ordered after the preamble's globals).
     assert!(
         !output.source.contains("enable f16;"),
         "output body must not carry the directive when the preamble supplies it: {}",
         output.source
     );
-    // Contract 2: the artifact the consumer actually ships re-parses.
     let shipped = format!("{preamble}\n{}", output.source);
     io::validate_wgsl_text(&shipped)
         .expect("the shipped [preamble, output] concatenation must be valid WGSL");
@@ -1383,17 +1445,13 @@ fn preamble_with_enable_f16_shader() {
 
 #[test]
 fn preamble_missing_directive_errors_not_silent_ship() {
-    // A source that genuinely uses f16 but whose preamble does NOT supply
-    // `enable f16;`.  The directive cannot validly live in the output (it
-    // would land after the preamble's globals) nor be dropped (f16 then has
-    // no enabling directive anywhere), so there is no valid `[preamble,
-    // output]` to emit.  It must ERROR here, naming the missing extension, so
-    // the user adds the directive to the preamble.
+    // The directive can neither live in the output (after the preamble's
+    // globals) nor be dropped, so no valid `[preamble, output]` exists; the
+    // error must name the extension.
     let preamble = "\
             @group(0) @binding(0) var<uniform> bias: f32;\
         ";
-    // The f16 write to a storage buffer is observable, so DCE keeps it and
-    // the emitted module genuinely needs `enable f16;`.
+    // The storage write keeps the f16 use alive through DCE.
     let source = "\
             @group(0) @binding(1) var<storage, read_write> sink: f16;\n\
             @compute @workgroup_size(1) fn main() {\n\
@@ -1419,11 +1477,8 @@ fn preamble_missing_directive_errors_not_silent_ship() {
 
 #[test]
 fn preamble_declares_f16_in_comma_separated_enable_list() {
-    // A preamble that declares f16 as one entry of a comma-separated enable
-    // list (valid WGSL) supplies the directive just as a lone `enable f16;`
-    // does, so an f16 body must minify - NOT trip the missing-directive
-    // guard.  Regression: the guard's single-extension-only detection used to
-    // hard-error this valid input.
+    // `f16` in a comma-separated enable list supplies the directive like a
+    // lone `enable f16;`; the missing-directive guard must not hard-error it.
     let preamble = "\
             enable f16, clip_distances;\n\
             @group(0) @binding(0) var<uniform> bias: f16;\
@@ -1451,13 +1506,49 @@ fn preamble_declares_f16_in_comma_separated_enable_list() {
 }
 
 #[test]
+fn an_opted_in_binding_array_needs_the_enable_in_the_preamble() {
+    // The preamble owns every directive, so a wgpu-facing body whose preamble
+    // never declares the extension would ship a document naga cannot parse.
+    let source = "\
+            enable wgpu_binding_array;\n\
+            @group(0) @binding(0) var tex: binding_array<texture_2d<f32>>;\n\
+            @fragment fn m() -> @location(0) vec4f {\n\
+                return textureLoad(tex[0], vec2i(0), 0) * SCALE;\n\
+            }";
+    let err = run(
+        source,
+        &Config {
+            preamble: Some("const SCALE: f32 = 2.0;".to_string()),
+            ..Default::default()
+        },
+    )
+    .err()
+    .expect("a preamble without the extension cannot carry this body");
+    assert!(
+        err.to_string().contains("wgpu_binding_array"),
+        "the error must name the missing directive: {err}"
+    );
+
+    let ok = run(
+        source,
+        &Config {
+            preamble: Some("enable wgpu_binding_array;\nconst SCALE: f32 = 2.0;".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("a preamble that declares it minifies");
+    assert!(
+        !ok.source.contains("enable wgpu_binding_array;"),
+        "the preamble owns the directive: {}",
+        ok.source
+    );
+}
+
+#[test]
 fn binding_array_minifies_under_preamble_without_naga_only_enable() {
-    // naga needs `enable wgpu_binding_array;` to PARSE a binding_array, but
-    // tint supports them natively (no enable) so the shipped body omits it and
-    // the preamble need not declare it.  The preamble self-check injects that
-    // naga-only enable for its naga re-parse ONLY.  Regression: the self-check
-    // validated the enable-less body against naga and hard-errored, with no
-    // preamble spelling that both minified and shipped tint-valid output.
+    // tint needs no enable for binding arrays, so the shipped body omits the
+    // naga-only `enable wgpu_binding_array;` and the preamble need not
+    // declare it; the self-check must inject it for its naga re-parse only.
     let preamble = "const SCALE: f32 = 2.0;";
     let source = "\
             @group(0) @binding(0) var tex: binding_array<texture_2d<f32>, 4>;\n\
@@ -1480,17 +1571,13 @@ fn binding_array_minifies_under_preamble_without_naga_only_enable() {
         "the binding_array type must survive: {}",
         output.source
     );
-    // The shipped body is tint-valid without the enable; naga needs it, so
-    // prepend it to confirm [preamble, body] round-trips through naga.
+    // naga needs the enable, so prepend it for the round-trip.
     let shipped = format!("enable wgpu_binding_array;\n{preamble}\n{}", output.source);
     io::validate_wgsl_text(&shipped).expect("[preamble, body] must round-trip through naga");
 }
 
 // MARK: Splat elision tests
 
-/// Minify with the `Max` profile (mangle + inline) and assert the
-/// result is valid WGSL.  Returns the minified source for the
-/// caller's own assertions.
 fn minify_and_validate(src: &str) -> String {
     let config = Config {
         profile: config::Profile::Max,
@@ -1505,19 +1592,15 @@ fn minify_and_validate(src: &str) -> String {
 
 #[test]
 fn run_never_ships_invalid_wgsl_when_fallback_is_also_invalid() {
-    // Regression for the rollback re-validation guard: when BOTH the
-    // custom generator AND naga's own wgsl-out fallback emit text that
-    // naga's frontend rejects, run() must surface a diagnosable error
-    // rather than silently shipping output that does not re-parse.
-    // Invariant under test: run() either errors, or returns output that
-    // round-trips.  (Robust to future naga changes - if a naga release
-    // accepts these forms, the Ok branch simply validates clean.)
+    // When both the generator and naga's wgsl-out fallback emit text naga's
+    // frontend rejects, `run()` must error rather than ship; if a naga release
+    // accepts these forms the Ok branch simply validates clean.
     let inputs = [
-        // f64 literal narrowed to f32: naga const-substitutes the literal
-        // under the cast, then rejects `f32(<F64 literal>)`.
+        // naga const-substitutes the f64 literal under the cast, then rejects
+        // `f32(<F64 literal>)`.
         "@group(0) @binding(0) var<storage, read_write> s: f32;\n\
              @compute @workgroup_size(1) fn m() { let a: f64 = 0.5lf; s = f32(a); }",
-        // f16 literal in a cast whose `enable f16;` naga's backend drops.
+        // An f16 cast whose `enable f16;` naga's backend drops.
         "enable f16;\n\
              @fragment fn m() -> @location(0) vec4f { let h: f16 = 1.0h; return vec4f(f32(h)); }",
     ];
@@ -1535,11 +1618,9 @@ fn run_never_ships_invalid_wgsl_when_fallback_is_also_invalid() {
 
 #[test]
 fn folds_f64_literal_narrowing_cast_to_valid_literal() {
-    // Regression for issue A: naga const-substitutes `let a: f64 = 2.5lf`
-    // into the cast, yielding `As { Literal(F64), convert }`, which the
-    // emitter rendered as `f32(2.5lf)` - a token naga rejects on re-parse.
-    // const_fold now folds the narrowing cast of an F64 literal to the
-    // converted scalar literal, so the output round-trips (and shrinks).
+    // naga const-substitutes `let a: f64 = 2.5lf` into the cast, yielding
+    // `As { Literal(F64), convert }` whose `f32(2.5lf)` rendering naga
+    // rejects on re-parse; const_fold folds it to the converted literal.
     for (decl, stmt) in [
         ("var<storage, read_write> s: f32;", "s = f32(a);"),
         ("var<storage, read_write> s: i32;", "s = i32(a);"),
@@ -1553,8 +1634,6 @@ fn folds_f64_literal_narrowing_cast_to_valid_literal() {
             .unwrap_or_else(|e| panic!("f64 narrowing cast must minify, got error: {e}"));
         io::validate_wgsl_text(&output.source)
             .unwrap_or_else(|e| panic!("output is invalid WGSL: {e}\n{}", output.source));
-        // The `T(<F64 literal>)` cast must be folded away, not emitted
-        // (no `lf)` token - the f64 literal no longer appears in a cast).
         assert!(
             !output.source.contains("lf)"),
             "f64 cast literal should be folded, not emitted as a cast: {}",
@@ -1565,10 +1644,9 @@ fn folds_f64_literal_narrowing_cast_to_valid_literal() {
 
 #[test]
 fn folds_f64_vector_narrowing_cast_to_valid_constructor() {
-    // A const f64 VECTOR narrowing cast (`vec2<f32>(vec2<f64>(.5lf,1.5lf))`)
-    // is rejected by naga on re-parse, and const_fold can't materialize the
-    // converted vector (the converted F32 component literals don't exist as
-    // arena handles).  The generator folds it to a converted constructor.
+    // const_fold cannot materialise the converted vector (no arena handles
+    // for the F32 components), so the generator folds the cast to a converted
+    // constructor.
     for (store_ty, decl_a, cast) in [
         ("vec2<f32>", "vec2<f64>(0.5lf, 1.5lf)", "vec2<f32>(a)"),
         (
@@ -1587,7 +1665,6 @@ fn folds_f64_vector_narrowing_cast_to_valid_constructor() {
         });
         io::validate_wgsl_text(&output.source)
             .unwrap_or_else(|e| panic!("output is invalid WGSL: {e}\n{}", output.source));
-        // The `vecN<f32>(vecN<f64>(..lf..))` cast must be folded away.
         assert!(
             !output.source.contains("lf)"),
             "f64 vector cast should be folded, not emitted: {}",
@@ -1598,12 +1675,10 @@ fn folds_f64_vector_narrowing_cast_to_valid_constructor() {
 
 #[test]
 fn folds_int64_narrowing_cast_to_valid_literal() {
-    // The u64/i64 (`lu`/`li`) narrowing cast is the exact analogue of the
-    // f64 cast: naga rejects re-parsing `u32(<U64 literal>)`, and naga's own
-    // backend emits the same token, so it used to hard-error.  const_fold
-    // (scalar) and the generator (vector) now fold it, WRAPPING on
-    // narrowing - `u32(i64(-1))` is `4294967295`, NOT a clamped `0` -
-    // matching naga's value-conversion semantics.
+    // `u32(<U64 literal>)` is rejected on re-parse like the f64 cast and
+    // naga's backend emits the same token; the fold wraps on narrowing
+    // (`u32(i64(-1))` is `4294967295`, not a clamped `0`), matching naga's
+    // conversion semantics.
     let cases = [
         // (decl, cast, expected substring in the folded output)
         ("let a: u64 = 107lu;", "o = u32(a);", "107"),
@@ -1630,7 +1705,6 @@ fn folds_int64_narrowing_cast_to_valid_literal() {
         });
         io::validate_wgsl_text(&output.source)
             .unwrap_or_else(|e| panic!("output is invalid WGSL: {e}\n{}", output.source));
-        // The `T(<width-8 literal>)` cast must be folded (no `lu)`/`li)`).
         assert!(
             !output.source.contains("lu)") && !output.source.contains("li)"),
             "int64 cast should be folded, not emitted: {}",
@@ -1646,7 +1720,7 @@ fn folds_int64_narrowing_cast_to_valid_literal() {
 
 #[test]
 fn splat_elision_add_vec3f() {
-    // vec3f(1) + vec3f_var  ->  bare `1` via scalar-vector broadcasting
+    // Scalar-vector broadcasting makes the splat redundant.
     let src = r#"
             @fragment fn main() -> @location(0) vec4f {
                 var c = vec3f(0.5, 0.6, 0.7);
@@ -1655,8 +1729,6 @@ fn splat_elision_add_vec3f() {
             }
         "#;
     let out = minify_and_validate(src);
-    // The splat `vec3f(1)` (or its alias) should NOT appear;
-    // instead the bare scalar should be used in the addition.
     assert!(
         !out.contains("vec3f(1)") && !out.contains("vec3<f32>(1"),
         "splat should be elided in addition: {out}"
@@ -1697,7 +1769,6 @@ fn splat_elision_multiply_vec4f() {
 
 #[test]
 fn splat_elision_divide_by_splat() {
-    // vector / splat  ->  vector / scalar
     let src = r#"
             fn helper(v: vec3f) -> vec3f {
                 return v / vec3f(dot(v, v));
@@ -1707,7 +1778,6 @@ fn splat_elision_divide_by_splat() {
             }
         "#;
     let out = minify_and_validate(src);
-    // The vec3f(dot(...)) should be elided to just dot(...)
     assert!(
         !out.contains("vec3f(dot") && !out.contains("vec3<f32>(dot"),
         "splat wrapping dot() should be elided in division: {out}"
@@ -1716,7 +1786,6 @@ fn splat_elision_divide_by_splat() {
 
 #[test]
 fn splat_elision_compound_assign() {
-    // v -= vec2f(0.5)  ->  v -= .5
     let src = r#"
             @fragment fn main() -> @location(0) vec4f {
                 var uv = vec2f(1.0, 1.0);
@@ -1733,8 +1802,7 @@ fn splat_elision_compound_assign() {
 
 #[test]
 fn splat_elision_no_double_elide() {
-    // vec3f(a) + vec3f(b): at most one side should be elided so the
-    // result stays a vector (not scalar + scalar = scalar).
+    // At most one side may elide or the sum becomes a scalar.
     let src = r#"
             @fragment fn main() -> @location(0) vec4f {
                 let a = 1.0;
@@ -1744,14 +1812,12 @@ fn splat_elision_no_double_elide() {
             }
         "#;
     let out = minify_and_validate(src);
-    // Output must be valid WGSL - validation above ensures the type is correct.
     assert!(!out.is_empty());
 }
 
 #[test]
 fn splat_elision_skipped_when_other_is_scalar() {
-    // vec4f(1.0) * scalar must NOT elide the Splat, because
-    // 1.0 * scalar = scalar, not vec4f.
+    // `1.0 * scalar` would be a scalar.
     let src = r#"
             struct S { b: f32 }
             @group(0) @binding(0) var<uniform> u: S;
@@ -1760,7 +1826,6 @@ fn splat_elision_skipped_when_other_is_scalar() {
             }
         "#;
     let out = minify_and_validate(src);
-    // The output must still contain vec4f - the splat can't be elided.
     assert!(
         out.contains("vec4"),
         "splat must not be elided when other operand is scalar: {out}"
@@ -1769,8 +1834,6 @@ fn splat_elision_skipped_when_other_is_scalar() {
 
 #[test]
 fn splat_elision_skipped_when_other_is_scalar_rhs() {
-    // scalar * vec4f(1.0) must NOT elide the Splat, because
-    // scalar * 1.0 = scalar, not vec4f.  (Reverse of the LHS test.)
     let src = r#"
             struct S { b: f32 }
             @group(0) @binding(0) var<uniform> u: S;
@@ -1787,8 +1850,7 @@ fn splat_elision_skipped_when_other_is_scalar_rhs() {
 
 #[test]
 fn splat_elision_non_arithmetic_unchanged() {
-    // Comparison operators should NOT elide splats.
-    // vec3f(0) == vec3f_var is NOT valid as 0 == vec3f_var.
+    // A comparison against a bare scalar is not valid WGSL.
     let src = r#"
             @fragment fn main() -> @location(0) vec4f {
                 let v = vec3f(1.0, 2.0, 3.0);
@@ -1796,7 +1858,6 @@ fn splat_elision_non_arithmetic_unchanged() {
                 return select(vec4f(0), vec4f(1), mask.x);
             }
         "#;
-    // Just verify it's valid - comparison ops shouldn't trigger elision.
     minify_and_validate(src);
 }
 
@@ -1804,10 +1865,8 @@ fn splat_elision_non_arithmetic_unchanged() {
 
 #[test]
 fn last_store_inlined_when_earlier_loads_keep_var_alive() {
-    // Pattern: var m is loaded before AND after the last store.
-    // The pre-store load keeps m alive (non-dead).  The post-store
-    // load should still be inlined to the stored expression, and
-    // the store itself should be removed.
+    // The pre-store load keeps `m` alive; the post-store load still inlines
+    // the stored expression.
     let src = r#"
             fn helper(v: vec3<f32>) -> vec3<f32> { return v; }
             @fragment fn main() -> @location(0) vec4f {
@@ -1819,18 +1878,11 @@ fn last_store_inlined_when_earlier_loads_keep_var_alive() {
             }
         "#;
     let out = minify_and_validate(src);
-    // The variable `m` should still exist (pre-store load keeps it alive),
-    // but the last store's value should be inlined into the return.
-    // Check that the output doesn't contain a redundant store+load pattern.
-    // The output should be shorter than without inlining.
     assert!(!out.is_empty(), "output should not be empty");
 }
 
 #[test]
 fn last_store_not_inlined_when_escaped() {
-    // When a variable's pointer escapes via a function call,
-    // its Stores must be preserved - the callee may read through
-    // the pointer at any time.
     let src = r#"
             fn consume(p: ptr<function, vec3f>) -> vec3f { return *p; }
             @fragment fn main() -> @location(0) vec4f {
@@ -1847,8 +1899,7 @@ fn last_store_not_inlined_when_escaped() {
 
 #[test]
 fn last_store_not_inlined_with_partial_stores() {
-    // When a variable has partial stores (field access), the whole-variable
-    // store must be preserved because the partial store reads the full value.
+    // The partial store reads the full value.
     let src = r#"
             @fragment fn main() -> @location(0) vec4f {
                 var v = vec3f(1.0, 2.0, 3.0);
@@ -1865,10 +1916,8 @@ fn last_store_not_inlined_with_partial_stores() {
 
 #[test]
 fn last_store_preserves_other_stores_to_same_var() {
-    // Regression: last-store inlining must only remove the specific
-    // Store that was proven dead, not ALL stores to the same variable.
-    // Here, the conditional store inside `if` must be preserved because
-    // the final `log(1+m)` reads `m` which depends on it.
+    // Only the specific dead Store may go: the conditional store feeds the
+    // final `log(1+m)` read.
     let src = r#"
             fn heavy(a: vec3f, b: vec3f) -> vec3f { return a + b; }
             struct U { v: f32 }
@@ -1884,8 +1933,6 @@ fn last_store_preserves_other_stores_to_same_var() {
             }
         "#;
     let out = minify_and_validate(src);
-    // The conditional store `m = heavy(...)` must be preserved.
-    // Without it, m stays vec3f(0) and the result is always black.
     assert!(
         out.contains("if"),
         "conditional branch must be preserved (store to m is live): {out}"
@@ -1894,10 +1941,8 @@ fn last_store_preserves_other_stores_to_same_var() {
 
 #[test]
 fn last_store_init_preserved_when_loop_reads_var() {
-    // Regression: when a variable's init Store has a seeded load
-    // that gets forwarded, but the variable is also read inside a
-    // subsequent loop body (where cache is cleared), the init Store
-    // must NOT be removed.
+    // The init's seeded load is forwarded, but the loop body (cache cleared)
+    // still reads the init on its first iteration.
     let src = r#"
             fn transform(v: vec3f) -> vec3f { return abs(v) - vec3f(0.7); }
             @fragment fn main() -> @location(0) vec4f {
@@ -1910,10 +1955,6 @@ fn last_store_init_preserved_when_loop_reads_var() {
             }
         "#;
     let out = minify_and_validate(src);
-    // The init `p = vec3f(1,2,3)` must be preserved.  Without it, the
-    // loop reads p=vec3f(0) on the first iteration, producing wrong results.
-    // Verify the output produces valid WGSL (validation above) and that
-    // the transform call appears (loop body is not dead).
     assert!(
         out.contains("abs"),
         "loop body with transform must be preserved: {out}"
@@ -1922,10 +1963,8 @@ fn last_store_init_preserved_when_loop_reads_var() {
 
 #[test]
 fn last_store_in_loop_not_removed() {
-    // Regression: a Store inside a loop body must NOT be removed by
-    // last-store inlining, even if all seeded loads are forwarded.
-    // On the next iteration, loads BEFORE the Store in the loop body
-    // observe the Store's value via the loop back-edge.
+    // Loads before the Store in the loop body observe it via the back-edge on
+    // the next iteration.
     let src = r#"
             fn complexSquare(a: vec2f) -> vec2f {
                 return vec2f(a.x * a.x - a.y * a.y, 2.0 * a.x * a.y);
@@ -1940,17 +1979,13 @@ fn last_store_in_loop_not_removed() {
             }
         "#;
     let out = minify_and_validate(src);
-    // Both stores to p in the loop must be preserved.
-    // The .zxy swizzle is the telltale of the second store.
+    // `.zxy` is the second store's telltale.
     assert!(
         out.contains(".zxy"),
         "second store in loop (with .zxy swizzle) must be preserved: {out}"
     );
 }
 
-// Regression: `split_directives` must word-boundary-match the
-// `diagnostic` keyword.  A bare `starts_with("diagnostic")` would
-// misclassify user identifiers such as `diagnostic_counter`.
 // MARK: Name map
 
 /// Every surviving module-scope symbol keyed by ORIGINAL name, values
@@ -2034,11 +2069,7 @@ fn name_map_omits_eliminated_declarations() {
 /// Bailouts ship input names: no map.
 #[test]
 fn name_map_is_none_on_bailout() {
-    let src = "var<workgroup> arr: array<f32, 64>;\n\
-               fn setf(p: ptr<workgroup, f32>) { *p = 1.0; }\n\
-               @compute @workgroup_size(64) fn m(@builtin(local_invocation_id) l: vec3u) {\n\
-                 setf(&arr[l.x]);\n\
-               }";
+    let src = "@compute @workgroup_size(1) fn m() { var x = 1; let d = x / 0; }";
     let output = run(src, &Config::default()).expect("bailout returns Ok");
     assert!(output.report.bailout.is_some(), "fixture must bail");
     assert!(output.name_map.is_none());
@@ -2046,11 +2077,11 @@ fn name_map_is_none_on_bailout() {
 
 // MARK: Review-round regressions
 
-/// A preamble-declared banned helper must keep bailing out gracefully:
-/// its text re-ships verbatim, so no module repair helps, and a
-/// "successful" repair used to turn exit-0 degradation into a hard error.
+/// A preamble-declared banned helper is frozen (its text re-ships verbatim,
+/// so no specialization), and the stand-in still lets the body minify
+/// against it.
 #[test]
-fn preamble_declared_ptr_param_helper_still_bails_out() {
+fn preamble_declared_ptr_param_helper_runs_the_pipeline() {
     let preamble = "var<workgroup> sh: array<f32, 8>;\n\
                     fn touch(p: ptr<workgroup, array<f32, 8>>, i: u32) { (*p)[i] = 1.0; }";
     let src = "@compute @workgroup_size(8) fn m(@builtin(local_invocation_id) l: vec3u) {\n\
@@ -2060,15 +2091,21 @@ fn preamble_declared_ptr_param_helper_still_bails_out() {
         preamble: Some(preamble.to_string()),
         ..Default::default()
     };
-    let output = run(src, &config).expect("must degrade gracefully, not Err");
-    let reason = output
-        .report
-        .bailout
-        .as_deref()
-        .expect("expected the validation bailout");
+    let output = run(src, &config).expect("runs");
     assert!(
-        reason.starts_with("naga rejects the input: "),
-        "expected the validation bailout, got: {reason}"
+        output.report.bailout.is_none(),
+        "{:?}",
+        output.report.bailout
+    );
+    assert!(
+        output.source.contains("touch(&sh,"),
+        "the body keeps calling the preamble's helper by name: {}",
+        output.source
+    );
+    assert!(
+        !output.source.contains("fn touch("),
+        "preamble-owned text is not re-emitted: {}",
+        output.source
     );
 }
 
@@ -2080,7 +2117,6 @@ fn name_map_omits_constants_folded_out_of_the_text() {
                @fragment fn fs_main() -> @location(0) vec4f { return vec4f(MODULE_CONST); }";
     let output = run(src, &Config::default()).expect("valid shader minifies");
     let map = output.name_map.as_ref().expect("map present");
-    // Every mapped value must exist in the shipped text.
     for (orig, new) in &map.constants {
         assert!(
             output.source.contains(new.as_str()),
@@ -2132,4 +2168,31 @@ fn name_map_covers_both_override_flavors() {
         Some("named_override"),
         "@id-less override is the host's pipeline-constant key and must be identity"
     );
+}
+
+#[test]
+fn an_extracted_literal_never_takes_a_preserved_name() {
+    // A preamble binding that DCE prunes leaves no arena entry, so only the
+    // preserve list stands between the minted `const` and a redefinition.
+    let preamble = "var<private> A: f32;\n\
+                    @group(0) @binding(0) var<storage, read_write> Buf: array<f32>;";
+    let src = "@compute @workgroup_size(1) fn main() {\n\
+                 Buf[0] = 1234.5678; Buf[1] = 1234.5678; Buf[2] = 1234.5678;\n\
+                 Buf[3] = 1234.5678; Buf[4] = 1234.5678;\n\
+               }";
+    let output = run(
+        src,
+        &Config {
+            preamble: Some(preamble.to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("a pruned preamble binding must not block minification");
+    assert!(
+        !output.source.contains("const A="),
+        "the minted constant must avoid the preamble name: {}",
+        output.source
+    );
+    io::validate_wgsl_text(&format!("{preamble}\n{}", output.source))
+        .expect("the shipped concatenation must be valid");
 }

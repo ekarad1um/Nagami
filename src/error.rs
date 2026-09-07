@@ -1,37 +1,15 @@
-//! Error type for the WGSL minification pipeline.  Every public entry
-//! point funnels failures into [`Error`]; the variants here are the
-//! canonical taxonomy and their [`Display`] formats are a stable part
-//! of the crate's public surface.
+//! Error type for the minification pipeline; the [`Display`] formats are a
+//! stable part of the public surface.
 
 use std::fmt::{Display, Formatter};
 
 /// Errors that can occur during WGSL minification.
 ///
-/// Each variant stores a fully-formatted, self-describing message.
-/// [`Error::Parse`] and [`Error::Validation`] may carry multi-line
-/// source-annotated codespan diagnostics produced via naga's
-/// `emit_to_string`; the remaining variants carry bare strings.
-///
-/// # Display convention
-///
-/// The [`Display`] impl deliberately treats variants asymmetrically:
-///
-/// | Variant      | `Display` output format                |
-/// |--------------|----------------------------------------|
-/// | `Parse`      | `{msg}` (no prefix)                    |
-/// | `Validation` | `{msg}` (no prefix)                    |
-/// | `Emit`       | `emit error: {msg}`                    |
-/// | `Io`         | `I/O error: {msg}`                     |
-///
-/// `Parse` and `Validation` messages already begin with `error: ` and
-/// embed source context, so adding a category prefix would produce
-/// redundant noise (e.g. `parse: error: bad token ...`).  The other
-/// variants carry bare strings that benefit from an explicit prefix.
-///
-/// NOTE: these formats are part of the public surface.  Downstream
-/// consumers (the CLI's stderr printer, log scrapers) parse them
-/// verbatim.  The snapshot test in this module locks each variant's
-/// output so an incidental cleanup cannot silently renormalise them.
+/// `Parse` and `Validation` carry naga diagnostics, typically codespan
+/// renderings that already begin with `error: ` and embed source context,
+/// so [`Display`] adds no prefix; `Emit` and `Io` carry bare strings shown
+/// as `emit error: {msg}` and `I/O error: {msg}`.  These formats are public
+/// surface, parsed verbatim downstream and locked by a snapshot test.
 #[derive(Debug)]
 pub enum Error {
     /// WGSL source could not be parsed.
@@ -45,8 +23,8 @@ pub enum Error {
 }
 
 impl Error {
-    /// Short, stable category label suitable for log scraping.
-    /// One of `"parse"`, `"validation"`, `"emit"`, `"io"`.
+    /// Stable category label for log scraping: `parse`, `validation`,
+    /// `emit` or `io`.
     pub fn kind(&self) -> &'static str {
         match self {
             Error::Parse(_) => "parse",
@@ -66,10 +44,6 @@ impl Error {
 
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        // Parse/Validation messages already begin with "error: " and embed
-        // codespan context, so they are emitted verbatim.  Other variants
-        // prepend a category prefix.  See the type-level doc for the full
-        // format table and its stability guarantee.
         match self {
             Error::Parse(msg) | Error::Validation(msg) => f.write_str(msg),
             Error::Emit(msg) => write!(f, "emit error: {msg}"),
@@ -90,8 +64,7 @@ impl From<std::io::Error> for Error {
 mod tests {
     use super::*;
 
-    /// Snapshot lock for every `Display` format and `kind` label: drift is a
-    /// breaking change to the public surface described on [`Error`].
+    /// Drift in any format or label is a breaking change to the public surface.
     #[test]
     fn display_and_kind_snapshot() {
         let cases = [

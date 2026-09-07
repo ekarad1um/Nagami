@@ -1,17 +1,9 @@
-//! Repeated-literal extraction.
-//!
-//! Scans every function body for textual literals that appear enough
-//! times across the module to justify replacing them with a shared
-//! `const NAME = ...;` declaration.  The scan has to mirror every
-//! emission-time literal-collapsing rule exactly, otherwise the
-//! extraction either overcounts (and emits unused constants) or
-//! undercounts (and misses profitable shares).
-//!
-//! The counting logic in [`Generator::scan_and_extract_literals`]
-//! documents each emission bypass path in detail; keep those notes in
-//! sync with `expr_emit` if new collapse rules are added there.
+//! Repeated-literal extraction: literals whose textual emission count across
+//! the module pays for a shared `const NAME = ...;` are bound to one.  The
+//! count must mirror every emission-time literal-collapsing rule exactly:
+//! overcounting emits unused constants, undercounting misses profitable shares.
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::name_gen::next_name_unique;
 
@@ -21,50 +13,21 @@ use super::expr_emit::{
     concretize_abstract_literal_via_inner, literal_bare_form_changes_type, literal_is_width8,
 };
 use super::syntax::{LiteralExtractKey, literal_extract_key};
+use crate::handle_set::HandleSet;
 
 impl<'a> Generator<'a> {
-    /// Scan every function's expression arena for repeated literal
-    /// values.  When the combined textual emission count of a literal
-    /// exceeds the break-even threshold, extract it into a shared
-    /// module-scope `const` so each use site shrinks to the bound name.
+    /// Bind module-wide repeated literals to shared `const`s where the
+    /// emission count beats the break-even threshold.
     pub(super) fn scan_and_extract_literals(&mut self) {
         let precision = &self.options.float_precision;
         let module = &self.module;
 
-        // Helper: count textual literal emissions in a single function.
-        //
-        // Two IR shapes produce literal text in a function body:
-        //   1. `Expression::Literal(lit)` - direct literal use.
-        //   2. `Expression::Constant(h)` where the constant is *unnamed*
-        //      and its init in `global_expressions` is `Literal(lit)` -
-        //      naga inlines the literal text at every reference.
-        //
-        // Counting strategy: start from `ref_counts` (which already restricts
-        // to live handles), then correct for emission-time collapsing.
-        //
-        // - naga never places `Literal` or `Constant` expressions in
-        //   `Statement::Emit` ranges, so they are *always* inlined at every
-        //   reference rather than being let-bound.  The textual emission
-        //   count per literal-like handle therefore starts at `ref_counts[h]`,
-        //   not 1.  Counting one-per-handle (the previous behaviour) would
-        //   undercount any literal shared across N inline use sites and
-        //   suppress profitable extractions.
-        //
-        // - However, vector `Compose` constructors with all components equal
-        //   are emitted in splat form (`vec3f(x)` instead of `vec3f(x,x,x)`)
-        //   - see `compose_is_splat` and the splat path in
-        //   `emit_expr_uncached::Compose`.  In that case the parent Compose
-        //   bumped the literal handle's ref count once *per slot* (N times)
-        //   but emission produces the literal text only **once**.  Worse,
-        //   value-equivalent-but-distinct literal handles in the same
-        //   splat-collapsable Compose all map to the same key, but only
-        //   `components[0]` is emitted; the rest contribute zero emissions.
-        //
-        //   For each live splat-collapsable Compose we therefore subtract
-        //   the over-count that `count_expr_children` introduced for each
-        //   literal-like component handle:
-        //     - `components[0]`: parent-contributed bumps reduce to 1.
-        //     - other slots:     parent-contributed bumps reduce to 0.
+        // Textual literal emissions in one function.  Literal-like handles are
+        // `Literal`s and unnamed `Constant`s with a `Literal` init (naga inlines
+        // the text at every reference).  Neither ever sits in an `Emit` range,
+        // so each is inlined at every use and its emission count starts at
+        // `ref_counts[h]` (live handles only), then drops by the emission-time
+        // bypasses tallied in `adjust`.
         let count_literals =
             |func: &naga::Function,
              func_info: &naga::valid::FunctionInfo,
@@ -72,8 +35,6 @@ impl<'a> Generator<'a> {
              live: &[bool],
              deferrable: &[bool],
              literal_counts: &mut FxHashMap<LiteralExtractKey, (usize, bool)>| {
-                // Predicate: is this handle a literal-like that we would tally
-                // (a `Literal`, or an unnamed `Constant` whose init is a literal)?
                 let literal_lit = |h: naga::Handle<naga::Expression>| -> Option<naga::Literal> {
                     match func.expressions[h] {
                         naga::Expression::Literal(lit) => Some(lit),
@@ -91,75 +52,34 @@ impl<'a> Generator<'a> {
                     }
                 };
 
-                // Per-handle adjustment: how many bumps to *subtract* from
-                // `ref_counts[h]` to obtain the true textual emission count.
-                //
-                // Initially zero; the expression-level bypasses are fused into
-                // a single iteration since their predicates are disjoint and the
-                // per-iteration overhead (`live[]` index, `expr`-kind dispatch)
-                // dominates the inner work for typical shader sizes.
-                //
-                // Bypass paths (kept in sync with the emission code):
-                //   * `emit_expr::Compose` splat-collapse - vector composes whose
-                //     components are all equal (per `compose_is_splat`) emit only
-                //     `components[0]`; literal-like components in slots `>= 1`
-                //     contribute zero textual emissions despite each bumping
-                //     `ref_counts` once via `count_expr_children`.
-                //   * `emit_expr` width-8 vector-narrowing fold - a vector
-                //     `As{convert:Some}` over an inlined width-8 Compose/Splat
-                //     emits every component as CONVERTED text, so the original
-                //     width-8 literals contribute zero emissions (the
-                //     `narrow_folded` pre-pass below identifies these operands).
-                //   * `emit_expr::Select` - direct `Expression::Literal` operands
-                //     (NOT unnamed `Constant` operands) in the `reject`/`accept`
-                //     slots are forced to typed form so both branches share a
-                //     single concrete type.
-                //   * `emit_expr::Derivative` - a direct `Expression::Literal`
-                //     `expr` arg is forced to typed form to avoid i32 inference
-                //     for derivatives (which require float).
-                //   * `emit_expr::As` scalar `bitcast` (`convert: None`) - a
-                //     direct CONCRETE `Literal` operand is forced to typed form
-                //     so the reinterpreted bits keep the source's concrete type
-                //     (a bare token re-types as abstract); abstract operands are
-                //     not forced.
-                //   * `stmt_emit::emit_expr_for_atomic` - INTEGER literal/unnamed
-                //     constant args of atomic statements are forced to the
-                //     atomic's scalar type (handled in the second walk below).
-                //
-                // Note for Select/Derivative: unnamed-Constant operands take
-                // `emit_expr`'s normal path and substitute correctly, so they
-                // remain eligible (no adjustment).
+                // Bumps to subtract from `ref_counts[h]` for uses the emitter
+                // renders without consulting `extracted_literals`: splat-collapsed
+                // `Compose` slots, width-8 narrowing folds, and operands forced to
+                // typed form (Select / Derivative branches, bitcast, shift and
+                // bit-op operands, atomic arguments, a deferred local's first
+                // store, a switch selector).  Select / Derivative force only a
+                // direct `Literal`; an unnamed `Constant` there takes the normal,
+                // extraction-aware path and needs no adjustment.
                 let mut adjust: Vec<usize> = vec![0; func.expressions.len()];
 
-                // `bare_handle[h]` = true if literal-like handle `h` is ever
-                // emitted in a BARE constructor context (a `Compose` slot or a
-                // `Splat` value).  This drives the extraction cost model: a
-                // needs-typed literal (F16/F64/I64/U64) used only in TYPED
-                // (standalone) positions emits the longer suffixed form and can
-                // be priced there, but if it also appears bare we price
-                // conservatively at the bare length to avoid over-extracting
-                // into a net-larger output.
+                // `bare_handle[h]`: `h` is emitted somewhere in a bare
+                // constructor slot (`Compose` component or `Splat` value).  A
+                // needs-typed literal (F16/F64/I64/U64) used only standalone emits
+                // the longer suffixed form and is priced there; one that also
+                // appears bare is priced at the bare length so extraction never
+                // nets larger.
                 let mut bare_handle: Vec<bool> = vec![false; func.expressions.len()];
 
-                // Operands of the const width-8 vector-narrowing fold (see
-                // `try_emit_const_width8_vector_narrow`): an `As { convert:
-                // Some, .. }` whose single-use, inlined operand is a vector
-                // `Compose` / `Splat` of width-8 (F64/U64/I64) literals.  That
-                // fold emits each component's CONVERTED text directly and never
-                // consults `extracted_literals`, so the width-8 literals it
-                // covers contribute zero substitutable emissions under their
-                // original suffixed key.  Counting them (as `count_expr_children`
-                // does) would extract a `const` no use site references - a
-                // strictly net-larger output.  Collected first so the
-                // Compose/Splat arms below can drop those slots wholesale
-                // (and skip the splat-collapse accounting, which models the
-                // operand's normal emission path that the fold replaces).
-                // `ref_counts == 1` mirrors the emitter's "operand not
-                // let-bound" gate; over-matching only forgoes an extraction
-                // (never a miscompile), so the approximation is safe.
+                // Operands of the const width-8 vector-narrowing fold: an
+                // `As { convert: Some }` over a single-use inlined vector
+                // `Compose` / `Splat` of width-8 literals emits each component's
+                // CONVERTED text and never consults `extracted_literals`, so
+                // those literals contribute no substitutable emission under their
+                // suffixed key; counting them would extract a `const` no use site
+                // references.  `ref_counts == 1` mirrors the emitter's
+                // not-`let`-bound gate; over-matching only forgoes an extraction.
                 let is_width8_lit = |h: naga::Handle<naga::Expression>| matches!(func.expressions[h], naga::Expression::Literal(l) if literal_is_width8(l));
-                let mut narrow_folded: FxHashSet<naga::Handle<naga::Expression>> =
-                    FxHashSet::default();
+                let mut narrow_folded: HandleSet<naga::Expression> = Default::default();
                 for (ch, expr) in func.expressions.iter() {
                     if !live[ch.index()] {
                         continue;
@@ -194,21 +114,17 @@ impl<'a> Generator<'a> {
                     }
                     match expr {
                         naga::Expression::Compose { ty, components } => {
-                            // Consumed by a width-8 narrowing fold: every slot is
-                            // emitted as converted text under a different key, so
-                            // drop all per-slot bumps and skip the splat logic.
-                            // `narrow_folded` guarantees every component is a
-                            // width-8 `Literal`, so no `literal_lit` filter needed.
-                            if narrow_folded.contains(&ch) {
+                            // Every slot renders as converted text under another
+                            // key: drop all per-slot bumps, skip the splat
+                            // accounting.
+                            if narrow_folded.contains(ch) {
                                 for &comp in components.iter() {
                                     adjust[comp.index()] += 1;
                                 }
                                 continue;
                             }
-                            // Every Compose slot (vector / matrix / array /
-                            // struct) is emitted bare via `emit_constructor_arg`,
-                            // so mark each literal-like component as having a bare
-                            // use BEFORE the splat-collapse early-returns below.
+                            // Every slot is emitted bare; mark before the splat
+                            // early-outs.
                             for &comp in components.iter() {
                                 if literal_lit(comp).is_some() {
                                     bare_handle[comp.index()] = true;
@@ -217,24 +133,18 @@ impl<'a> Generator<'a> {
                             if components.len() < 2 {
                                 continue;
                             }
-                            // Splat-collapse only applies to vector composes;
-                            // matrix / array / struct composes always emit each
-                            // slot.
+                            // Only vector composes splat-collapse.
                             if !matches!(module.types[*ty].inner, naga::TypeInner::Vector { .. }) {
                                 continue;
                             }
                             if !compose_is_splat(components, &func.expressions) {
                                 continue;
                             }
-                            // Only the first slot is emitted; subtract over-counts
-                            // for every literal-like component slot.  We walk
-                            // slot-by-slot (rather than de-duplicating component
-                            // handles first) so repeated handles get one
-                            // subtraction per slot, exactly cancelling
+                            // Only slot 0 is emitted; one subtraction per later
+                            // slot, repeated handles included, exactly cancels
                             // `count_expr_children`'s per-slot bumps.
                             for (i, &comp) in components.iter().enumerate() {
                                 if i == 0 {
-                                    // First slot is emitted once; no adjustment.
                                     continue;
                                 }
                                 if literal_lit(comp).is_some() {
@@ -255,8 +165,7 @@ impl<'a> Generator<'a> {
                                 adjust[e.index()] += 1;
                             }
                         }
-                        // Forced typed by the emitter (no sibling pins
-                        // them).
+                        // Forced typed by the emitter (no sibling pins them).
                         naga::Expression::Binary {
                             op: naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight,
                             left,
@@ -297,14 +206,11 @@ impl<'a> Generator<'a> {
                                 adjust[src.index()] += 1;
                             }
                         }
-                        // A Splat's scalar value is emitted bare inside the
-                        // vector constructor it expands to.
+                        // The value is emitted bare inside the vector constructor.
                         naga::Expression::Splat { value, .. } if literal_lit(*value).is_some() => {
-                            // Consumed by a width-8 narrowing fold: the value is
-                            // emitted once as converted text, never under its
-                            // original key, so drop the bump `count_expr_children`
-                            // added for this Splat's single value reference.
-                            if narrow_folded.contains(&ch) {
+                            // Width-8 narrowing fold: converted text, never under
+                            // its key.
+                            if narrow_folded.contains(ch) {
                                 adjust[value.index()] += 1;
                             } else {
                                 bare_handle[value.index()] = true;
@@ -313,14 +219,9 @@ impl<'a> Generator<'a> {
                         _ => {}
                     }
                 }
-                // Statement-level bypass: walk all atomic statements.
-                //
-                // Only INTEGER literals get type-pinned by `emit_expr_for_atomic`;
-                // float / bool literals fall through to `emit_expr`, which
-                // already consults `extracted_literals`.  We must therefore only
-                // subtract over-counts for integer-literal arguments, otherwise
-                // we wrongly suppress profitable float-literal extractions
-                // (e.g. `atomicAdd(&a, 1.5)` repeated N times).
+                // Atomic statement arguments: `emit_expr_for_atomic` pins only
+                // INTEGER literals to the atomic's scalar type; float / bool
+                // literals reach `emit_expr` and stay extraction-aware.
                 fn is_int_lit(lit: naga::Literal) -> bool {
                     matches!(
                         lit,
@@ -331,10 +232,8 @@ impl<'a> Generator<'a> {
                             | naga::Literal::AbstractInt(_)
                     )
                 }
-                // Mirror `atomic_scalar_for_expr`: a `Store` whose pointer
-                // resolves to `atomic<T>` lowers through `emit_atomic_store`,
-                // forcing an integer literal value to typed form just like an
-                // `Atomic` statement.
+                // A `Store` through an `atomic<T>` pointer lowers to `atomicStore`
+                // and pins its integer literal the same way.
                 fn pointer_is_atomic(
                     pointer: naga::Handle<naga::Expression>,
                     func_info: &naga::valid::FunctionInfo,
@@ -359,15 +258,11 @@ impl<'a> Generator<'a> {
                             crate::passes::expr_util::visit_atomic_function_handles(fun, visit);
                             visit(*value);
                         }
-                        // `atomicStore(&a, <int lit>)`: same typed-form force
-                        // via `emit_atomic_store`/`emit_expr_for_atomic`.
                         naga::Statement::Store { pointer, value }
                             if pointer_is_atomic(*pointer, func_info, types) =>
                         {
                             visit(*value);
                         }
-                        // `ImageAtomic` value (and Exchange compare) route
-                        // through `emit_expr_for_atomic` too.
                         naga::Statement::ImageAtomic { fun, value, .. } => {
                             crate::passes::expr_util::visit_atomic_function_handles(fun, visit);
                             visit(*value);
@@ -383,22 +278,14 @@ impl<'a> Generator<'a> {
                     }
                 });
 
-                // Two more statement-context paths force a *direct* `Literal`
-                // operand to its typed form via `literal_to_wgsl`, bypassing
-                // `extracted_literals` substitution:
-                //   * the FIRST Store to a deferred local (`var X = <lit>;`,
-                //     and the absorbed for-init form) - stmt_emit's deferred /
-                //     for-init handlers; and
-                //   * a literal Switch selector (`switch <lit>`), forced to
-                //     match the typed case labels.
-                // Each over-counts the literal's emission-shrinking uses by 1.
-                // Unlike the atomic walk these force ALL literal kinds, so no
-                // `is_int_lit` filter; and unlike that walk they fire only for
-                // direct `Literal` (an unnamed `Constant` value/selector takes
-                // the normal, extraction-aware `emit_expr` path), so do NOT use
-                // `literal_lit` (which also matches Constants).  Only the first
-                // store to a deferred local emits the declaration; later stores
-                // are extraction-aware, hence the first-touch `consumed` gate.
+                // Two statement paths render a direct `Literal` through
+                // `literal_to_wgsl`, bypassing substitution: the FIRST store to a
+                // deferred local (`var X = <lit>;`, for-init form included; later
+                // stores are extraction-aware, hence the `consumed` gate) and a
+                // literal switch selector, forced to match the typed case labels.
+                // Both force every literal kind, and only a direct `Literal` (an
+                // unnamed `Constant` takes the extraction-aware path), so this
+                // must not use `literal_lit`.
                 fn walk_typed_form_lits<F: FnMut(naga::Handle<naga::Expression>)>(
                     block: &naga::Block,
                     expressions: &naga::Arena<naga::Expression>,
@@ -439,34 +326,16 @@ impl<'a> Generator<'a> {
                         continue;
                     }
                     let Some(lit) = literal_lit(h) else { continue };
-                    // Subtract the over-count accumulated in `adjust` (splat
-                    // collapse, width-8 narrow fold, atomic int-literal and
-                    // deferred/switch typed-form forcing).
-                    // `adjust[h]` cannot exceed `refs[h]` (it counts a strict
-                    // subset of the bumps that produced `refs[h]`), but we
-                    // saturate defensively.
+                    // `adjust[h]` counts a strict subset of the bumps behind
+                    // `refs`; saturate anyway.
                     let emissions = refs.saturating_sub(adjust[h.index()]);
                     if emissions == 0 {
                         continue;
                     }
-                    // Project abstract literals to their concrete form via
-                    // the same helper the emission path uses
-                    // (`expr_emit::concretize_abstract_literal_via_inner`).
-                    // Without this, an abstract literal counted under its
-                    // bare-form key would never match the
-                    // typed-form-via-`literal_extract_key(concrete)` lookup
-                    // performed in
-                    // `Generator::concretize_abstract_literal_for_expr`,
-                    // and the extracted `const` would sit unreferenced.
-                    //
-                    // Three cases:
-                    //   * `Some(Lit(c))`  - count under the concrete key.
-                    //   * `Some(Text(_))` - emission goes through a wrapper
-                    //                       (`f16(...)`, `i32(<huge>)`)
-                    //                       that bypasses
-                    //                       `extracted_literals`; skip.
-                    //   * `None`          - non-abstract literal; key on
-                    //                       the original `lit` directly.
+                    // Key abstract literals by their concrete form, the key the
+                    // emitter looks up; a bare-form key would never match and the
+                    // `const` would sit unreferenced.  A `Text` concretization
+                    // (`f16(...)`, `i32(<huge>)`) bypasses `extracted_literals`.
                     let key_lit = match concretize_abstract_literal_via_inner(
                         lit,
                         func_info[h].ty.inner_with(&module.types),
@@ -482,15 +351,9 @@ impl<'a> Generator<'a> {
                 }
             };
 
-        // 1. Count literal strings exactly as they are emitted in general
-        //    expression contexts.  Walk regular functions then entry
-        //    points; the `cache_idx` counter mirrors the order in which
-        //    `compute_expression_ref_counts` populated `ref_count_cache`.
-        //    Splitting the chain (vs. the previous `chain().enumerate()`
-        //    pattern) lets each branch index `self.info` naturally
-        //    (`self.info[handle]` vs. `self.info.get_entry_point(idx)`)
-        //    without an O(N) `.nth(cache_idx)` walk.
-        let mut literal_counts: FxHashMap<LiteralExtractKey, (usize, bool)> = FxHashMap::default();
+        // `cache_idx` follows the order `compute_expression_ref_counts` filled
+        // `ref_count_cache`: functions, then entry points.
+        let mut literal_counts: FxHashMap<LiteralExtractKey, (usize, bool)> = Default::default();
         let mut cache_idx: usize = 0;
         for (handle, func) in self.module.functions.iter() {
             let live = std::mem::take(&mut self.ref_count_cache[cache_idx].live);
@@ -518,9 +381,8 @@ impl<'a> Generator<'a> {
         }
         debug_assert_eq!(cache_idx, self.ref_count_cache.len());
 
-        // 2. Build forbidden name set: module-scope + all function-scope names.
-        //    This prevents the extracted const name from being shadowed by
-        //    any argument or local variable in any function.
+        // Names the extracted `const` must avoid: every module-scope name and,
+        // since function-scope names shadow them, every argument and local.
         let mut forbidden = std::collections::HashSet::new();
         for name in self.type_names.values() {
             forbidden.insert(name.clone());
@@ -540,30 +402,24 @@ impl<'a> Generator<'a> {
         for ep in self.module.entry_points.iter() {
             forbidden.insert(ep.name.clone());
         }
-        // Function-scope names shadow module-scope names, so the extracted
-        // constant must also avoid every argument and local.
+        // Preserve-listed names (the preamble's among them) may be absent from
+        // every arena - a pruned preamble binding - yet exist in the
+        // consumer's spliced document.
+        forbidden.extend(self.options.preserve_symbols.iter().cloned());
         forbidden.extend(
             super::core::all_functions(self.module)
                 .flat_map(crate::name_gen::function_local_names)
                 .map(str::to_owned),
         );
 
-        // 3. Collect profitable candidates sorted by estimated savings.
-        //    `savings = K * (L - N) - (BOILERPLATE + N + D)` where `K`
-        //    is the use count, `L` the per-use emitted length, `N` the
-        //    bound name length (estimated as 1 for the initial filter),
-        //    and `D` the declaration text length.  The boilerplate term
-        //    is the shared per-declaration constant in `super::cost`.
-        //
-        //    Per-use length `L`: a needs-typed literal (F16/F64/I64/U64 - the
-        //    only kinds where `decl_text` carries a suffix `expr_text` lacks)
-        //    emits the longer TYPED form (= `decl_text`) at every standalone
-        //    use, so it is priced there - UNLESS it also appears bare in a
-        //    constructor (`has_bare`), in which case some uses are the shorter
-        //    bare form and we stay conservative (`expr_text`) so we never
-        //    over-extract into a net-larger output.  For every other kind
-        //    `decl_text == expr_text`, so this is a no-op.
-        let boilerplate = super::cost::decl_boilerplate(self.options.beautify) as isize;
+        // Estimated savings `K * (L - N) - (BOILERPLATE + N + D)`: `K` uses, `L`
+        // per-use length, `N` the name length (1 for this filter), `D` the
+        // declaration text.  A needs-typed literal (F16/F64/I64/U64, the only
+        // kinds whose `decl_text` carries a suffix `expr_text` lacks) emits the
+        // typed form at every standalone use and is priced there, unless it also
+        // appears bare (`has_bare`), where the shorter `expr_text` keeps the
+        // estimate conservative; for every other kind the two texts are equal.
+        let boilerplate = super::syntax::decl_boilerplate(self.options.beautify) as isize;
         let mut candidates: Vec<(isize, LiteralExtractKey, usize, bool)> = literal_counts
             .into_iter()
             .filter_map(|(key, (count, has_bare))| {
@@ -580,24 +436,16 @@ impl<'a> Generator<'a> {
                 }
             })
             .collect();
-        // Descending by estimated savings; ties break on the full key
-        // (`expr_text`, then `decl_text`) for a total order independent of
-        // map iteration order.
+        // Ties break on the full key for a total order independent of map
+        // iteration order.
         candidates.sort_by(|a, b| {
             b.0.cmp(&a.0)
                 .then_with(|| a.1.expr_text.cmp(&b.1.expr_text))
                 .then_with(|| a.1.decl_text.cmp(&b.1.decl_text))
         });
 
-        // 4. Greedily assign names, re-computing savings with the true
-        //    name length once a concrete name has been picked; extracts
-        //    are kept only when the corrected savings stay positive.
-        //
-        // When a candidate's actual-name savings turn negative, restore
-        // the counter so the rejected slot can be claimed by a later
-        // candidate whose savings are still net positive.  Without this
-        // rollback, every rejection silently consumes a short-name slot
-        // and pushes accepted-but-later candidates into longer names.
+        // Re-price with the real name; on rejection restore the counter so the
+        // short-name slot goes to a later candidate instead of being consumed.
         let mut counter = 0usize;
         for (_, key, count, has_bare) in candidates {
             let counter_before = counter;
@@ -605,7 +453,6 @@ impl<'a> Generator<'a> {
             let n = name.len() as isize;
             let expr_len = key.expr_text.len() as isize;
             let decl_len = key.decl_text.len() as isize;
-            // Same per-use pricing as the filter pass (see step 3).
             let typed_only = !has_bare && key.decl_text != key.expr_text;
             let use_len = if typed_only { decl_len } else { expr_len };
             let k = count as isize;

@@ -1,9 +1,6 @@
 //! Local-variable reference resolution: root a pointer chain at its
 //! function-local and detect whether statements reference a given local.
 
-/// Walk a chain of `AccessIndex` / `Access` / `LocalVariable`
-/// expressions and return the root local when the chain ultimately
-/// resolves to one, or `None` otherwise.
 pub(super) fn resolve_local_var(
     expr: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
@@ -17,13 +14,10 @@ pub(super) fn resolve_local_var(
     }
 }
 
-/// Check if `local` is referenced (read *or* written) in any of `stmts`.
-/// Scans recursively into nested blocks.  Used in the deferred-var look-ahead
-/// safety check: a deferred-var Store + Loop may only be absorbed into a
-/// `for(var x=init;...)` when `x` is not referenced after the Loop,
-/// because the for-init scopes `x` inside the loop body.
-/// `true` when any statement in `stmts` references the local `lh`,
-/// either directly, through an access chain, or inside a nested block.
+/// `true` when any statement in `stmts` reads or writes `local`, access chains
+/// and nested blocks included.  Gates the deferred-var `Store` + `Loop`
+/// absorption: the for-init scopes the local to the loop body, so nothing after
+/// the loop may reference it.
 pub(in crate::generator) fn local_var_in_stmts(
     stmts: &[&naga::Statement],
     local: naga::Handle<naga::LocalVariable>,
@@ -34,7 +28,6 @@ pub(in crate::generator) fn local_var_in_stmts(
         .any(|s| local_var_in_stmt(s, local, expressions))
 }
 
-/// Block-scoped variant of [`local_var_in_stmts`].
 fn local_var_in_block(
     block: &naga::Block,
     local: naga::Handle<naga::LocalVariable>,
@@ -45,9 +38,9 @@ fn local_var_in_block(
         .any(|s| local_var_in_stmt(s, local, expressions))
 }
 
-/// Single-statement variant of [`local_var_in_stmts`].  A value read is a
-/// `Load` in an `Emit` range; every other reference is a pointer operand,
-/// which `resolve_local_var` roots (value operands root nothing).
+/// A value read is a `Load` in an `Emit` range; every other reference is a
+/// pointer operand, which `resolve_local_var` roots (value operands root
+/// nothing).
 fn local_var_in_stmt(
     stmt: &naga::Statement,
     local: naga::Handle<naga::LocalVariable>,

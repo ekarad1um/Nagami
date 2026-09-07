@@ -4,14 +4,10 @@
 //! into a `for` header.
 
 use super::local_resolve::resolve_local_var;
-use rustc_hash::FxHashSet;
+use crate::handle_set::HandleSet;
 
-/// Mark in `seen` (a bitmap indexed by local handle) every local that
-/// `block` references anywhere in its subtree.  The deferral and
-/// for-loop analyses use per-sub-block runs of this census to decide
-/// which single sub-block, if any, owns all of a candidate's uses.
-///
-/// A value read is a `Load` in an `Emit` range (`expr_reads`); every other
+/// Mark in `seen` every local `block` references anywhere in its subtree.  A
+/// value read is a `Load` in an `Emit` range (`expr_reads`); every other
 /// reference is a pointer chain in a statement operand, which
 /// `resolve_local_var` roots (value operands root nothing).
 fn collect_block_local_refs(
@@ -36,36 +32,21 @@ fn collect_block_local_refs(
     });
 }
 
-/// Identify locals whose declaration can be deferred to the site of
-/// their first `Store` (at any nesting depth) and locals that turn
-/// out to be entirely dead.  The returned vectors are indexed by
-/// local handle.
-///
-/// A variable is deferrable when BOTH of these hold (the analysis does
-/// NOT inspect `local.init` directly):
-///
-/// 1. its first reference in the enclosing block (considering both
-///    reads in `Emit` ranges and writes in `Store` statements, plus
-///    any sub-block references) is a *direct* whole-variable `Store`
-///    at that block level; and
-/// 2. all of its references are confined to that block, so the
-///    `var` declaration emitted at the store site stays in scope
-///    for every use.
-///
-/// Condition (1) is exactly what makes any initialiser dead-on-arrival:
-/// the first thing that happens to the variable is a full overwrite, so
-/// the init value is never observed.  The deferred `var` therefore drops
-/// the init and re-emits it as the store's value at the deferred site;
-/// a variable whose init IS live fails condition (1) (its first
-/// reference is a read) and is not deferred.
+/// `(deferrable, dead)` bitmaps indexed by local handle: locals whose
+/// declaration can defer to their first `Store` (at any depth), and locals never
+/// referenced.  A local defers when its first reference in a block (reads,
+/// writes and sub-block references alike) is a direct whole-variable `Store`
+/// at that level and every reference stays inside that block, so the `var`
+/// emitted at the store stays in scope.  The first condition is what makes any
+/// initialiser dead: a full overwrite precedes every observation, so the
+/// deferred `var` drops the init; a live init means the first reference is a
+/// read, which fails it.
 pub(in crate::generator) fn find_deferrable_vars(func: &naga::Function) -> (Vec<bool>, Vec<bool>) {
     use naga::Expression as E;
 
     let expr_len = func.expressions.len();
     let local_len = func.local_variables.len();
 
-    // Map expression handles that **read** a local variable (via Load whose
-    // pointer chain resolves to a LocalVariable).
     let mut expr_reads: Vec<Option<naga::Handle<naga::LocalVariable>>> = vec![None; expr_len];
     for (eh, expr) in func.expressions.iter() {
         if let E::Load { pointer } = *expr
@@ -75,8 +56,6 @@ pub(in crate::generator) fn find_deferrable_vars(func: &naga::Function) -> (Vec<
         }
     }
 
-    // All locals are candidates at the top level (the function body contains
-    // every possible reference).
     let candidates = vec![true; local_len];
 
     let mut deferrable = vec![false; local_len];
@@ -88,9 +67,6 @@ pub(in crate::generator) fn find_deferrable_vars(func: &naga::Function) -> (Vec<
         &mut deferrable,
     );
 
-    // Variables never referenced (no stores, no loads) are dead.
-    // Use collect_block_local_refs on the whole function body to build
-    // the complete `seen` set.
     let mut seen = vec![false; local_len];
     collect_block_local_refs(&func.body, &func.expressions, &expr_reads, &mut seen);
     let mut dead = vec![false; local_len];
@@ -103,11 +79,10 @@ pub(in crate::generator) fn find_deferrable_vars(func: &naga::Function) -> (Vec<
     (deferrable, dead)
 }
 
-/// DFS walker for [`find_deferrable_vars`]: marks a candidate deferrable
-/// when its first program-order touch at this block level is a direct
-/// whole-variable `Store`, recursing into sub-blocks that own all of a
-/// candidate's references.  `candidates[i]` is `true` when local `i` has
-/// all of its references within `block` and is not already deferrable.
+/// Mark a candidate deferrable when its first program-order touch at this
+/// block level is a direct whole-variable `Store`, recursing into sub-blocks
+/// that own all of a candidate's references.  `candidates[i]`: local `i` has
+/// every reference within `block` and is not yet deferrable.
 fn scan_block_deferrable_vars(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
@@ -120,13 +95,9 @@ fn scan_block_deferrable_vars(
         return;
     }
 
-    // We need ownership info for the recursion step (determining which
-    // sub-block a candidate is confined to).
     let ref_owner = compute_block_ownership(block, expressions, expr_reads, local_len);
 
-    // Walk statements in program order, tracking which candidates have been
-    // "seen" (any reference).  A direct Store to an unseen candidate is
-    // deferrable at this block level.
+    // A direct Store to a candidate not yet seen at this level defers it.
     let mut seen = vec![false; local_len];
     for stmt in block.iter() {
         match stmt {
@@ -141,14 +112,12 @@ fn scan_block_deferrable_vars(
             }
             naga::Statement::Store { pointer, .. } => {
                 if let naga::Expression::LocalVariable(lh) = expressions[*pointer] {
-                    // Direct store to the whole variable.
                     if candidates[lh.index()] && !seen[lh.index()] && !result[lh.index()] {
                         result[lh.index()] = true;
                     }
                     seen[lh.index()] = true;
                 } else if let Some(lh) = resolve_local_var(*pointer, expressions) {
-                    // Indirect store (e.g. field/index access) - not deferrable,
-                    // but the variable is now "seen".
+                    // An indirect store never defers, but marks the variable seen.
                     if candidates[lh.index()] {
                         seen[lh.index()] = true;
                     }
@@ -162,8 +131,6 @@ fn scan_block_deferrable_vars(
                         seen[lh.index()] = true;
                     }
                 });
-                // A compound statement's sub-blocks conservatively mark every
-                // candidate they reference as seen.
                 for nested in crate::passes::expr_util::nested_blocks(other) {
                     collect_block_local_refs(nested, expressions, expr_reads, &mut seen);
                 }
@@ -171,9 +138,7 @@ fn scan_block_deferrable_vars(
         }
     }
 
-    // Recurse into compound statements for candidates not resolved at this
-    // level.  A candidate that is owned by a single compound statement can
-    // potentially be deferred inside that statement's sub-block.
+    // A candidate owned by a single compound statement may defer inside it.
     for (idx, stmt) in block.iter().enumerate() {
         let any_owned =
             (0..local_len).any(|i| candidates[i] && !result[i] && ref_owner[i] == Some(idx));
@@ -239,7 +204,6 @@ fn scan_block_deferrable_vars(
             naga::Statement::Loop {
                 body, continuing, ..
             } => {
-                // Recurse into body for candidates confined to body only.
                 let mut seen_b = vec![false; local_len];
                 let mut seen_c = vec![false; local_len];
                 collect_block_local_refs(body, expressions, expr_reads, &mut seen_b);
@@ -260,22 +224,18 @@ fn scan_block_deferrable_vars(
     }
 }
 
-/// Identify locals whose references are confined to exactly one `Loop`
-/// statement (at any nesting depth), so their declaration can be absorbed
-/// into `for(var x=init;...)` or `for(var x:type;...)` (no init).
-/// Return the per-local bitmap of init-once locals whose uses stay
-/// confined to a single `Loop` and can therefore be absorbed into
-/// that loop's `for (var ...; ...; ...)` header.
+/// Per-local bitmap of counters whose references are confined to exactly one
+/// `Loop` (at any depth), absorbable into that loop's `for(var x=init;...)` /
+/// `for(var x:type;...)` header.
 pub(super) fn find_for_loop_vars(
     func: &naga::Function,
-    must_bind_loads: &FxHashSet<naga::Handle<naga::Expression>>,
+    must_bind_loads: &HandleSet<naga::Expression>,
 ) -> Vec<bool> {
     use naga::Expression as E;
 
     let expr_len = func.expressions.len();
     let local_len = func.local_variables.len();
 
-    // Build Load->LocalVariable map, same pattern as find_deferrable_vars.
     let mut expr_reads: Vec<Option<naga::Handle<naga::LocalVariable>>> = vec![None; expr_len];
     for (eh, expr) in func.expressions.iter() {
         if let E::Load { pointer } = *expr
@@ -285,10 +245,8 @@ pub(super) fn find_for_loop_vars(
         }
     }
 
-    // Every local is a candidate at the top level (naga arena handles are
-    // contiguous `0..local_len`).  Variables without an explicit init are
-    // zero-initialised in WGSL and can still serve as for-loop counters
-    // (e.g. after a dead-init removal pass).
+    // A local without an explicit init is zero-initialised and still a counter
+    // candidate.
     let candidates = vec![true; local_len];
 
     let mut result = vec![false; local_len];
@@ -305,24 +263,19 @@ pub(super) fn find_for_loop_vars(
     result
 }
 
-/// Sentinel value indicating a local is referenced by multiple statements.
+/// Owner sentinel: referenced by more than one statement.
 const MULTI_OWNER: usize = usize::MAX;
 
-/// Mark a local as referenced by statement `idx` in a block.  If it was
-/// already referenced by a different statement, set it to `MULTI_OWNER`.
 fn mark_owner(ref_owner: &mut [Option<usize>], lh_idx: usize, idx: usize) {
     match ref_owner[lh_idx] {
         None => ref_owner[lh_idx] = Some(idx),
-        Some(prev) if prev == idx => {} // same stmt, no change
+        Some(prev) if prev == idx => {}
         _ => ref_owner[lh_idx] = Some(MULTI_OWNER),
     }
 }
 
-/// For each local variable, compute which statement index in `block` "owns"
-/// all of its references.  Returns `None` if the local is not referenced in
-/// this block, `Some(idx)` if all references are within statement `idx`, or
-/// `Some(MULTI_OWNER)` if referenced by multiple statements.  Shared by the
-/// deferred-var and for-loop-counter analyses.
+/// Per local, the statement index in `block` owning all of its references:
+/// `None` when unreferenced, `Some(MULTI_OWNER)` when several statements do.
 fn compute_block_ownership(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
@@ -347,10 +300,9 @@ fn compute_block_ownership(
                 }
             }),
         }
-        // For compound statements, scan sub-blocks and attribute to `idx`.
         let mut nested = crate::passes::expr_util::nested_blocks(stmt).peekable();
         if nested.peek().is_none() {
-            continue; // Leaf statement - no sub-block refs to drain.
+            continue;
         }
         tmp_seen.fill(false);
         for sub in nested {
@@ -366,30 +318,21 @@ fn compute_block_ownership(
     ref_owner
 }
 
-/// Check whether a `Loop` statement matches the for-loop pattern
-/// recognised by `try_emit_for_loop`:
-///
-/// - `break_if` is `None`;
-/// - `continuing` has at most one non-`Emit` statement (the update);
-/// - the update, when present, is a `Store`, `Call`, or `ImageStore`;
-/// - `body` starts with an if-break guard.
+/// Whether the emitter will render this `Loop` as a `for`: the same parse,
+/// update-kind check, preload-safety predicate and header depth cap as the
+/// emitter, so counter-`var` suppression can never disagree with the emission
+/// decision (a disagreement leaves the counter undeclared).
 fn is_for_loop_candidate(
     body: &naga::Block,
     continuing: &naga::Block,
     break_if: &Option<naga::Handle<naga::Expression>>,
     expressions: &naga::Arena<naga::Expression>,
-    must_bind_loads: &FxHashSet<naga::Handle<naga::Expression>>,
+    must_bind_loads: &HandleSet<naga::Expression>,
 ) -> bool {
-    // Parse via the SHARED parser so this var-suppression decision and
-    // `try_emit_for_loop`'s emission decision can never drift.  `None` => not
-    // for-convertible (break_if present, no if-break guard, or >1 continuing
-    // core update statement).
     let Some(shape) = crate::generator::stmt_emit::parse_for_loop_shape(body, continuing, break_if)
     else {
         return false;
     };
-    // Update must be Store / Call / ImageStore, matching try_emit_for_loop's
-    // pre-validation.
     if let Some(stmt) = shape.update_stmt
         && !matches!(
             stmt,
@@ -400,10 +343,6 @@ fn is_for_loop_candidate(
     {
         return false;
     }
-    // And the preloads must be safe to inline into the for-header, else
-    // try_emit_for_loop bails to plain `loop` emission and the suppressed
-    // counter `var` would be left undeclared.  The header depth cap is
-    // mirrored for the same reason.
     crate::generator::stmt_emit::for_loop_preload_inlining_is_safe(
         &shape,
         body,
@@ -411,13 +350,12 @@ fn is_for_loop_candidate(
         expressions,
         must_bind_loads,
     ) && !crate::generator::stmt_emit::for_header_exceeds_depth_cap(&shape, expressions)
+        && !crate::generator::stmt_emit::for_header_has_msl_cast_ambiguity(&shape, expressions)
 }
 
-/// Recursively scan a block (and its nested sub-blocks) looking for
-/// for-loop-shaped `Loop` statements that fully confine candidate locals.
-///
-/// `candidates[i]` is `true` when local `i` has all of its references
-/// within `block` and is eligible for for-loop absorption.
+/// Find for-shaped `Loop`s that fully confine candidate locals, recursing into
+/// nested blocks.  `candidates[i]`: local `i` has every reference within
+/// `block` and is eligible for absorption.
 #[allow(clippy::too_many_arguments)]
 fn scan_block_for_loop_vars(
     block: &naga::Block,
@@ -426,13 +364,13 @@ fn scan_block_for_loop_vars(
     expr_reads: &[Option<naga::Handle<naga::LocalVariable>>],
     candidates: &[bool],
     result: &mut Vec<bool>,
-    must_bind_loads: &FxHashSet<naga::Handle<naga::Expression>>,
-    // `true` once the walk has descended through a `Loop`.  A counter absorbed
-    // into a for-init via its declaration/zero-init (not an explicit pre-loop
-    // re-init `Store`) is sound only at top level: nested in another loop that
-    // init would re-execute every outer iteration, whereas the source declared
-    // the counter once.  Legitimate nested `for`s re-init via a `Store` (the
-    // deferred-var path, which ignores this flag), so gating here is safe.
+    must_bind_loads: &HandleSet<naga::Expression>,
+    // `true` once the walk has descended through a `Loop`.  Absorbing a counter
+    // via its declaration / zero-init (not an explicit pre-loop `Store`) is
+    // sound only at top level: nested in another loop that init would
+    // re-execute every outer iteration, whereas the source declared the
+    // counter once.  Nested `for`s re-init via a `Store` (the deferred-var
+    // path, which ignores this flag).
     inside_loop: bool,
 ) {
     let local_len = result.len();
@@ -443,7 +381,6 @@ fn scan_block_for_loop_vars(
     let ref_owner = compute_block_ownership(block, expressions, expr_reads, local_len);
     let stmts: Vec<_> = block.iter().collect();
 
-    // Check for-loop candidates: locals owned by a single Loop at this level.
     for (h, _local) in local_variables.iter() {
         let i = h.index();
         if !candidates[i] || result[i] {
@@ -477,9 +414,7 @@ fn scan_block_for_loop_vars(
         }
     }
 
-    // Recurse into compound statements for remaining candidates.
     for (idx, stmt) in block.iter().enumerate() {
-        // Collect candidates that are owned by this statement and not yet resolved.
         let any_owned =
             (0..local_len).any(|i| candidates[i] && !result[i] && ref_owner[i] == Some(idx));
         if !any_owned {
@@ -488,7 +423,6 @@ fn scan_block_for_loop_vars(
 
         match stmt {
             naga::Statement::If { accept, reject, .. } => {
-                // Determine which sub-block each candidate is confined to.
                 let mut seen_a = vec![false; local_len];
                 let mut seen_r = vec![false; local_len];
                 collect_block_local_refs(accept, expressions, expr_reads, &mut seen_a);
@@ -581,10 +515,8 @@ fn scan_block_for_loop_vars(
             naga::Statement::Loop {
                 body, continuing, ..
             } => {
-                // This Loop was either already handled as a for-loop candidate
-                // above, or it doesn't match the pattern.  Either way, recurse
-                // into the body for locals that are confined to body only
-                // (not referenced in continuing).
+                // Whether or not this Loop absorbed a counter, locals confined
+                // to its body may still be absorbed by an inner loop.
                 let mut seen_b = vec![false; local_len];
                 let mut seen_c = vec![false; local_len];
                 collect_block_local_refs(body, expressions, expr_reads, &mut seen_b);
@@ -606,8 +538,7 @@ fn scan_block_for_loop_vars(
                     &b_cands,
                     result,
                     must_bind_loads,
-                    // Descending through this Loop: any counter marked below is
-                    // nested and must not be absorbed via declaration/zero init.
+                    // Inside this Loop a counter is nested.
                     true,
                 );
             }

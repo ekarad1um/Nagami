@@ -1,25 +1,14 @@
-//! Shared fixtures for the generator test suite.
-//!
-//! Every helper here runs the `parse -> validate -> generate` chain
-//! with a different [`GenerateOptions`] preset, letting each test
-//! focus on asserting the emitted text instead of repeating the
-//! boilerplate.  [`assert_valid_wgsl`] re-parses the generated output
-//! to confirm it round-trips cleanly, and [`compact_with_passes`]
-//! layers the full IR-pass pipeline on top for end-to-end assertions.
+//! Shared fixtures: each helper runs `parse -> validate -> generate` under one
+//! [`GenerateOptions`] preset; [`compact_with_passes`] runs the full IR pipeline.
+//! Validation goes through `crate::io::validate_module`, so pointer parameters
+//! naga alone rejects are fixtures too.
 
 use super::super::{GenerateOptions, generate_wgsl};
 pub use crate::config::{Config, FloatPrecision, PrecisionMode, Profile};
 
-/// Parse, validate, and emit `src` with the baseline
-/// compact-mode options: no beautify, no mangling, full precision.
 pub fn compact(src: &str) -> String {
     let module = naga::front::wgsl::parse_str(src).expect("parse failed");
-    let info = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    )
-    .validate(&module)
-    .expect("validation failed");
+    let info = crate::io::validate_module(&module).expect("validation failed");
     generate_wgsl(
         &module,
         &info,
@@ -35,22 +24,13 @@ pub fn compact(src: &str) -> String {
     .0
 }
 
-/// Compact variant with mangling enabled and no preserved symbols.
-/// Convenience wrapper over [`compact_mangled_preserved`].
 pub fn compact_mangled(src: &str) -> String {
     compact_mangled_preserved(src, &[])
 }
 
-/// Compact variant with `type_alias` enabled, mangling off.  Used by
-/// alias-emission tests.
 pub fn compact_aliased(src: &str) -> String {
     let module = naga::front::wgsl::parse_str(src).expect("parse failed");
-    let info = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    )
-    .validate(&module)
-    .expect("validation failed");
+    let info = crate::io::validate_module(&module).expect("validation failed");
     generate_wgsl(
         &module,
         &info,
@@ -67,17 +47,9 @@ pub fn compact_aliased(src: &str) -> String {
     .0
 }
 
-/// Compact variant with both mangling and type aliasing active;
-/// exercises the interaction between alias rewriting and mangled type
-/// names.
 pub fn compact_mangled_aliased(src: &str) -> String {
     let module = naga::front::wgsl::parse_str(src).expect("parse failed");
-    let info = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    )
-    .validate(&module)
-    .expect("validation failed");
+    let info = crate::io::validate_module(&module).expect("validation failed");
     generate_wgsl(
         &module,
         &info,
@@ -94,17 +66,9 @@ pub fn compact_mangled_aliased(src: &str) -> String {
     .0
 }
 
-/// Compact mangled variant that preserves the given symbol names.
-/// Used to pin the preserve-symbols contract exercised by the
-/// higher-level tests.
 pub fn compact_mangled_preserved(src: &str, preserve: &[&str]) -> String {
     let module = naga::front::wgsl::parse_str(src).expect("parse failed");
-    let info = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    )
-    .validate(&module)
-    .expect("validation failed");
+    let info = crate::io::validate_module(&module).expect("validation failed");
     generate_wgsl(
         &module,
         &info,
@@ -121,16 +85,11 @@ pub fn compact_mangled_preserved(src: &str, preserve: &[&str]) -> String {
     .0
 }
 
-/// Assert that `out` parses and validates as WGSL: the emitter's
-/// most important contract.  `#[track_caller]` ensures panics point
-/// at the offending test rather than this helper.
 #[track_caller]
 pub fn assert_valid_wgsl(out: &str) {
-    // naga requires `enable wgpu_binding_array;` to parse a `binding_array`, but
-    // nagami's shipped output omits that naga-only directive (tint rejects it
-    // and supports binding arrays natively; `run` strips it).  Inject it for the
-    // naga re-parse here, exactly as the real consumer's toolchain / the
-    // pipeline self-check does, so the helper still validates the body.
+    // Shipped output omits the naga-only `enable wgpu_binding_array;` (tint
+    // rejects it; `run` strips it), so re-inject it for the naga re-parse as the
+    // pipeline self-check does.
     let injected;
     let to_parse = if out.contains("binding_array") && !out.contains("enable wgpu_binding_array;") {
         injected = format!("enable wgpu_binding_array;\n{out}");
@@ -141,26 +100,14 @@ pub fn assert_valid_wgsl(out: &str) {
     let module = naga::front::wgsl::parse_str(to_parse).unwrap_or_else(|e| {
         panic!("re-parse failed for:\n{out}\nerror: {e:?}");
     });
-    naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    )
-    .validate(&module)
-    .unwrap_or_else(|e| {
+    crate::io::validate_module(&module).unwrap_or_else(|e| {
         panic!("re-validation failed for:\n{out}\nerror: {e:?}");
     });
 }
 
-/// Beautified variant (indent = 2, mangling off) used by tests that
-/// assert on human-readable output.
 pub fn compact_beautified(src: &str) -> String {
     let module = naga::front::wgsl::parse_str(src).expect("parse failed");
-    let info = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    )
-    .validate(&module)
-    .expect("validation failed");
+    let info = crate::io::validate_module(&module).expect("validation failed");
     generate_wgsl(
         &module,
         &info,
@@ -176,26 +123,13 @@ pub fn compact_beautified(src: &str) -> String {
     .0
 }
 
-/// Compact variant with `DecimalPlaces(prec)` applied to every float
-/// kind.  Used by tests that exercise lossy float trimming with a
-/// single uniform mode, mirroring the simple "one knob for every kind"
-/// case of the [`FloatPrecision`] API.
 pub fn compact_with_precision(src: &str, prec: u8) -> String {
     compact_with_float_precision(src, FloatPrecision::all(PrecisionMode::DecimalPlaces(prec)))
 }
 
-/// Compact variant driven by an explicit [`FloatPrecision`].  Used by
-/// tests that exercise `SignificantFigures` (and per-type) trimming
-/// end-to-end through the generator, where the rounded value must still
-/// emit a token that re-parses as valid WGSL.
 pub fn compact_with_float_precision(src: &str, float_precision: FloatPrecision) -> String {
     let module = naga::front::wgsl::parse_str(src).expect("parse failed");
-    let info = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    )
-    .validate(&module)
-    .expect("validation failed");
+    let info = crate::io::validate_module(&module).expect("validation failed");
     generate_wgsl(
         &module,
         &info,
@@ -211,9 +145,6 @@ pub fn compact_with_float_precision(src: &str, float_precision: FloatPrecision) 
     .0
 }
 
-/// Run the full `parse -> validate -> IR passes -> generate`
-/// pipeline at `profile` with beautify on, asserting the output
-/// round-trips through [`assert_valid_wgsl`] before returning it.
 pub fn compact_with_passes(src: &str, profile: Profile) -> String {
     let config = Config {
         profile,

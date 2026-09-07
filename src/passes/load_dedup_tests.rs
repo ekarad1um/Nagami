@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::Config;
+use crate::handle_set::{HandleMap, HandleSet};
 
 fn run_pass(source: &str) -> (bool, naga::Module) {
     let mut module = naga::front::wgsl::parse_str(source).expect("source should parse");
@@ -25,7 +26,6 @@ fn count_loads_from_local(function: &naga::Function) -> usize {
             if let naga::Expression::Load { pointer } = expr
                 && let naga::Expression::LocalVariable(_) = &function.expressions[*pointer]
             {
-                // Check if this handle is actually referenced (in an Emit range)
                 return is_handle_in_any_emit(&function.body, *handle);
             }
             false
@@ -44,11 +44,9 @@ fn is_handle_in_any_emit(block: &naga::Block, target: naga::Handle<naga::Express
 
 #[test]
 fn nested_load_keeps_backing_store_alive() {
-    // A local read through a depth>=2 nested pointer chain (`e.a.x`) must
-    // keep its backing Store alive.  The liveness scan previously ignored
-    // such loads (`get_pointer_key` can't forward them), so `e` was wrongly
-    // marked dead and `e = s` removed - leaving the nested load reading the
-    // WGSL zero-default instead of the stored value (silent miscompile).
+    // The liveness scan must count a depth>=2 nested load (`e.a.x`) that
+    // `get_pointer_key` cannot forward, or `e` is marked dead, `e = s`
+    // removed, and the load reads the zero-default.
     let source = r#"
 struct Inner { x: f32, y: f32 }
 struct Outer { a: Inner, b: f32 }
@@ -105,8 +103,6 @@ fn fs_main() -> @location(0) vec4f {
     let (changed, module) = run_pass(source);
     assert!(changed, "should detect redundant loads");
 
-    // The hash function should have fewer emitted whole-var loads
-    // after dedup: 3 consecutive loads of v become 1.
     let hash_fn = module
         .functions
         .iter()
@@ -124,8 +120,7 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn forwards_multi_store_variable_in_straight_line() {
-    // Variable `a` has 2 stores.  Both loads are forwarded to the
-    // stored values because each store seeds the cache.
+    // Each store seeds the cache.
     let source = r#"
 fn test_fn(x: f32) -> f32 {
     var a: f32;
@@ -160,9 +155,6 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn forwards_single_store_copy_variable() {
-    // Variable `tmp` has exactly 1 store and is only used to carry
-    // a value to `result`. The forwarding should replace Load(tmp)
-    // with the stored value and eliminate tmp.
     let source = r#"
 fn test_fn(x: f32) -> f32 {
     var tmp: f32;
@@ -212,8 +204,6 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn dead_store_removed_for_forwarded_variable() {
-    // After forwarding, the Store to `tmp` becomes dead and should be
-    // removed.  The local variable itself has no live references.
     let source = r#"
 fn test_fn(x: f32) -> f32 {
     var tmp: f32;
@@ -236,7 +226,6 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(_, f)| f)
         .expect("test_fn function should exist");
 
-    // Count Store statements remaining in the function body.
     fn count_stores(block: &naga::Block) -> usize {
         let mut count = 0;
         for stmt in block {
@@ -258,8 +247,6 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn var_with_init_not_forwarded() {
-    // Variable has init (not None) - should NOT be eligible for
-    // store forwarding even if it has 1 store later.
     let source = r#"
 fn test_fn(x: f32) -> f32 {
     var a: f32 = 0.0;
@@ -275,14 +262,12 @@ fn fs_main() -> @location(0) vec4f {
 "#;
 
     let (_, module) = run_pass(source);
-    // The key point is the module remains valid after the pass.
+    // Only validity is asserted.
     let _ = crate::io::validate_module(&module).expect("module should remain valid");
 }
 
 #[test]
 fn cache_invalidated_after_if_branches() {
-    // After an if/else that stores to `a`, the cache should be cleared.
-    // A subsequent load of `a` must NOT be replaced with a stale value.
     let source = r#"
 fn test_fn(x: f32, c: bool) -> f32 {
     var a: f32;
@@ -304,14 +289,12 @@ fn fs_main() -> @location(0) vec4f {
 "#;
 
     let (_, module) = run_pass(source);
+    // Only validity is asserted.
     let _ = crate::io::validate_module(&module).expect("module should remain valid");
-    // v2 must NOT be replaced with x (from the store before if), because
-    // the if branches modify a. The module being valid confirms this.
 }
 
 #[test]
 fn chained_copy_variables_forwarded() {
-    // a = expr; b = a; use b -> b should resolve to expr through the chain.
     let source = r#"
 fn test_fn(x: f32) -> f32 {
     var a: f32;
@@ -345,9 +328,7 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn dynamic_index_store_invalidates_cache() {
-    // A store through a runtime-indexed pointer (Access) must invalidate
-    // the cache for that local, not silently leave stale entries.
-    // Use whole-variable loads so count_loads_from_local picks them up.
+    // Whole-variable loads so `count_loads_from_local` sees them.
     let source = r#"
 fn test_fn(idx: i32) -> vec3<f32> {
     var v: vec3<f32>;
@@ -368,11 +349,8 @@ fn fs_main() -> @location(0) vec4f {
     let (_, module) = run_pass(source);
     let _ = crate::io::validate_module(&module).expect("module should remain valid");
 
-    // `a` would normally be forwarded to vec3(1,2,3) via store
-    // seeding, but the undo phase reverts this: `v` is not dead
-    // (b still loads it), and the Compose expression is complex,
-    // so forwarding is reverted to keep the cheap variable reference.
-    // `b` is never forwarded because v[idx] invalidates the cache.
+    // `a`'s forward is undone (`v` stays live via `b` and the Compose is
+    // complex); `b` is never forwarded.
     let test_fn = module
         .functions
         .iter()
@@ -390,11 +368,6 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn trace_ray_payload_invalidates_cache_and_marks_escaped() {
-    // Construct IR where a local `payload_var` is stored to, loaded,
-    // then passed as the payload of TraceRay, then loaded again.
-    // The second load must NOT be deduplicated with the first because
-    // TraceRay can modify the payload through the pointer.
-
     let mut module = naga::Module::default();
 
     let f32_ty = module.types.insert(
@@ -479,11 +452,8 @@ fn trace_ray_payload_invalidates_cache_and_marks_escaped() {
         naga::Span::UNDEFINED,
     );
 
-    // Block:
-    //   Store(payload_var, 1.0)
-    //   Emit(load1)          -> cache: {payload_var: load1}
-    //   TraceRay(payload=ptr_payload) -> should INVALIDATE cache
-    //   Emit(load2)          -> must NOT be replaced with load1
+    // Store; Emit(load1); TraceRay(payload=&payload_var); Emit(load2): the
+    // TraceRay may write the payload, so load2 must not dedup to load1.
     let mut body = naga::Block::new();
     body.push(
         naga::Statement::Store {
@@ -510,11 +480,10 @@ fn trace_ray_payload_invalidates_cache_and_marks_escaped() {
     );
     function.body = body;
 
-    // Run the core redundant-load collection.
-    let mut replacements = FxHashMap::default();
+    let mut replacements = HandleMap::default();
     let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
-    let mut all_loads = FxHashMap::default();
-    let mut seeded_by_store = FxHashMap::default();
+    let mut all_loads = HandleMap::default();
+    let mut seeded_by_store = HandleMap::default();
     let scope_idx = ExpressionScopeIndex::build(&function.body, &function.expressions);
     collect_redundant_loads(
         &function.body,
@@ -525,37 +494,27 @@ fn trace_ray_payload_invalidates_cache_and_marks_escaped() {
         &mut all_loads,
         &mut seeded_by_store,
         false,
-        &mut FxHashSet::default(),
+        &mut HandleSet::default(),
     );
 
-    // load2 must NOT be in replacements - TraceRay should have cleared
-    // the cache so the second load is treated as a fresh access.
     assert!(
-        !replacements.contains_key(&load2),
+        !replacements.contains_key(load2),
         "load after TraceRay must not be deduplicated (cache should be invalidated)"
     );
 
-    // Verify escaped-local tracking: payload_var should be marked escaped.
     let escaped = locals_passed_by_pointer(&function.body, &function.expressions);
     assert!(
-        escaped.contains(&local_payload),
+        escaped.contains(local_payload),
         "local passed as TraceRay payload should be marked as escaped"
     );
 }
 
 #[test]
 fn cooperative_store_through_data_pointer_invalidates_cache() {
-    // Construct realistic IR (matching what naga's WGSL frontend
-    // produces for `coopStore(matrix_value, &mat_var, stride)`):
-    //
-    //   target = FunctionArgument(0)   (CooperativeMatrix VALUE - read)
-    //   data.pointer = LocalVariable(mat_var)  (destination - WRITE)
-    //
-    // A cache entry for `mat_var` seeded before the CooperativeStore
-    // must be invalidated by data.pointer's root, even though
-    // `target` has CooperativeMatrix type and therefore cannot itself
-    // resolve to a LocalVariable per naga's validator.
-
+    // Mirrors naga's lowering of `coopStore(matrix_value, &mat_var, stride)`:
+    // `target` is the matrix VALUE and `data.pointer` the destination, so the
+    // invalidation must key on `data.pointer`'s root (a CooperativeMatrix
+    // `target` can never resolve to a LocalVariable).
     let mut module = naga::Module::default();
 
     let f32_scalar = naga::Scalar::F32;
@@ -608,11 +567,8 @@ fn cooperative_store_through_data_pointer_invalidates_cache() {
         naga::Span::UNDEFINED,
     );
 
-    // Block:
-    //   Store(&mat_var, mat_in)         (seed: mat_var := mat_in)
-    //   Emit(load1)                     (cache forwards to mat_in)
-    //   coopStore(mat_in, &mat_var, 16) (writes into mat_var via data.pointer)
-    //   Emit(load2)                     (must NOT dedup with load1)
+    // Store(&mat_var, mat_in); Emit(load1); coopStore(mat_in, &mat_var, 16);
+    // Emit(load2): load2 must not dedup to load1.
     let mut body = naga::Block::new();
     body.push(
         naga::Statement::Store {
@@ -642,11 +598,10 @@ fn cooperative_store_through_data_pointer_invalidates_cache() {
     );
     function.body = body;
 
-    // Run the core redundant-load collection.
-    let mut replacements = FxHashMap::default();
+    let mut replacements = HandleMap::default();
     let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
-    let mut all_loads = FxHashMap::default();
-    let mut seeded_by_store = FxHashMap::default();
+    let mut all_loads = HandleMap::default();
+    let mut seeded_by_store = HandleMap::default();
     let scope_idx = ExpressionScopeIndex::build(&function.body, &function.expressions);
     collect_redundant_loads(
         &function.body,
@@ -657,23 +612,17 @@ fn cooperative_store_through_data_pointer_invalidates_cache() {
         &mut all_loads,
         &mut seeded_by_store,
         false,
-        &mut FxHashSet::default(),
+        &mut HandleSet::default(),
     );
 
-    // load2 must NOT be in replacements: the CooperativeStore wrote
-    // to mat_var through `data.pointer`, so the cache entry forwarded
-    // by load1 is stale.
     assert!(
-        !replacements.contains_key(&load2),
+        !replacements.contains_key(load2),
         "load after CooperativeStore must not be deduplicated \
              (cache must be invalidated via data.pointer's root local)"
     );
 
-    // Verify partial-store tracking: `mat_var` should be flagged as
-    // partially-stored because the matrix write through
-    // `data.pointer` may not cover the local's full type.
-    let mut escaped = FxHashSet::default();
-    let mut partially_stored = FxHashSet::default();
+    let mut escaped = HandleSet::default();
+    let mut partially_stored = HandleSet::default();
     collect_escaped_and_partially_stored(
         &function.body,
         &function.expressions,
@@ -681,7 +630,7 @@ fn cooperative_store_through_data_pointer_invalidates_cache() {
         &mut partially_stored,
     );
     assert!(
-        partially_stored.contains(&local_mat),
+        partially_stored.contains(local_mat),
         "local written by CooperativeStore must be flagged as partially_stored \
              (matrix write through data.pointer may not cover the full local)"
     );
@@ -689,10 +638,6 @@ fn cooperative_store_through_data_pointer_invalidates_cache() {
 
 #[test]
 fn atomic_invalidates_cache_and_counts_as_store() {
-    // Construct IR where a local is stored to, loaded, then modified
-    // by an Atomic operation, then loaded again.  The second load must
-    // NOT be deduplicated with the first.
-
     let mut module = naga::Module::default();
 
     let u32_ty = module.types.insert(
@@ -738,11 +683,8 @@ fn atomic_invalidates_cache_and_counts_as_store() {
         naga::Span::UNDEFINED,
     );
 
-    // Block:
-    //   Store(atom_var, 1)
-    //   Emit(load1)            -> cache: {atom_var: load1}
-    //   Atomic(atom_var, Add)  -> should INVALIDATE cache
-    //   Emit(load2)            -> must NOT be replaced with load1
+    // Store; Emit(load1); Atomic(Add); Emit(load2): load2 must not dedup to
+    // load1.
     let mut body = naga::Block::new();
     body.push(
         naga::Statement::Store {
@@ -770,19 +712,17 @@ fn atomic_invalidates_cache_and_counts_as_store() {
     );
     function.body = body;
 
-    // Verify Atomic counts as a store.
     let store_counts = count_local_stores(&function.body, &function.expressions);
     assert_eq!(
-        store_counts.get(&local_var).copied().unwrap_or(0),
+        store_counts.get(local_var).copied().unwrap_or(0),
         2,
         "Store + Atomic should count as 2 stores"
     );
 
-    // Verify the load cache is invalidated by Atomic.
-    let mut replacements = FxHashMap::default();
+    let mut replacements = HandleMap::default();
     let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
-    let mut all_loads = FxHashMap::default();
-    let mut seeded_by_store = FxHashMap::default();
+    let mut all_loads = HandleMap::default();
+    let mut seeded_by_store = HandleMap::default();
     let scope_idx = ExpressionScopeIndex::build(&function.body, &function.expressions);
     collect_redundant_loads(
         &function.body,
@@ -793,19 +733,17 @@ fn atomic_invalidates_cache_and_counts_as_store() {
         &mut all_loads,
         &mut seeded_by_store,
         false,
-        &mut FxHashSet::default(),
+        &mut HandleSet::default(),
     );
 
     assert!(
-        !replacements.contains_key(&load2),
+        !replacements.contains_key(load2),
         "load after Atomic must not be deduplicated (cache should be invalidated)"
     );
 }
 
 #[test]
 fn deduplicates_loads_through_same_dynamic_index() {
-    // Two consecutive loads through the same Access (dynamic index) expression
-    // should be deduplicated.
     let source = r#"
 fn test_fn(idx: i32) -> f32 {
     var v: vec3<f32>;
@@ -835,7 +773,6 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(_, f)| f)
         .expect("test_fn function should exist");
 
-    // Count emitted Load expressions that reference a local through Access.
     let dynamic_load_count = test_fn
         .expressions
         .iter()
@@ -862,9 +799,6 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn init_seeded_load_forwarded_and_dead_local_removed() {
-    // `var a: f32 = 0.0;` has init=Some(literal(0.0)).
-    // A subsequent Load(a) should be forwarded to the init expression,
-    // and the dead local should have its stores removed.
     let source = r#"
 fn test_fn() -> f32 {
     var a: f32 = 0.0;
@@ -896,8 +830,6 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn init_seeded_then_overwritten_uses_store_value() {
-    // If a variable has an init but is overwritten before reading,
-    // the load should use the stored value, not the init.
     let source = r#"
 fn test_fn(x: f32) -> f32 {
     var a: f32 = 0.0;
@@ -930,8 +862,6 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn forwarding_survives_loop_for_unmodified_local() {
-    // A variable stored before a loop and loaded after should be forwarded
-    // when the loop body does not modify it.
     let source = r#"
 fn test_fn(x: f32) -> f32 {
     var a: f32 = x;
@@ -963,8 +893,6 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(_, f)| f)
         .expect("test_fn function should exist");
 
-    // `a` is not modified in the loop, so Load(a) after the loop should
-    // be forwarded, leaving 0 active loads of `a`.
     let store_count = count_local_stores(&test_fn.body, &test_fn.expressions);
     let a_handle = test_fn
         .local_variables
@@ -973,7 +901,7 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(h, _)| h)
         .expect("variable a should exist");
     assert_eq!(
-        store_count.get(&a_handle).copied().unwrap_or(0),
+        store_count.get(a_handle).copied().unwrap_or(0),
         0,
         "stores to a should be eliminated (dead local after forwarding)"
     );
@@ -981,8 +909,6 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn forwarding_survives_if_for_unmodified_local() {
-    // A variable stored before an if and loaded after should be forwarded
-    // when neither branch modifies it.
     let source = r#"
 fn test_fn(x: f32, c: bool) -> f32 {
     var a: f32 = x;
@@ -1019,7 +945,7 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(h, _)| h)
         .expect("variable a should exist");
     assert_eq!(
-        store_count.get(&a_handle).copied().unwrap_or(0),
+        store_count.get(a_handle).copied().unwrap_or(0),
         0,
         "stores to a should be eliminated (dead local after forwarding across if)"
     );
@@ -1027,7 +953,6 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn no_forwarding_across_loop_when_modified() {
-    // If the loop modifies the variable, forwarding should NOT happen.
     let source = r#"
 fn test_fn(x: f32) -> f32 {
     var a: f32 = x;
@@ -1057,7 +982,6 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(_, f)| f)
         .expect("test_fn function should exist");
 
-    // `a` is modified in the loop, so it must NOT be eliminated.
     let store_count = count_local_stores(&test_fn.body, &test_fn.expressions);
     let a_handle = test_fn
         .local_variables
@@ -1066,15 +990,13 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(h, _)| h)
         .expect("variable a should exist");
     assert!(
-        store_count.get(&a_handle).copied().unwrap_or(0) > 0,
+        store_count.get(a_handle).copied().unwrap_or(0) > 0,
         "stores to a should NOT be eliminated when loop modifies it"
     );
 }
 
 #[test]
 fn dead_store_eliminated_when_overwritten_before_load() {
-    // Two consecutive whole-variable Stores with no Load in between:
-    // the first Store is dead and should be removed.
     let source = r#"
 fn test_fn(x: vec3f) -> f32 {
     var p: vec3f;
@@ -1099,7 +1021,6 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(_, f)| f)
         .expect("test_fn function should exist");
 
-    // Only one Store to p should remain (the second one).
     let store_count = count_local_stores(&test_fn.body, &test_fn.expressions);
     let p_handle = test_fn
         .local_variables
@@ -1108,7 +1029,7 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(h, _)| h)
         .expect("variable p should exist");
     assert_eq!(
-        store_count.get(&p_handle).copied().unwrap_or(0),
+        store_count.get(p_handle).copied().unwrap_or(0),
         1,
         "first dead store to p should be removed, leaving only one"
     );
@@ -1116,7 +1037,6 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn dead_store_not_eliminated_when_loaded_between_stores() {
-    // A Load between two Stores means the first Store is NOT dead.
     let source = r#"
 fn test_fn(x: vec3f) -> f32 {
     var p: vec3f;
@@ -1141,8 +1061,6 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(_, f)| f)
         .expect("test_fn function should exist");
 
-    // Both Stores should remain because the first is loaded before
-    // the second.
     let store_count = count_local_stores(&test_fn.body, &test_fn.expressions);
     let p_handle = test_fn
         .local_variables
@@ -1151,7 +1069,7 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(h, _)| h)
         .expect("variable p should exist");
     assert_eq!(
-        store_count.get(&p_handle).copied().unwrap_or(0),
+        store_count.get(p_handle).copied().unwrap_or(0),
         2,
         "both stores to p should remain when first is loaded before second"
     );
@@ -1159,9 +1077,8 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn dead_store_chain_eliminates_all_but_last() {
-    // Three consecutive whole-variable Stores with no Loads: only the last
-    // survives.  Use vec3f + field access so load-dedup cannot forward the
-    // whole-variable Store, keeping exactly one Store alive.
+    // vec3f + field access keep load-dedup from forwarding the whole-variable
+    // Store, so exactly one Store stays.
     let source = r#"
 fn test_fn(x: vec3f) -> f32 {
     var a: vec3f;
@@ -1195,7 +1112,7 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(h, _)| h)
         .expect("variable a should exist");
     assert_eq!(
-        store_count.get(&a_handle).copied().unwrap_or(0),
+        store_count.get(a_handle).copied().unwrap_or(0),
         1,
         "only the last store in a chain should survive"
     );
@@ -1203,11 +1120,8 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn undo_phase_reverts_complex_forwarding_for_non_dead_variable() {
-    // Store seeds `v -> (x + vec3(1))` and load `a` gets forwarded.
-    // But a partial store `v.x = 0` invalidates the cache, so load `b`
-    // is fresh.  `v` is NOT dead (b's load is not replaced).
-    // The undo phase should revert `a -> (x + vec3(1))` because v is
-    // non-dead and the forwarded expr is complex (Binary).
+    // The partial store `v.x = 0` keeps `v` live via `b`, so the complex
+    // (Binary) forward of `a` must be undone.
     let source = r#"
 fn test_fn(x: vec3<f32>) -> f32 {
     var v: vec3<f32>;
@@ -1232,8 +1146,6 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(_, f)| f)
         .expect("test_fn function should exist");
 
-    // Both loads should remain: the undo phase reverts the complex
-    // store-to-load forwarding for non-dead v, and b was never forwarded.
     let active_loads = count_loads_from_local(test_fn);
     assert_eq!(
         active_loads, 2,
@@ -1244,9 +1156,6 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn undo_phase_keeps_simple_forwarding_for_non_dead_variable() {
-    // Store seeds `a` with a simple expression (FunctionArgument),
-    // and `a` is not dead (has loads across a cache-invalidating store).
-    // The undo phase should keep the simple forwarding.
     let source = r#"
 fn test_fn(x: f32) -> f32 {
     var a: f32;
@@ -1272,8 +1181,7 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(_, f)| f)
         .expect("test_fn function should exist");
 
-    // Both loads forwarded: v1 -> x (simple, kept), v2 -> x+1 (a is dead
-    // because both loads replaced, so kept regardless).
+    // v1 -> x is simple; v2 -> x+1 is kept because `a` ends up dead.
     let active_loads = count_loads_from_local(test_fn);
     assert_eq!(
         active_loads, 0,
@@ -1283,10 +1191,8 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn compose_init_not_seeded_for_multi_load_variable() {
-    // `var v: vec3f = vec3(1,2,3)` has a Compose init.
-    // The Compose init should NOT be seeded into the cache, so
-    // loads go through Load-to-Load dedup instead of Compose forwarding.
-    // This prevents output inflation from duplicating constructors.
+    // A Compose init is not seeded, so loads dedup Load-to-Load instead of
+    // duplicating the constructor.
     let source = r#"
 fn test_fn() -> f32 {
     var v: vec3<f32> = vec3<f32>(1.0, 2.0, 3.0);
@@ -1310,9 +1216,6 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(_, f)| f)
         .expect("test_fn function should exist");
 
-    // With Compose init skip, the first Load becomes canonical and the
-    // second Load deduplicates to the first (Load-to-Load).
-    // The variable is NOT dead because the first Load is NOT replaced.
     let active_loads = count_loads_from_local(test_fn);
     assert_eq!(
         active_loads, 1,
@@ -1320,7 +1223,6 @@ fn fs_main() -> @location(0) vec4f {
         active_loads
     );
 
-    // Variable v should still have stores (it's alive).
     let v_handle = test_fn
         .local_variables
         .iter()
@@ -1335,9 +1237,8 @@ fn fs_main() -> @location(0) vec4f {
 
 #[test]
 fn chain_resolution_flattens_load_chains_after_undo() {
-    // Scenario: store seeds `a -> expr`, load1 -> expr (+ re-register a -> load1),
-    // load2 -> load1 (Load-to-Load). If load1->expr is undone, load2->load1 must
-    // still be valid.  This tests chain resolution handles the post-undo state.
+    // load1 -> expr is undone, so load2 -> load1 (Load-to-Load) must still
+    // resolve.
     let source = r#"
 fn test_fn(x: vec3<f32>) -> f32 {
     var a: vec3<f32>;
@@ -1366,11 +1267,7 @@ fn fs_main() -> @location(0) vec4f {
         .map(|(_, f)| f)
         .expect("test_fn function should exist");
 
-    // v1 and v2 are both loads before the partial store.
-    // v1 -> complex expr (undone because a is not dead), v2 -> v1 (Load-to-Load).
-    // After undo of v1->complex, chain resolution makes v2->v1 (stays as-is since v1 is
-    // no longer in replacements).  v3 is after cache invalidation, fresh.
-    // Result: 2 active loads (v1=canonical, v3=fresh; v2 deduplicated to v1).
+    // v1 canonical, v2 deduplicated to v1, v3 fresh after the invalidation.
     let active_loads = count_loads_from_local(test_fn);
     assert_eq!(
         active_loads, 2,
@@ -1381,7 +1278,6 @@ fn fs_main() -> @location(0) vec4f {
 
 // Dead init removal (Phase 1: zero inits, Phase 2: dead non-zero inits)
 
-/// Helper: check whether a local variable has an init expression.
 fn local_has_init(function: &naga::Function, name: &str) -> bool {
     function
         .local_variables
@@ -1441,9 +1337,8 @@ fn test_fn() -> bool {
 
 #[test]
 fn non_zero_init_preserved_when_loaded() {
-    // Compose init with non-zero value - Compose inits are NOT seeded
-    // into the forwarding cache, so the first Load reads the init.
-    // The variable stays alive and the init must be preserved.
+    // Compose inits are not seeded, so the first Load reads the init and
+    // keeps `v` alive.
     let source = r#"
 fn test_fn() -> f32 {
     var v: vec3<f32> = vec3<f32>(1.0, 2.0, 3.0);
@@ -1468,7 +1363,6 @@ fn test_fn() -> f32 {
 
 #[test]
 fn zero_init_vec3_compose_removed() {
-    // vec3(0.0, 0.0, 0.0) is a Compose of zero literals.
     let source = r#"
 fn test_fn() -> vec3<f32> {
     var v: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
@@ -1488,7 +1382,6 @@ fn test_fn() -> vec3<f32> {
 
 #[test]
 fn partially_non_zero_compose_preserved() {
-    // vec3(0.0, 1.0, 0.0) has a non-zero component.
     let source = r#"
 fn test_fn() -> f32 {
     var v: vec3<f32> = vec3<f32>(0.0, 1.0, 0.0);
@@ -1498,7 +1391,7 @@ fn test_fn() -> f32 {
 "#;
     let (_, module) = run_pass(source);
     let f = module.functions.iter().next().unwrap().1;
-    // Variable may be eliminated by forwarding; if it survives, init must be kept.
+    // Forwarding may eliminate `v`; if it survives, the init must stay.
     let v_init = f
         .local_variables
         .iter()
@@ -1516,9 +1409,8 @@ fn test_fn() -> f32 {
 
 #[test]
 fn dead_non_zero_scalar_init_removed() {
-    // `var a = 5.0; a = x;` - init is overwritten before any load.
-    // After dedup_loads forwards the load to x, the Emit is gone,
-    // and find_dead_inits sees Store(a, x) as the first reference.
+    // After the load forwards to `x` its Emit is gone, so `find_dead_inits`
+    // sees `Store(a, x)` first.
     let source = r#"
 fn test_fn(x: f32) -> f32 {
     var a: f32 = 5.0;
@@ -1534,7 +1426,6 @@ fn test_fn(x: f32) -> f32 {
 
 #[test]
 fn dead_non_zero_compose_init_removed() {
-    // Compose init overwritten before any load.
     let source = r#"
 fn test_fn(x: vec3<f32>) -> vec3<f32> {
     var v: vec3<f32> = vec3<f32>(1.0, 2.0, 3.0);
@@ -1556,8 +1447,6 @@ fn test_fn(x: vec3<f32>) -> vec3<f32> {
 
 #[test]
 fn dead_init_across_unrelated_control_flow() {
-    // An If that does NOT involve `a` should not block dead-init
-    // detection.  `a = x` is the first reference to `a`.
     let source = r#"
 fn test_fn(x: f32, c: bool) -> f32 {
     var a: f32 = 5.0;
@@ -1575,8 +1464,7 @@ fn test_fn(x: f32, c: bool) -> f32 {
 
 #[test]
 fn init_preserved_when_read_through_control_flow() {
-    // `a` is loaded inside the if - in the else path, the init value
-    // is the one that reaches `return a`.  Init must be preserved.
+    // On the else path the init reaches `return a`.
     let source = r#"
 fn test_fn(x: f32, c: bool) -> f32 {
     var a: f32 = 5.0;
@@ -1588,8 +1476,6 @@ fn test_fn(x: f32, c: bool) -> f32 {
     let (_, module) = run_pass(source);
     let _ = crate::io::validate_module(&module).expect("module should remain valid");
     let f = module.functions.iter().next().unwrap().1;
-    // a is modified in one branch - find_dead_inits stops tracking.
-    // The init is NOT zero, so it must be preserved.
     let a_init = f
         .local_variables
         .iter()
@@ -1604,7 +1490,7 @@ fn test_fn(x: f32, c: bool) -> f32 {
 
 #[test]
 fn dead_init_partial_store_prevents_removal() {
-    // A partial (field) store reads the old value, so the init IS used.
+    // A partial (field) store reads the old value, so the init is used.
     let source = r#"
 fn test_fn() -> f32 {
     var v: vec3<f32> = vec3<f32>(1.0, 2.0, 3.0);
@@ -1629,7 +1515,6 @@ fn test_fn() -> f32 {
     }
 }
 
-/// Helper: run dead_branch then load_dedup, validating after each.
 fn run_dead_branch_then_load_dedup(source: &str) -> (bool, naga::Module) {
     let mut module = naga::front::wgsl::parse_str(source).expect("source should parse");
     let config = Config::default();
@@ -1649,7 +1534,6 @@ fn run_dead_branch_then_load_dedup(source: &str) -> (bool, naga::Module) {
     (changed, module)
 }
 
-/// Verify the module round-trips through WGSL emission and re-parsing.
 fn assert_wgsl_round_trips(module: &naga::Module) {
     let info = crate::io::validate_module(module).expect("module should validate");
     let wgsl =
@@ -1666,25 +1550,11 @@ fn assert_wgsl_round_trips(module: &naga::Module) {
 
 #[test]
 fn forward_ref_replacement_preserves_short_circuit_local() {
-    // Regression: short-circuit re-sugaring can create forward
-    // references that break dead-local detection.
-    //
-    // naga lowers `a && b` into:
-    //   var local: bool;
-    //   if (a) { local = b; } else { local = false; }
-    //   let hit = local;
-    //
-    // desugar_short_circuit folds this back into a Binary(LogicalAnd)
-    // appended at the END of the expression arena:
-    //   local = (a && b);   // Binary handle > original Load handle
-    //   let hit = local;
-    //
-    // load_dedup's store-forwarding detects Load(local) -> Binary_h,
-    // but Binary_h > Load_h (forward reference). The expression-arena
-    // apply loop guards against forward references, so this replacement
-    // is never applied.  If load_dedup still marks `local` as dead it
-    // removes the Store while the Load persists, leaving the variable
-    // uninitialised.
+    // naga lowers `a && b` to `if (a) { local = b; } else { local = false; }`
+    // and the re-sugar rebuilds it as a `Binary(LogicalAnd)` appended at the
+    // arena's end, so the store-forward `Load(local) -> Binary` is a forward
+    // reference the apply loop refuses; `local` must then not be marked dead
+    // or the Store goes while the Load persists.
     let source = r#"
 fn test_fn(a: f32, b: f32, c: f32) -> f32 {
     let hit = a > 0.0 && b > 0.0 && c > 0.0;
@@ -1700,8 +1570,6 @@ fn fs_main() -> @location(0) vec4f {
     let (_, module) = run_dead_branch_then_load_dedup(source);
     assert_wgsl_round_trips(&module);
 
-    // Extra safety: verify no local has loads but no stores or init
-    // (which would indicate the bug).
     let test_fn = module
         .functions
         .iter()
@@ -1746,9 +1614,7 @@ fn has_store_to(block: &naga::Block, ptr_h: naga::Handle<naga::Expression>) -> b
 
 #[test]
 fn forward_ref_chained_short_circuit_preserves_locals() {
-    // Chained short-circuit (a && b && c && d) creates multiple locals,
-    // each with a forward-reference Binary replacement.  This is common
-    // in ray-tracing shaders that chain intersection tests.
+    // Each link of the chain carries a forward-reference Binary replacement.
     let source = r#"
 fn test_fn(a: f32, b: f32, c: f32, d: f32) -> f32 {
     let hit = a > 0.0 && b > 0.0 && c > 0.0 && d > 0.0;
@@ -1765,13 +1631,9 @@ fn fs_main() -> @location(0) vec4f {
     assert_wgsl_round_trips(&module);
 }
 
-// Regression tests for `remove_dead_stores_in_block` per-local invalidation
-//
-// These tests pin the precision of `remove_dead_stores_in_block`'s
-// pending-store invalidation: a non-aliasing statement (Barrier,
-// Atomic on a global, ImageStore, etc.) must not save a dead Store
-// from removal, and a Return / Kill terminator must mark all still-
-// pending Stores as dead since they cannot be observed afterwards.
+// `remove_dead_stores_in_block` pending-store precision: a non-aliasing
+// statement (Barrier, Atomic on a global, ImageStore) must not save a dead
+// Store, and a Return/Kill terminator marks every pending Store dead.
 
 fn count_stores_to_local(
     function: &naga::Function,
@@ -1814,13 +1676,9 @@ fn local_handle_by_name(
 
 #[test]
 fn dead_store_removed_across_atomic_on_global() {
-    // `x = 1; atomicAdd(&g, 1); x = 2; if(c) { x = 3; } return x;`
-    // The atomic targets a storage-bound atomic (cannot alias the
-    // function-local `x`), so `x = 1` is overwritten before it can be
-    // observed and must be collapsed.  The trailing If keeps the load
-    // dependency live so dedup_loads cannot trim the later stores -
-    // the only path that removes `x = 1` is the new per-local
-    // invalidation in `remove_dead_stores_in_block`.
+    // The atomic targets a storage atomic that cannot alias `x`, so `x = 1`
+    // is dead; the trailing If keeps the load live so only the per-local
+    // invalidation can remove it.
     let source = r#"
 @group(0) @binding(0) var<storage, read_write> g: atomic<i32>;
 fn f(c: bool) -> i32 {
@@ -1850,9 +1708,7 @@ fn f(c: bool) -> i32 {
 
 #[test]
 fn dead_store_removed_across_barrier() {
-    // Same shape as above, with a workgroup barrier in place of the
-    // atomic.  Barriers do not reference function-local pointers, so
-    // the first store is unconditionally dead.
+    // Barriers reference no function-local pointers.
     let source = r#"
 fn f(c: bool) -> i32 {
     var x: i32;
@@ -1881,12 +1737,9 @@ fn f(c: bool) -> i32 {
 
 #[test]
 fn dead_trailing_store_removed_before_return_unit() {
-    // Direct unit test of `remove_dead_stores_in_function` (NOT the
-    // whole pass): the Return terminator drains `pending_store`
-    // marking trailing stores dead.  At the full-pass level
-    // `dead_store_ids` in `dedup_loads_in_function` reaches the same
-    // result via a different path; this test pins the standalone
-    // semantic so future refactors of either side don't drop it.
+    // `remove_dead_stores_in_function` alone: the Return drains
+    // `pending_store`.  The full pass reaches the same result via
+    // `dead_store_ids`, so this pins the standalone semantic.
     let source = r#"
 fn f() -> i32 {
     var x: i32;
@@ -1923,10 +1776,8 @@ fn f() -> i32 {
 
 #[test]
 fn dead_store_kept_across_call_with_pointer_arg() {
-    // `x = 1; g(&x); x = 2; if(c){x=3;} return x + y;` - the callee
-    // may read the pending Store through the `ptr<function, i32>`
-    // argument, so per-arg invalidation must drop `x` from
-    // `pending_store`, keeping the first Store live.
+    // The callee may read the pending Store through the `ptr<function>`
+    // argument, so per-arg invalidation must keep it.
     let source = r#"
 fn g(p: ptr<function, i32>) -> i32 {
     return *p;
@@ -1958,10 +1809,8 @@ fn f(c: bool) -> i32 {
 
 #[test]
 fn dead_store_removed_across_call_without_pointer_arg() {
-    // `x = 1; g(&y); x = 2; if(c){x=3;} return x;` - the call cannot
-    // observe `x` (its `ptr<function, T>` arg points to `y`).  The
-    // first Store is dead under per-arg invalidation; the trailing If
-    // prevents dedup_loads from trimming `x = 2` / `x = 3`.
+    // The call's pointer argument targets `y`, so `x = 1` is dead; the
+    // trailing If keeps dedup_loads from trimming `x = 2` / `x = 3`.
     let source = r#"
 fn g(p: ptr<function, i32>) -> i32 {
     return *p;
@@ -1994,19 +1843,13 @@ fn f(c: bool) -> i32 {
 
 // MARK: Block / If / Switch scope-leak regressions
 //
-// Each of these shaders sets up a value that is bound by an `Emit`
-// inside a `Statement::Block` / `Statement::If` / `Statement::Switch`,
-// then reads the variable that received it from outside the block.  The
-// pass must NOT forward the post-block load to the in-block value handle:
-// that produces IR the validator rejects ("expression used outside its
-// scope").  `run_pass`'s post-pass `validate_module` call asserts this
-// never happens.
+// A value bound by an `Emit` inside a nested Block/If/Switch is read through
+// a variable after it; forwarding the post-block load to the in-block handle
+// is IR the validator rejects ("expression used outside its scope"), which
+// `run_pass`'s validation catches.
 
 #[test]
 fn block_scope_leak_regression_statement_block() {
-    // The inner brace forces the Compose's `let temp` binding to be
-    // lexically scoped to the block; the post-block load of `x` would be
-    // forwarded to that binding without the scope-aware filter.
     let source = r#"
 fn f(a: f32, b: f32, c: f32) -> vec3<f32> {
     var x: vec3<f32>;
@@ -2024,9 +1867,6 @@ fn f(a: f32, b: f32, c: f32) -> vec3<f32> {
 
 #[test]
 fn block_scope_leak_regression_if_branch() {
-    // The Compose is bound inside the accept branch.  A naive
-    // forward into the post-if read of `x` would land on an
-    // out-of-scope handle on the reject path.
     let source = r#"
 fn f(c: bool, a: f32, b: f32, d: f32) -> vec3<f32> {
     var x: vec3<f32>;
@@ -2048,13 +1888,9 @@ fn f(c: bool, a: f32, b: f32, d: f32) -> vec3<f32> {
 
 #[test]
 fn scope_index_assigns_monotonic_positions_in_emit_order() {
-    // Build a tiny function body by hand:
-    //   Emit(e0, e1)   <- position 0
-    //   Store(p, v)    <- position 1
-    //   Emit(e2)       <- position 2
+    // Emit(e0, e1) at position 0, Store(p, v) at 1, Emit(e2) at 2.
     let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
-    // Fake pointer + value; we never resolve them to real types,
-    // we just need stable Expression handles.
+    // Placeholder literals: only handle identity matters.
     let p = arena.append(
         naga::Expression::Literal(naga::Literal::U32(0)),
         naga::Span::UNDEFINED,
@@ -2094,26 +1930,18 @@ fn scope_index_assigns_monotonic_positions_in_emit_order() {
 
     let idx = ExpressionScopeIndex::build(&body, &arena);
 
-    // All handles in the first Emit share position 0.
     assert_eq!(idx.handle_position(e0), Some(0));
     assert_eq!(idx.handle_position(e1), Some(0));
-    // Store gets position 1.
     assert_eq!(idx.store_position((p, v)), Some(1));
-    // Second Emit gets position 2.
     assert_eq!(idx.handle_position(e2), Some(2));
-    // The top-level body's interval covers all 3 positions.
     assert!(idx.is_in_subtree(&body, e0));
     assert!(idx.is_in_subtree(&body, e2));
 }
 
 #[test]
 fn scope_index_recurses_into_control_flow() {
-    // Body: Store(p,v)               pos 0
-    //       If {                     pos 1
-    //         accept: Emit(a)        pos 2
-    //         reject: Emit(b)        pos 3
-    //       }
-    //       Store(p2, v2)            pos 4
+    // Store(p,v) at 0; If at 1 with accept Emit(a) at 2 and reject Emit(b)
+    // at 3; Store(p2,v2) at 4.
     let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
     let p = arena.append(
         naga::Expression::Literal(naga::Literal::U32(0)),
@@ -2184,17 +2012,12 @@ fn scope_index_recurses_into_control_flow() {
     assert_eq!(idx.store_position((p, v)), Some(0));
     assert_eq!(idx.handle_position(a), Some(2));
     assert_eq!(idx.handle_position(b), Some(3));
-    // Second Store comes AFTER both branches, so position 4.
     assert_eq!(idx.store_position((p2, v2)), Some(4));
-    // And the key invariant: second-store position > both
-    // branch-Emit positions.
     assert!(idx.store_position((p2, v2)).unwrap() > idx.handle_position(a).unwrap());
     assert!(idx.store_position((p2, v2)).unwrap() > idx.handle_position(b).unwrap());
 
-    // Subtree membership: `a` is in `accept` only, `b` is in
-    // `reject` only.  Re-borrow the branches through the body so
-    // the assertions exercise the same block addresses that
-    // production callers see.
+    // Re-borrow through the body so the block addresses match production
+    // callers'.
     let (accept_ref, reject_ref) = match &body[1] {
         naga::Statement::If { accept, reject, .. } => (accept, reject),
         _ => unreachable!(),
@@ -2207,10 +2030,8 @@ fn scope_index_recurses_into_control_flow() {
 
 #[test]
 fn scope_index_collides_stores_to_minimum() {
-    // Two distinct Store statements with the same (ptr, val)
-    // identity: the index records the MINIMUM position so a
-    // Load between them is correctly classified as "after" the
-    // earliest Store (conservative: over-keeps).
+    // Two Stores with one (ptr, val) identity record the minimum position,
+    // so a Load between them counts as after the earliest (conservative).
     let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
     let p = arena.append(
         naga::Expression::Literal(naga::Literal::U32(0)),
@@ -2238,26 +2059,14 @@ fn scope_index_collides_stores_to_minimum() {
 
     let idx = ExpressionScopeIndex::build(&body, &arena);
 
-    // Two distinct stores share identity (p, v); the recorded
-    // position is the earliest (0), not the latest (1).
     assert_eq!(idx.store_position((p, v)), Some(0));
 }
 
-/// Statement-bound result handles (Call.result, Atomic.result,
-/// WorkGroupUniformLoad.result, Subgroup*.result,
-/// RayQueryFunction::Proceed.result) are NOT in any Emit range.
-/// The pre-fix `compute_statement_positions` only walked Emit
-/// ranges and Stores, so result handles had no recorded position -
-/// any has_later_live_load check against a result handle would
-/// fail and the producing Store would be wrongly classified as
-/// having no later live Load.  The merged `ExpressionScopeIndex`
-/// must record result-handle positions so the scope-leak filter
-/// and the dead-store gate both see consistent positions.
-///
-/// Atomic exercises the `Option<Handle>`-bearing arm; the same
-/// codepath in the index walker covers all other result-bearing
-/// statement variants (WorkGroupUniformLoad, Call, Subgroup*,
-/// RayQueryFunction::Proceed).
+/// Statement-bound results (Call, Atomic, WorkGroupUniformLoad, Subgroup*,
+/// RayQueryFunction::Proceed) sit in no Emit range; without a recorded
+/// position a has_later_live_load check against one fails and the producing
+/// Store is misclassified.  Atomic covers the `Option<Handle>` arm; the
+/// walker shares the codepath for the other variants.
 #[test]
 fn scope_index_records_statement_bound_result_handles() {
     let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
@@ -2269,9 +2078,7 @@ fn scope_index_records_statement_bound_result_handles() {
         naga::Expression::Literal(naga::Literal::U32(1)),
         naga::Span::UNDEFINED,
     );
-    // Using a Literal placeholder for the result handle keeps the
-    // test self-contained; the index doesn't validate expression
-    // shape, only handle identity.
+    // Literal placeholders: the index checks handle identity only.
     let atomic_result = arena.append(
         naga::Expression::Literal(naga::Literal::U32(2)),
         naga::Span::UNDEFINED,
@@ -2301,22 +2108,15 @@ fn scope_index_records_statement_bound_result_handles() {
 
     let idx = ExpressionScopeIndex::build(&body, &arena);
 
-    // Statement-bound result handles get the position of their
-    // emitting statement.  Atomic is at position 0,
-    // WorkGroupUniformLoad at 1.
     assert_eq!(idx.handle_position(atomic_result), Some(0));
     assert_eq!(idx.handle_position(wg_result), Some(1));
 
-    // Both result handles are inside the body's subtree.
     assert!(idx.is_in_subtree(&body, atomic_result));
     assert!(idx.is_in_subtree(&body, wg_result));
 }
 
-/// The empty-block interval `[enter, enter)` must reject every
-/// handle (no handle is "inside" an empty block).  Loop
-/// continuing blocks are routinely empty in WGSL output, so the
-/// scope-leak filter's `is_in_subtree` would mis-classify
-/// handles if the empty case were wrong.
+/// The empty-block interval `[enter, enter)` must reject every handle; loop
+/// continuing blocks are routinely empty.
 #[test]
 fn scope_index_empty_block_subtree_membership() {
     let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
@@ -2324,8 +2124,7 @@ fn scope_index_empty_block_subtree_membership() {
         naga::Expression::Literal(naga::Literal::U32(0)),
         naga::Span::UNDEFINED,
     );
-    // Body: Emit(e0)                  pos 0
-    //       Block { /* empty */ }     pos 1 (no descendants)
+    // Emit(e0) at 0, an empty Block at 1.
     let inner = naga::Block::new();
     let mut body = naga::Block::new();
     body.push(
@@ -2336,7 +2135,6 @@ fn scope_index_empty_block_subtree_membership() {
 
     let idx = ExpressionScopeIndex::build(&body, &arena);
 
-    // e0 is in body's subtree but NOT in the empty inner block.
     let inner_ref = match &body[1] {
         naga::Statement::Block(b) => b,
         _ => unreachable!(),
@@ -2345,22 +2143,17 @@ fn scope_index_empty_block_subtree_membership() {
     assert!(!idx.is_in_subtree(inner_ref, e0));
 }
 
-/// Pre-emit expressions (Literal, Constant, LocalVariable, ...)
-/// are not bound by any statement and are in scope everywhere in
-/// the function.  `handle_position` must return `None` for them,
-/// and the subtree-membership check correctly treats them as
-/// outside (the filter sites `||` with `needs_pre_emit` to keep
-/// them).
+/// Pre-emit expressions (Literal, Constant, LocalVariable) are bound by no
+/// statement and in scope everywhere: `handle_position` is `None` and
+/// subtree membership false (the filter sites `||` with `needs_pre_emit`).
 #[test]
 fn scope_index_pre_emit_handles_have_no_position() {
     let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
-    // A literal that is NEVER emitted - it could be used as a
-    // pointer/value expression but no Emit statement covers it.
     let unused_literal = arena.append(
         naga::Expression::Literal(naga::Literal::U32(42)),
         naga::Span::UNDEFINED,
     );
-    let body = naga::Block::new(); // empty body
+    let body = naga::Block::new();
     let idx = ExpressionScopeIndex::build(&body, &arena);
     assert_eq!(idx.handle_position(unused_literal), None);
     assert!(!idx.is_in_subtree(&body, unused_literal));
@@ -2368,10 +2161,8 @@ fn scope_index_pre_emit_handles_have_no_position() {
 
 #[test]
 fn block_scope_leak_regression_switch_case() {
-    // Same shape inside a switch case body.  `has_default` and no
-    // fall-through make the switch eligible for meet-over-branches,
-    // so the post-switch cache would otherwise have carried the
-    // in-case value forward.
+    // `has_default` and no fall-through make the switch eligible for
+    // meet-over-branches, which would carry the in-case value forward.
     let source = r#"
 fn f(sel: u32, a: f32, b: f32, c: f32) -> vec3<f32> {
     var x: vec3<f32>;
@@ -2392,17 +2183,10 @@ fn f(sel: u32, a: f32, b: f32, c: f32) -> vec3<f32> {
     let (_, _module) = run_pass(source);
 }
 
-/// Statement-bound result handles (CallResult, AtomicResult,
-/// WorkGroupUniformLoadResult, SubgroupBallotResult,
-/// SubgroupOperationResult, RayQueryProceedResult) are NOT bound
-/// inside `Emit` ranges - they are let-bound by naga's WGSL writer
-/// at the statement's containing block.  If `Statement::Block { x =
-/// helper(); }` stores a `CallResult` into a local, the cache entry
-/// `Local(x) -> CallResult_handle` must be filtered out at the
-/// closing brace just like Emit'd values.  Pre-fix
-/// `collect_emitted_handles_in_block` only walked `Emit` ranges
-/// and missed every statement-bound result, leaking forwarding
-/// targets past the brace.
+/// Statement-bound results (CallResult, AtomicResult,
+/// WorkGroupUniformLoadResult, Subgroup*Result, RayQueryProceedResult) are
+/// let-bound at the statement's block, not in an Emit range, so a cache
+/// entry `Local(x) -> CallResult` must be filtered at the closing brace too.
 #[test]
 fn block_scope_leak_regression_call_result_in_block() {
     let source = r#"
@@ -2420,8 +2204,7 @@ fn f(a: f32, b: f32, c: f32) -> vec3<f32> {
     let (_, _module) = run_pass(source);
 }
 
-/// Same scope-leak shape but exercising `Statement::If` branch
-/// containing the CallResult-seeded Store.
+/// The CallResult-seeded Store inside an `If` branch.
 #[test]
 fn block_scope_leak_regression_call_result_in_if_branch() {
     let source = r#"
@@ -2441,8 +2224,7 @@ fn f(cond: bool, a: f32, b: f32, c: f32) -> vec3<f32> {
     let (_, _module) = run_pass(source);
 }
 
-/// Same scope-leak shape exercising `Statement::Atomic` whose
-/// `result` is bound at the statement site (not in an Emit).
+/// The statement-bound `Atomic` result.
 #[test]
 fn block_scope_leak_regression_atomic_result_in_block() {
     let source = r#"
@@ -2460,37 +2242,13 @@ fn f() -> u32 {
     let (_, _module) = run_pass(source);
 }
 
-/// Regression for the Block-arm cache-staleness bug.
-///
-/// Setup: a local `var failed = false;` followed by `failed |= X;`
-/// chains, where SOME `failed |= X;` statements live inside nested
-/// `{ ... }` blocks.
-///
-/// Pre-fix bug: on exit from a nested `Statement::Block` that wrote
-/// to `failed`, the cache rollback restored the pre-block init
-/// entry (`Local(failed) -> Literal(false)`) without invalidating
-/// it.  A subsequent `Load(failed)` inside another nested block
-/// would cache-hit on the stale init and be forwarded to
-/// `Literal(false)`, producing `failed = false | X` in the
-/// generator output - structurally valid WGSL that OVERWRITES
-/// `failed`'s accumulated state with `X`, dropping every earlier
-/// `failed |= ...`.  Naga's validator does not catch this because
-/// it checks structural validity, not semantic equivalence with
-/// the source.
-///
-/// Fix: after rollback, drop cache entries for any local that was
-/// modified inside the block - mirrors the existing invalidation
-/// step in the `If`, `Switch`, and `Loop` arms.
-///
-/// This `var failed = false; { failed |= ...; }` shape occurs in real
-/// shaders, where pre-fix output dropped accumulator state at several of
-/// the nested-block writes.
-///
-/// Signal: emit the optimised IR back to WGSL and check that the
-/// pattern `failed=false|` does NOT appear in writes inside nested
-/// blocks.  An init-forwarded first write is acceptable (init IS
-/// `false`), but subsequent writes inside nested blocks must read
-/// `failed`'s current value, not the pre-block init.
+/// On exit from a nested `Statement::Block` that wrote `failed`, the cache
+/// rollback restores the pre-block init entry (`Local(failed) ->
+/// Literal(false)`); a later `Load(failed)` in another block then forwards
+/// to `false`, emitting `failed = false | X`, structurally valid WGSL that
+/// drops every earlier `failed |= ...`.  Rollback must drop entries for
+/// locals written inside the block, as the If/Switch/Loop arms do.  Signal:
+/// at most one init-forwarded `failed=false|` (the first write is correct).
 #[test]
 fn block_arm_does_not_forward_stale_init_after_inner_block_writes() {
     let source = r#"
@@ -2514,9 +2272,6 @@ fn test_fn(a: bool, b: bool, c: bool) -> bool {
 "#;
     let (_, module) = run_pass(source);
 
-    // Emit the optimised IR back to WGSL.  Bypass naga's
-    // capability gate for f16-only features; this test uses only
-    // booleans.
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::all(),
@@ -2528,19 +2283,9 @@ fn test_fn(a: bool, b: bool, c: bool) -> bool {
         naga::back::wgsl::Writer::new(&mut out, naga::back::wgsl::WriterFlags::empty());
     writer.write(&module, &info).expect("should emit WGSL");
 
-    // Strip whitespace for robust pattern matching across naga
-    // formatting tweaks.
+    // Whitespace-insensitive match.
     let stripped: String = out.chars().filter(|c| !c.is_whitespace()).collect();
 
-    // Pre-fix bug signature: writes inside nested blocks would
-    // emit as `failed = false | X` (or some form where the LHS of
-    // the OR is the literal `false` instead of `Load(failed)`).
-    // With the fix, the first write may still forward the init
-    // (`failed = false | a`) - that one is correct because the
-    // init IS `false`.  Subsequent writes must NOT carry that
-    // pattern.  We check that the count of `failed=false|`
-    // occurrences is at most one (the init-forwarded first
-    // write).
     let bad_pattern_count = stripped.matches("failed=false|").count();
     assert!(
         bad_pattern_count <= 1,
@@ -2554,11 +2299,9 @@ fn test_fn(a: bool, b: bool, c: bool) -> bool {
     );
 }
 
-/// `true` when any `Divide`/`Modulo` in `function` has a right operand that
-/// IS an integer-zero literal - directly, or through the `Splat`/`Compose`
-/// naga wraps a scalar divisor in for a component-wise `vecN / scalar`.  This
-/// is the exact shape `decline_static_error_forwards` prevents load_dedup
-/// from materialising.
+/// True when a `Divide`/`Modulo` right operand is an integer-zero literal,
+/// directly or through the `Splat`/`Compose` naga wraps a scalar divisor in
+/// for `vecN / scalar`: the shape `decline_static_error_forwards` prevents.
 fn has_const_zero_divisor(function: &naga::Function) -> bool {
     fn operand_is_zero(
         exprs: &naga::Arena<naga::Expression>,
@@ -2587,11 +2330,10 @@ fn has_const_zero_divisor(function: &naga::Function) -> bool {
 
 #[test]
 fn declines_forwarding_zero_into_scalar_divisor() {
-    // `b` is a zero-init var used only as a divisor.  Forwarding `b -> 0u`
-    // makes `a / 0u` a const divide-by-zero (a WGSL shader-creation error):
-    // naga rejects it and the WHOLE pass rolls back with a spurious warning.
-    // `run_pass` validates the post-pass module, so without the guard this
-    // panics; with it, the divisor stays a runtime read.
+    // Forwarding `b -> 0u` makes `a / 0u` a const divide-by-zero
+    // (shader-creation error): naga rejects it and the whole pass rolls back
+    // with a spurious warning; `run_pass` validates, so the guard's absence
+    // panics.
     let src = "\
 @compute @workgroup_size(1)
 fn f() {
@@ -2627,8 +2369,7 @@ fn f() {
 #[test]
 fn declines_forwarding_overflow_into_shift_amount() {
     // Forwarding `s -> 40u` makes `1i << 40u` a const shift past the 32-bit
-    // width (a shader-creation error).  `run_pass`'s post-pass validation is
-    // the assertion: without the guard the module is invalid and it panics.
+    // width; `run_pass`'s validation is the assertion.
     let src = "\
 @compute @workgroup_size(1)
 fn f() {
@@ -2641,8 +2382,7 @@ fn f() {
 
 #[test]
 fn still_forwards_legal_shift_and_divisor() {
-    // Control: an in-range shift amount and a non-zero divisor must STILL
-    // forward (the guard is surgical, not a blanket ban on shift/div RHS).
+    // The guard is surgical, not a blanket ban on shift/div RHS.
     let src = "\
 @compute @workgroup_size(1)
 fn f() {
@@ -2657,4 +2397,82 @@ fn f() {
         !has_const_zero_divisor(&module.entry_points[0].function),
         "a non-zero divisor is never flagged"
     );
+}
+
+/// Dawn on Metal flushes a negative-zero LITERAL to +0 while a runtime
+/// negation keeps the sign, so `-0.0` never forwards into a load: the
+/// initializer form and the store form both keep their reads.
+#[test]
+fn dead_stores_clear_at_a_discard_and_the_scan_continues() {
+    // The terminator drains the pending-store map, and the block keeps
+    // storing afterwards: the scan must survive the reset.
+    let (changed, module) = run_pass(
+        "@fragment fn m(@location(0) x: f32) -> @location(0) vec4f {\n\
+           var a: f32;\n\
+           a = x;\n\
+           discard;\n\
+           a = 2.0;\n\
+           return vec4f(a);\n\
+         }",
+    );
+    assert!(changed, "the overwritten store is dead");
+    let f = &module.entry_points[0].function;
+    assert_eq!(
+        f.body
+            .iter()
+            .filter(|s| matches!(s, naga::Statement::Store { .. }))
+            .count(),
+        0,
+        "the first store is overwritten and the second forwards into the return"
+    );
+}
+
+#[test]
+fn module_scope_values_are_not_forwarded_into_a_runtime_read() {
+    // An override has no value until pipeline creation and a constant's tree
+    // lives in an arena the pass does not hold, so neither can be shown free
+    // of a `-0.0` that Dawn's Metal backend would flush.
+    for (decl, init, forwarded) in [
+        ("override OV: f32 = -0.0;", "OV", false),
+        ("const CN: f32 = -0.0;", "CN", false),
+        ("", "0.5", true),
+    ] {
+        let source = format!(
+            "{decl}\n\
+             @group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+             @compute @workgroup_size(1) fn main() {{\n\
+               var z = {init};\n\
+               out[0] = bitcast<u32>(-(z * z));\n\
+             }}"
+        );
+        let (_, module) = run_pass(&source);
+        let loads = count_loads_from_local(&module.entry_points[0].function);
+        assert_eq!(loads == 0, forwarded, "init {init}: {loads} loads");
+    }
+}
+
+#[test]
+fn negative_zero_literals_are_not_forwarded() {
+    for (init, store, forwarded) in [
+        ("-(0.0)", "", false),
+        ("0.5", "", true),
+        ("0.0", "z = -(0.0);", false),
+        ("0.0", "z = 0.5;", true),
+    ] {
+        let source = format!(
+            "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+             @compute @workgroup_size(1) fn main() {{\n\
+               var z = {init};\n\
+               {store}\n\
+               out[0] = bitcast<u32>(-z);\n\
+             }}"
+        );
+        let (_, module) = run_pass(&source);
+        let loads = count_loads_from_local(&module.entry_points[0].function);
+        assert_eq!(
+            loads == 0,
+            forwarded,
+            "init {init} store {store:?}: {loads} loads"
+        );
+    }
 }

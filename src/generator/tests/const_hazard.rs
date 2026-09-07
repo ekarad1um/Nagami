@@ -195,6 +195,29 @@ fn f16_conversion_out_of_range_binds() {
 }
 
 #[test]
+fn f16_conversion_of_an_opaque_integer_binds() {
+    // `unpack4xI8` is beyond both evaluators, so the integer converted is
+    // unknown; only f16 can overflow on an integer, so the f32 conversion
+    // of the same tree stays inline.
+    let out = minify(
+        "enable f16; @group(0)@binding(0) var<storage,read_write> out: array<f16>;\
+         @compute @workgroup_size(1) fn main() { var v = unpack4xI8(0x7f7f7f7fu).x; \
+         out[0] = f16(v); }",
+    );
+    assert!(
+        out.contains("let ") && !out.contains("f16(unpack4xI8"),
+        "an opaque integer must bind before its conversion to f16: {out}"
+    );
+    let out = minify(&body(
+        "var v = unpack4xI8(0x7f7f7f7fu).x; out[0] = u32(f32(v));",
+    ));
+    assert!(
+        !out.contains("let ") && out.contains("f32(unpack4xI8("),
+        "f32 spans every integer type, so nothing binds: {out}"
+    );
+}
+
+#[test]
 fn conversion_of_out_of_range_literal_keeps_its_suffix() {
     // `i32(3000000000)` converts from the ABSTRACT value and is rejected;
     // `i32(3000000000u)` wraps like the runtime conversion did.
@@ -287,4 +310,99 @@ fn ldexp_limit_follows_the_float_width() {
         out.contains("ldexp(f32(a[1]),20)"),
         "f32 ldexp allows 128: {out}"
     );
+}
+
+/// A forwarded literal can make both shift operands constant while the
+/// amount hides behind a builtin the hazard evaluator does not model; the
+/// signed overflow is rejected at const-evaluation, so the operand binds.
+#[test]
+fn unmodeled_constant_shift_amount_binds_the_shifted_literal() {
+    let out: String = compact_with_passes(
+        &body("var v = -100i; out[0] = u32(v << (reverseBits(u32(v)) & 31u));"),
+        Profile::Max,
+    )
+    .split_whitespace()
+    .collect();
+    assert!(out.contains("let"), "{out}");
+    assert!(!out.contains("-100i<<"), "{out}");
+}
+
+/// Dawn's MSL for `~u32(i32(x))` is `(~(uint(int(v))) & 3u)`, which Metal
+/// parses as a C-style cast of `&3u`; the inner conversion binds so the
+/// unary operand is `uint(a)`.
+
+#[test]
+fn unary_over_nested_vector_constructors_binds_the_inner_one() {
+    // Dawn's Metal backend reads `-(float4(int4(v)))` as a function type, so
+    // a splat under a conversion needs the same binding as `~u32(i32(v))`.
+    let src = "@group(0)@binding(0) var<storage,read_write> out: array<u32>;\n\
+               @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) i: u32) {\n\
+                 let v = vec4i(i32(i));\n\
+                 out[0] = u32((-vec4f(v) * 2.0).x);\n\
+               }";
+    let bound: String = compact_with_passes(src, Profile::Max)
+        .split_whitespace()
+        .collect();
+    assert!(!bound.contains("vec4f(vec4i("), "{bound}");
+}
+
+#[test]
+fn unary_over_three_conversions_binds_below_the_outer_one() {
+    // Binding only the innermost would leave `uint(int(name))`, ambiguous
+    // again; the operand one level down leaves a single constructor.
+    let src = "@group(0)@binding(0) var<storage,read_write> out: array<u32>;\n\
+               @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) i: u32) {\n\
+                 let a = u32(i);\n\
+                 out[0] = ~u32(i32(u32(a))) & 3u;\n\
+               }";
+    let bound: String = compact_with_passes(src, Profile::Max)
+        .split_whitespace()
+        .collect();
+    assert!(!bound.contains("u32(i32("), "{bound}");
+}
+
+#[test]
+fn a_for_header_declines_rather_than_render_the_metal_cast_shape() {
+    // The header cannot `let`-bind, and hoisting the binding above the loop
+    // would freeze a value the body updates, so the plain `loop` form wins.
+    let src = "@group(0)@binding(0) var<storage,read_write> out: array<u32>;\n\
+               @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) i: u32) {\n\
+                 var b = i32(i);\n\
+                 var n = 0u;\n\
+                 loop {\n\
+                   let t = i32(b);\n\
+                   if ((~u32(t) & 7u) <= n) { break; }\n\
+                   n += 1u; b += 1;\n\
+                 }\n\
+                 out[0] = n;\n\
+               }";
+    let out: String = compact_with_passes(src, Profile::Max)
+        .split_whitespace()
+        .collect();
+    assert!(out.contains("loop{") && !out.contains("~u32(i32("), "{out}");
+}
+
+#[test]
+fn unary_over_nested_conversion_of_an_identifier_binds_the_inner_cast() {
+    // An indexed leaf (`int(out[1u])`) is no declarator, so only the bare
+    // identifier form binds.
+    let src = |arg: &str| {
+        format!(
+            "@group(0)@binding(0) var<storage,read_write> out: array<u32>;\n\
+             @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) i: u32) {{\n\
+               out[0] = ~u32(i32({arg})) & 3u;\n\
+             }}"
+        )
+    };
+    let bound: String = compact_with_passes(&src("i"), Profile::Max)
+        .split_whitespace()
+        .collect();
+    assert!(
+        bound.contains("let") && !bound.contains("~u32(i32("),
+        "{bound}"
+    );
+    let inline: String = compact_with_passes(&src("out[1]"), Profile::Max)
+        .split_whitespace()
+        .collect();
+    assert!(inline.contains("~u32(i32("), "{inline}");
 }

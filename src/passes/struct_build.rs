@@ -1,89 +1,54 @@
-//! Struct field-wise build coalescing.
+//! Struct field-wise build coalescing: a struct local declared empty and
+//! filled one member at a time (`var t: T; t.pos = ...; t.scale = ...;`),
+//! completely built and only then read, becomes one constructor
+//! (`var t = T(..., ...);`, members in declaration order).
 //!
-//! A common hand-authored pattern declares an empty struct local and fills it
-//! one member at a time:
-//!
-//! ```wgsl
-//! var t: Transform2D;
-//! t.pos = mix(a.pos, b.pos, k);
-//! t.scale = mix(a.scale, b.scale, k);
-//! // ...
-//! return t;
-//! ```
-//!
-//! Every member store costs `t.<member> = ...;`.  When the local is built up
-//! completely and only THEN read, the whole thing is one struct constructor:
-//!
-//! ```wgsl
-//! var t = Transform2D(mix(...), mix(...), ...);  // members in declaration order
-//! ```
-//!
-//! ## Why this is value-safe
-//!
-//! In naga IR every store's right-hand side is a *pre-materialised* expression
-//! handle - it was computed in an `Emit` range BEFORE the `Store`.  Rewriting
-//! the member stores into one `Store(t, Compose{member handles in decl order})`
-//! references those already-computed values at their original positions, so the
-//! values AND their evaluation order are unchanged, regardless of whether a
-//! right-hand side has side effects.  The only genuine hazards are excluded by
-//! the gates below: a member store whose value reads `t` (the constructor would
-//! read an unset member), a read of `t` before the build finishes, a pointer to
-//! `t` escaping to a callee, or incomplete member coverage.
-//!
-//! Value-safety rests on the gates, not on validation: the pipeline's per-pass
-//! re-validation rejects only structurally-invalid IR (rolling it back to a
-//! no-op), so a gate that wrongly admits an unsafe build yields valid-but-wrong
-//! IR that slips straight through.
+//! Value-safe because every store's right-hand side is a pre-materialised
+//! expression handle computed in an `Emit` range before the `Store`:
+//! `Store(t, Compose{member handles in decl order})` references those
+//! already-computed values at their original positions, so values and
+//! evaluation order are unchanged whatever side effects they carry.  The
+//! genuine hazards are excluded by the gates: a member value that reads
+//! `t` (the constructor would read an unset member), a read of `t` before
+//! the build finishes, a pointer to `t` escaping to a callee, incomplete
+//! member coverage.  Safety rests on the gates, not on validation: per-pass
+//! re-validation rejects only structurally invalid IR, so a wrongly
+//! admitted build yields valid-but-wrong IR that slips straight through.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::Error;
+use crate::handle_set::HandleMap;
 use crate::passes::load_dedup::get_stored_local;
 use crate::pipeline::{Pass, PassContext};
 
-/// Pass entry point; the algorithm and its safety gates are the
-/// module-level docs.
+/// Collapses member-wise struct builds into one constructor store.
 pub struct StructBuildPass;
 
-/// `true` when the expression subtree rooted at `h` reads the local `g`
-/// (a `Load` whose pointer roots at `g`).  Used to reject a member value that
-/// depends on a sibling member (`t.b = t.a + 1`).
+/// A `Load` whose pointer roots at `g` anywhere under `h`; rejects a member
+/// value that depends on a sibling member (`t.b = t.a + 1`).  Shared
+/// sub-expressions make an unmemoised walk exponential (a ~1KB shader hangs
+/// the pass), and `memo` records both answers, so one memo serves every query
+/// about the same `g`.
 fn expr_loads_local(
     h: naga::Handle<naga::Expression>,
     g: naga::Handle<naga::LocalVariable>,
     arena: &naga::Arena<naga::Expression>,
+    memo: &mut HandleMap<naga::Expression, bool>,
 ) -> bool {
-    let mut visited = FxHashSet::default();
-    expr_loads_local_memo(h, g, arena, &mut visited)
-}
-
-fn expr_loads_local_memo(
-    h: naga::Handle<naga::Expression>,
-    g: naga::Handle<naga::LocalVariable>,
-    arena: &naga::Arena<naga::Expression>,
-    visited: &mut FxHashSet<naga::Handle<naga::Expression>>,
-) -> bool {
-    // A shared sub-expression forms a diamond in the DAG; without a visited set
-    // each incoming edge re-walks it, making this exponential (2^depth) on wide
-    // shared trees (a ~1KB shader can then hang the pass).  A handle is inserted
-    // before it is explored and only ever memoises `false`: a handle whose
-    // subtree DOES contain `g` returns `true` on its first visit and the
-    // caller's `if !found` guard short-circuits every later edge, so it is never
-    // revisited to yield a wrong `false`.
-    if !visited.insert(h) {
-        return false;
+    if let Some(&known) = memo.get(h) {
+        return known;
     }
-    if let naga::Expression::Load { pointer } = arena[h]
-        && get_stored_local(arena, pointer) == Some(g)
-    {
-        return true;
+    let mut found = matches!(arena[h], naga::Expression::Load { pointer }
+        if get_stored_local(arena, pointer) == Some(g));
+    if !found {
+        crate::passes::expr_util::visit_expression_children(&arena[h], |child| {
+            if !found {
+                found = expr_loads_local(child, g, arena, memo);
+            }
+        });
     }
-    let mut found = false;
-    crate::passes::expr_util::visit_expression_children(&arena[h], |child| {
-        if !found {
-            found = expr_loads_local_memo(child, g, arena, visited);
-        }
-    });
+    memo.insert(h, found);
     found
 }
 
@@ -117,7 +82,6 @@ impl Pass for StructBuildPass {
 }
 
 fn collapse_in_function(func: &mut naga::Function, types: &naga::UniqueArena<naga::Type>) -> bool {
-    // Candidate locals: struct-typed, no initializer.
     let candidates: Vec<(naga::Handle<naga::LocalVariable>, usize)> = func
         .local_variables
         .iter()
@@ -136,8 +100,14 @@ fn collapse_in_function(func: &mut naga::Function, types: &naga::UniqueArena<nag
     }
 
     let mut plans: Vec<BuildPlan> = Vec::new();
+    // Both memos answer "about `g`", so they reset per candidate and keep
+    // their slots across candidates.
+    let mut loads: HandleMap<naga::Expression, bool> = Default::default();
+    let mut mentions: HandleMap<naga::Expression, bool> = Default::default();
     for (g, member_count) in candidates {
-        if let Some(plan) = plan_local(func, g, member_count) {
+        loads.clear();
+        mentions.clear();
+        if let Some(plan) = plan_local(func, g, member_count, &mut loads, &mut mentions) {
             plans.push(plan);
         }
     }
@@ -149,26 +119,25 @@ fn collapse_in_function(func: &mut naga::Function, types: &naga::UniqueArena<nag
     true
 }
 
-/// Analyse local `g`; return a [`BuildPlan`] when it is built member-by-member
-/// in the top-level body and only read afterwards.  Returns `None` (leave it
-/// alone) on ANYTHING that does not match exactly - this is the whole safety
-/// surface, so it is deliberately strict.
+/// A plan when `g` is built member-by-member in the top-level body and only
+/// read afterwards; `None` on anything else, since this is the whole safety
+/// surface.
 fn plan_local(
     func: &naga::Function,
     g: naga::Handle<naga::LocalVariable>,
     member_count: usize,
+    loads: &mut HandleMap<naga::Expression, bool>,
+    mentions: &mut HandleMap<naga::Expression, bool>,
 ) -> Option<BuildPlan> {
     use naga::Statement as S;
     let arena = &func.expressions;
 
-    // 1. Scan the top-level body once for member stores, escapes, and reads.
-    let mut members: FxHashMap<u32, (usize, naga::Handle<naga::Expression>)> = FxHashMap::default();
+    let mut members: FxHashMap<u32, (usize, naga::Handle<naga::Expression>)> = Default::default();
     let mut ptr: Option<naga::Handle<naga::Expression>> = None;
     let mut last_store_idx: Option<usize> = None;
     let mut first_read_idx: Option<usize> = None;
 
     for (idx, stmt) in func.body.iter().enumerate() {
-        // Member store?
         if let S::Store { pointer, value } = stmt
             && let Some((local, spec)) =
                 crate::passes::coalescing::resolve_local_and_element(*pointer, arena)
@@ -177,7 +146,7 @@ fn plan_local(
             match spec {
                 crate::passes::coalescing::ElementSpec::Index(i) => {
                     // A member written twice, or a value that reads `g`, is out.
-                    if members.contains_key(&i) || expr_loads_local(*value, g, arena) {
+                    if members.contains_key(&i) || expr_loads_local(*value, g, arena, loads) {
                         return None;
                     }
                     members.insert(i, (idx, *value));
@@ -195,17 +164,16 @@ fn plan_local(
         if statement_escapes_local(stmt, g, arena) {
             return None;
         }
-        // A VALUE read of `g` (a `Load` rooting at it).  Bare `AccessIndex` /
-        // `LocalVariable` pointer materialisations - including the member-store
-        // pointers emitted up front - are addresses, NOT reads, so they do not
-        // count (otherwise the build would never look "completed before read").
-        if statement_value_reads_local(stmt, g, arena) {
+        // Pointer materialisations (including the member-store pointers
+        // emitted up front) are addresses, not reads, or the build would never
+        // look completed before its first read.
+        if statement_value_reads_local(stmt, g, arena, loads) {
             first_read_idx = Some(first_read_idx.map_or(idx, |p| p.min(idx)));
         }
     }
 
-    // 2. Gates: every member covered exactly once; first read strictly after
-    //    the last member store.
+    // Every member covered exactly once; first read strictly after the last
+    // member store.
     if members.len() != member_count {
         return None;
     }
@@ -216,15 +184,13 @@ fn plan_local(
         return None;
     }
 
-    // 3. Reject any reference to `g` inside a NESTED block - the positional
-    //    "read after build" reasoning above only covers the top-level body, so
-    //    any Load/Access/Store rooting at `g` (or `g` escaping) in a nested
-    //    block is unsafe.  This is the one whole-nested-tree walk; done last so
-    //    it runs only for a candidate that already passed the cheap top-level
-    //    gates, not for every struct local.
+    // The positional read-after-build reasoning covers only the top-level
+    // body, so any reference to `g` in a nested block is unsafe.  The one
+    // whole-tree walk, done last so only candidates past the cheap gates pay
+    // for it.
     let mut nested_ref = false;
     walk_nested(&func.body, &mut |stmt| {
-        if statement_references_local(stmt, g, arena) {
+        if statement_references_local(stmt, g, arena, mentions) {
             nested_ref = true;
         }
     });
@@ -232,7 +198,6 @@ fn plan_local(
         return None;
     }
 
-    // 4. Build the component list in declaration (member-index) order.
     let mut components = Vec::with_capacity(member_count);
     let mut store_indices = Vec::with_capacity(member_count);
     for i in 0..member_count as u32 {
@@ -248,46 +213,35 @@ fn plan_local(
     })
 }
 
-/// Rewrite the member stores of every plan into one struct-constructor store
-/// apiece, in a SINGLE rebuild of the body.
-///
-/// All plans' `store_indices` / `insert_at` are positions in the *current*
-/// (pre-mutation) body.  Applying them one at a time would be unsound: each
-/// rewrite changes the statement count, so a later plan's indices would point
-/// at the wrong (shifted) statements and could drop a live, unrelated statement
-/// or splice a constructor in the wrong place.  Instead we consult every plan's
-/// original indices in one pass, so no index is ever invalidated.
-///
-/// The plans are mutually independent: each targets a distinct local, so their
-/// member-store index sets are disjoint and their `insert_at` positions are
-/// distinct; and the gates (a value read of a local before its build completes
-/// blocks that local's plan) guarantee no plan's rewrite changes another's
-/// observed values.
+/// One rebuild of the body for every plan: all `store_indices` are
+/// positions in the pre-mutation body, and applying plans one at a time
+/// would shift a later plan's indices onto the wrong statements.  Plans are
+/// independent: each targets a distinct local, so their index sets are
+/// disjoint and their insertion points distinct, and the gates guarantee no
+/// rewrite changes another plan's observed values.
 fn apply_plans(
     func: &mut naga::Function,
     types: &naga::UniqueArena<naga::Type>,
     plans: Vec<BuildPlan>,
 ) {
     // member-store indices to drop, and `insert_at` -> (compose, struct ptr).
-    let mut drop: FxHashSet<usize> = FxHashSet::default();
+    let mut drop: FxHashSet<usize> = Default::default();
     let mut splice: FxHashMap<
         usize,
         (
             naga::Handle<naga::Expression>,
             naga::Handle<naga::Expression>,
         ),
-    > = FxHashMap::default();
+    > = Default::default();
     for plan in plans {
         let struct_ty = func.local_variables[plan.local].ty;
-        // Sanity: the local's type must still be the struct we planned for.
         debug_assert!(matches!(
             types[struct_ty].inner,
             naga::TypeInner::Struct { .. }
         ));
-        // Appending the Compose at the end of the arena is topologically safe:
-        // it references only the (lower-handle) member values materialised
-        // earlier.  naga permits a high-handle `Emit` range before later
-        // lower-handle ones, so the splice position does not constrain ordering.
+        // Appending the Compose is topologically safe: it references only
+        // lower-handle member values, and naga permits a high-handle `Emit`
+        // range before later lower-handle ones.
         let compose = func.expressions.append(
             naga::Expression::Compose {
                 ty: struct_ty,
@@ -303,9 +257,8 @@ fn apply_plans(
     let original = std::mem::replace(&mut func.body, naga::Block::new());
     for (idx, (stmt, span)) in original.span_into_iter().enumerate() {
         if drop.contains(&idx) {
-            // A member store: at the position of the LAST one for its local,
-            // splice `Emit(Compose); Store(g, Compose)` (every member value is
-            // already materialised before here).
+            // At the last member store of a local every member value is
+            // already materialised.
             if let Some(&(compose, ptr)) = splice.get(&idx) {
                 func.body.push(
                     naga::Statement::Emit(naga::Range::new_from_bounds(compose, compose)),
@@ -325,17 +278,17 @@ fn apply_plans(
     }
 }
 
-/// `true` when `stmt` references `local` in any way (Store target, Load,
-/// value operand, escape).  Conservative: used both to reject nested refs and
-/// to find reads in the body.
+/// Any reference at all (store target, load, operand, escape); conservative
+/// by design.
 fn statement_references_local(
     stmt: &naga::Statement,
     local: naga::Handle<naga::LocalVariable>,
     arena: &naga::Arena<naga::Expression>,
+    memo: &mut HandleMap<naga::Expression, bool>,
 ) -> bool {
     let mut found = false;
     let mut check = |h: naga::Handle<naga::Expression>| {
-        if !found && expr_mentions_local(h, local, arena) {
+        if !found && expr_mentions_local(h, local, arena, memo) {
             found = true;
         }
     };
@@ -343,17 +296,17 @@ fn statement_references_local(
     found
 }
 
-/// `true` when `stmt` performs a VALUE read of `local` (a `Load` rooting at
-/// it) - the genuine "use" that must come after the build, as opposed to the
-/// bare pointer materialisations.
+/// A `Load` rooting at `local`: the genuine use that must follow the build,
+/// unlike bare pointer materialisations.
 fn statement_value_reads_local(
     stmt: &naga::Statement,
     local: naga::Handle<naga::LocalVariable>,
     arena: &naga::Arena<naga::Expression>,
+    memo: &mut HandleMap<naga::Expression, bool>,
 ) -> bool {
     let mut found = false;
     let mut check = |h: naga::Handle<naga::Expression>| {
-        if !found && expr_loads_local(h, local, arena) {
+        if !found && expr_loads_local(h, local, arena, memo) {
             found = true;
         }
     };
@@ -361,8 +314,7 @@ fn statement_value_reads_local(
     found
 }
 
-/// `true` when `stmt` passes a pointer rooting at `local` to a callee / atomic
-/// / other escape channel.
+/// A pointer rooting at `local` handed to a callee or an atomic.
 fn statement_escapes_local(
     stmt: &naga::Statement,
     local: naga::Handle<naga::LocalVariable>,
@@ -380,43 +332,31 @@ fn statement_escapes_local(
     }
 }
 
-/// `true` when the expression subtree rooted at `h` mentions `local` (as the
-/// base of an `AccessIndex`/`Access`, the pointer of a `Load`, or bare).
+/// `LocalVariable(local)` anywhere under `h`; memoised like
+/// [`expr_loads_local`].
 fn expr_mentions_local(
     h: naga::Handle<naga::Expression>,
     local: naga::Handle<naga::LocalVariable>,
     arena: &naga::Arena<naga::Expression>,
+    memo: &mut HandleMap<naga::Expression, bool>,
 ) -> bool {
-    let mut visited = FxHashSet::default();
-    expr_mentions_local_memo(h, local, arena, &mut visited)
-}
-
-fn expr_mentions_local_memo(
-    h: naga::Handle<naga::Expression>,
-    local: naga::Handle<naga::LocalVariable>,
-    arena: &naga::Arena<naga::Expression>,
-    visited: &mut FxHashSet<naga::Handle<naga::Expression>>,
-) -> bool {
-    // Memoised for the same reason as `expr_loads_local_memo`: without a visited
-    // set, shared sub-expressions make this exponential on the DAG.
-    if !visited.insert(h) {
-        return false;
+    if let Some(&known) = memo.get(h) {
+        return known;
     }
-    if matches!(arena[h], naga::Expression::LocalVariable(l) if l == local) {
-        return true;
+    let mut found = matches!(arena[h], naga::Expression::LocalVariable(l) if l == local);
+    if !found {
+        crate::passes::expr_util::visit_expression_children(&arena[h], |child| {
+            if !found {
+                found = expr_mentions_local(child, local, arena, memo);
+            }
+        });
     }
-    let mut found = false;
-    crate::passes::expr_util::visit_expression_children(&arena[h], |child| {
-        if !found {
-            found = expr_mentions_local_memo(child, local, arena, visited);
-        }
-    });
+    memo.insert(h, found);
     found
 }
 
-/// Run `f` on every statement that lives inside a NESTED block of `body` (i.e.
-/// every statement reachable through a block-bearing statement, NOT the
-/// top-level statements themselves).
+/// Every statement inside a nested block of `body`, excluding the top-level
+/// statements themselves.
 fn walk_nested(body: &naga::Block, f: &mut impl FnMut(&naga::Statement)) {
     for stmt in body.iter() {
         for nested in crate::passes::expr_util::nested_blocks(stmt) {

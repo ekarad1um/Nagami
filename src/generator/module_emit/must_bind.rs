@@ -1,14 +1,14 @@
 //! Mutated-load binding analysis: which emitted loads must become
 //! `let` bindings because a write to their place intervenes before a use.
 
-use crate::passes::expr_util::visit_expression_children;
-use rustc_hash::{FxHashMap, FxHashSet};
+use crate::handle_set::HandleSet;
+use crate::passes::expr_util::{const_index_value, visit_expression_children};
+use rustc_hash::FxHashMap;
 
-/// The memory location a pointer refers to, resolved to a root variable
-/// plus one level of refinement off that root.  Two places that share a
-/// root but carry distinct *constant* first-level indices are provably
-/// disjoint; anything coarser (`Whole` or a dynamic `Opaque` index)
-/// conservatively aliases everything in the root.
+/// A pointer's memory location: a root variable plus one level of refinement.
+/// Two places sharing a root with distinct constant first-level indices are
+/// provably disjoint; anything coarser (`Whole`, a dynamic `Opaque` index)
+/// aliases everything in the root.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PlaceRoot {
     Local(naga::Handle<naga::LocalVariable>),
@@ -31,29 +31,22 @@ struct Place {
     refine: Refine,
 }
 
-/// Conservative may-alias test.  Sound direction: returns `true` whenever
-/// the two places *might* name overlapping memory.  Only proven-disjoint
-/// pairs (same root, distinct constant first-level indices) return `false`.
+/// Conservative may-alias: `false` only for proven-disjoint pairs.
 fn places_may_alias(a: Place, b: Place) -> bool {
     if a.root != b.root {
         return false;
     }
     match (a.refine, b.refine) {
         (Refine::Field(x), Refine::Field(y)) => x == y,
-        // `Whole` contains every field; `Opaque` could be any field.
         _ => true,
     }
 }
 
-/// Lower a pointer expression to its [`Place`], walking `Access` /
-/// `AccessIndex` chains down to the root variable.  The refinement is the
-/// access applied DIRECTLY to the root (the first level); deeper accesses
-/// keep that first-level refinement (conservative - sub-locations of the
-/// same first-level component are treated as aliasing).
-///
-/// Returns `None` when the root is not a concrete variable (a
-/// function-argument pointer, or an exotic pointer expression).  Such a
-/// place is treated as "Unknown" by the caller and aliases everything.
+/// Lower a pointer expression to its [`Place`]: the root variable plus the
+/// access applied directly to it; deeper accesses keep that first-level
+/// refinement (sub-locations of one component alias).  `None` when the root is
+/// not a concrete variable (a function-argument pointer, an exotic pointer),
+/// which the caller treats as aliasing everything.
 fn resolve_place(
     pointer: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
@@ -82,6 +75,7 @@ fn resolve_place(
             let base_place = resolve_place(*base, expressions)?;
             if matches!(base_place.refine, Refine::Whole) {
                 let refine = const_index_value(*index, expressions)
+                    .and_then(|v| u32::try_from(v).ok())
                     .map(Refine::Field)
                     .unwrap_or(Refine::Opaque);
                 Some(Place {
@@ -96,55 +90,27 @@ fn resolve_place(
     }
 }
 
-/// The constant value of an index expression, if it is a non-negative
-/// integer `Literal`; otherwise `None` (a dynamic or non-integer index).
-fn const_index_value(
-    index: naga::Handle<naga::Expression>,
-    expressions: &naga::Arena<naga::Expression>,
-) -> Option<u32> {
-    let naga::Expression::Literal(lit) = &expressions[index] else {
-        return None;
-    };
-    match lit {
-        naga::Literal::U32(v) => Some(*v),
-        naga::Literal::I32(v) => u32::try_from(*v).ok(),
-        naga::Literal::U64(v) => u32::try_from(*v).ok(),
-        naga::Literal::I64(v) => u32::try_from(*v).ok(),
-        naga::Literal::AbstractInt(v) => u32::try_from(*v).ok(),
-        _ => None,
-    }
-}
-
-/// `true` when a callee or another invocation could write this global
-/// (so a load of it can become stale).  Immutable address spaces
-/// (`uniform`, resource handles, immediate/push-constant, read-only
-/// storage) can never change and never produce a hazard.
+/// `true` when a callee or another invocation could write this global, so a
+/// load of it can go stale; immutable address spaces never produce a hazard.
 fn global_is_writable(module: &naga::Module, g: naga::Handle<naga::GlobalVariable>) -> bool {
     match module.global_variables[g].space {
         naga::AddressSpace::Uniform
         | naga::AddressSpace::Handle
         | naga::AddressSpace::Immediate => false,
         naga::AddressSpace::Storage { access } => access.contains(naga::StorageAccess::STORE),
-        // Function (locals), Private, WorkGroup, ray/task payloads: writable.
         _ => true,
     }
 }
 
-/// `true` when texture global `g` is a STORE-access storage texture, i.e.
-/// a `textureStore`/`textureAtomic` (here or in a callee) can mutate it, so
-/// a prior `textureLoad` of it can go stale.  Sampled textures and
-/// read-only storage textures are immutable resources and never produce a
-/// hazard.  Note: textures live in `AddressSpace::Handle`, for which
-/// [`global_is_writable`] returns `false` - writability for a texture is a
-/// property of its storage *access*, not its address space, so the
-/// `ImageLoad` hazard test MUST route through this helper, not that one.
-///
-/// A `binding_array<texture_storage_*<...>>` global has type
-/// `TypeInner::BindingArray`, not `Image`, so peel one level to its element
-/// type before classifying (WGSL/naga forbid nested binding arrays, so a
-/// single peel suffices).  Without it a `textureLoad(texs[i], ..)` would be
-/// dropped from the hazard set and inlined past a `textureStore` to the same
-/// element - a silent miscompile.
+/// `true` when texture global `g` is a STORE-access storage texture, so a
+/// `textureStore` / `textureAtomic` (here or in a callee) can stale a prior
+/// `textureLoad`.  Textures live in `AddressSpace::Handle`, which
+/// [`global_is_writable`] reports immutable: texture writability is a property
+/// of the storage access, so the `ImageLoad` hazard must route through this
+/// helper.  A `binding_array<texture_storage_*>` global is a `BindingArray`,
+/// peeled one level (nested binding arrays are forbidden); without the peel a
+/// `textureLoad(texs[i], ..)` would inline past a `textureStore` to the same
+/// element.
 fn image_is_writable_storage(module: &naga::Module, g: naga::Handle<naga::GlobalVariable>) -> bool {
     let mut inner = &module.types[module.global_variables[g].ty].inner;
     if let naga::TypeInner::BindingArray { base, .. } = inner {
@@ -159,24 +125,20 @@ fn image_is_writable_storage(module: &naga::Module, g: naga::Handle<naga::Global
     )
 }
 
-/// A write a statement performs, as seen by the load-hazard analysis.
-///
-/// Every `naga::Statement` variant is classified exhaustively in
-/// [`statement_write_effects`] (no wildcard arm), so a future statement
-/// kind that can write memory forces a compile error there rather than a
-/// silent miss - this enum needs no catch-all "writes everything" case.
+/// A write a statement performs.  [`statement_write_effects`] classifies every
+/// statement variant with no wildcard arm, so a new writing statement kind is a
+/// compile error rather than a silent miss.
 enum WriteEffect {
-    /// Writes a specific resolved place.
     Place(Place),
-    /// May write some writable global (a callee, barrier, or
-    /// param-pointer store): invalidates loads rooted at a global, plus
-    /// any Unknown-place load (a param pointer may itself target a global).
+    /// May write some writable global (a callee, barrier, or param-pointer
+    /// store): invalidates loads rooted at a global and every Unknown-place
+    /// load (a param pointer may itself target a global).
     Globals,
 }
 
 impl WriteEffect {
-    /// Whether this write could invalidate a tracked load whose place is
-    /// `load` (`None` = an Unknown place that aliases everything).
+    /// Whether this write could invalidate a tracked load at `load` (`None` =
+    /// an Unknown place that aliases everything).
     fn invalidates(&self, load: &Option<Place>) -> bool {
         match self {
             WriteEffect::Globals => match load {
@@ -185,11 +147,9 @@ impl WriteEffect {
             },
             WriteEffect::Place(w) => match load {
                 // A `None` (function-argument pointer) load reads caller memory
-                // or a global - NEVER a named local of THIS function (the caller
-                // cannot hold a pointer to a local that does not exist in its
-                // scope).  So a store to a resolved LOCAL place can never alias
-                // it; a store to a GLOBAL still might (the param could point
-                // there), so stay conservative for globals.
+                // or a global, never a named local of THIS function, so a store
+                // to a resolved LOCAL place cannot alias it; a store to a GLOBAL
+                // might.
                 None => !matches!(w.root, PlaceRoot::Local(_)),
                 Some(p) => places_may_alias(*w, *p),
             },
@@ -198,16 +158,12 @@ impl WriteEffect {
 }
 
 /// Record the pointer-to-LOCAL write place a call argument exposes: a callee
-/// taking `ptr<function, T>` may write the pointee.  A naga pointer argument is
-/// a root variable (`LocalVariable` / `GlobalVariable` / `FunctionArgument`)
-/// with optional `Access`/`AccessIndex` refinement, which `resolve_place` walks
-/// to the root - so the pointee is exactly the argument's own place.  Pointers
-/// are non-storable (no loadable pointer values, no pointer aggregates), so no
-/// sub-expression can carry a second writable pointee, and an index
-/// sub-expression is a value the callee reads, never writes; hence NO recursion
-/// into children.  Only a LOCAL root is recorded - pointers to globals, and
-/// param-pointer roots (which resolve to `None`), are already covered by the
-/// blanket [`WriteEffect::Globals`] every `Call` records.
+/// taking `ptr<function, T>` may write the pointee, which is exactly the
+/// argument's own place (a naga pointer argument is a root variable with
+/// optional `Access` / `AccessIndex` refinement).  Pointers are non-storable,
+/// so no sub-expression carries a second pointee and an index sub-expression is
+/// only read; hence no recursion.  Global and param-pointer roots are covered
+/// by the blanket [`WriteEffect::Globals`] every `Call` records.
 fn collect_ptr_local_writes(
     arg: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
@@ -225,9 +181,7 @@ fn collect_ptr_local_writes(
     }
 }
 
-/// Append every [`WriteEffect`] a single statement performs to `out`.
-/// Control-flow statements (`Block`/`If`/`Switch`/`Loop`) contribute
-/// nothing here - their nested blocks are walked separately.
+/// Every [`WriteEffect`] of one statement; nested blocks are walked separately.
 fn statement_write_effects(
     stmt: &naga::Statement,
     expressions: &naga::Arena<naga::Expression>,
@@ -238,31 +192,26 @@ fn statement_write_effects(
         S::Store { pointer, .. } | S::Atomic { pointer, .. } => {
             match resolve_place(*pointer, expressions) {
                 Some(p) => out.push(WriteEffect::Place(p)),
-                // A store through an unresolved (function-argument) pointer
-                // could land in any global; it cannot reach our own locals.
+                // Through a function-argument pointer: any global, never a local.
                 None => out.push(WriteEffect::Globals),
             }
         }
-        // The write is through `data.pointer` (the destination); `target` is the
-        // matrix VALUE being stored, a read - not a written place.  (Latent today:
-        // the generator cannot yet emit CooperativeStore; kept correct so the
-        // exhaustive match holds no silent miss.)
+        // The destination is `data.pointer`; `target` is the stored matrix
+        // value, a read.
         S::CooperativeStore { data, .. } => match resolve_place(data.pointer, expressions) {
             Some(p) => out.push(WriteEffect::Place(p)),
             None => out.push(WriteEffect::Globals),
         },
         S::Call { arguments, .. } => {
-            // A callee may write any global, plus any local it receives by pointer.
             out.push(WriteEffect::Globals);
             for &arg in arguments {
                 collect_ptr_local_writes(arg, expressions, out);
             }
         }
-        // Memory-synchronisation points make other invocations' prior stores
-        // to shared globals observable, so a pre-barrier load of such a global
-        // can differ from a post-barrier re-read.  (Conservatively `Globals`;
-        // this also over-invalidates private-space loads - harmless over-binding,
-        // since a barrier cannot change a per-invocation private value.)
+        // A barrier makes other invocations' stores to shared globals
+        // observable, so a pre-barrier load can differ from a post-barrier
+        // re-read; `Globals` also over-invalidates private-space loads, a
+        // harmless over-binding.
         S::ControlBarrier(_) | S::MemoryBarrier(_) | S::WorkGroupUniformLoad { .. } => {
             out.push(WriteEffect::Globals)
         }
@@ -279,27 +228,20 @@ fn statement_write_effects(
                 out.push(WriteEffect::Place(p));
             }
         }
-        // Image stores/atomics mutate a storage texture.  A buffer `Load`
-        // never reaches a texture, but an `ImageLoad` (registered as a
-        // pending load below) does, so the write must invalidate it.  The
-        // destination is `image`; the stored value / atomic operand is a
-        // read handled by the use-detection path.
+        // A pending `ImageLoad` reaches a storage texture, so its write must
+        // invalidate it; the stored value / atomic operand is a read.
         S::ImageStore { image, .. } | S::ImageAtomic { image, .. } => {
             match resolve_place(*image, expressions) {
                 Some(p) => out.push(WriteEffect::Place(p)),
-                // An image reached through an unresolved (function-argument)
-                // value could be any texture global; stay conservative.
+                // A function-argument texture could be any texture global.
                 None => out.push(WriteEffect::Globals),
             }
         }
-        // Subgroup operations exchange already-computed values across lanes via
-        // registers; they perform NO memory access and impose no memory
-        // ordering, so they cannot stale any load.  (Their argument operands
-        // are still seen as uses via the leaf use-detection path.)
+        // Subgroup ops exchange register values across lanes: no memory access,
+        // no ordering, nothing to stale.
         S::SubgroupBallot { .. }
         | S::SubgroupGather { .. }
         | S::SubgroupCollectiveOperation { .. } => {}
-        // No memory write of their own (control flow handled by recursion).
         S::Emit(_)
         | S::Block(_)
         | S::If { .. }
@@ -312,9 +254,7 @@ fn statement_write_effects(
     }
 }
 
-/// Accumulate every [`WriteEffect`] performed anywhere inside `block`,
-/// recursing through nested control flow.  Used to pre-mark loads that
-/// outlive a loop's back-edge.
+/// Every [`WriteEffect`] anywhere inside `block`, nested control flow included.
 fn collect_block_write_effects(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
@@ -325,11 +265,11 @@ fn collect_block_write_effects(
     });
 }
 
-/// A `Load` that has been emitted and is still in flight: its place plus
-/// whether a write to that place has been observed since its `Emit`.
+/// An emitted `Load` still in flight: its place, and whether a write to that
+/// place has been observed since its `Emit`.
 #[derive(Clone)]
 struct PendingLoad {
-    /// `None` = an Unknown place (function-argument pointer) - aliases all.
+    /// `None` = an Unknown place (function-argument pointer), aliases all.
     place: Option<Place>,
     written: bool,
 }
@@ -374,28 +314,26 @@ impl Walk<'_> {
     }
 }
 
-/// Merge two control-flow successor states: a load is "written" after the
-/// join if it was written on EITHER path (conservative).  Keys from both
-/// sides are kept so a branch-local load that (legally) outlives its
-/// branch is still tracked downstream.
-fn merge_pending(mut a: Pending, b: Pending) -> Pending {
+/// Join two successor states into `a`: written on either path is written after
+/// the join, and keys from both sides are kept so a branch-local load that
+/// outlives its branch stays tracked.  Commutative, so a caller may run one
+/// successor over the pre-branch state in place and fold the other in.
+fn merge_pending_into(a: &mut Pending, b: Pending) {
     for (h, pl) in b {
         a.entry(h)
             .and_modify(|e| e.written |= pl.written)
             .or_insert(pl);
     }
-    a
 }
 
-/// Walk the operand cone of `root`, flagging every in-flight load that is
-/// (a) reachable from `root` and (b) already marked written.  Such a load
-/// is read AFTER its place was overwritten, so it must be bound.  The
-/// `walk` keeps it linear over shared sub-DAGs.
+/// Flag every in-flight load in `root`'s operand cone that is already marked
+/// written: it is read AFTER its place was overwritten, so it must be bound.
+/// `walk` keeps the traversal linear over shared sub-DAGs.
 fn flag_used_loads(
     root: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
     pending: &Pending,
-    must_bind: &mut FxHashSet<naga::Handle<naga::Expression>>,
+    must_bind: &mut HandleSet<naga::Expression>,
     walk: &mut Walk<'_>,
 ) {
     if !walk.enter(root) {
@@ -405,15 +343,11 @@ fn flag_used_loads(
         && pl.written
     {
         must_bind.insert(root);
-        // Stop here.  A written `root` is added to `must_bind`, so it emits as
-        // a `let` at its own Emit site, freezing its WHOLE operand cone
-        // (unbound children inlined, bound children naming their own earlier
-        // `let`s) lexically before the write that marked it `written` -
-        // including any nested written load reachable only via `root`.
-        // Re-pinning a child would therefore change nothing.  A child also used
-        // OUTSIDE this parent is still pinned at that other use: the early
-        // return marks only `root` (children stay enterable), and each
-        // statement starts a fresh walk.
+        // A written `root` emits as a `let` at its own Emit site, freezing its
+        // whole operand cone lexically before the write, nested written loads
+        // included, so re-pinning a child changes nothing; a child also used
+        // outside this parent is pinned at that other use (only `root` is
+        // marked, and each statement starts a fresh walk).
         return;
     }
     visit_expression_children(&expressions[root], |child| {
@@ -421,14 +355,12 @@ fn flag_used_loads(
     });
 }
 
-/// Forward dataflow over one block, threading `pending` (in-flight loads)
-/// and accumulating into `must_bind`.  See [`compute_must_bind_loads`].
 fn analyze_block(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
     module: &naga::Module,
     pending: &mut Pending,
-    must_bind: &mut FxHashSet<naga::Handle<naga::Expression>>,
+    must_bind: &mut HandleSet<naga::Expression>,
     visited: &mut Visited,
 ) {
     for stmt in block.iter() {
@@ -461,20 +393,19 @@ fn analyze_statement(
     expressions: &naga::Arena<naga::Expression>,
     module: &naga::Module,
     pending: &mut Pending,
-    must_bind: &mut FxHashSet<naga::Handle<naga::Expression>>,
+    must_bind: &mut HandleSet<naga::Expression>,
     visited: &mut Visited,
 ) {
     use naga::Statement as S;
     match stmt {
         S::Emit(range) => {
-            // Uses first (a write never occurs within an Emit): a load defined
-            // in this same range is not yet pending, so a sibling consuming it
-            // is correctly not flagged.
+            // Uses first: a write never occurs within an Emit, and a load defined
+            // in this range is not yet pending, so a sibling consuming it is
+            // correctly not flagged.
             let mut walk = visited.walk();
             for h in range.clone() {
                 flag_used_loads(h, expressions, pending, must_bind, &mut walk);
             }
-            // Then register the loads this Emit introduces.
             for h in range.clone() {
                 match &expressions[h] {
                     naga::Expression::Load { pointer } => {
@@ -484,8 +415,7 @@ fn analyze_statement(
                                 PlaceRoot::Global(g) => global_is_writable(module, g),
                                 PlaceRoot::Local(_) => true,
                             },
-                            // Unknown place (function-argument pointer): track it -
-                            // any later write may alias the pointee.
+                            // Function-argument pointer: any later write may alias it.
                             None => true,
                         };
                         if track {
@@ -498,26 +428,19 @@ fn analyze_statement(
                             );
                         }
                     }
-                    // `textureLoad` reads a texel; a later `textureStore` /
-                    // `textureAtomic` (or a callee) to the same storage texture
-                    // can stale it, exactly like a buffer `Load`.  Track it so a
-                    // single-use `textureLoad` is bound rather than inlined past
-                    // the write.  Gate on storage-texture writability via
-                    // `image_is_writable_storage` - NOT `global_is_writable`,
-                    // which reports textures (Handle space) as non-writable and
-                    // would silently drop the hazard.
+                    // A `textureLoad` stales like a buffer `Load` under a later
+                    // `textureStore` / `textureAtomic` (or callee); gate on
+                    // `image_is_writable_storage`, since `global_is_writable`
+                    // reports textures immutable.
                     naga::Expression::ImageLoad { image, .. } => {
                         let place = resolve_place(*image, expressions);
                         let track = match &place {
                             Some(p) => match p.root {
                                 PlaceRoot::Global(g) => image_is_writable_storage(module, g),
-                                // A texture is always a Handle-space global,
-                                // never a local; treat a malformed Local root
-                                // conservatively.
+                                // A texture is never a local; stay conservative.
                                 PlaceRoot::Local(_) => true,
                             },
-                            // Texture passed as a value parameter: a callee may
-                            // hold and store to it - track conservatively.
+                            // Value-parameter texture: a callee may store to it.
                             None => true,
                         };
                         if track {
@@ -530,15 +453,10 @@ fn analyze_statement(
                             );
                         }
                     }
-                    // Both read the query object's CURRENT traversal state; a
-                    // later `Statement::RayQuery` (Proceed / Confirm /
-                    // Terminate / GenerateIntersection - all modeled as
-                    // `WriteEffect::Place(query)`) stales them exactly like a
-                    // buffer `Load` crossing a `Store`, so a crossing read
-                    // must bind rather than re-evaluate at its use site.  The
-                    // query is always function-address-space (a `ray_query`
-                    // local, or a pointer argument resolving to `None` place),
-                    // so there is no writability gate to consult.
+                    // Both read the query's CURRENT traversal state, which a
+                    // later `Statement::RayQuery` (modeled as
+                    // `WriteEffect::Place(query)`) stales like a `Store`; the
+                    // query is always function-space, so no writability gate.
                     naga::Expression::RayQueryGetIntersection { query, .. }
                     | naga::Expression::RayQueryVertexPositions { query, .. } => {
                         pending.insert(
@@ -566,6 +484,8 @@ fn analyze_statement(
                 must_bind,
                 &mut visited.walk(),
             );
+            // One clone, not two: the reject arm may run over the pre-branch
+            // state in place because the join is commutative.
             let mut accept_state = pending.clone();
             analyze_block(
                 accept,
@@ -575,16 +495,8 @@ fn analyze_statement(
                 must_bind,
                 visited,
             );
-            let mut reject_state = pending.clone();
-            analyze_block(
-                reject,
-                expressions,
-                module,
-                &mut reject_state,
-                must_bind,
-                visited,
-            );
-            *pending = merge_pending(accept_state, reject_state);
+            analyze_block(reject, expressions, module, pending, must_bind, visited);
+            merge_pending_into(pending, accept_state);
         }
         S::Switch { selector, cases } => {
             flag_used_loads(
@@ -595,21 +507,19 @@ fn analyze_statement(
                 &mut visited.walk(),
             );
             if cases.iter().any(|c| c.fall_through) {
-                // A fall-through case chains into the next, so a write in one
-                // case can reach a use in a later one.  WGSL source never
-                // produces fall-through, but handle it soundly by threading the
-                // SAME state sequentially through the cases (a conservative
-                // over-approximation: it also assumes a directly-entered case
-                // ran after its predecessors, which only ever over-binds).
+                // A fall-through case chains into the next, so thread one state
+                // through the cases sequentially; assuming a directly-entered
+                // case ran after its predecessors only over-binds.
                 for case in cases {
                     analyze_block(&case.body, expressions, module, pending, must_bind, visited);
                 }
             } else {
-                // Cases are mutually exclusive: analyse each from the pre-switch
-                // state and union (OR) their post-states.  Every case is
-                // reachable (WGSL switches are exhaustive).
+                // Mutually exclusive cases: each from the pre-switch state, then
+                // the union of the post-states.
+                // The last case runs over the pre-switch state in place, so
+                // `cases` costs one clone fewer than it has arms.
                 let mut merged: Option<Pending> = None;
-                for case in cases {
+                for case in &cases[..cases.len().saturating_sub(1)] {
                     let mut case_state = pending.clone();
                     analyze_block(
                         &case.body,
@@ -619,13 +529,16 @@ fn analyze_statement(
                         must_bind,
                         visited,
                     );
-                    merged = Some(match merged {
-                        None => case_state,
-                        Some(m) => merge_pending(m, case_state),
-                    });
+                    match &mut merged {
+                        None => merged = Some(case_state),
+                        Some(m) => merge_pending_into(m, case_state),
+                    }
+                }
+                if let Some(last) = cases.last() {
+                    analyze_block(&last.body, expressions, module, pending, must_bind, visited);
                 }
                 if let Some(m) = merged {
-                    *pending = m;
+                    merge_pending_into(pending, m);
                 }
             }
         }
@@ -634,9 +547,9 @@ fn analyze_statement(
             continuing,
             break_if,
         } => {
-            // Back-edge: a write anywhere in the loop can execute before an
-            // earlier-or-later use (next iteration) and after a load emitted
-            // before the loop.  Pre-mark every outer load the loop may write.
+            // Back-edge: a write anywhere in the loop runs after a load emitted
+            // before it and before a next-iteration use, so pre-mark every
+            // outer load the loop may write.
             let mut loop_writes = Vec::new();
             collect_block_write_effects(body, expressions, &mut loop_writes);
             collect_block_write_effects(continuing, expressions, &mut loop_writes);
@@ -647,16 +560,16 @@ fn analyze_statement(
                     }
                 }
             }
-            // Loads emitted INSIDE the loop are re-evaluated each iteration
-            // (expression values never cross the back-edge - only memory does),
-            // so a single linear pass over body+continuing is exact for them.
+            // Loads emitted inside the loop are re-evaluated each iteration
+            // (only memory crosses the back-edge), so one linear pass over
+            // body + continuing is exact for them.
             analyze_block(body, expressions, module, pending, must_bind, visited);
             analyze_block(continuing, expressions, module, pending, must_bind, visited);
             if let Some(h) = break_if {
                 flag_used_loads(*h, expressions, pending, must_bind, &mut visited.walk());
             }
         }
-        // Leaf statements: their operands are uses, then their writes apply.
+        // Leaf statement: operands are uses, then its writes apply.
         _ => {
             let mut walk = visited.walk();
             crate::passes::expr_util::visit_statement_expression_handles(stmt, false, &mut |h| {
@@ -667,24 +580,20 @@ fn analyze_statement(
     }
 }
 
-/// Identify every `Load` expression in `func` that must be bound to a
-/// `let` rather than inlined, because the place it reads is written
-/// between the `Load`'s `Emit` and a use of its value.  Inlining such a
-/// load relocates the memory read past the write and yields the
-/// post-write value - a silent miscompile.
-///
-/// The analysis is a single forward pass over the structured statement
-/// tree (`analyze_*`).  It deliberately OVER-approximates the hazard
-/// (binding a load is always semantically safe; the only cost is a few
-/// bytes), so unresolved places, branches, loops, and call/barrier write
-/// effects are all handled conservatively.  Read-only globals and pure
-/// read-only locals are never flagged, so the common case stays inlined.
+/// Every `Load` in `func` that must be `let`-bound rather than inlined because
+/// the place it reads is written between the `Load`'s `Emit` and a use of its
+/// value; inlining would relocate the read past the write and yield the
+/// post-write value.  One forward pass over the structured statement tree,
+/// over-approximating the hazard (binding is always safe and costs only
+/// bytes): unresolved places, branches, loops and call / barrier write effects
+/// are handled conservatively, while read-only globals and locals are never
+/// flagged.
 pub(super) fn compute_must_bind_loads(
     func: &naga::Function,
     module: &naga::Module,
-) -> FxHashSet<naga::Handle<naga::Expression>> {
-    let mut pending: Pending = FxHashMap::default();
-    let mut must_bind = FxHashSet::default();
+) -> HandleSet<naga::Expression> {
+    let mut pending: Pending = Default::default();
+    let mut must_bind = Default::default();
     let mut visited = Visited::new(func.expressions.len());
     analyze_block(
         &func.body,

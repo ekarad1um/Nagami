@@ -1,8 +1,6 @@
-//! Expression-level emission tests spanning the generator's
-//! size-oriented rewrites: bare-literal emission inside constructor
-//! arguments, single-use `let` inlining, swizzle folding, bitcast
-//! and `select` shapes, `arrayLength` handling, vector and matrix
-//! accesses, splat expressions, and the Compose-to-splat collapse.
+//! Expression emission: bare literals in constructors, single-use `let`
+//! inlining, swizzle folding, bitcast/`select`/`arrayLength`, vector and
+//! matrix access, splats, and the Compose-to-splat collapse.
 
 use super::helpers::*;
 
@@ -11,7 +9,6 @@ use super::helpers::*;
 #[test]
 fn compose_uses_bare_literals() {
     let out = compact("fn f() -> vec2<f32> { return vec2<f32>(1.0, 2.0); }");
-    // Inside vec2f(...), literals must have no `f` suffix.
     assert!(out.contains("vec2f(1,2)"), "got: {out}");
     assert!(!out.contains("1f"), "typed suffix inside compose: {out}");
 }
@@ -19,7 +16,7 @@ fn compose_uses_bare_literals() {
 #[test]
 fn splat_uses_bare_literal() {
     let out = compact("fn f() -> vec3<f32> { return vec3<f32>(5.0, 5.0, 5.0); }");
-    // naga may lower this to Splat(5.0).  Either way, no `f` suffix inside constructor.
+    // naga may lower this to a Splat.
     assert!(
         !out.contains("5f)") && !out.contains("5.f)"),
         "typed suffix in splat: {out}"
@@ -31,16 +28,13 @@ fn splat_uses_bare_literal() {
 #[test]
 fn single_use_expression_is_inlined() {
     let out = compact("fn f(a: f32, b: f32) -> f32 { return a + b; }");
-    // `a + b` should be inlined into the return, not bound to a let.
     assert!(!out.contains("let "), "unexpected let binding: {out}");
     assert!(out.contains("return"), "missing return: {out}");
 }
 
 #[test]
 fn multi_use_expression_gets_let_binding() {
-    // `a + b` used twice: both operands are function arguments (1-char names),
-    // so the expression text is ~3 chars (`a+b`).  At only 2 references the
-    // `let` overhead exceeds the savings - the generator should inline it.
+    // `a+b` is 3 chars; at 2 refs the `let` overhead exceeds the savings.
     let out = compact("fn f(a: f32, b: f32) -> f32 { let s = a + b; return s * s; }");
     assert!(
         !out.contains("let "),
@@ -50,8 +44,6 @@ fn multi_use_expression_gets_let_binding() {
 
 #[test]
 fn longer_multi_use_expression_gets_let_binding() {
-    // `normalize(cross(a, b))` is long enough that a `let` binding saves
-    // space when used twice (textLen >> 7).
     let src = r#"
         fn f(a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
             let n = normalize(cross(a, b));
@@ -65,12 +57,36 @@ fn longer_multi_use_expression_gets_let_binding() {
     );
 }
 
+#[test]
+fn shared_initializer_subexpression_is_not_bound() {
+    // CSE gives the repeated `vec2u(1,0)`/`vec2u(0,1)` two refs each, but the
+    // hoisted `var` renders the whole tree before any `Emit` range is priced,
+    // so a later `let` would be dead text.
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> out: array<vec2u>;
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {
+            var offs = array<vec2u, 6>(vec2u(0, 0), vec2u(1, 0), vec2u(0, 1),
+                                       vec2u(0, 1), vec2u(1, 0), vec2u(1, 1));
+            out[0] = offs[id.x % 6u];
+        }
+    "#;
+    let out = compact_with_passes(src, Profile::Max);
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(
+        flat.matches("(1,0)").count(),
+        2,
+        "the initializer renders inline: {out}"
+    );
+    assert!(
+        !out.contains("let "),
+        "no binding serves an initializer tree: {out}"
+    );
+}
+
 // MARK: Literal emission: different types coexist
 
 #[test]
 fn different_literal_types_not_conflated() {
-    // 1.0 (f32) and 1 (i32) have different bare strings.
-    // They should NOT be conflated into the same extracted const.
     let src = r#"
             fn a(x: f32) -> f32 { return x; }
             fn b(x: i32) -> i32 { return x; }
@@ -86,7 +102,6 @@ fn different_literal_types_not_conflated() {
 
 #[test]
 fn struct_field_access_roundtrip() {
-    // Exercises struct_field_name through AccessIndex.
     let src = r#"
             struct S { x: f32, y: f32 }
             @group(0) @binding(0) var<uniform> u: S;
@@ -130,9 +145,8 @@ fn select_expression_roundtrip() {
 
 #[test]
 fn whole_number_float_literals_outside_constructor_keep_type() {
-    // Whole-number float literals emit as bare integers (same as the original
-    // minifier baseline).  WGSL abstract-type coercion handles promotion to
-    // the required float type in binary-arithmetic and similar contexts.
+    // Abstract-type coercion promotes a bare whole number to the float operand
+    // type.
     let out = compact(
         "fn f(x: f32) -> f32 { return x + 1.0; }\n\
              @compute @workgroup_size(1) fn main() { _ = f(1.0); }",
@@ -180,8 +194,6 @@ fn whole_number_float_literal_comparison_can_drop_dot() {
 
 #[test]
 fn whole_number_float_binary_of_literals_stays_float_like() {
-    // Two whole-number float literals multiplied: naga const-folds to a single
-    // float literal.  With bare emission, the result emits without a dot.
     let out = compact(
         "fn f() -> f32 { return 2.0 * 3.0; }\n\
              @compute @workgroup_size(1) fn main() { _ = f(); }",
@@ -191,8 +203,7 @@ fn whole_number_float_binary_of_literals_stays_float_like() {
 
 #[test]
 fn negative_zero_float_binary_operand_keeps_float_marker() {
-    // -0.0 emits as the bare form; the semantic distinction of negative-zero
-    // is lost (same behaviour as the original minifier baseline).
+    // `-0.0` emits bare; the negative-zero distinction is knowingly lost.
     let out = compact(
         "fn f(x: f32) -> f32 { return -0.0 * x; }\n\
              @compute @workgroup_size(1) fn main() { _ = f(1.0); }",
@@ -276,8 +287,6 @@ fn array_length_roundtrip() {
 
 #[test]
 fn negation_fallback_wraps_in_not() {
-    // Condition is a function call result - cannot flip a comparison,
-    // so the fallback `!(expr)` path should be used.
     let src = r#"
             fn cond() -> bool { return true; }
             fn f() -> i32 {
@@ -317,8 +326,6 @@ fn vector_access_index_uses_dot_xyzw() {
         }
     "#;
     let out = compact(src);
-    // All four AccessIndex components on the same vec4 base are folded
-    // into a single swizzle expression: vec4f(v.w,v.z,v.y,v.x) -> v.wzyx.
     assert!(
         out.contains(".wzyx"),
         "full compose should fold to swizzle: {out}"
@@ -332,7 +339,6 @@ fn vector_access_index_uses_dot_xyzw() {
 
 #[test]
 fn vector_access_index_on_pointer_deref() {
-    // Accessing .x on a var (pointer-to-vector) should also use swizzle form.
     let src = r#"
         @fragment fn fs(@location(0) c: vec3<f32>) -> @location(0) vec4<f32> {
             var tmp = c;
@@ -343,8 +349,6 @@ fn vector_access_index_on_pointer_deref() {
         }
     "#;
     let out = compact(src);
-    // Load-of-AccessIndex components through a var are grouped into a
-    // partial swizzle: vec4f(tmp.x,tmp.y,tmp.z,1) -> vec4f(tmp.xyz,1).
     assert!(
         out.contains(".xyz"),
         "vector access through var should be grouped into swizzle: {out}"
@@ -354,7 +358,6 @@ fn vector_access_index_on_pointer_deref() {
 
 #[test]
 fn matrix_access_index_stays_bracket() {
-    // Matrix column access must still use [idx] (no swizzle notation).
     let src = r#"
         @fragment fn fs(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             let m = mat2x2<f32>(1.0, 0.0, 0.0, 1.0);
@@ -364,8 +367,6 @@ fn matrix_access_index_stays_bracket() {
         }
     "#;
     let out = compact(src);
-    // Matrix column access should be [0], [1] - not .x, .y.
-    // But the vector components of the result should use .x, .y.
     assert_valid_wgsl(&out);
 }
 
@@ -373,14 +374,12 @@ fn matrix_access_index_stays_bracket() {
 
 #[test]
 fn full_swizzle_identity_vec4_eliminates_constructor() {
-    // vec4f(v.x, v.y, v.z, v.w) on a vec4 base -> just `v` (identity).
     let src = r#"
         @fragment fn fs(@location(0) v: vec4f) -> @location(0) vec4f {
             return vec4f(v.x, v.y, v.z, v.w);
         }
     "#;
     let out = compact(src);
-    // Identity swizzle on same-size vector: no constructor, no swizzle suffix.
     assert!(
         !out.contains("vec4f(v"),
         "identity should eliminate the constructor: {out}"
@@ -390,15 +389,10 @@ fn full_swizzle_identity_vec4_eliminates_constructor() {
 
 #[test]
 fn identity_swizzle_collapse_in_constructor_arg_is_not_parenthesized() {
-    // A matrix column written as a full identity swizzle of a BINARY value -
-    // `mat3x3f(vec3f(c.x,c.y,c.z), ..)` where `c` is `col*s` - collapses to the
-    // bare base `col*s`.  As a comma-delimited constructor argument nothing is
-    // appended, so the base must stay UNPARENTHESIZED: `mat3x3f(a*b, ..)`, not
-    // `mat3x3f((a*b), ..)`.  (Regression: the identity collapse routed through
-    // the postfix-aware emitter, which over-wrapped the loose argument.)
-    //
-    // The full pipeline is needed: CSE must unify the three `col*s` swizzle
-    // components onto a single shared base before the identity collapse fires.
+    // An identity swizzle of a binary (`vec3f(c.x,c.y,c.z)`, `c = col*s`)
+    // collapses to the bare base; as a comma-delimited constructor argument
+    // nothing is appended, so it must stay unparenthesised.  The full pipeline
+    // is needed so CSE first unifies the three components onto one base.
     let src = r#"
         @fragment fn fs(@location(0) col: vec3f, @location(1) s: f32) -> @location(0) vec4f {
             let m = mat3x3f(
@@ -411,8 +405,6 @@ fn identity_swizzle_collapse_in_constructor_arg_is_not_parenthesized() {
     "#;
     let out = compact_with_passes(src, crate::config::Profile::Max);
     let flat: String = out.split_whitespace().collect();
-    // Isolate the `mat3x3(` / `mat3x3f(` constructor argument list and assert
-    // each operator column is bare (`a*b`, `a+a`), not wrapped (`(a*b)`).
     let ctor = flat
         .split_once("mat3x3")
         .and_then(|(_, rest)| rest.split_once('('))
@@ -430,10 +422,8 @@ fn identity_swizzle_collapse_in_constructor_arg_is_not_parenthesized() {
 
 #[test]
 fn identity_swizzle_collapse_as_postfix_base_keeps_parens() {
-    // Tight-context guard for the fix above: when an identity-collapsed binary
-    // is the base of a postfix swizzle/index, the parens ARE required -
-    // `(a-b).x` must not degrade to `a-b.x` (parsed as `a-(b.x)`).  Build the
-    // collapse with the full pipeline, then index the result vector.
+    // As the base of a postfix swizzle the collapsed binary needs its parens:
+    // `(a-b).x` must not degrade to `a-b.x` (= `a-(b.x)`).
     let src = r#"
         @fragment fn fs(@location(0) p: vec3f, @location(1) q: vec3f) -> @location(0) vec4f {
             let r = vec3f((p - q).x, (p - q).y, (p - q).z);
@@ -442,20 +432,15 @@ fn identity_swizzle_collapse_as_postfix_base_keeps_parens() {
     "#;
     let out = compact_with_passes(src, crate::config::Profile::Max);
     let flat: String = out.split_whitespace().collect();
-    // Confirm this is the OPTIMISED generator emission, not naga's verbose
-    // fallback (which spells `vec4<f32>` and would mask a generator regression
-    // behind a still-valid `vec3<f32>(...).x` that also contains `).x`).  The
-    // generator emits the short `vec4f`; naga's writer never does.
+    // naga's fallback spells `vec4<f32>` and would mask a regression behind its
+    // own valid `vec3<f32>(...).x`.
     assert!(
         flat.contains("vec4f"),
         "expected the optimised generator emission (short `vec4f`), not the \
          naga fallback: {out}"
     );
-    // `Profile::Max` mangles `p`/`q`, so assert STRUCTURALLY: the collapsed
-    // binary base `(p - q)` carries a `.x` swizzle and must stay parenthesised -
-    // `(A-a).x` contains `).x`; the miscompiled bare form `A-a.x` (which parses
-    // as `A-(a.x)`) does not.  Both are valid WGSL, so this structural check -
-    // not `assert_valid_wgsl` - is what guards the fix.
+    // Both forms validate and names are mangled, so only this structural check
+    // guards the fix.
     assert!(
         flat.contains(").x"),
         "the binary base of a postfix `.x` swizzle must stay parenthesised \
@@ -466,7 +451,6 @@ fn identity_swizzle_collapse_as_postfix_base_keeps_parens() {
 
 #[test]
 fn full_swizzle_reorder_vec4() {
-    // vec4f(v.w, v.z, v.y, v.x) -> v.wzyx
     let src = r#"
         @fragment fn fs(@location(0) v: vec4f) -> @location(0) vec4f {
             return vec4f(v.w, v.z, v.y, v.x);
@@ -486,7 +470,6 @@ fn full_swizzle_reorder_vec4() {
 
 #[test]
 fn full_swizzle_vec2_from_vec4() {
-    // vec2f(v.z, v.w) on a vec4 base -> v.zw (non-identity, smaller output vec)
     let src = r#"
         @fragment fn fs(@location(0) v: vec4f) -> @location(0) vec4f {
             return vec4f(vec2f(v.z, v.w), 0., 1.);
@@ -499,7 +482,6 @@ fn full_swizzle_vec2_from_vec4() {
 
 #[test]
 fn partial_swizzle_grouping_vec4() {
-    // vec4f(v.x, v.y, 0., 1.) -> vec4f(v.xy, 0., 1.)
     let src = r#"
         @fragment fn fs(@location(0) v: vec4f) -> @location(0) vec4f {
             return vec4f(v.x, v.y, 0., 1.);
@@ -515,7 +497,6 @@ fn partial_swizzle_grouping_vec4() {
 
 #[test]
 fn partial_swizzle_trailing_group() {
-    // vec4f(1., 0., v.x, v.y) -> vec4f(1., 0., v.xy)
     let src = r#"
         @fragment fn fs(@location(0) v: vec4f) -> @location(0) vec4f {
             return vec4f(1., 0., v.x, v.y);
@@ -528,14 +509,12 @@ fn partial_swizzle_trailing_group() {
 
 #[test]
 fn no_swizzle_for_different_bases() {
-    // vec2f(a.x, b.y) - different bases, no grouping.
     let src = r#"
         @fragment fn fs(@location(0) a: vec4f, @location(1) b: vec4f) -> @location(0) vec4f {
             return vec4f(a.x, b.y, 0., 1.);
         }
     "#;
     let out = compact(src);
-    // Should still have individual accesses (no swizzle grouping across bases).
     assert!(
         !out.contains(".xy"),
         "different bases must not be grouped: {out}"
@@ -545,7 +524,6 @@ fn no_swizzle_for_different_bases() {
 
 #[test]
 fn swizzle_through_var_pointer() {
-    // Access through var (ptr-to-vector) should also produce swizzle.
     let src = r#"
         @fragment fn fs(@location(0) c: vec4f) -> @location(0) vec4f {
             var v = c;
@@ -562,7 +540,6 @@ fn swizzle_through_var_pointer() {
 
 #[test]
 fn swizzle_identity_through_var() {
-    // vec3f(v.x, v.y, v.z) where v is vec3 var -> just v (identity via load-path).
     let src = r#"
         fn helper(v: vec3f) -> vec3f {
             return vec3f(v.x, v.y, v.z);
@@ -572,7 +549,6 @@ fn swizzle_identity_through_var() {
         }
     "#;
     let out = compact(src);
-    // Identity on a by-value vec3 parameter should eliminate the constructor.
     assert!(
         !out.contains("vec3f(v"),
         "identity on by-value vec3 should fold: {out}"
@@ -582,21 +558,18 @@ fn swizzle_identity_through_var() {
 
 #[test]
 fn no_swizzle_for_single_component() {
-    // A single AccessIndex component should not trigger grouping.
     let src = r#"
         @fragment fn fs(@location(0) v: vec4f) -> @location(0) vec4f {
             return vec4f(v.x, 0., 0., 1.);
         }
     "#;
     let out = compact(src);
-    // Single component -> no swizzle; should stay as v.x
     assert!(out.contains("v.x"), "single component stays as .x: {out}");
     assert_valid_wgsl(&out);
 }
 
 #[test]
 fn swizzle_non_sequential_indices() {
-    // vec2f(v.w, v.x) -> v.wx (non-sequential but same base)
     let src = r#"
         @fragment fn fs(@location(0) v: vec4f) -> @location(0) vec4f {
             return vec4f(v.w, v.x, 0., 1.);
@@ -612,10 +585,7 @@ fn swizzle_non_sequential_indices() {
 
 #[test]
 fn swizzle_base_binary_keeps_parens() {
-    // When a single-use `let d = a - b` is inlined as the shared base of a
-    // swizzle, the base carries a `.swizzle` suffix and so must be
-    // parenthesised: `(a-b).yx`, NOT `a-b.yx` (which parses as `a-(b.yx)`,
-    // a DIFFERENT value that still validates -> silent miscompilation).
+    // `a-b.yx` parses as `a-(b.yx)` and still validates: a silent miscompile.
     let full = compact("fn f(a:vec2f,b:vec2f)->vec2f{ let d=a-b; return vec2f(d.y,d.x); }");
     assert!(
         full.contains("(a-b).yx") && !full.contains("a-b.yx"),
@@ -623,8 +593,7 @@ fn swizzle_base_binary_keeps_parens() {
     );
     assert_valid_wgsl(&full);
 
-    // Partial-group path (emit_compose_grouped): the grouped swizzle base
-    // must be parenthesised too.
+    // Partial-group path.
     let grouped =
         compact("fn f(a:vec3f,b:vec3f)->vec4f{ let d=a-b; return vec4f(d.x,d.y,0.,1.); }");
     assert!(
@@ -636,9 +605,6 @@ fn swizzle_base_binary_keeps_parens() {
 
 #[test]
 fn swizzle_identity_collapse_of_binary_keeps_parens() {
-    // Identity swizzle (`vec2f(d.x, d.y)` over a 2-component base) collapses
-    // to the bare base; when that base is a binary used in an operator
-    // context, it must still carry parens so it does not re-associate.
     let out = compact("fn f(a:vec2f,b:vec2f,k:f32)->vec2f{ let d=a-b; return vec2f(d.x,d.y)*k; }");
     assert!(
         out.contains("(a-b)*k") && !out.contains("a-b*k"),
@@ -649,10 +615,8 @@ fn swizzle_identity_collapse_of_binary_keeps_parens() {
 
 #[test]
 fn swizzle_struct_field_vector() {
-    // When the front-end creates separate AccessIndex handles for each
-    // `s.color` reference, the expressions have different handles and
-    // cannot be grouped.  This is a known limitation - the optimisation
-    // requires components to share the same expression handle.
+    // Each `s.color` gets its own AccessIndex handle, so grouping cannot fire;
+    // only validity is asserted.
     let src = r#"
         struct S { color: vec4f }
         @fragment fn fs(@location(0) v: vec4f) -> @location(0) vec4f {
@@ -661,7 +625,6 @@ fn swizzle_struct_field_vector() {
         }
     "#;
     let out = compact(src);
-    // Even without grouping, the output must be valid.
     assert_valid_wgsl(&out);
 }
 
@@ -669,7 +632,6 @@ fn swizzle_struct_field_vector() {
 
 #[test]
 fn global_splat_vec3_roundtrip() {
-    // `vec3f(1.0)` produces a Splat in the global expression arena.
     let src = r#"
         const a = vec3f(1.0);
         @fragment fn main() -> @location(0) vec4f {
@@ -677,7 +639,6 @@ fn global_splat_vec3_roundtrip() {
         }
     "#;
     let out = compact(src);
-    // The const should emit with a vec3f constructor.
     assert!(
         out.contains("vec3f("),
         "global Splat should produce vec3f(...): {out}"
@@ -738,7 +699,6 @@ fn global_splat_integer_roundtrip() {
 
 #[test]
 fn compose_identical_f32_collapses_to_splat() {
-    // vec3f(1.2, 1.2, 1.2) should emit as vec3f(1.2).
     let src = r#"
         @fragment fn main() -> @location(0) vec4f {
             return vec4f(vec3f(1.2, 1.2, 1.2), 1.0);
@@ -817,7 +777,6 @@ fn compose_identical_u32_collapses_to_splat() {
 
 #[test]
 fn compose_different_components_not_collapsed() {
-    // Non-identical components must NOT be collapsed.
     let src = r#"
         @fragment fn main() -> @location(0) vec4f {
             return vec4f(1.0, 2.0, 3.0, 4.0);
@@ -833,7 +792,6 @@ fn compose_different_components_not_collapsed() {
 
 #[test]
 fn compose_matrix_not_collapsed() {
-    // Matrix constructors must NOT be collapsed even with identical components.
     let src = r#"
         @fragment fn main() -> @location(0) vec4f {
             let m = mat2x2f(1.0, 1.0, 1.0, 1.0);
@@ -841,7 +799,7 @@ fn compose_matrix_not_collapsed() {
         }
     "#;
     let out = compact(src);
-    // mat2x2f(1) would mean diagonal identity, NOT all-ones.
+    // `mat2x2f(1)` would be the diagonal identity, not all-ones.
     assert!(
         !out.contains("mat2x2f(1)") && !out.contains("mat2x2<f32>(1)"),
         "matrix Compose must not be collapsed to splat: {out}"
@@ -851,7 +809,6 @@ fn compose_matrix_not_collapsed() {
 
 #[test]
 fn global_compose_identical_collapses_to_splat() {
-    // const-declared Compose in the global expression arena.
     let src = r#"
         const v = vec3f(2.5, 2.5, 2.5);
         @fragment fn main() -> @location(0) vec4f {
@@ -899,8 +856,7 @@ fn vector_ctor_keeps_suffix_when_all_components_are_literals() {
         }
         "#,
     );
-    // Both components are literals (bare/abstract inside the constructor);
-    // dropping `u` would re-infer vec2<i32>, so the suffix MUST stay.
+    // Bare literals are abstract; dropping `u` would re-infer vec2<i32>.
     assert!(
         out.contains("vec2u("),
         "all-literal vec2u must keep its suffix: {out}"
@@ -925,4 +881,36 @@ fn vector_ctor_drops_suffix_for_subvector_component() {
         "a vec2f component pins f32, so vec4f drops its suffix: {out}"
     );
     assert_valid_wgsl(&out);
+}
+
+#[test]
+fn an_overflowing_literal_pair_keeps_its_i32_type() {
+    // Two bare literals evaluate as AbstractInt, which is exact where i32
+    // wraps: the value changes and an out-of-range result becomes a
+    // shader-creation error.  Typing the left operand pins the pair back.
+    let src = "@group(0)@binding(0) var<storage,read_write> out: array<u32>;\n\
+               @compute @workgroup_size(1) fn main() {\n\
+                 var c = 2147483647i;\n\
+                 c = c + 1i;\n\
+                 out[0] = u32(c);\n\
+                 var d = -2147483647i;\n\
+                 out[1] = u32(clamp(abs(d * d), -100i, 100i));\n\
+               }";
+    let out: String = compact_with_passes(src, Profile::Max)
+        .split_whitespace()
+        .collect();
+    assert!(out.contains("2147483647i+1"), "{out}");
+    assert!(out.contains("-2147483647i*-2147483647"), "{out}");
+
+    // A pair that does not overflow keeps the shorter bare form.
+    let plain = "@group(0)@binding(0) var<storage,read_write> out: array<u32>;\n\
+                 @compute @workgroup_size(1) fn main() {\n\
+                   var c = 3i;\n\
+                   c = c + 4i;\n\
+                   out[0] = u32(c);\n\
+                 }";
+    let short: String = compact_with_passes(plain, Profile::Max)
+        .split_whitespace()
+        .collect();
+    assert!(!short.contains("3i+4"), "{short}");
 }

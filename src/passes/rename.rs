@@ -1,38 +1,31 @@
-//! Identifier rename pass.  Replaces every user-chosen identifier the
-//! pipeline is free to touch with a short generated name, keeping the
-//! output deterministic and collision-free against both WGSL reserved
-//! words and any symbols the caller asked to preserve.
+//! Identifier rename: every user-chosen identifier the pipeline may touch
+//! gets a short generated name, deterministic and collision-free against
+//! WGSL reserved words and preserved symbols.  Struct type and member names
+//! are renamed by the generator (naga's `UniqueArena<Type>` is immutable
+//! mid-pipeline); this pass covers the mutable arenas: globals, constants,
+//! overrides, functions, arguments, and locals.
 //!
-//! Struct type and member names are renamed at the generator layer
-//! (naga's `UniqueArena<Type>` is immutable mid-pipeline), so this
-//! pass only covers the mutable arenas: globals, constants, overrides,
-//! functions, arguments, and locals.
-//!
-//! Frequency ordering: name length grows with how many identifiers are in
-//! play (52 single-character names, then two-character, ...), so the pass
-//! assigns the shortest names to the identifiers that appear most often.  It
-//! ranks every renameable identifier by an occurrence weight (its declaration
-//! plus its in-body references - the generator's inline/bind ref-count signal)
-//! and draws names heaviest-first.  Because every identifier still
-//! receives a globally distinct name, the SET of names drawn is independent of
-//! the order: ordering only permutes which identifier holds which name, leaving
-//! the pool of names the generator must avoid (for struct types, aliases, and
-//! extracted literals) unchanged.  So no downstream generator decision shifts,
-//! and total identifier bytes are minimised by the rearrangement inequality.
+//! Name length grows with the number of identifiers (52 single-character
+//! names, then two-character, ...), so identifiers are ranked by occurrence
+//! weight (declaration plus in-body references) and named heaviest-first,
+//! which minimises total identifier bytes by the rearrangement inequality.
+//! Every identifier still gets a globally distinct name, so the SET of names
+//! drawn is independent of the order and no downstream generator decision
+//! (struct types, aliases, and extracted literals avoiding the pool) shifts.
 
 use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 
 use crate::error::Error;
+use crate::handle_set::HandleMap;
 use crate::name_gen;
 use crate::passes::expr_util::{
     for_each_statement, visit_block_expression_handles, visit_expression_children,
 };
 use crate::pipeline::{Pass, PassContext};
 
-/// Rename pass state.  `preserve` lists names that must survive
-/// verbatim; `mangle` extends the rename scope to include constants
-/// and overrides (whose names otherwise leak into the final output).
+/// `preserve` lists names kept verbatim; `mangle` extends renaming to
+/// constants and overrides.
 #[derive(Debug)]
 pub struct RenamePass {
     preserve: HashSet<String>,
@@ -40,8 +33,8 @@ pub struct RenamePass {
 }
 
 impl RenamePass {
-    /// Construct a new pass from the user-facing `preserve_symbols`
-    /// vector and the resolved `mangle` flag.
+    /// A pass from the user-facing `preserve_symbols` and the resolved
+    /// `mangle` flag.
     pub fn new(preserve_symbols: Vec<String>, mangle: bool) -> Self {
         Self {
             preserve: preserve_symbols.into_iter().collect(),
@@ -58,28 +51,16 @@ impl Pass for RenamePass {
     fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
         let mut used_names = collect_reserved_names(module, &self.preserve, self.mangle);
 
-        // Occurrence weights approximate how often each identifier's name
-        // appears in the output (its declaration plus its live in-body
-        // references).  Assigning the shortest names to the heaviest
-        // identifiers minimises total identifier bytes.  Weights are structural
-        // (handle/arena based, name independent), so the assignment is
-        // deterministic and the pass stays idempotent at the convergence fixed
-        // point.
+        // Weights are structural (handle-based, name-independent), so the
+        // assignment is deterministic and idempotent at the convergence
+        // fixed point.
         let weights = compute_weights(module);
 
-        // Enumerate every renameable identifier as a `(target, weight, seq)`
-        // triple.  `seq` is the declaration-order index, a deterministic
-        // tie-break giving equal-weight identifiers a stable assignment.  The
-        // candidate set is exactly the renameable identifiers (the
-        // preserve / mangle / `@id` gating below), so the multiset of names
-        // drawn depends only on their count, not the order: ordering only
-        // repermutes which identifier receives which name.
+        // `seq` is the declaration-order tie-break, so equal weights get a
+        // stable assignment.
         let mut targets: Vec<(Target, usize, usize)> = Vec::new();
         let mut seq = 0usize;
 
-        // Mangling extends renaming to module-scope constants and overrides.
-        // Struct types and members are handled at the generator layer because
-        // naga's `UniqueArena<Type>` is immutable after lowering.
         if self.mangle {
             for (h, c) in module.constants.iter() {
                 if let Some(name) = c.name.as_deref()
@@ -89,14 +70,10 @@ impl Pass for RenamePass {
                 }
             }
             for (h, ov) in module.overrides.iter() {
-                // An override with an explicit `@id(N)` is identified to the
-                // host by its numeric id, so its name is free to mangle.  An
-                // `@id`-less override is identified ONLY by its declaration
-                // name - the key in the pipeline `constants` record - so
-                // renaming it silently breaks host pipeline-constant
-                // specialization.  Treat `@id`-less overrides like
-                // preserve-listed names; they are reserved in
-                // `collect_reserved_names`.
+                // An `@id`-less override is identified to the host ONLY by
+                // its declaration name (the pipeline `constants` key), so
+                // renaming it breaks host specialization; it is reserved
+                // instead.
                 if let Some(name) = ov.name.as_deref()
                     && ov.id.is_some()
                     && !self.preserve.contains(name)
@@ -116,7 +93,6 @@ impl Pass for RenamePass {
         }
 
         for (fh, function) in module.functions.iter() {
-            // Regular function names are module scope: rename unless preserved.
             if !matches!(function.name.as_deref(), Some(n) if self.preserve.contains(n)) {
                 push_target(&mut targets, &mut seq, Target::Function(fh), &weights);
             }
@@ -142,15 +118,10 @@ impl Pass for RenamePass {
             );
         }
 
-        // Heaviest weight first, declaration order breaking ties.  `seq` is
-        // unique per target, so the ordering is total and independent of sort
-        // stability.
+        // Heaviest first; `seq` is unique per target, so the order is total
+        // and independent of sort stability.
         targets.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
 
-        // Draw names shortest-first into per-arena side tables, then apply.
-        // Each draw takes the smallest unused name, so the consumed set is
-        // exactly the first N non-reserved names regardless of order - only
-        // the identifier-to-name pairing changes.
         let mut counter = 0usize;
         let mut assigned = AssignedNames::default();
         for (target, _, _) in &targets {
@@ -166,7 +137,7 @@ impl Pass for RenamePass {
             for (h, c) in module.constants.iter_mut() {
                 apply_module_name(
                     &mut c.name,
-                    assigned.constant.remove(&h),
+                    assigned.constant.remove(h),
                     &mut changed,
                     &mut module_renames,
                 );
@@ -174,7 +145,7 @@ impl Pass for RenamePass {
             for (h, ov) in module.overrides.iter_mut() {
                 apply_module_name(
                     &mut ov.name,
-                    assigned.over.remove(&h),
+                    assigned.over.remove(h),
                     &mut changed,
                     &mut module_renames,
                 );
@@ -183,7 +154,7 @@ impl Pass for RenamePass {
         for (h, global) in module.global_variables.iter_mut() {
             apply_module_name(
                 &mut global.name,
-                assigned.global.remove(&h),
+                assigned.global.remove(h),
                 &mut changed,
                 &mut module_renames,
             );
@@ -191,7 +162,7 @@ impl Pass for RenamePass {
         for (fh, function) in module.functions.iter_mut() {
             apply_module_name(
                 &mut function.name,
-                assigned.function.remove(&fh),
+                assigned.function.remove(fh),
                 &mut changed,
                 &mut module_renames,
             );
@@ -217,9 +188,8 @@ impl Pass for RenamePass {
     }
 }
 
-/// A renameable identifier, identified by the arena slot its name lives in.
-/// Args and locals are scoped to a [`FuncRef`] so the same arena handle in
-/// two functions never collides in the side tables.
+/// A renameable identifier by arena slot; args and locals carry a
+/// [`FuncRef`] so the same handle in two functions never collides.
 #[derive(Clone, Copy)]
 enum Target {
     Constant(naga::Handle<naga::Constant>),
@@ -230,22 +200,21 @@ enum Target {
     Local(FuncRef, naga::Handle<naga::LocalVariable>),
 }
 
-/// Identifies a function body for per-function (argument / local) scoping.
-/// Regular functions are keyed by arena handle, entry points by index.
+/// A function body, for argument / local scoping.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum FuncRef {
     Function(naga::Handle<naga::Function>),
     Entry(usize),
 }
 
-/// Names assigned this sweep, bucketed by arena so application is a single
-/// `iter_mut` per arena rather than a per-handle random-access lookup.
+/// Names assigned this sweep, bucketed by arena so application is one
+/// `iter_mut` per arena.
 #[derive(Default)]
 struct AssignedNames {
-    constant: FxHashMap<naga::Handle<naga::Constant>, String>,
-    over: FxHashMap<naga::Handle<naga::Override>, String>,
-    global: FxHashMap<naga::Handle<naga::GlobalVariable>, String>,
-    function: FxHashMap<naga::Handle<naga::Function>, String>,
+    constant: HandleMap<naga::Constant, String>,
+    over: HandleMap<naga::Override, String>,
+    global: HandleMap<naga::GlobalVariable, String>,
+    function: HandleMap<naga::Function, String>,
     arg: FxHashMap<(FuncRef, usize), String>,
     local: FxHashMap<(FuncRef, naga::Handle<naga::LocalVariable>), String>,
 }
@@ -275,15 +244,14 @@ impl AssignedNames {
     }
 }
 
-/// Per-identifier occurrence weights used to rank name length.  Every
-/// renameable identifier gets an entry (at least its declaration), so a
-/// missing key means a non-renameable handle and is treated as weight 1.
+/// Occurrence weights; a missing key is a non-renameable handle and counts
+/// as 1.
 #[derive(Default)]
 struct Weights {
-    global: FxHashMap<naga::Handle<naga::GlobalVariable>, usize>,
-    constant: FxHashMap<naga::Handle<naga::Constant>, usize>,
-    over: FxHashMap<naga::Handle<naga::Override>, usize>,
-    function: FxHashMap<naga::Handle<naga::Function>, usize>,
+    global: HandleMap<naga::GlobalVariable, usize>,
+    constant: HandleMap<naga::Constant, usize>,
+    over: HandleMap<naga::Override, usize>,
+    function: HandleMap<naga::Function, usize>,
     arg: FxHashMap<(FuncRef, usize), usize>,
     local: FxHashMap<(FuncRef, naga::Handle<naga::LocalVariable>), usize>,
 }
@@ -291,10 +259,10 @@ struct Weights {
 impl Weights {
     fn of(&self, target: Target) -> usize {
         match target {
-            Target::Constant(h) => self.constant.get(&h).copied(),
-            Target::Override(h) => self.over.get(&h).copied(),
-            Target::Global(h) => self.global.get(&h).copied(),
-            Target::Function(h) => self.function.get(&h).copied(),
+            Target::Constant(h) => self.constant.get(h).copied(),
+            Target::Override(h) => self.over.get(h).copied(),
+            Target::Global(h) => self.global.get(h).copied(),
+            Target::Function(h) => self.function.get(h).copied(),
             Target::Arg(f, i) => self.arg.get(&(f, i)).copied(),
             Target::Local(f, h) => self.local.get(&(f, h)).copied(),
         }
@@ -302,8 +270,6 @@ impl Weights {
     }
 }
 
-/// Push one renameable identifier onto the candidate list with its weight and
-/// the next declaration-order tie-break index.
 fn push_target(
     targets: &mut Vec<(Target, usize, usize)>,
     seq: &mut usize,
@@ -314,8 +280,6 @@ fn push_target(
     *seq += 1;
 }
 
-/// Enumerate the renameable arguments and locals of one function body,
-/// shared by regular functions and entry points.
 fn enumerate_locals(
     function: &naga::Function,
     fref: FuncRef,
@@ -338,7 +302,6 @@ fn enumerate_locals(
     }
 }
 
-/// Write `name` into `slot`, recording whether it actually changed.
 fn apply_name(slot: &mut Option<String>, name: Option<String>, changed: &mut bool) {
     if let Some(name) = name {
         *changed |= slot.as_deref() != Some(name.as_str());
@@ -347,7 +310,7 @@ fn apply_name(slot: &mut Option<String>, name: Option<String>, changed: &mut boo
 }
 
 /// [`apply_name`] that logs (old, new) for a NAMED slot; an unnamed slot
-/// gaining a name is synthetic and applied unlogged.
+/// gaining a name is synthetic and unlogged.
 fn apply_module_name(
     slot: &mut Option<String>,
     name: Option<String>,
@@ -364,7 +327,6 @@ fn apply_module_name(
     }
 }
 
-/// Apply this sweep's argument and local names to one function body.
 fn apply_locals(
     function: &mut naga::Function,
     fref: FuncRef,
@@ -379,14 +341,11 @@ fn apply_locals(
     }
 }
 
-/// Clear `named_expressions` whenever the function carries any - even if no
-/// identifier was renamed - and report that as a change.  The "report as
-/// change" piece looks like a perf wart (it costs one extra convergence sweep
-/// on shaders that name expressions but rename nothing else), but it is
-/// load-bearing: the extra sweep gives downstream passes a chance to observe
-/// IR that settled only in this sweep's earlier passes (e.g. DCE catches an
-/// orphaned global that became unreachable once an upstream phony-assignment
-/// load was eliminated).
+/// Clear `named_expressions` whenever the function has any and report it as
+/// a change even when nothing was renamed.  The extra convergence sweep
+/// looks like a perf wart but is load-bearing: it lets downstream passes
+/// observe IR that settled only in this sweep's earlier passes (DCE catching
+/// a global orphaned by a phony-assignment load elimination).
 fn clear_named_expressions(function: &mut naga::Function) -> bool {
     if function.named_expressions.is_empty() {
         return false;
@@ -397,21 +356,15 @@ fn clear_named_expressions(function: &mut naga::Function) -> bool {
 
 // MARK: Occurrence weights
 
-/// Compute occurrence weights ranking identifiers by how often their name is
-/// emitted: the declaration plus every live reference in a function or entry
-/// body, mirroring the per-function `compute_expression_ref_counts` (for a
-/// trivially inlined node like `GlobalVariable(g)`, its ref count equals the
-/// textual occurrences of `g`'s name in that body).
-///
-/// This is a size-ranking heuristic, not an exact emission count: references
-/// in module-scope initializers are not counted, and the body walkers cover
-/// only the block-bearing statements naga has today.  An imperfect weight can
-/// only yield a longer-than-optimal name - never affecting correctness or
-/// collision-freedom, which the all-distinct draw alone guarantees.
+/// Occurrence weights: the declaration plus every live reference in a
+/// function or entry body, mirroring the generator's per-function expression
+/// ref counts (for an inlined `GlobalVariable(g)` that count is the textual
+/// occurrences of `g`).  A size heuristic, not an exact count (module-scope
+/// initializers are not counted): an imperfect weight only yields a longer
+/// name, never a collision, which the all-distinct draw alone guarantees.
 fn compute_weights(module: &naga::Module) -> Weights {
     let mut w = Weights::default();
 
-    // Declaration occurrences: every emitted declaration prints its name once.
     for (h, _) in module.global_variables.iter() {
         *w.global.entry(h).or_insert(0) += 1;
     }
@@ -437,9 +390,7 @@ fn compute_weights(module: &naga::Module) -> Weights {
     w
 }
 
-/// Fold one function's reference counts into the module-wide weight tables.
 fn accumulate_function_weights(w: &mut Weights, fref: FuncRef, function: &naga::Function) {
-    // Declaration occurrences for parameters and locals.
     for i in 0..function.arguments.len() {
         *w.arg.entry((fref, i)).or_insert(0) += 1;
     }
@@ -466,11 +417,10 @@ fn accumulate_function_weights(w: &mut Weights, fref: FuncRef, function: &naga::
     }
 }
 
-/// Per-handle reference counts for one function, mirroring the generator's
-/// `compute_expression_ref_counts`: count children of every live (in an
-/// `Emit` range) expression plus every statement-level operand.  Dead
-/// expressions are excluded so identifiers used only by dead code score 0 and
-/// sort last, never claiming a short name.
+/// Per-handle reference counts mirroring the generator's expression ref
+/// counts: children of every live (Emit'd) expression plus statement
+/// operands.  Dead expressions are excluded so identifiers used only by dead
+/// code score 0 and never claim a short name.
 fn function_ref_counts(function: &naga::Function) -> Vec<usize> {
     let len = function.expressions.len();
     let mut live = vec![false; len];
@@ -482,14 +432,13 @@ fn function_ref_counts(function: &naga::Function) -> Vec<usize> {
             visit_expression_children(expr, |child| counts[child.index()] += 1);
         }
     }
-    // `false` suppresses Emit handles: emission sequencing is not a use.
+    // Emit handles excluded: emission sequencing is not a use.
     visit_block_expression_handles(&function.body, false, &mut |h| counts[h.index()] += 1);
     counts
 }
 
-/// Mark every expression handle that appears inside an `Emit` range of
-/// `block`, recursing through control flow.  Emission-range membership is the
-/// liveness signal `function_ref_counts` filters on.
+/// Emit-range membership, the liveness signal [`function_ref_counts`]
+/// filters on.
 fn mark_emit_live(block: &naga::Block, live: &mut [bool]) {
     for_each_statement(block, &mut |stmt| {
         if let naga::Statement::Emit(range) = stmt {
@@ -500,9 +449,8 @@ fn mark_emit_live(block: &naga::Block, live: &mut [bool]) {
     });
 }
 
-/// Count `Statement::Call` targets in `block` (recursing through control
-/// flow) so a frequently-called function earns a shorter name.
-fn count_calls(block: &naga::Block, calls: &mut FxHashMap<naga::Handle<naga::Function>, usize>) {
+/// Call counts, so a frequently-called function earns a shorter name.
+fn count_calls(block: &naga::Block, calls: &mut HandleMap<naga::Function, usize>) {
     for_each_statement(block, &mut |stmt| {
         if let naga::Statement::Call { function, .. } = stmt {
             *calls.entry(*function).or_insert(0) += 1;
@@ -510,21 +458,16 @@ fn count_calls(block: &naga::Block, calls: &mut FxHashMap<naga::Handle<naga::Fun
     });
 }
 
-/// Build the starting `used_names` set for one rename sweep.
-///
-/// The policy differs by `mangle` because idempotence hinges on it:
-///
-/// - With `mangle = false`, constant and override names are kept
-///   verbatim and must be reserved so generated names do not collide
-///   with them.
-/// - With `mangle = true`, those names are themselves rewritten, so
-///   reserving the previous sweep's assignments would pollute the used
-///   set and shift subsequent assignments one slot, producing a
-///   two-sweep oscillation that keeps the pipeline from converging.
-///
-/// Every preserve-listed name is reserved unconditionally, including names
-/// absent from every arena - e.g. a preamble binding a prior pass pruned - so
-/// the user-visible names survive and are never re-minted for a body symbol.
+/// The names one rename sweep may not mint.  With `mangle = false`,
+/// constant and override names stay verbatim and are reserved; with
+/// `mangle = true` they are rewritten, and reserving the previous sweep's
+/// assignments would shift every later assignment one slot into a two-sweep
+/// oscillation that never converges.  Every preserve-listed name is
+/// reserved unconditionally, including names absent from every arena (a
+/// preamble binding a prior pass pruned): the scans see only surviving
+/// names, and a re-minted preamble name would make the generator suppress
+/// that body declaration as preamble-owned and rebind every reference to the
+/// host's binding.
 fn collect_reserved_names(
     module: &naga::Module,
     preserve: &HashSet<String>,
@@ -532,18 +475,6 @@ fn collect_reserved_names(
 ) -> HashSet<String> {
     let mut reserved = HashSet::new();
 
-    // Reserve every preserve-listed name unconditionally, before the
-    // arena scans below.  `preserve` includes all preamble-declared symbols
-    // (they are added to `preserve_symbols` automatically), and a preamble
-    // declaration may have been pruned from the module arenas by an earlier
-    // pass (e.g. `CompactPass` dropping an unused preamble global).  The
-    // per-arena scans only see names that still exist, so a pruned preamble
-    // name would otherwise be re-minted for an unrelated body identifier;
-    // the generator then suppresses that same-named body declaration as
-    // preamble-owned and every reference silently rebinds to the host's
-    // preamble binding.  Reserving here is deterministic per config, so
-    // idempotence is unaffected, and it subsumes the preserve half of the scans
-    // below - which therefore only reserve their non-preserve cases.
     reserved.extend(preserve.iter().cloned());
 
     if !mangle {
@@ -559,9 +490,8 @@ fn collect_reserved_names(
             }
         }
     } else {
-        // Every `@id`-less override keeps its name (the host's pipeline-constant
-        // key) and is not renamed, so no mangled identifier may collide with it.
-        // (Preserve-listed overrides are already covered by the seed above.)
+        // `@id`-less overrides keep their name (the host's pipeline-constant
+        // key).
         for (_, ov) in module.overrides.iter() {
             if let Some(name) = ov.name.as_deref()
                 && ov.id.is_none()
@@ -571,34 +501,17 @@ fn collect_reserved_names(
         }
     }
 
-    // Entry-point names are host-referenced and never renamed, so reserve them
-    // unconditionally.
+    // Entry-point names are host-referenced.
     for entry in module.entry_points.iter() {
         reserved.insert(entry.name.clone());
     }
 
-    // Always reserve every source struct type name and struct member
-    // name, regardless of `mangle`.  Two reasons:
-    //
-    // * Under `mangle = false` the generator emits source struct type
-    //   names verbatim (see `core.rs::type_names`).  If the rename
-    //   counter ever mints one of those names for a global / function
-    //   / local, the WGSL output contains two same-named symbols and
-    //   the user's struct becomes unreachable.  Round-trip validation
-    //   catches the bad output (see lib.rs fallback), but the bug
-    //   silently halves compaction quality.
-    //
-    // * Under `mangle = true` the generator independently re-mangles
-    //   struct type / member names via its own `used_names` set in
-    //   `core.rs`, so the source names are *not* the final WGSL names.
-    //   Reserving them is still harmless: the rename counter just
-    //   skips a few short names, and the generator's mangling decides
-    //   what each struct is ultimately called.  The cost of reserving
-    //   here is bounded by the number of source-named structs.
-    //
-    // Preserve-listed names in the type / member arenas are an extra
-    // case the generator never mangles regardless of `mangle`, so
-    // reserving unconditionally also covers them.
+    // Source struct type and member names, regardless of `mangle`: without
+    // mangling the generator emits them verbatim, so minting one for a
+    // global / function / local puts two same-named symbols in the output
+    // (round-trip validation catches it, but compaction silently halves);
+    // with mangling the generator re-mangles them itself, and reserving
+    // costs only a few short names.
     for (_, ty) in module.types.iter() {
         if let Some(name) = ty.name.as_deref() {
             reserved.insert(name.to_string());
@@ -612,17 +525,12 @@ fn collect_reserved_names(
         }
     }
 
-    // Cooperative-matrix role enumerants `A`/`B`/`C` are predeclared names in
-    // the `coop_mat<T, role>` type-argument position.  nagami's generator
-    // cannot emit cooperative-matrix types, so such modules fall back to naga's
-    // own wgsl-out, which renders the role literally as `A`/`B`/`C`.  If the
-    // rename sweep mints one of those names for a global / local / function,
-    // naga re-reads the role position as that declaration ("identifier `B`
-    // resolves to a declaration" / "declaration of `B` is recursive") and
-    // rejects the fallback.  Reserve the three role names so no renamed
-    // identifier can collide.  Guarded on actual coop-matrix usage, so every
-    // non-coop module is unaffected (`A`/`B`/`C` are the cheapest names the
-    // counter would otherwise hand out).
+    // `A` / `B` / `C` are predeclared cooperative-matrix role names in the
+    // `coop_mat<T, role>` type argument.  The generator cannot emit those
+    // types, so such modules fall back to naga's wgsl-out, which spells the
+    // role literally, and a declaration minted onto one makes naga re-read
+    // the role position as that declaration and reject the fallback.  Gated
+    // on actual usage since these are the cheapest names.
     if module
         .types
         .iter()
@@ -636,8 +544,6 @@ fn collect_reserved_names(
     reserved
 }
 
-/// Thin wrapper over [`name_gen::next_name_insert`] so the pass body
-/// is readable without the longer function name spelled out.
 fn next_available_name(counter: &mut usize, used_names: &mut HashSet<String>) -> String {
     name_gen::next_name_insert(counter, used_names)
 }
@@ -788,10 +694,8 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn cooperative_matrix_reserves_role_enumerants() {
-        // The generator cannot emit coop-matrix types, so such modules fall
-        // back to naga's wgsl-out, which renders the role literally as
-        // `A`/`B`/`C`.  Renaming a declaration onto one of those names collides
-        // with the role position, so they must be reserved.
+        // The naga wgsl-out fallback spells the role literally, so a
+        // declaration minted onto `A` / `B` / `C` collides with it.
         let source = "enable wgpu_cooperative_matrix;\n\
             var<private> a: coop_mat8x8<f32, A>;\n\
             var<private> bb: coop_mat8x8<f32, B>;\n\
@@ -810,7 +714,6 @@ fn fs_main() -> @location(0) vec4f {
             );
         }
 
-        // End-to-end: the rename sweep must not mint a role name for any decl.
         let (_, renamed) = run_pass(source, &[]);
         let decl_names = collect_declaration_names(&renamed);
         for role in ["A", "B", "C"] {
@@ -823,8 +726,8 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn non_coop_module_leaves_role_enumerants_free() {
-        // `A`/`B`/`C` are the cheapest names; they are reserved ONLY for coop
-        // modules so the whole non-coop corpus keeps them in the rename pool.
+        // Reserved ONLY for coop modules, so the rest of the corpus keeps the
+        // cheapest names.
         let source = "var<private> some_long_global: f32 = 1.0;\n\
             @compute @workgroup_size(1) fn main() { some_long_global = some_long_global + 1.0; }";
         let module = naga::front::wgsl::parse_str(source).expect("source should parse");
@@ -881,12 +784,8 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn assigns_shortest_name_to_most_referenced_identifier() {
-        // Frequency ordering: the shortest name goes to the most-referenced
-        // identifier, not the first-declared one.  `hot` is declared LAST yet
-        // read five times; only weight-sorted assignment gives it the first
-        // name "A" - plain declaration order would hand it a later name - so
-        // this assertion fails if the heaviest-first sort ever regresses to
-        // declaration order.
+        // `hot` is declared LAST yet read five times; only weight-sorted
+        // assignment gives it "A".
         let source = r#"
 var<private> cold_a: f32 = 1.0;
 var<private> cold_b: f32 = 2.0;
@@ -902,7 +801,6 @@ fn fs_main() -> @location(0) vec4f {
         let (_, module) = run_pass_with_mangle(source, &[], true);
         let weights = compute_weights(&module);
 
-        // The heaviest renameable identifier is the global read five times.
         let heaviest = module
             .global_variables
             .iter()
@@ -952,7 +850,6 @@ fn fs_main() -> @location(0) vec4f {
             .any(|(_, c)| c.name.as_deref() == Some("MY_CONSTANT"));
         assert!(!has_original, "original constant name should be replaced");
 
-        // All constant names should follow the short-name pattern.
         for (_, c) in module.constants.iter() {
             if let Some(name) = c.name.as_deref() {
                 assert!(
@@ -992,10 +889,8 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn no_collision_with_unrenamed_constant_names() {
-        // With mangle off, constants keep their original names.  The
-        // generator must not reassign those same names to other
-        // declarations.  Here the constant `A` is exactly the first
-        // generated name, so the sweep must skip past it.
+        // The constant `A` is exactly the first generated name, so the sweep
+        // must skip past it.
         let source = r#"
 const A: f32 = 1.0;
 var<private> long_global_name: f32 = 2.0;
@@ -1013,7 +908,6 @@ fn fs_main() -> @location(0) vec4f {
 
         let (_, module) = run_pass(source, &[]);
 
-        // Constant "A" should still exist.
         let has_const_a = module
             .constants
             .iter()
@@ -1023,7 +917,6 @@ fn fs_main() -> @location(0) vec4f {
             "constant A should keep its name when mangle is off"
         );
 
-        // No renamed declaration should collide with "A".
         let decl_names = collect_declaration_names(&module);
         let a_count = decl_names.iter().filter(|n| n.as_str() == "A").count();
         assert_eq!(
@@ -1034,10 +927,7 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn mangle_rename_is_idempotent() {
-        // Running the rename pass twice with `mangle = true` on the
-        // same module must produce identical results; the second run
-        // has to report `changed = false`.  Without this the pipeline's
-        // convergence loop oscillates between two name assignments.
+        // Otherwise the convergence loop oscillates between two assignments.
         let source = r#"
 const LONG_CONST_A: f32 = 1.0;
 const LONG_CONST_B: f32 = 2.0;
@@ -1059,7 +949,6 @@ fn fs_main() -> @location(0) vec4f {
         let (changed1, module1) = run_pass_with_mangle(source, &[], true);
         assert!(changed1, "first rename should change names");
 
-        // Run a second rename on the already-renamed module.
         let mut module2 = module1.clone();
         let mut pass = RenamePass::new(Vec::new(), true);
         let config = Config::default();
@@ -1075,7 +964,6 @@ fn fs_main() -> @location(0) vec4f {
             "second rename with mangle should be idempotent (no changes)"
         );
 
-        // Names should be identical.
         let names1 = collect_declaration_names(&module1);
         let names2 = collect_declaration_names(&module2);
         assert_eq!(names1, names2, "names must be identical across runs");
@@ -1083,14 +971,9 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn clears_named_expressions_and_reports_change_even_when_nothing_renamed() {
-        // INVERSE regression: a tempting "perf" fix gated this clear
-        // on `changed > 0` so a preserve-all pass would not report a
-        // change.  Google Tint test corpus showed the convergence
-        // loop exits one sweep too early in that mode and downstream
-        // DCE never gets a chance to remove orphaned globals.  This
-        // test pins the "always clear and report changed" behaviour
-        // so a future maintainer who notices the apparent redundancy
-        // does not silently re-introduce the regression.
+        // Gating the clear on `changed` makes a preserve-all pass exit the
+        // convergence loop one sweep early, before downstream DCE can remove
+        // orphaned globals (seen on the Tint corpus).
         let source = r#"
 @fragment
 fn fs_main() -> @location(0) vec4f {
@@ -1118,18 +1001,11 @@ fn fs_main() -> @location(0) vec4f {
 
     // MARK: Struct-name reservation regression
 
-    /// Source struct type names must be reserved as the rename pass
-    /// mints fresh short identifiers - otherwise (with `mangle = false`,
-    /// where the generator keeps source struct names verbatim) the
-    /// pass can mint a local / global / function name that collides
-    /// with an existing struct name and the emitted WGSL ends up with
-    /// two same-named symbols.
+    /// Without mangling the generator keeps source struct names verbatim, so
+    /// a minted name colliding with one puts two same-named symbols in the
+    /// WGSL.
     #[test]
     fn reserves_source_struct_type_names_without_mangle() {
-        // The struct is named single-character `A`; with enough
-        // unrenamed globals and a multi-arg function the rename
-        // counter would normally reach `A` quickly and clobber the
-        // type name.  We assert `A` appears in the reserved set.
         let src = r#"
 struct A { x: f32, y: f32 }
 @group(0) @binding(0) var<uniform> g: A;
@@ -1158,10 +1034,9 @@ fn h(p: f32, q: f32, r: f32) -> A {
         );
     }
 
-    /// Same reservation must apply under `mangle = true`: even though
-    /// the generator independently re-mangles type / member names,
-    /// reserving them in the rename pass is safe and prevents short-
-    /// lived collisions that a future refactor could expose.
+    /// Under `mangle = true` the generator re-mangles type / member names
+    /// itself, but reserving them here is safe and forecloses collisions a
+    /// future refactor could expose.
     #[test]
     fn reserves_source_struct_type_names_with_mangle() {
         let src = r#"

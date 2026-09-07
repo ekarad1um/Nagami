@@ -1,8 +1,5 @@
-//! Tests covering WGSL texture built-ins: stores, gathers, sample
-//! variants (bias, grad, compare, compare-level, base-clamp-to-edge),
-//! array-indexed sampling, and image-atomic operations.  Each MARK
-//! block targets one built-in so regressions point directly at the
-//! offending emission path.
+//! WGSL texture built-ins: stores, gathers, sample variants, array-indexed
+//! sampling, image atomics; one MARK block per built-in.
 
 use super::helpers::*;
 
@@ -196,8 +193,7 @@ fn image_atomic_add_roundtrip() {
 
 #[test]
 fn image_atomic_multi_use_coord_roundtrip() {
-    // Exercise ImageAtomic with a shared coordinate expression to verify
-    // ref counts are computed correctly for ImageAtomic operands.
+    // Shared coordinate: ref counts must cover ImageAtomic operands.
     let src = r#"
         @group(0) @binding(0) var t: texture_storage_2d<r32uint, atomic>;
         @compute @workgroup_size(1) fn main() {
