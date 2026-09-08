@@ -24,9 +24,9 @@ use crate::pipeline::{Pass, PassContext};
 
 use super::expr_util::has_negative_zero_leaf;
 use super::expr_util::{
-    flatten_replacement_chains, for_each_statement, nested_blocks, nested_blocks_mut,
-    remap_statement_handles, try_map_expression_handles_in_place, visit_expression_children,
-    visit_statement_write_pointers,
+    flatten_replacement_chains, for_each_statement, is_integer_zero_literal, nested_blocks,
+    nested_blocks_mut, remap_statement_handles, root_local_var, shift_amount_is_static_error,
+    try_map_expression_handles_in_place, visit_expression_children, visit_statement_write_pointers,
 };
 use super::scoped_map::ScopedMap;
 use crate::handle_set::{HandleMap, HandleSet};
@@ -341,7 +341,7 @@ fn find_dead_inits(
             naga::Statement::Emit(range) => {
                 for h in range.clone() {
                     if let naga::Expression::Load { pointer } = &expressions[h]
-                        && let Some(local) = get_stored_local(expressions, *pointer)
+                        && let Some(local) = root_local_var(*pointer, expressions)
                     {
                         pending.remove(local);
                     }
@@ -352,7 +352,7 @@ fn find_dead_inits(
                     if pending.remove(lh) {
                         dead.insert(lh);
                     }
-                } else if let Some(local) = get_stored_local(expressions, *pointer) {
+                } else if let Some(local) = root_local_var(*pointer, expressions) {
                     // A partial store reads the old value.
                     pending.remove(local);
                 }
@@ -360,7 +360,7 @@ fn find_dead_inits(
             // A callee / atomic / ray / cooperative write may read or
             // overwrite the init.
             other => visit_statement_write_pointers(other, &mut |p| {
-                if let Some(local) = get_stored_local(expressions, p) {
+                if let Some(local) = root_local_var(p, expressions) {
                     pending.remove(local);
                 }
             }),
@@ -395,14 +395,14 @@ fn collect_touched_locals(
         if let naga::Statement::Emit(range) = stmt {
             for h in range.clone() {
                 if let naga::Expression::Load { pointer } = &expressions[h]
-                    && let Some(local) = get_stored_local(expressions, *pointer)
+                    && let Some(local) = root_local_var(*pointer, expressions)
                 {
                     touched.insert(local);
                 }
             }
         }
         visit_statement_write_pointers(stmt, &mut |p| {
-            if let Some(local) = get_stored_local(expressions, p) {
+            if let Some(local) = root_local_var(p, expressions) {
                 touched.insert(local);
             }
         });
@@ -436,7 +436,7 @@ fn eliminate_write_only_locals(function: &mut naga::Function) -> bool {
             _ => None,
         };
         if let Some(ptr) = read_ptr
-            && let Some(local) = get_stored_local(exprs, ptr)
+            && let Some(local) = root_local_var(ptr, exprs)
         {
             used.insert(local);
         }
@@ -494,7 +494,7 @@ fn collect_nonstore_pointer_locals(
             | naga::Statement::SubgroupGather { .. }
             | naga::Statement::SubgroupCollectiveOperation { .. } => return,
         };
-        if let Some(local) = get_stored_local(expressions, pointer) {
+        if let Some(local) = root_local_var(pointer, expressions) {
             used.insert(local);
         }
     });
@@ -509,7 +509,7 @@ fn remove_stores_to_dead_locals(
     let original = std::mem::replace(block, naga::Block::new());
     for (mut stmt, span) in original.span_into_iter() {
         if let naga::Statement::Store { pointer, .. } = &stmt
-            && let Some(local) = get_stored_local(expressions, *pointer)
+            && let Some(local) = root_local_var(*pointer, expressions)
             && !used.contains(local)
         {
             changed = true;
@@ -546,7 +546,7 @@ fn remove_dead_stores_in_block(
             naga::Statement::Emit(range) => {
                 for h in range.clone() {
                     if let naga::Expression::Load { pointer } = &expressions[h]
-                        && let Some(local) = get_stored_local(expressions, *pointer)
+                        && let Some(local) = root_local_var(*pointer, expressions)
                     {
                         pending_store.remove(local);
                     }
@@ -557,7 +557,7 @@ fn remove_dead_stores_in_block(
                     if let Some(prev_idx) = pending_store.insert(lh, idx) {
                         dead_indices.push(prev_idx);
                     }
-                } else if let Some(local) = get_stored_local(expressions, *pointer) {
+                } else if let Some(local) = root_local_var(*pointer, expressions) {
                     // A partial store reads the old value.
                     pending_store.remove(local);
                 }
@@ -578,7 +578,7 @@ fn remove_dead_stores_in_block(
             // A callee / atomic / ray / cooperative write may be partial and
             // observe the unwritten bytes: keep the pending store live.
             other => visit_statement_write_pointers(other, &mut |p| {
-                if let Some(local) = get_stored_local(expressions, p) {
+                if let Some(local) = root_local_var(p, expressions) {
                     pending_store.remove(local);
                 }
             }),
@@ -610,39 +610,6 @@ fn remove_dead_stores_in_block(
 }
 
 // MARK: Load deduplication
-
-/// Only INTEGER `/` `%` by zero is a WGSL shader-creation error; float
-/// `x / 0.0` is a defined `inf` / `nan` and must stay forwardable.
-fn is_integer_zero_literal(lit: &naga::Literal) -> bool {
-    matches!(
-        lit,
-        naga::Literal::I16(0)
-            | naga::Literal::U16(0)
-            | naga::Literal::I32(0)
-            | naga::Literal::U32(0)
-            | naga::Literal::I64(0)
-            | naga::Literal::U64(0)
-            | naga::Literal::AbstractInt(0)
-    )
-}
-
-/// A shift by `>= 32` is a shader-creation error for the ubiquitous
-/// 32-bit operand.  A 16-bit operand shifted by `[16, 32)` is left to
-/// the whole-module rollback (fail-safe); a 64-bit one is over-declined
-/// harmlessly.
-fn shift_amount_is_static_error(lit: &naga::Literal) -> bool {
-    let amount: i128 = match lit {
-        naga::Literal::U32(v) => i128::from(*v),
-        naga::Literal::U16(v) => i128::from(*v),
-        naga::Literal::I32(v) => i128::from(*v),
-        naga::Literal::I16(v) => i128::from(*v),
-        naga::Literal::U64(v) => i128::from(*v),
-        naga::Literal::I64(v) => i128::from(*v),
-        naga::Literal::AbstractInt(v) => i128::from(*v),
-        _ => return false,
-    };
-    amount >= 32
-}
 
 /// Literal at the end of `start`'s forward chain; the budget is a cycle
 /// safety net (chains are acyclic by construction).
@@ -843,7 +810,7 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         .iter()
         .filter_map(|(&load_h, &replacement_h)| {
             if let naga::Expression::Load { pointer } = &function.expressions[load_h] {
-                let local = get_stored_local(&function.expressions, *pointer)?;
+                let local = root_local_var(*pointer, &function.expressions)?;
                 if dead_locals.contains(local) {
                     return None;
                 }
@@ -871,7 +838,7 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         ) {
             continue;
         }
-        let local = match get_stored_local(&function.expressions, store_ptr) {
+        let local = match root_local_var(store_ptr, &function.expressions) {
             Some(l) => l,
             None => continue,
         };
@@ -927,7 +894,7 @@ fn dedup_loads_in_function(function: &mut naga::Function) -> bool {
         let (store_ptr, _) = store_id;
         // A lookup miss keeps the Store (`false` drops it from the dead
         // set), the safe direction.
-        let Some(local) = get_stored_local(&function.expressions, store_ptr) else {
+        let Some(local) = root_local_var(store_ptr, &function.expressions) else {
             return false;
         };
         let Some(store_pos) = scope_idx.store_position(store_id) else {
@@ -1047,20 +1014,6 @@ fn build_max_live_load_positions(
     max_pos
 }
 
-/// Root local of an `Access` / `AccessIndex` chain, if any.
-pub(crate) fn get_stored_local(
-    expressions: &naga::Arena<naga::Expression>,
-    pointer_handle: naga::Handle<naga::Expression>,
-) -> Option<naga::Handle<naga::LocalVariable>> {
-    match &expressions[pointer_handle] {
-        naga::Expression::LocalVariable(local) => Some(*local),
-        naga::Expression::AccessIndex { base, .. } | naga::Expression::Access { base, .. } => {
-            get_stored_local(expressions, *base)
-        }
-        _ => None,
-    }
-}
-
 /// Cheap to reference from many sites: pre-emit declaratives never get a
 /// `let`, and a `Load` forwarded to N sites is N references to one
 /// already-emitted handle, not N memory reads - unlike `const_fold`'s
@@ -1152,7 +1105,7 @@ fn collect_escaped_and_partially_stored(
     for_each_statement(block, &mut |stmt| match stmt {
         naga::Statement::Store { pointer, .. } => {
             if !matches!(expressions[*pointer], naga::Expression::LocalVariable(_))
-                && let Some(local) = get_stored_local(expressions, *pointer)
+                && let Some(local) = root_local_var(*pointer, expressions)
             {
                 partially_stored.insert(local);
             }
@@ -1160,7 +1113,7 @@ fn collect_escaped_and_partially_stored(
         // A cooperative write covers only part of the local; `target` is
         // the source value.
         naga::Statement::CooperativeStore { data, .. } => {
-            if let Some(local) = get_stored_local(expressions, data.pointer) {
+            if let Some(local) = root_local_var(data.pointer, expressions) {
                 partially_stored.insert(local);
             }
         }
@@ -1168,7 +1121,7 @@ fn collect_escaped_and_partially_stored(
         // may read or write through the pointer later; an atomic pointer
         // lands here too but never roots at a function local.
         other => visit_statement_write_pointers(other, &mut |p| {
-            if let Some(local) = get_stored_local(expressions, p) {
+            if let Some(local) = root_local_var(p, expressions) {
                 escaped.insert(local);
             }
         }),
@@ -1194,19 +1147,19 @@ fn count_stores_recursive(
     for stmt in block {
         match stmt {
             naga::Statement::Store { pointer, .. } => {
-                if let Some(lh) = get_stored_local(expressions, *pointer) {
+                if let Some(lh) = root_local_var(*pointer, expressions) {
                     *counts.entry(lh).or_insert(0) += 1;
                 }
             }
             naga::Statement::Atomic { pointer, .. } => {
                 // Read-modify-write counts as a store.
-                if let Some(lh) = get_stored_local(expressions, *pointer) {
+                if let Some(lh) = root_local_var(*pointer, expressions) {
                     *counts.entry(lh).or_insert(0) += 1;
                 }
             }
             naga::Statement::RayQuery { query, .. } => {
                 // Initialize / Proceed mutate through the query pointer.
-                if let Some(lh) = get_stored_local(expressions, *query) {
+                if let Some(lh) = root_local_var(*query, expressions) {
                     *counts.entry(lh).or_insert(0) += 1;
                 }
             }
@@ -1264,7 +1217,7 @@ fn collect_redundant_loads<'body>(
                     // cannot forward: otherwise their local could be judged
                     // dead, its Store dropped, and the surviving load left
                     // reading the zero-default.
-                    if let Some(local) = get_stored_local(expressions, *pointer) {
+                    if let Some(local) = root_local_var(*pointer, expressions) {
                         all_loads.entry(local).or_default().push(handle);
                     }
                     if let Some(key) = get_pointer_key(expressions, *pointer) {
@@ -1292,7 +1245,7 @@ fn collect_redundant_loads<'body>(
                 }
             }
             naga::Statement::Store { pointer, value } => {
-                if let Some(local) = get_stored_local(expressions, *pointer) {
+                if let Some(local) = root_local_var(*pointer, expressions) {
                     modified_out.insert(local);
                     invalidate_cache_for_local(cache, local);
                     invalidate_store_source_for_local(&mut store_source, local);
@@ -1572,7 +1525,7 @@ fn collect_redundant_loads<'body>(
             // outliving a cache miss mis-classifies its Store's forwarded
             // loads.
             other => visit_statement_write_pointers(other, &mut |p| {
-                if let Some(local) = get_stored_local(expressions, p) {
+                if let Some(local) = root_local_var(p, expressions) {
                     modified_out.insert(local);
                     invalidate_cache_for_local(cache, local);
                     invalidate_store_source_for_local(&mut store_source, local);
@@ -1637,26 +1590,26 @@ fn collect_escaped_locals(
         match stmt {
             naga::Statement::Call { arguments, .. } => {
                 for &arg in arguments {
-                    if let Some(local) = get_stored_local(expressions, arg) {
+                    if let Some(local) = root_local_var(arg, expressions) {
                         escaped.insert(local);
                     }
                 }
             }
             naga::Statement::RayPipelineFunction(fun) => {
                 let naga::RayPipelineFunction::TraceRay { payload, .. } = fun;
-                if let Some(local) = get_stored_local(expressions, *payload) {
+                if let Some(local) = root_local_var(*payload, expressions) {
                     escaped.insert(local);
                 }
             }
             naga::Statement::CooperativeStore { data, .. } => {
                 // `data.pointer` is the write side.
-                if let Some(local) = get_stored_local(expressions, data.pointer) {
+                if let Some(local) = root_local_var(data.pointer, expressions) {
                     escaped.insert(local);
                 }
             }
             naga::Statement::RayQuery { query, .. } => {
                 // The runtime mutates through the query pointer.
-                if let Some(local) = get_stored_local(expressions, *query) {
+                if let Some(local) = root_local_var(*query, expressions) {
                     escaped.insert(local);
                 }
             }
@@ -1677,7 +1630,7 @@ pub(crate) fn collect_modified_locals(
 ) {
     for_each_statement(block, &mut |stmt| {
         visit_statement_write_pointers(stmt, &mut |p| {
-            if let Some(lh) = get_stored_local(expressions, p) {
+            if let Some(lh) = root_local_var(p, expressions) {
                 modified.insert(lh);
             }
         });
@@ -1739,7 +1692,7 @@ fn apply_to_block(
                 continue;
             }
             naga::Statement::Store { pointer, value } => {
-                if let Some(lh) = get_stored_local(expressions, *pointer)
+                if let Some(lh) = root_local_var(*pointer, expressions)
                     && dead_locals.contains(lh)
                 {
                     continue;

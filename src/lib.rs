@@ -494,6 +494,36 @@ fn untextable_ir_bailout(source: &str, before_bytes: usize, reason: String) -> E
     }
 }
 
+/// Ship `naga_output` instead of the generator's text.  naga's wgsl-out can
+/// emit tokens its own front-end rejects (an `f32(<f64 literal>)` cast, an
+/// f16 literal whose `enable f16;` it drops), so re-validate first; a
+/// doubly-invalid IR has no WGSL spelling for any consumer and is not
+/// necessarily a pass bug, hence the loud degrade to the compacted input.
+/// `context` names the rung that got here, for that warning.
+fn ship_naga_fallback(
+    naga_output: String,
+    source: &str,
+    before_bytes: usize,
+    duration_us: u64,
+    context: &str,
+) -> EmitOutcome {
+    if let Err(ve) = io::validate_wgsl_text(&naga_output) {
+        eprintln!(
+            "warning: {context}; minified IR cannot round-trip WGSL text ({ve}); \
+             shipping the input lexically compacted"
+        );
+        return untextable_ir_bailout(source, before_bytes, ve.to_string());
+    }
+    let fallback = finalize_naga_fallback_text(naga_output, source);
+    EmitOutcome {
+        changed: fallback.len() != before_bytes,
+        source: fallback,
+        rolled_back: true,
+        duration_us,
+        untextable_reason: None,
+    }
+}
+
 /// The fallback ladder: naga's output when the generator errs or emits
 /// invalid WGSL, the compacted input when that text fails re-validation
 /// too.  With a preamble (`normalized_preamble` / `effective_preamble` are
@@ -612,26 +642,13 @@ fn resolve_generator_output(
                 if trace_enabled && let Err(e) = &validation_result {
                     eprintln!("warning: generator WGSL validation error: {e}");
                 }
-                // naga's wgsl-out can emit tokens its own front-end rejects (an
-                // `f32(<f64 literal>)` cast, an f16 literal whose `enable f16;`
-                // it drops), so re-validate; a doubly-invalid IR has no WGSL
-                // spelling for any consumer and is not necessarily a pass bug,
-                // hence the loud bailout.
-                if let Err(ve) = io::validate_wgsl_text(&naga_output) {
-                    eprintln!(
-                        "warning: minified IR cannot round-trip WGSL text ({ve}); \
-                         shipping the input lexically compacted"
-                    );
-                    return Ok(untextable_ir_bailout(source, before_bytes, ve.to_string()));
-                }
-                let fallback = finalize_naga_fallback_text(naga_output, source);
-                Ok(EmitOutcome {
-                    changed: fallback.len() != before_bytes,
-                    source: fallback,
-                    rolled_back: true,
-                    duration_us: emitted.duration_us,
-                    untextable_reason: None,
-                })
+                Ok(ship_naga_fallback(
+                    naga_output,
+                    source,
+                    before_bytes,
+                    emitted.duration_us,
+                    "generator output failed text validation",
+                ))
             } else {
                 // No baseline (naga's writer-abort set) means no fallback emitter.
                 let underlying = match validation_result {
@@ -654,22 +671,13 @@ fn resolve_generator_output(
                     "warning: generator emit failed ({e}); \
                      shipping naga emitter output (still IR-minified)"
                 );
-                // Doubly-invalid degrades to the compacted-input bailout.
-                if let Err(ve) = io::validate_wgsl_text(&naga_output) {
-                    eprintln!(
-                        "warning: generator emit failed ({e}); minified IR cannot \
-                         round-trip WGSL text ({ve}); shipping the input lexically compacted"
-                    );
-                    return Ok(untextable_ir_bailout(source, before_bytes, ve.to_string()));
-                }
-                let fallback = finalize_naga_fallback_text(naga_output, source);
-                Ok(EmitOutcome {
-                    changed: fallback.len() != before_bytes,
-                    source: fallback,
-                    rolled_back: true,
-                    duration_us: 0,
-                    untextable_reason: None,
-                })
+                Ok(ship_naga_fallback(
+                    naga_output,
+                    source,
+                    before_bytes,
+                    /*duration_us=*/ 0,
+                    &format!("generator emit failed ({e})"),
+                ))
             }
             // No fallback (writer-abort set): the generator's error is the
             // only diagnosis.

@@ -125,7 +125,7 @@ fn round_sig_figs_f64(v: f64, sig_figs: i32) -> f64 {
 /// lossy round must never manufacture an `inf`.  Call once per literal arm
 /// and feed the rounded value to every candidate form, or an alternative
 /// could emit the precise original of a value the user asked to truncate.
-fn round_f32(v: f32, mode: PrecisionMode) -> f32 {
+pub(super) fn round_f32(v: f32, mode: PrecisionMode) -> f32 {
     if !v.is_finite() {
         return v;
     }
@@ -154,7 +154,7 @@ fn round_f32(v: f32, mode: PrecisionMode) -> f32 {
 /// `v * scale` from overflowing, and a `SignificantFigures` scale-back that
 /// overflowed near `f64::MAX` falls back to the original rather than an
 /// `inflf` / `inf` token.
-fn round_f64(v: f64, mode: PrecisionMode) -> f64 {
+pub(super) fn round_f64(v: f64, mode: PrecisionMode) -> f64 {
     if !v.is_finite() {
         return v;
     }
@@ -182,7 +182,7 @@ fn round_f64(v: f64, mode: PrecisionMode) -> f64 {
 /// A lossy round can leave `f16`'s finite range (`SignificantFigures(1)` of
 /// `65504` is `70000`, finite as `f32`), and `70000h` makes naga reject the
 /// whole output, so an out-of-range result falls back to the original.
-fn round_f16(v: f32, mode: PrecisionMode) -> f32 {
+pub(super) fn round_f16(v: f32, mode: PrecisionMode) -> f32 {
     // `f16::MAX`, inlined to avoid a `half` dependency.
     const F16_MAX: f32 = 65504.0;
     let rounded = round_f32(v, mode);
@@ -583,6 +583,38 @@ pub(super) fn scalar_name(kind: naga::ScalarKind, width: u8) -> Result<&'static 
     })
 }
 
+/// Predeclared alias spellings a surviving declaration has taken, so
+/// emission falls back to the long form instead of naming the user's type:
+/// `struct vec4f {...}` is legal WGSL, and after it `vec4f` is that struct.
+/// Empty for any shader that shadows nothing, which is nearly all of them.
+///
+/// std-hashed like the sibling name sets in `core`; `FxHashSet` here would
+/// be a second hashbrown instantiation for `String` keys, and measurement
+/// separates none of the candidates.
+pub(super) type ShadowedAliases = std::collections::HashSet<String>;
+
+/// The suffix set mirrors [`scalar_short_suffix`] rather than WGSL's shorter
+/// one, so a new suffix cannot arrive on one side only; the unreachable
+/// spellings it admits (WGSL has no integer matrix) cost nothing.
+///
+/// Only alias spellings need reserving: the long forms (`vec4<f32>`,
+/// `array`, `f32`) are grammar or predeclared types naga refuses to see
+/// redeclared and then used.
+pub(super) fn is_predeclared_type_alias(name: &str) -> bool {
+    let suffix = |s: &u8| matches!(s, b'f' | b'h' | b'i' | b'u');
+    let dim = |c: &u8| (b'2'..=b'4').contains(c);
+    match name.as_bytes() {
+        [b'v', b'e', b'c', n, s] => dim(n) && suffix(s),
+        [b'm', b'a', b't', c, b'x', r, s] => dim(c) && dim(r) && suffix(s),
+        _ => false,
+    }
+}
+
+/// `short` unless shadowed, in which case the caller's long form stands.
+fn unshadowed(short: String, shadowed: &ShadowedAliases) -> Option<String> {
+    (!shadowed.contains(&short)).then_some(short)
+}
+
 /// Suffix of the predeclared `vec3f` / `mat2x2f` aliases; `None` for
 /// bool/i64/u64/f64, which have none.
 fn scalar_short_suffix(kind: naga::ScalarKind, width: u8) -> Option<&'static str> {
@@ -625,6 +657,7 @@ pub(super) fn type_resolution_name(
     module: &naga::Module,
     struct_names: &HandleMap<naga::Type, String>,
     override_names: &[String],
+    shadowed: &ShadowedAliases,
 ) -> Result<String, Error> {
     match resolution {
         TypeResolution::Handle(h) => {
@@ -636,6 +669,7 @@ pub(super) fn type_resolution_name(
                 module,
                 struct_names,
                 override_names,
+                shadowed,
             )
         }
         TypeResolution::Value(inner) => {
@@ -649,24 +683,30 @@ pub(super) fn type_resolution_name(
             }) {
                 return Ok(name);
             }
-            type_inner_name(inner, module, struct_names, override_names)
+            type_inner_name(inner, module, struct_names, override_names, shadowed)
         }
     }
 }
 
 /// WGSL name of a [`naga::TypeInner`], aliases substituted where a handle
-/// has one.
+/// has one and `shadowed` has not claimed the spelling.  `shadowed` is
+/// module-wide though a function-local shadows only inside its function: a
+/// spelling that varied by function would be harder to reason about than the
+/// few characters it saves in a shader that already collides.
 pub(super) fn type_inner_name(
     inner: &naga::TypeInner,
     module: &naga::Module,
     struct_names: &HandleMap<naga::Type, String>,
     override_names: &[String],
+    shadowed: &ShadowedAliases,
 ) -> Result<String, Error> {
     Ok(match inner {
         naga::TypeInner::Scalar(s) => scalar_name(s.kind, s.width)?.to_string(),
         naga::TypeInner::Vector { size, scalar } => {
-            match scalar_short_suffix(scalar.kind, scalar.width) {
-                Some(suffix) => format!("vec{}{}", vector_size_num(*size), suffix),
+            match scalar_short_suffix(scalar.kind, scalar.width)
+                .and_then(|s| unshadowed(format!("vec{}{}", vector_size_num(*size), s), shadowed))
+            {
+                Some(short) => short,
                 None => format!(
                     "vec{}<{}>",
                     vector_size_num(*size),
@@ -678,13 +718,18 @@ pub(super) fn type_inner_name(
             columns,
             rows,
             scalar,
-        } => match scalar_short_suffix(scalar.kind, scalar.width) {
-            Some(suffix) => format!(
-                "mat{}x{}{}",
-                vector_size_num(*columns),
-                vector_size_num(*rows),
-                suffix
-            ),
+        } => match scalar_short_suffix(scalar.kind, scalar.width).and_then(|s| {
+            unshadowed(
+                format!(
+                    "mat{}x{}{}",
+                    vector_size_num(*columns),
+                    vector_size_num(*rows),
+                    s
+                ),
+                shadowed,
+            )
+        }) {
+            Some(short) => short,
             None => format!(
                 "mat{}x{}<{}>",
                 vector_size_num(*columns),
@@ -699,7 +744,7 @@ pub(super) fn type_inner_name(
             format!(
                 "ptr<{},{}{}>",
                 address_space(*space),
-                type_ref_from_handle(*base, module, struct_names, override_names)?,
+                type_ref_from_handle(*base, module, struct_names, override_names, shadowed)?,
                 pointer_access_suffix(*space)
             )
         }
@@ -709,8 +754,10 @@ pub(super) fn type_inner_name(
             space,
         } => {
             let value_ty = match size {
-                Some(v) => match scalar_short_suffix(scalar.kind, scalar.width) {
-                    Some(suffix) => format!("vec{}{}", vector_size_num(*v), suffix),
+                Some(v) => match scalar_short_suffix(scalar.kind, scalar.width)
+                    .and_then(|s| unshadowed(format!("vec{}{}", vector_size_num(*v), s), shadowed))
+                {
+                    Some(short) => short,
                     None => format!(
                         "vec{}<{}>",
                         vector_size_num(*v),
@@ -727,7 +774,8 @@ pub(super) fn type_inner_name(
             )
         }
         naga::TypeInner::Array { base, size, .. } => {
-            let base_ty = type_ref_from_handle(*base, module, struct_names, override_names)?;
+            let base_ty =
+                type_ref_from_handle(*base, module, struct_names, override_names, shadowed)?;
             match size {
                 naga::ArraySize::Constant(n) => format!("array<{},{}>", base_ty, n.get()),
                 naga::ArraySize::Dynamic => format!("array<{}>", base_ty),
@@ -754,7 +802,8 @@ pub(super) fn type_inner_name(
             }
         }
         naga::TypeInner::BindingArray { base, size } => {
-            let base_ty = type_ref_from_handle(*base, module, struct_names, override_names)?;
+            let base_ty =
+                type_ref_from_handle(*base, module, struct_names, override_names, shadowed)?;
             match size {
                 naga::ArraySize::Constant(n) => format!("binding_array<{},{}>", base_ty, n.get()),
                 naga::ArraySize::Dynamic => format!("binding_array<{}>", base_ty),
@@ -781,7 +830,10 @@ pub(super) fn type_inner_name(
             }
         }
         _ => {
-            return Err(Error::Emit(format!("unsupported type: {:?}", inner,)));
+            return Err(Error::Emit(format!(
+                "unsupported type: {}",
+                type_inner_kind(inner)
+            )));
         }
     })
 }
@@ -792,6 +844,7 @@ pub(super) fn type_ref_from_handle(
     module: &naga::Module,
     struct_names: &HandleMap<naga::Type, String>,
     override_names: &[String],
+    shadowed: &ShadowedAliases,
 ) -> Result<String, Error> {
     if let Some(name) = struct_names.get(ty) {
         return Ok(name.clone());
@@ -801,7 +854,105 @@ pub(super) fn type_ref_from_handle(
         module,
         struct_names,
         override_names,
+        shadowed,
     )
+}
+
+// MARK: Diagnostic names
+
+// Variant names for "cannot emit this" errors, so those messages never
+// `{:?}` the value: deriving `Debug` for `naga::Expression` / `Statement` /
+// `TypeInner` drags the whole recursive formatter into the binary (33 KB
+// native) to serve paths that already fall back to naga's emitter, and a
+// variant name beats the multi-line tree dump as a diagnostic anyway.
+
+pub(super) fn expression_kind(expression: &naga::Expression) -> &'static str {
+    use naga::Expression as E;
+    match expression {
+        E::Literal(_) => "Literal",
+        E::Constant(_) => "Constant",
+        E::Override(_) => "Override",
+        E::ZeroValue(_) => "ZeroValue",
+        E::Compose { .. } => "Compose",
+        E::Access { .. } => "Access",
+        E::AccessIndex { .. } => "AccessIndex",
+        E::Splat { .. } => "Splat",
+        E::Swizzle { .. } => "Swizzle",
+        E::FunctionArgument(_) => "FunctionArgument",
+        E::GlobalVariable(_) => "GlobalVariable",
+        E::LocalVariable(_) => "LocalVariable",
+        E::Load { .. } => "Load",
+        E::ImageSample { .. } => "ImageSample",
+        E::ImageLoad { .. } => "ImageLoad",
+        E::ImageQuery { .. } => "ImageQuery",
+        E::Unary { .. } => "Unary",
+        E::Binary { .. } => "Binary",
+        E::Select { .. } => "Select",
+        E::Derivative { .. } => "Derivative",
+        E::Relational { .. } => "Relational",
+        E::Math { .. } => "Math",
+        E::As { .. } => "As",
+        E::CallResult(_) => "CallResult",
+        E::AtomicResult { .. } => "AtomicResult",
+        E::WorkGroupUniformLoadResult { .. } => "WorkGroupUniformLoadResult",
+        E::ArrayLength(_) => "ArrayLength",
+        E::RayQueryProceedResult => "RayQueryProceedResult",
+        E::RayQueryGetIntersection { .. } => "RayQueryGetIntersection",
+        E::RayQueryVertexPositions { .. } => "RayQueryVertexPositions",
+        E::SubgroupBallotResult => "SubgroupBallotResult",
+        E::SubgroupOperationResult { .. } => "SubgroupOperationResult",
+        E::CooperativeLoad { .. } => "CooperativeLoad",
+        E::CooperativeMultiplyAdd { .. } => "CooperativeMultiplyAdd",
+    }
+}
+
+pub(super) fn statement_kind(statement: &naga::Statement) -> &'static str {
+    use naga::Statement as S;
+    match statement {
+        S::Emit(_) => "Emit",
+        S::Block(_) => "Block",
+        S::If { .. } => "If",
+        S::Switch { .. } => "Switch",
+        S::Loop { .. } => "Loop",
+        S::Break => "Break",
+        S::Continue => "Continue",
+        S::Return { .. } => "Return",
+        S::Kill => "Kill",
+        S::ControlBarrier(_) => "ControlBarrier",
+        S::MemoryBarrier(_) => "MemoryBarrier",
+        S::Store { .. } => "Store",
+        S::ImageStore { .. } => "ImageStore",
+        S::Atomic { .. } => "Atomic",
+        S::ImageAtomic { .. } => "ImageAtomic",
+        S::WorkGroupUniformLoad { .. } => "WorkGroupUniformLoad",
+        S::Call { .. } => "Call",
+        S::RayQuery { .. } => "RayQuery",
+        S::RayPipelineFunction(_) => "RayPipelineFunction",
+        S::SubgroupBallot { .. } => "SubgroupBallot",
+        S::SubgroupGather { .. } => "SubgroupGather",
+        S::SubgroupCollectiveOperation { .. } => "SubgroupCollectiveOperation",
+        S::CooperativeStore { .. } => "CooperativeStore",
+    }
+}
+
+pub(super) fn type_inner_kind(inner: &naga::TypeInner) -> &'static str {
+    use naga::TypeInner as T;
+    match inner {
+        T::Scalar(_) => "Scalar",
+        T::Vector { .. } => "Vector",
+        T::Matrix { .. } => "Matrix",
+        T::Atomic(_) => "Atomic",
+        T::Pointer { .. } => "Pointer",
+        T::ValuePointer { .. } => "ValuePointer",
+        T::Array { .. } => "Array",
+        T::Struct { .. } => "Struct",
+        T::Image { .. } => "Image",
+        T::Sampler { .. } => "Sampler",
+        T::AccelerationStructure { .. } => "AccelerationStructure",
+        T::RayQuery { .. } => "RayQuery",
+        T::BindingArray { .. } => "BindingArray",
+        T::CooperativeMatrix { .. } => "CooperativeMatrix",
+    }
 }
 
 // MARK: Attribute and qualifier rendering

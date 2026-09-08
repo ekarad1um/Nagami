@@ -3,10 +3,10 @@
 //! splat elision, single-use inlining).  The pipeline ([`crate::run`]) falls
 //! back to naga's emitter when this one errors or its output fails validation,
 //! so the custom path only optimises the happy case.  `syntax` holds grammar
-//! constants, `core` the `Generator` state and options, `cost` the shared
-//! byte pricing, `literal_extract` the repeated-literal `const` extraction,
-//! `const_hazard` the tint const-expression guard, and `expr_emit` /
-//! `stmt_emit` / `module_emit` one emitter per IR scope.
+//! constants, `core` the `Generator` state and options, `literal_extract` the
+//! repeated-literal `const` extraction, `const_hazard` the tint
+//! const-expression guard, and `expr_emit` / `stmt_emit` / `module_emit` one
+//! emitter per IR scope.
 
 mod const_hazard;
 mod core;

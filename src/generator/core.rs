@@ -80,6 +80,8 @@ pub(super) struct Generator<'a> {
     pub(super) override_names: Vec<String>,
     pub(super) global_names: Vec<String>,
     pub(super) function_names: Vec<String>,
+    /// See [`super::syntax::ShadowedAliases`].
+    pub(super) shadowed_type_aliases: super::syntax::ShadowedAliases,
     pub(super) extracted_literals: FxHashMap<LiteralExtractKey, String>,
     /// `(alias_name, type_string)` alias declarations awaiting emission.
     pub(super) type_alias_decls: Vec<(String, String)>,
@@ -216,6 +218,71 @@ impl<'a, 'm> FunctionCtx<'a, 'm> {
                 return name;
             }
         }
+    }
+}
+
+/// Every module-scope identifier as the output SPELLS it - renamed
+/// declarations, entry points, and the preserve / preamble list, whose pruned
+/// bindings are in no arena yet stand in the consumer's spliced text.  Not
+/// `name_gen::module_scope_names`, which censuses the IR's source names.
+///
+/// The three name decisions - which alias spellings are taken, and what a
+/// minted `alias` or `let` must dodge - all start here and chain on what
+/// each alone adds, so none can drift from the others.
+fn emitted_module_names<'a>(
+    module: &'a naga::Module,
+    options: &'a GenerateOptions,
+    type_names: &'a HandleMap<naga::Type, String>,
+    constant_names: &'a [String],
+    override_names: &'a [String],
+    global_names: &'a [String],
+    function_names: &'a [String],
+) -> impl Iterator<Item = &'a str> + 'a {
+    type_names
+        .values()
+        .chain(constant_names)
+        .chain(override_names)
+        .chain(global_names)
+        .chain(function_names)
+        .chain(module.entry_points.iter().map(|ep| &ep.name))
+        .map(String::as_str)
+        .chain(options.preserve_symbols.iter().map(String::as_str))
+}
+
+/// [`emitted_module_names`] plus the function-locals that shadow them.
+fn emitted_names<'a>(
+    module: &'a naga::Module,
+    options: &'a GenerateOptions,
+    type_names: &'a HandleMap<naga::Type, String>,
+    constant_names: &'a [String],
+    override_names: &'a [String],
+    global_names: &'a [String],
+    function_names: &'a [String],
+) -> impl Iterator<Item = &'a str> + 'a {
+    emitted_module_names(
+        module,
+        options,
+        type_names,
+        constant_names,
+        override_names,
+        global_names,
+        function_names,
+    )
+    .chain(all_functions(module).flat_map(crate::name_gen::function_local_names))
+}
+
+impl<'a> Generator<'a> {
+    /// [`emitted_module_names`] over a constructed generator's own tables.
+    pub(super) fn emitted_module_names(&self) -> impl Iterator<Item = &str> + '_ {
+        emitted_module_names(
+            self.module,
+            &self.options,
+            &self.type_names,
+            &self.constant_names,
+            &self.override_names,
+            &self.global_names,
+            &self.function_names,
+        )
     }
 }
 
@@ -859,29 +926,28 @@ impl<'a> Generator<'a> {
         let live_constants = compute_live_constants(module, &options.preserve_symbols);
         let live_types = compute_live_types(module, &live_constants, &defer_cache);
 
+        let in_scope = || {
+            emitted_names(
+                module,
+                &options,
+                &type_names,
+                &constant_names,
+                &override_names,
+                &global_names,
+                &function_names,
+            )
+        };
+
+        let shadowed_type_aliases: super::syntax::ShadowedAliases = in_scope()
+            .filter(|name| super::syntax::is_predeclared_type_alias(name))
+            .map(str::to_owned)
+            .collect();
+
         let type_alias_decls = if options.type_alias {
             let ref_counts =
                 count_type_handle_refs(module, &live_constants, &live_types, &defer_cache);
 
-            // Every name in use, function-local ones included: a same-named
-            // local would shadow the alias inside its function.
-            let mut alias_used: HashSet<String> = HashSet::new();
-            alias_used.extend(type_names.values().cloned());
-            alias_used.extend(constant_names.iter().cloned());
-            alias_used.extend(override_names.iter().cloned());
-            alias_used.extend(global_names.iter().cloned());
-            alias_used.extend(function_names.iter().cloned());
-            alias_used.extend(module.entry_points.iter().map(|ep| ep.name.clone()));
-            // Preserve-listed / preamble names may be absent from every arena (a
-            // pruned preamble binding) yet exist in the consumer's spliced
-            // document; reserve them so a minted alias cannot shadow or
-            // redeclare one.
-            alias_used.extend(options.preserve_symbols.iter().cloned());
-            alias_used.extend(
-                all_functions(module)
-                    .flat_map(crate::name_gen::function_local_names)
-                    .map(str::to_owned),
-            );
+            let mut alias_used: HashSet<String> = in_scope().map(str::to_owned).collect();
 
             let mut alias_counter = 0usize;
             let mut decls: Vec<(String, String)> = Vec::new();
@@ -931,6 +997,7 @@ impl<'a> Generator<'a> {
                     module,
                     &type_names,
                     &override_names,
+                    &shadowed_type_aliases,
                 ) {
                     Ok(s) => s,
                     Err(_) => continue,
@@ -967,6 +1034,7 @@ impl<'a> Generator<'a> {
             override_names,
             global_names,
             function_names,
+            shadowed_type_aliases,
             extracted_literals: Default::default(),
             type_alias_decls,
             expr_to_const: Default::default(),

@@ -5,6 +5,7 @@
 use crate::error::Error;
 
 use super::core::{FunctionCtx, Generator};
+use super::syntax::{expression_kind, statement_kind};
 use crate::handle_set::{HandleMap, HandleSet};
 
 /// Rewrite a function-tail statement so its arms no longer end in a void
@@ -1001,9 +1002,13 @@ impl<'a> Generator<'a> {
             // Bind a tint-rejected const-expression's operand first so the
             // consumer evaluates at runtime as the input did (`const_hazard`).
             if ctx.ref_counts[h.index()] > 0
-                && let Some(operand) =
-                    super::const_hazard::creation_error_operand(self.module, ctx, h)
-                        .or_else(|| super::const_hazard::msl_cast_ambiguity_operand(ctx, h))
+                && let Some(operand) = super::const_hazard::creation_error_operand(
+                    self.module,
+                    ctx,
+                    h,
+                    &self.options.float_precision,
+                )
+                .or_else(|| super::const_hazard::msl_cast_ambiguity_operand(ctx, h))
                 && !ctx.expr_names.contains_key(operand)
             {
                 if emitted_any {
@@ -1381,8 +1386,8 @@ impl<'a> Generator<'a> {
         debug_assert!(
             matches!(ctx.exprs[*query], naga::Expression::LocalVariable(_)),
             "Statement::RayQuery.query must be a LocalVariable per \
-                     naga's validator; got {:?}",
-            ctx.exprs[*query]
+                     naga's validator; got {}",
+            expression_kind(&ctx.exprs[*query])
         );
         let query_text = self.emit_expr(*query, ctx)?;
         match fun {
@@ -1728,8 +1733,12 @@ impl<'a> Generator<'a> {
             }
         }
         for h in cone {
-            if let Some(operand) = super::const_hazard::creation_error_operand(self.module, ctx, h)
-                && !ctx.expr_names.contains_key(operand)
+            if let Some(operand) = super::const_hazard::creation_error_operand(
+                self.module,
+                ctx,
+                h,
+                &self.options.float_precision,
+            ) && !ctx.expr_names.contains_key(operand)
             {
                 self.push_indent();
                 self.emit_const_hazard_binding(operand, ctx)?;
@@ -1997,8 +2006,9 @@ impl<'a> Generator<'a> {
             _ => {
                 return Err(Error::Emit(format!(
                     "unsupported statement in for-loop update clause \
-                     in function '{}': {:?}",
-                    ctx.display_name, stmt,
+                     in function '{}': {}",
+                    ctx.display_name,
+                    statement_kind(stmt),
                 )));
             }
         }

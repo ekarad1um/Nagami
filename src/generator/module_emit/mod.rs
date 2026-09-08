@@ -538,17 +538,13 @@ impl<'a> Generator<'a> {
             has_prev_section = true;
         }
 
-        let mut module_used_names = std::collections::HashSet::new();
-        module_used_names.extend(self.type_names.values().cloned());
-        module_used_names.extend(self.constant_names.iter().cloned());
-        module_used_names.extend(self.override_names.iter().cloned());
-        module_used_names.extend(self.global_names.iter().cloned());
-        module_used_names.extend(self.function_names.iter().cloned());
-        module_used_names.extend(self.module.entry_points.iter().map(|ep| ep.name.clone()));
+        // Preserved names are in scope because a `let` shadowing one is legal
+        // but would leave the name map unable to account for the extra
+        // occurrences.  Function-locals are not: `local_used_names` tracks the
+        // ones actually in scope.
+        let mut module_used_names: std::collections::HashSet<String> =
+            self.emitted_module_names().map(str::to_owned).collect();
         module_used_names.extend(self.extracted_literals.values().cloned());
-        // A `let` may legally shadow a preserved module-scope name, but the
-        // name map would not account for the extra occurrences.
-        module_used_names.extend(self.options.preserve_symbols.iter().cloned());
 
         let num_functions = self.module.functions.len();
 

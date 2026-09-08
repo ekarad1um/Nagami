@@ -1,7 +1,7 @@
 //! Call purity and single-use call-inlining analysis.
 
-use super::local_resolve::resolve_local_var;
 use crate::handle_set::{HandleMap, HandleSet};
+use crate::passes::expr_util::root_local_var;
 use crate::passes::expr_util::visit_expression_children;
 use rustc_hash::FxHashSet;
 
@@ -45,7 +45,7 @@ fn collect_loaded_locals(
     }
     match &expressions[expr] {
         naga::Expression::Load { pointer } => {
-            if let Some(local) = resolve_local_var(*pointer, expressions) {
+            if let Some(local) = root_local_var(*pointer, expressions) {
                 out.insert(local);
             }
         }
@@ -54,7 +54,7 @@ fn collect_loaded_locals(
         naga::Expression::LocalVariable(_)
         | naga::Expression::Access { .. }
         | naga::Expression::AccessIndex { .. } => {
-            if let Some(local) = resolve_local_var(expr, expressions) {
+            if let Some(local) = root_local_var(expr, expressions) {
                 out.insert(local);
             }
         }
@@ -368,7 +368,7 @@ fn find_inlineable_calls_in_block(
                 // Only pending calls whose arguments read local `L` are
                 // re-evaluated after a store to `L`; a non-local store is
                 // observable by any callee, so clear everything.
-                if let Some(stored) = resolve_local_var(*pointer, expressions) {
+                if let Some(stored) = root_local_var(*pointer, expressions) {
                     pending.retain(|p| !p.reads_locals.contains(stored));
                 } else {
                     pending.clear();

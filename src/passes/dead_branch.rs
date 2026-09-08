@@ -31,7 +31,7 @@ use rustc_hash::FxHashMap;
 
 use super::expr_util::{
     has_negative_zero_leaf, is_bool_false, is_bool_true, literal_bit_eq, nested_blocks,
-    nested_blocks_mut,
+    nested_blocks_mut, root_local_var,
 };
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
@@ -362,7 +362,7 @@ fn remove_forwarded_stores(
     *block = rebuilt;
 }
 
-use super::load_dedup::{collect_modified_locals, get_stored_local, is_zero_literal};
+use super::load_dedup::{collect_modified_locals, is_zero_literal};
 use super::scoped_map::ScopedMap;
 use crate::handle_set::{HandleMap, HandleSet};
 
@@ -1197,103 +1197,32 @@ fn case_body_has_bare_break(cases: &[naga::SwitchCase], start_idx: usize) -> boo
     false
 }
 
-/// A bare `Break` or `Continue` targeting the immediately enclosing loop.
-/// In naga IR `Break` exits the innermost `Loop` OR `Switch` while
-/// `Continue` targets only the innermost `Loop`, so `Loop` is never
-/// entered and `Switch` only for `Continue`.
-fn contains_bare_loop_control(block: &naga::Block) -> bool {
-    for stmt in block.iter() {
-        match stmt {
-            naga::Statement::Break | naga::Statement::Continue => return true,
-            naga::Statement::Block(inner) => {
-                if contains_bare_loop_control(inner) {
-                    return true;
-                }
-            }
-            naga::Statement::If { accept, reject, .. } => {
-                if contains_bare_loop_control(accept) || contains_bare_loop_control(reject) {
-                    return true;
-                }
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    if contains_bare_continue(&case.body) {
-                        return true;
-                    }
-                }
-            }
-            naga::Statement::Loop { .. } => {}
-            // No catch-all: a new block-bearing naga variant must fail to
-            // compile here.
-            naga::Statement::Emit(_)
-            | naga::Statement::Store { .. }
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Call { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
+/// Search `block` for a bare `Break` / `Continue` bound to the enclosing
+/// loop, descending only through constructs that do not rebind them: a
+/// `Loop` rebinds both, a `Switch` rebinds `Break` but not `Continue`.
+/// Everything else delegates its descent to `nested_blocks`, so a new
+/// block-bearing naga variant is entered by construction.
+fn contains_loop_control(block: &naga::Block, want_break: bool, want_continue: bool) -> bool {
+    block.iter().any(|stmt| match stmt {
+        naga::Statement::Break => want_break,
+        naga::Statement::Continue => want_continue,
+        naga::Statement::Loop { .. } => false,
+        naga::Statement::Switch { cases, .. } => {
+            want_continue
+                && cases
+                    .iter()
+                    .any(|case| contains_loop_control(&case.body, false, true))
         }
-    }
-    false
+        _ => nested_blocks(stmt)
+            .any(|nested| contains_loop_control(nested, want_break, want_continue)),
+    })
 }
 
-/// A bare `Continue` targeting the enclosing loop; `Switch` does not capture
-/// `Continue`, so cases are entered.
-fn contains_bare_continue(block: &naga::Block) -> bool {
-    for stmt in block.iter() {
-        match stmt {
-            naga::Statement::Continue => return true,
-            naga::Statement::Block(inner) => {
-                if contains_bare_continue(inner) {
-                    return true;
-                }
-            }
-            naga::Statement::If { accept, reject, .. } => {
-                if contains_bare_continue(accept) || contains_bare_continue(reject) {
-                    return true;
-                }
-            }
-            naga::Statement::Switch { cases, .. } => {
-                for case in cases {
-                    if contains_bare_continue(&case.body) {
-                        return true;
-                    }
-                }
-            }
-            naga::Statement::Loop { .. } => {}
-            // No catch-all: a new block-bearing naga variant must fail to
-            // compile here.
-            naga::Statement::Emit(_)
-            | naga::Statement::Store { .. }
-            | naga::Statement::Break
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Call { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
-        }
-    }
-    false
+/// A bare `Break` or `Continue` targeting the immediately enclosing loop.
+fn contains_bare_loop_control(block: &naga::Block) -> bool {
+    contains_loop_control(
+        block, /*want_break=*/ true, /*want_continue=*/ true,
+    )
 }
 
 /// A bare `Break` targeting the immediately enclosing `Switch` or `Loop`.
@@ -1302,43 +1231,9 @@ fn contains_bare_continue(block: &naga::Block) -> bool {
 /// code with the PRE-break cache state the fall-off-the-end meet never
 /// sees).
 pub(crate) fn contains_bare_break(block: &naga::Block) -> bool {
-    for stmt in block.iter() {
-        match stmt {
-            naga::Statement::Break => return true,
-            naga::Statement::Block(inner) => {
-                if contains_bare_break(inner) {
-                    return true;
-                }
-            }
-            naga::Statement::If { accept, reject, .. } => {
-                if contains_bare_break(accept) || contains_bare_break(reject) {
-                    return true;
-                }
-            }
-            naga::Statement::Loop { .. } | naga::Statement::Switch { .. } => {}
-            // No catch-all: a new block-bearing naga variant must fail to
-            // compile here.
-            naga::Statement::Emit(_)
-            | naga::Statement::Store { .. }
-            | naga::Statement::Continue
-            | naga::Statement::Return { .. }
-            | naga::Statement::Kill
-            | naga::Statement::ControlBarrier(_)
-            | naga::Statement::MemoryBarrier(_)
-            | naga::Statement::ImageStore { .. }
-            | naga::Statement::ImageAtomic { .. }
-            | naga::Statement::Call { .. }
-            | naga::Statement::Atomic { .. }
-            | naga::Statement::RayQuery { .. }
-            | naga::Statement::RayPipelineFunction(_)
-            | naga::Statement::WorkGroupUniformLoad { .. }
-            | naga::Statement::SubgroupBallot { .. }
-            | naga::Statement::SubgroupGather { .. }
-            | naga::Statement::SubgroupCollectiveOperation { .. }
-            | naga::Statement::CooperativeStore { .. } => {}
-        }
-    }
-    false
+    contains_loop_control(
+        block, /*want_break=*/ true, /*want_continue=*/ false,
+    )
 }
 
 /// A `Return` at ANY depth, nested loops and switches included: it exits
@@ -1770,7 +1665,7 @@ fn eliminate_redundant_else_stores(
                     } else {
                         known_values.remove(&lh);
                     }
-                } else if let Some(lh) = get_stored_local(expressions, *pointer) {
+                } else if let Some(lh) = root_local_var(*pointer, expressions) {
                     // Partial store: value unknown.
                     known_values.remove(&lh);
                     fresh_loads.remove(lh);
@@ -1851,7 +1746,7 @@ fn eliminate_redundant_else_stores(
 
             // Pointer writes by callees / atomics / ray / cooperative ops.
             other => super::expr_util::visit_statement_write_pointers(other, &mut |p| {
-                if let Some(lh) = get_stored_local(expressions, p) {
+                if let Some(lh) = root_local_var(p, expressions) {
                     known_values.remove(&lh);
                     fresh_loads.remove(lh);
                 }

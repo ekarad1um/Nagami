@@ -1,18 +1,7 @@
-//! Local-variable reference resolution: root a pointer chain at its
-//! function-local and detect whether statements reference a given local.
+//! Whether statements reference a given function-local; the pointer-chain
+//! root itself comes from [`crate::passes::expr_util::root_local_var`].
 
-pub(super) fn resolve_local_var(
-    expr: naga::Handle<naga::Expression>,
-    expressions: &naga::Arena<naga::Expression>,
-) -> Option<naga::Handle<naga::LocalVariable>> {
-    match &expressions[expr] {
-        naga::Expression::LocalVariable(lh) => Some(*lh),
-        naga::Expression::AccessIndex { base, .. } | naga::Expression::Access { base, .. } => {
-            resolve_local_var(*base, expressions)
-        }
-        _ => None,
-    }
-}
+use crate::passes::expr_util::root_local_var;
 
 /// `true` when any statement in `stmts` reads or writes `local`, access chains
 /// and nested blocks included.  Gates the deferred-var `Store` + `Loop`
@@ -39,7 +28,7 @@ fn local_var_in_block(
 }
 
 /// A value read is a `Load` in an `Emit` range; every other reference is a
-/// pointer operand, which `resolve_local_var` roots (value operands root
+/// pointer operand, which `root_local_var` roots (value operands root
 /// nothing).
 fn local_var_in_stmt(
     stmt: &naga::Statement,
@@ -49,12 +38,12 @@ fn local_var_in_stmt(
     if let naga::Statement::Emit(range) = stmt {
         return range.clone().any(|h| {
             matches!(&expressions[h], naga::Expression::Load { pointer }
-                    if resolve_local_var(*pointer, expressions) == Some(local))
+                    if root_local_var(*pointer, expressions) == Some(local))
         });
     }
     let mut hit = false;
     crate::passes::expr_util::visit_statement_operands(stmt, false, &mut |h| {
-        hit |= resolve_local_var(h, expressions) == Some(local);
+        hit |= root_local_var(h, expressions) == Some(local);
     });
     hit || crate::passes::expr_util::nested_blocks(stmt)
         .any(|block| local_var_in_block(block, local, expressions))

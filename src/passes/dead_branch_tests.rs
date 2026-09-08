@@ -576,8 +576,8 @@ fn fs(@location(0) v: i32) -> @location(0) vec4f {
     });
     assert!(loop_body.is_some());
     assert!(
-        contains_bare_continue(loop_body.unwrap()),
-        "continue inside switch should be detected by contains_bare_continue"
+        contains_loop_control(loop_body.unwrap(), false, true),
+        "continue inside switch should be detected by the continue-only search"
     );
     assert!(
         contains_bare_loop_control(loop_body.unwrap()),
@@ -613,7 +613,7 @@ fn fs() -> @location(0) vec4f {
     });
     assert!(outer_loop_body.is_some());
     assert!(
-        !contains_bare_continue(outer_loop_body.unwrap()),
+        !contains_loop_control(outer_loop_body.unwrap(), false, true),
         "continue inside nested loop should NOT be detected"
     );
 }

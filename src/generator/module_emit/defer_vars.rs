@@ -3,13 +3,13 @@
 //! is provably dead there), and which loop counters can be absorbed
 //! into a `for` header.
 
-use super::local_resolve::resolve_local_var;
 use crate::handle_set::HandleSet;
+use crate::passes::expr_util::root_local_var;
 
 /// Mark in `seen` every local `block` references anywhere in its subtree.  A
 /// value read is a `Load` in an `Emit` range (`expr_reads`); every other
 /// reference is a pointer chain in a statement operand, which
-/// `resolve_local_var` roots (value operands root nothing).
+/// `root_local_var` roots (value operands root nothing).
 fn collect_block_local_refs(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
@@ -25,7 +25,7 @@ fn collect_block_local_refs(
             }
         }
         other => crate::passes::expr_util::visit_statement_operands(other, false, &mut |h| {
-            if let Some(lh) = resolve_local_var(h, expressions) {
+            if let Some(lh) = root_local_var(h, expressions) {
                 seen[lh.index()] = true;
             }
         }),
@@ -50,7 +50,7 @@ pub(in crate::generator) fn find_deferrable_vars(func: &naga::Function) -> (Vec<
     let mut expr_reads: Vec<Option<naga::Handle<naga::LocalVariable>>> = vec![None; expr_len];
     for (eh, expr) in func.expressions.iter() {
         if let E::Load { pointer } = *expr
-            && let Some(lh) = resolve_local_var(pointer, &func.expressions)
+            && let Some(lh) = root_local_var(pointer, &func.expressions)
         {
             expr_reads[eh.index()] = Some(lh);
         }
@@ -116,7 +116,7 @@ fn scan_block_deferrable_vars(
                         result[lh.index()] = true;
                     }
                     seen[lh.index()] = true;
-                } else if let Some(lh) = resolve_local_var(*pointer, expressions) {
+                } else if let Some(lh) = root_local_var(*pointer, expressions) {
                     // An indirect store never defers, but marks the variable seen.
                     if candidates[lh.index()] {
                         seen[lh.index()] = true;
@@ -125,7 +125,7 @@ fn scan_block_deferrable_vars(
             }
             other => {
                 crate::passes::expr_util::visit_statement_operands(other, false, &mut |h| {
-                    if let Some(lh) = resolve_local_var(h, expressions)
+                    if let Some(lh) = root_local_var(h, expressions)
                         && candidates[lh.index()]
                     {
                         seen[lh.index()] = true;
@@ -239,7 +239,7 @@ pub(super) fn find_for_loop_vars(
     let mut expr_reads: Vec<Option<naga::Handle<naga::LocalVariable>>> = vec![None; expr_len];
     for (eh, expr) in func.expressions.iter() {
         if let E::Load { pointer } = *expr
-            && let Some(lh) = resolve_local_var(pointer, &func.expressions)
+            && let Some(lh) = root_local_var(pointer, &func.expressions)
         {
             expr_reads[eh.index()] = Some(lh);
         }
@@ -295,7 +295,7 @@ fn compute_block_ownership(
                 }
             }
             other => crate::passes::expr_util::visit_statement_operands(other, false, &mut |h| {
-                if let Some(lh) = resolve_local_var(h, expressions) {
+                if let Some(lh) = root_local_var(h, expressions) {
                     mark_owner(&mut ref_owner, lh.index(), idx);
                 }
             }),

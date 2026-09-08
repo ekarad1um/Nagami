@@ -90,8 +90,11 @@ impl<T> HandleSet<T> {
     }
 
     /// Members in first-insertion order.
-    pub fn iter(&self) -> impl Iterator<Item = &Handle<T>> + '_ {
-        self.order.iter().filter(|h| self.contains(*h))
+    pub fn iter(&self) -> SetIter<'_, T> {
+        SetIter {
+            order: self.order.iter(),
+            flags: &self.flags,
+        }
     }
 
     pub fn intersection<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = &'a Handle<T>> + 'a {
@@ -115,6 +118,23 @@ impl<T> HandleSet<T> {
     }
 }
 
+/// [`HandleSet::iter`].  A named type rather than `impl Iterator` so
+/// `for h in &set` needs no boxed trait object: the erased form cost a heap
+/// allocation per loop on walks that run per statement.
+pub struct SetIter<'a, T> {
+    order: std::slice::Iter<'a, Handle<T>>,
+    flags: &'a [u8],
+}
+
+impl<'a, T> Iterator for SetIter<'a, T> {
+    type Item = &'a Handle<T>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let flags = self.flags;
+        self.order
+            .find(|h| flags.get(h.index()).is_some_and(|f| f & PRESENT != 0))
+    }
+}
+
 impl<T> Extend<Handle<T>> for HandleSet<T> {
     fn extend<I: IntoIterator<Item = Handle<T>>>(&mut self, iter: I) {
         for h in iter {
@@ -134,9 +154,9 @@ impl<T> IntoIterator for HandleSet<T> {
 
 impl<'a, T> IntoIterator for &'a HandleSet<T> {
     type Item = &'a Handle<T>;
-    type IntoIter = Box<dyn Iterator<Item = &'a Handle<T>> + 'a>;
+    type IntoIter = SetIter<'a, T>;
     fn into_iter(self) -> Self::IntoIter {
-        Box::new(self.iter())
+        self.iter()
     }
 }
 
@@ -277,10 +297,11 @@ impl<T, V> HandleMap<T, V> {
     }
 
     /// Entries in first-insertion order.
-    pub fn iter(&self) -> impl Iterator<Item = (&Handle<T>, &V)> + '_ {
-        self.order
-            .iter()
-            .filter_map(|h| self.get(h).map(|v| (h, v)))
+    pub fn iter(&self) -> MapIter<'_, T, V> {
+        MapIter {
+            order: self.order.iter(),
+            slots: &self.slots,
+        }
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &Handle<T>> + '_ {
@@ -325,6 +346,21 @@ impl<T, V> HandleMap<T, V> {
     }
 }
 
+/// [`HandleMap::iter`]; named for the same reason as [`SetIter`].
+pub struct MapIter<'a, T, V> {
+    order: std::slice::Iter<'a, Handle<T>>,
+    slots: &'a [Option<V>],
+}
+
+impl<'a, T, V> Iterator for MapIter<'a, T, V> {
+    type Item = (&'a Handle<T>, &'a V);
+    fn next(&mut self) -> Option<Self::Item> {
+        let slots = self.slots;
+        self.order
+            .find_map(|h| slots.get(h.index())?.as_ref().map(|v| (h, v)))
+    }
+}
+
 impl<T, V> std::ops::Index<Handle<T>> for HandleMap<T, V> {
     type Output = V;
     fn index(&self, handle: Handle<T>) -> &V {
@@ -362,9 +398,9 @@ impl<T, V> IntoIterator for HandleMap<T, V> {
 
 impl<'a, T, V> IntoIterator for &'a HandleMap<T, V> {
     type Item = (&'a Handle<T>, &'a V);
-    type IntoIter = Box<dyn Iterator<Item = (&'a Handle<T>, &'a V)> + 'a>;
+    type IntoIter = MapIter<'a, T, V>;
     fn into_iter(self) -> Self::IntoIter {
-        Box::new(self.iter())
+        self.iter()
     }
 }
 

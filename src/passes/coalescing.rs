@@ -378,6 +378,27 @@ fn mark_block_first(
     }
 }
 
+/// A read of `local`'s existing bytes - every non-`Store` pointer use is one:
+/// widen the live range, run the first-touch gate, and refuse coalescing
+/// unless the bytes `spec` names are written on every reaching path, since
+/// otherwise they are the predecessor local's residue.
+fn mark_covered_read(
+    usage: &mut HandleMap<naga::LocalVariable, LocalUse>,
+    block_seen: &mut HandleSet<naga::LocalVariable>,
+    local_init: &HandleMap<naga::LocalVariable, ElementInit>,
+    local: naga::Handle<naga::LocalVariable>,
+    spec: ElementSpec,
+    pos: usize,
+) {
+    mark_used(usage, local, pos);
+    mark_block_first(usage, block_seen, local, /*is_store=*/ false);
+    if !load_covers(local_init.get(local), spec)
+        && let Some(info) = usage.get_mut(local)
+    {
+        info.coalesce_safe = false;
+    }
+}
+
 /// DFS attributing every read, store, call argument and pointer operand to
 /// its root local, widening live ranges and running the first-touch and
 /// element-coverage gates with a fresh `block_seen` per scope.
@@ -415,13 +436,7 @@ fn scan_block_usage(
                         .get(h.index())
                         .and_then(|o| o.as_ref())
                     {
-                        mark_used(usage, local, current);
-                        mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
-                        if !load_covers(local_init.get(local), spec)
-                            && let Some(info) = usage.get_mut(local)
-                        {
-                            info.coalesce_safe = false;
-                        }
+                        mark_covered_read(usage, &mut block_seen, local_init, local, spec, current);
                     }
                 }
             }
@@ -458,51 +473,27 @@ fn scan_block_usage(
                 // scope's first touch, so the first-touch gate never fires.
                 for &arg in arguments {
                     if let Some((local, spec)) = resolve_local_and_element(arg, expressions) {
-                        mark_used(usage, local, current);
-                        mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
-                        if !load_covers(local_init.get(local), spec)
-                            && let Some(info) = usage.get_mut(local)
-                        {
-                            info.coalesce_safe = false;
-                        }
+                        mark_covered_read(usage, &mut block_seen, local_init, local, spec, current);
                     }
                 }
             }
             naga::Statement::Atomic { pointer, .. } => {
                 // Read-modify-write: a coverage-gated read.
                 if let Some((local, spec)) = resolve_local_and_element(*pointer, expressions) {
-                    mark_used(usage, local, current);
-                    mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
-                    if !load_covers(local_init.get(local), spec)
-                        && let Some(info) = usage.get_mut(local)
-                    {
-                        info.coalesce_safe = false;
-                    }
+                    mark_covered_read(usage, &mut block_seen, local_init, local, spec, current);
                 }
             }
             naga::Statement::RayQuery { query, .. } => {
                 // The query object's prior bytes matter: a coverage-gated read.
                 if let Some((local, spec)) = resolve_local_and_element(*query, expressions) {
-                    mark_used(usage, local, current);
-                    mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
-                    if !load_covers(local_init.get(local), spec)
-                        && let Some(info) = usage.get_mut(local)
-                    {
-                        info.coalesce_safe = false;
-                    }
+                    mark_covered_read(usage, &mut block_seen, local_init, local, spec, current);
                 }
             }
             naga::Statement::RayPipelineFunction(fun) => {
                 // The payload is read as input: a coverage-gated read.
                 let naga::RayPipelineFunction::TraceRay { payload, .. } = fun;
                 if let Some((local, spec)) = resolve_local_and_element(*payload, expressions) {
-                    mark_used(usage, local, current);
-                    mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
-                    if !load_covers(local_init.get(local), spec)
-                        && let Some(info) = usage.get_mut(local)
-                    {
-                        info.coalesce_safe = false;
-                    }
+                    mark_covered_read(usage, &mut block_seen, local_init, local, spec, current);
                 }
             }
             naga::Statement::CooperativeStore { target, data } => {
@@ -512,13 +503,7 @@ fn scan_block_usage(
                 // safe, under-tracking miscompiles).  `data.pointer` is the
                 // write destination: a regular store touch.
                 if let Some((local, spec)) = resolve_local_and_element(*target, expressions) {
-                    mark_used(usage, local, current);
-                    mark_block_first(usage, &mut block_seen, local, /*is_store=*/ false);
-                    if !load_covers(local_init.get(local), spec)
-                        && let Some(info) = usage.get_mut(local)
-                    {
-                        info.coalesce_safe = false;
-                    }
+                    mark_covered_read(usage, &mut block_seen, local_init, local, spec, current);
                 }
                 if let Some((local, spec)) = resolve_local_and_element(data.pointer, expressions) {
                     mark_used(usage, local, current);

@@ -19,9 +19,7 @@ use std::collections::HashSet;
 use crate::error::Error;
 use crate::handle_set::HandleMap;
 use crate::name_gen;
-use crate::passes::expr_util::{
-    for_each_statement, visit_block_expression_handles, visit_expression_children,
-};
+use crate::passes::expr_util::{for_each_statement, live_expression_ref_counts};
 use crate::pipeline::{Pass, PassContext};
 
 /// `preserve` lists names kept verbatim; `mangle` extends renaming to
@@ -398,7 +396,7 @@ fn accumulate_function_weights(w: &mut Weights, fref: FuncRef, function: &naga::
         *w.local.entry((fref, lh)).or_insert(0) += 1;
     }
 
-    let counts = function_ref_counts(function);
+    let (counts, _live) = live_expression_ref_counts(function);
     for (h, expr) in function.expressions.iter() {
         let c = counts[h.index()];
         if c == 0 {
@@ -415,38 +413,6 @@ fn accumulate_function_weights(w: &mut Weights, fref: FuncRef, function: &naga::
             _ => {}
         }
     }
-}
-
-/// Per-handle reference counts mirroring the generator's expression ref
-/// counts: children of every live (Emit'd) expression plus statement
-/// operands.  Dead expressions are excluded so identifiers used only by dead
-/// code score 0 and never claim a short name.
-fn function_ref_counts(function: &naga::Function) -> Vec<usize> {
-    let len = function.expressions.len();
-    let mut live = vec![false; len];
-    mark_emit_live(&function.body, &mut live);
-
-    let mut counts = vec![0usize; len];
-    for (h, expr) in function.expressions.iter() {
-        if live[h.index()] {
-            visit_expression_children(expr, |child| counts[child.index()] += 1);
-        }
-    }
-    // Emit handles excluded: emission sequencing is not a use.
-    visit_block_expression_handles(&function.body, false, &mut |h| counts[h.index()] += 1);
-    counts
-}
-
-/// Emit-range membership, the liveness signal [`function_ref_counts`]
-/// filters on.
-fn mark_emit_live(block: &naga::Block, live: &mut [bool]) {
-    for_each_statement(block, &mut |stmt| {
-        if let naga::Statement::Emit(range) = stmt {
-            for h in range.clone() {
-                live[h.index()] = true;
-            }
-        }
-    });
 }
 
 /// Call counts, so a frequently-called function earns a shorter name.

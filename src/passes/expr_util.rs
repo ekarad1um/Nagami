@@ -1184,6 +1184,101 @@ pub fn literal_bit_eq(a: &naga::Literal, b: &naga::Literal) -> bool {
     }
 }
 
+/// Per-handle reference counts plus the liveness bitmap, in one walk.  Live
+/// is "materialised by an `Emit` range", so dead code's children score zero
+/// and never claim a short name.  A statement RESULT is not a use - it stays
+/// at 0 until something consumes it, which single-use call inlining and
+/// dead-`let` elision key on - nor is an `Emit` handle, emission being
+/// sequencing.
+///
+/// The generator prices its output by these counts and `rename` spends short
+/// names by them; the two MUST agree, or a name the generator inlines away
+/// takes the shortest identifier with it.
+pub fn live_expression_ref_counts(function: &naga::Function) -> (Vec<usize>, Vec<bool>) {
+    let len = function.expressions.len();
+
+    let mut live = vec![false; len];
+    for_each_statement(&function.body, &mut |stmt| {
+        if let naga::Statement::Emit(range) = stmt {
+            for h in range.clone() {
+                live[h.index()] = true;
+            }
+        }
+    });
+
+    let mut counts = vec![0usize; len];
+    for (h, expr) in function.expressions.iter() {
+        if live[h.index()] {
+            visit_expression_children(expr, |child| counts[child.index()] += 1);
+        }
+    }
+    for_each_statement(&function.body, &mut |stmt| {
+        visit_statement_operands(
+            stmt,
+            /*include_emit_handles=*/ false,
+            &mut |h| counts[h.index()] += 1,
+        );
+    });
+
+    (counts, live)
+}
+
+/// A literal that turns a legal RUNTIME `/` `%` into a WGSL shader-creation
+/// error once it lands in the divisor.  Forwarding and folding both decline
+/// on it: either would build IR naga rejects, costing the driver's rollback
+/// a whole pass run.  Only INTEGER division qualifies - float `x / 0.0` is a
+/// defined `inf` / `nan`.
+pub(crate) fn is_integer_zero_literal(lit: &naga::Literal) -> bool {
+    matches!(
+        lit,
+        naga::Literal::I16(0)
+            | naga::Literal::U16(0)
+            | naga::Literal::I32(0)
+            | naga::Literal::U32(0)
+            | naga::Literal::I64(0)
+            | naga::Literal::U64(0)
+            | naga::Literal::AbstractInt(0)
+    )
+}
+
+/// [`is_integer_zero_literal`]'s counterpart: a shift by `>= 32` overruns the
+/// ubiquitous 32-bit operand.  The operand width is out of reach here, so a
+/// 16-bit one shifted by `[16, 32)` slips through to the whole-module
+/// rollback and a 64-bit one is over-declined; declining only ever costs a
+/// missed optimization.
+pub(crate) fn shift_amount_is_static_error(lit: &naga::Literal) -> bool {
+    let amount: i128 = match lit {
+        naga::Literal::U32(v) => i128::from(*v),
+        naga::Literal::U16(v) => i128::from(*v),
+        naga::Literal::I32(v) => i128::from(*v),
+        naga::Literal::I16(v) => i128::from(*v),
+        naga::Literal::U64(v) => i128::from(*v),
+        naga::Literal::I64(v) => i128::from(*v),
+        naga::Literal::AbstractInt(v) => i128::from(*v),
+        _ => return false,
+    };
+    amount >= 32
+}
+
+/// Root local of a pointer expression: the `LocalVariable` an
+/// `Access` / `AccessIndex` chain bottoms out in, `None` for any other root
+/// (a global, a function-argument pointer).  The one definition: liveness,
+/// dead-store elimination and the generator's deferred-variable analysis
+/// must agree on which local a pointer names, or one drops a store the
+/// other still reads.
+pub fn root_local_var(
+    pointer: naga::Handle<naga::Expression>,
+    expressions: &naga::Arena<naga::Expression>,
+) -> Option<naga::Handle<naga::LocalVariable>> {
+    match &expressions[pointer] {
+        naga::Expression::LocalVariable(local) => Some(*local),
+        naga::Expression::AccessIndex { base, .. } | naga::Expression::Access { base, .. } => {
+            root_local_var(*base, expressions)
+        }
+        _ => None,
+    }
+}
+
 /// The value of an integer `Literal` index; a `u64` past `i64::MAX`
 /// saturates, which is out of bounds for any composite.
 pub fn const_index_value(

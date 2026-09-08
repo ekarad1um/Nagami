@@ -19,7 +19,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::Error;
 use crate::handle_set::HandleMap;
-use crate::passes::load_dedup::get_stored_local;
+use crate::passes::expr_util::root_local_var;
 use crate::pipeline::{Pass, PassContext};
 
 /// Collapses member-wise struct builds into one constructor store.
@@ -40,7 +40,7 @@ fn expr_loads_local(
         return known;
     }
     let mut found = matches!(arena[h], naga::Expression::Load { pointer }
-        if get_stored_local(arena, pointer) == Some(g));
+        if root_local_var(pointer, arena) == Some(g));
     if !found {
         crate::passes::expr_util::visit_expression_children(&arena[h], |child| {
             if !found {
@@ -323,10 +323,10 @@ fn statement_escapes_local(
     match stmt {
         naga::Statement::Call { arguments, .. } => arguments
             .iter()
-            .any(|&a| get_stored_local(arena, a) == Some(local)),
+            .any(|&a| root_local_var(a, arena) == Some(local)),
         naga::Statement::Atomic { pointer, .. }
         | naga::Statement::WorkGroupUniformLoad { pointer, .. } => {
-            get_stored_local(arena, *pointer) == Some(local)
+            root_local_var(*pointer, arena) == Some(local)
         }
         _ => false,
     }

@@ -3,28 +3,11 @@
 
 use crate::generator::core::FunctionExprInfo;
 
-/// Per-handle reference counts from live expressions (those in `Emit` ranges)
-/// and from statements, plus the live bitmap, in one walk; dead expressions
-/// never inflate a count.
+/// [`crate::passes::expr_util::live_expression_ref_counts`] in the shape the
+/// generator caches it.
 pub(super) fn compute_expression_ref_counts(func: &naga::Function) -> FunctionExprInfo {
-    let len = func.expressions.len();
-    let mut counts: Vec<usize> = vec![0; len];
-
-    let mut live = vec![false; len];
-    collect_emitted_handles(&func.body, &mut live);
-
-    for (h, expr) in func.expressions.iter() {
-        if live[h.index()] {
-            count_expr_children(expr, &mut counts);
-        }
-    }
-
-    count_block_refs(&func.body, &mut counts);
-
-    FunctionExprInfo {
-        ref_counts: counts,
-        live,
-    }
+    let (ref_counts, live) = crate::passes::expr_util::live_expression_ref_counts(func);
+    FunctionExprInfo { ref_counts, live }
 }
 
 /// Discount references made from initializer trees that no body `let` can
@@ -56,33 +39,4 @@ pub(super) fn discount_initializer_refs(
             stack.push(child);
         });
     }
-}
-
-/// `Emit`-range membership across all control flow, the authoritative liveness
-/// signal for ref counting and literal extraction.
-fn collect_emitted_handles(block: &naga::Block, live: &mut [bool]) {
-    crate::passes::expr_util::for_each_statement(block, &mut |stmt| {
-        if let naga::Statement::Emit(range) = stmt {
-            for h in range.clone() {
-                live[h.index()] = true;
-            }
-        }
-    });
-}
-
-fn bump(counts: &mut [usize], h: naga::Handle<naga::Expression>) {
-    counts[h.index()] += 1;
-}
-
-fn count_expr_children(expr: &naga::Expression, counts: &mut [usize]) {
-    crate::passes::expr_util::visit_expression_children(expr, |h| bump(counts, h));
-}
-
-/// Bump `counts[h]` per statement operand, nested blocks included.  Defined
-/// results are not uses: a call / atomic result stays at 0 until consumed,
-/// which single-use call inlining and dead-`let` elision key on.
-fn count_block_refs(block: &naga::Block, counts: &mut [usize]) {
-    crate::passes::expr_util::for_each_statement(block, &mut |stmt| {
-        crate::passes::expr_util::visit_statement_operands(stmt, false, &mut |h| bump(counts, h));
-    });
 }

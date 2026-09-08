@@ -15,7 +15,10 @@ use naga::Handle;
 
 use crate::error::Error;
 use crate::handle_set::{HandleMap, HandleSet};
-use crate::passes::expr_util::{is_bool_false, is_bool_true, rebuild_emit_ranges_after_removal};
+use crate::passes::expr_util::{
+    is_bool_false, is_bool_true, is_integer_zero_literal, rebuild_emit_ranges_after_removal,
+    shift_amount_is_static_error,
+};
 use crate::pipeline::{Pass, PassContext};
 
 /// Whether a clone of `expression` in another arena slot reproduces the same
@@ -162,10 +165,10 @@ fn fold_global_expressions(
     for handle in handles {
         visiting.clear();
         let value = {
-            let ctx = GlobalConstFoldContext {
+            let ctx = ConstFoldContext {
                 arena: &module.global_expressions,
                 types: &module.types,
-                const_inits: &const_inits,
+                constants: ConstSource::Inits(&const_inits),
             };
             resolve_const_value(handle, &ctx, &mut visiting, &mut memo)
         };
@@ -204,37 +207,30 @@ fn fold_global_expressions(
 }
 
 /// `Constant -> Literal` for every constant whose initializer resolves.
+///
+/// MUST run after [`fold_global_expressions`], which is what makes this a
+/// plain arena read: that pass resolves every global expression and rewrites
+/// each scalar-valued one to its `Literal`, chains through
+/// `Expression::Constant` included, so "the init resolves to a scalar" and
+/// "the init IS a literal" are already the same predicate.
+///
 /// Abstract literals are skipped: naga's validator rejects `AbstractInt` /
 /// `AbstractFloat` in a function arena, and a cached one would roll the whole
 /// pass back every sweep, whereas skipping merely leaves the constant
 /// un-inlined.  (naga's frontend concretises `const X = 1` early, so the
 /// guard is defensive.)
 fn build_constant_literal_cache(module: &naga::Module) -> HandleMap<naga::Constant, naga::Literal> {
-    let const_inits = module
+    module
         .constants
         .iter()
-        .map(|(h, c)| (h, c.init))
-        .collect::<HandleMap<_, _>>();
-    let context = GlobalLiteralContext {
-        arena: &module.global_expressions,
-        const_inits: &const_inits,
-    };
-
-    let mut out = HandleMap::default();
-    let mut visiting = HandleSet::default();
-    for (ch, c) in module.constants.iter() {
-        visiting.clear();
-        if let Some(lit) = resolve_literal(c.init, &context, &mut visiting) {
-            if matches!(
-                lit,
-                naga::Literal::AbstractInt(_) | naga::Literal::AbstractFloat(_)
-            ) {
-                continue;
-            }
-            out.insert(ch, lit);
-        }
-    }
-    out
+        .filter_map(|(ch, c)| match module.global_expressions[c.init] {
+            naga::Expression::Literal(
+                naga::Literal::AbstractInt(_) | naga::Literal::AbstractFloat(_),
+            ) => None,
+            naga::Expression::Literal(lit) => Some((ch, lit)),
+            _ => None,
+        })
+        .collect()
 }
 
 // MARK: Per-function folding
@@ -311,6 +307,84 @@ fn build_emit_range_map(body: &naga::Block, expression_count: usize) -> Vec<u32>
     map
 }
 
+/// Roles that make a folded literal a WGSL shader-creation error.
+const ROLE_DIVISOR: u8 = 1;
+const ROLE_SHIFT_AMOUNT: u8 = 2;
+
+/// Per-handle roles: the right operand of an integer `/` `%` or of a shift,
+/// reached through `Splat` / `Compose` since any offending lane condemns a
+/// componentwise op.  Folding an offender into one of these cannot survive
+/// post-pass validation, and the rollback discards every OTHER fold of the
+/// same run - permanently, the pass being deterministic - so declining is
+/// free.
+fn static_error_roles(arena: &naga::Arena<naga::Expression>) -> Vec<u8> {
+    let mut stack: Vec<(Handle<naga::Expression>, u8)> = arena
+        .iter()
+        .filter_map(|(_, expr)| match expr {
+            naga::Expression::Binary { op, right, .. } => match op {
+                naga::BinaryOperator::Divide | naga::BinaryOperator::Modulo => {
+                    Some((*right, ROLE_DIVISOR))
+                }
+                naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight => {
+                    Some((*right, ROLE_SHIFT_AMOUNT))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    // Most arenas hold no `/` `%` `<<` `>>`; an empty map costs no allocation
+    // and reads as no role.
+    if stack.is_empty() {
+        return Vec::new();
+    }
+    let mut roles = vec![0u8; arena.len()];
+    while let Some((h, role)) = stack.pop() {
+        if roles[h.index()] & role != 0 {
+            continue;
+        }
+        roles[h.index()] |= role;
+        match &arena[h] {
+            naga::Expression::Splat { value, .. } => stack.push((*value, role)),
+            naga::Expression::Compose { components, .. } => {
+                stack.extend(components.iter().map(|&c| (c, role)));
+            }
+            _ => {}
+        }
+    }
+    roles
+}
+
+/// Role bits for `h`; an empty map is "no failable operator in the arena".
+fn role_of(roles: &[u8], h: Handle<naga::Expression>) -> u8 {
+    roles.get(h.index()).copied().unwrap_or(0)
+}
+
+/// `literal` in a slot with `roles` is a shader-creation error.
+fn literal_is_static_error(roles: u8, literal: naga::Literal) -> bool {
+    (roles & ROLE_DIVISOR != 0 && is_integer_zero_literal(&literal))
+        || (roles & ROLE_SHIFT_AMOUNT != 0 && shift_amount_is_static_error(&literal))
+}
+
+/// Clone `source` over `target`, declining (and writing nothing) when that
+/// would leave an offender where a runtime operation stood.  Every arm that
+/// narrows an expression to one of its operands writes through here, so the
+/// guard is structural rather than a rule each new arm must remember.
+fn clone_over(
+    arena: &mut naga::Arena<naga::Expression>,
+    roles: &[u8],
+    target: Handle<naga::Expression>,
+    source: Handle<naga::Expression>,
+) -> bool {
+    if matches!(arena[source], naga::Expression::Literal(lit)
+        if literal_is_static_error(role_of(roles, target), lit))
+    {
+        return false;
+    }
+    arena[target] = arena[source].clone();
+    true
+}
+
 /// Fold `arena` in place, returning the handles that must leave their `Emit`
 /// ranges and the number of simplifications.  `refcounts` and `emit_ranges`
 /// together gate cloning an impure operand in the identity / involution
@@ -337,6 +411,10 @@ fn fold_local_expressions(
         };
     let mut handles = Vec::with_capacity(arena.len());
     handles.extend(arena.iter().map(|(h, _)| h));
+    // Sound to compute once: the loops below replace whole `arena[handle]`
+    // values, never a `Binary`'s operand slots, so a role can retire but
+    // never appear.
+    let roles = static_error_roles(arena);
     let mut folded = HandleSet::default();
 
     let mut literal_cache = build_literal_cache(arena);
@@ -346,14 +424,15 @@ fn fold_local_expressions(
     for handle in handles.iter().copied() {
         visiting.clear();
         let value = {
-            let ctx = LocalConstFoldContext {
+            let ctx = ConstFoldContext {
                 arena: &*arena,
                 types,
-                const_literals,
+                constants: ConstSource::Literals(const_literals),
             };
             resolve_const_value(handle, &ctx, &mut visiting, &mut memo)
         };
 
+        let role = role_of(&roles, handle);
         match value {
             Some(ConstValue::Scalar(literal)) => {
                 // An abstract result (both operands abstract) trips naga's
@@ -363,6 +442,10 @@ fn fold_local_expressions(
                     literal,
                     naga::Literal::AbstractInt(_) | naga::Literal::AbstractFloat(_)
                 ) {
+                    continue;
+                }
+                // Same rollback, different cause; see `static_error_roles`.
+                if literal_is_static_error(role, literal) {
                     continue;
                 }
                 if !matches!(arena[handle], naga::Expression::Literal(existing) if existing == literal)
@@ -377,6 +460,13 @@ fn fold_local_expressions(
                 size,
                 scalar,
             }) => {
+                // One offending lane condemns the whole componentwise op.
+                if components
+                    .iter()
+                    .any(|&lane| literal_is_static_error(role, lane))
+                {
+                    continue;
+                }
                 // A `Compose` needs an `Emit` range, which only an
                 // already-emittable original sits in.
                 if crate::passes::expr_util::expression_needs_emit(&arena[handle])
@@ -419,8 +509,8 @@ fn fold_local_expressions(
                 );
                 if (is_logical_op || both_literal)
                     && let Some(absorb) = check_absorbing_operand(op, left, right, arena)
+                    && clone_over(arena, &roles, handle, absorb)
                 {
-                    arena[handle] = arena[absorb].clone();
                     simplify_count += 1;
                     folded.insert(handle); // result is a Literal, declarative.
                     continue;
@@ -438,8 +528,9 @@ fn fold_local_expressions(
                     let other_uniquely_owned = !other_pure
                         && refcounts.get(other.index()).copied() == Some(1)
                         && same_emit_range(other, handle);
-                    if other_pure || other_uniquely_owned {
-                        arena[handle] = arena[other].clone();
+                    if (other_pure || other_uniquely_owned)
+                        && clone_over(arena, &roles, handle, other)
+                    {
                         simplify_count += 1;
                         if !crate::passes::expr_util::expression_needs_emit(&arena[handle]) {
                             folded.insert(handle);
@@ -472,8 +563,9 @@ fn fold_local_expressions(
                         && intermediate_uniquely_owned
                         && refcounts.get(inner.index()).copied() == Some(1)
                         && same_emit_range(inner, handle);
-                    if inner_pure || inner_uniquely_owned {
-                        arena[handle] = arena[inner].clone();
+                    if (inner_pure || inner_uniquely_owned)
+                        && clone_over(arena, &roles, handle, inner)
+                    {
                         simplify_count += 1;
                         if !crate::passes::expr_util::expression_needs_emit(&arena[handle]) {
                             folded.insert(handle);
@@ -518,10 +610,11 @@ fn fold_local_expressions(
             naga::Expression::Select { accept, reject, .. }
                 if accept == reject && is_pure_to_clone(&arena[accept]) =>
             {
-                arena[handle] = arena[accept].clone();
-                simplify_count += 1;
-                if !crate::passes::expr_util::expression_needs_emit(&arena[handle]) {
-                    folded.insert(handle);
+                if clone_over(arena, &roles, handle, accept) {
+                    simplify_count += 1;
+                    if !crate::passes::expr_util::expression_needs_emit(&arena[handle]) {
+                        folded.insert(handle);
+                    }
                 }
                 continue;
             }
@@ -539,35 +632,6 @@ fn flip_equality(op: naga::BinaryOperator) -> Option<naga::BinaryOperator> {
         naga::BinaryOperator::Equal => Some(naga::BinaryOperator::NotEqual),
         naga::BinaryOperator::NotEqual => Some(naga::BinaryOperator::Equal),
         _ => None,
-    }
-}
-
-trait LiteralContext {
-    fn arena(&self) -> &naga::Arena<naga::Expression>;
-    fn resolve_constant(
-        &self,
-        handle: naga::Handle<naga::Constant>,
-        visiting: &mut HandleSet<naga::Expression>,
-    ) -> Option<naga::Literal>;
-}
-
-struct GlobalLiteralContext<'a> {
-    arena: &'a naga::Arena<naga::Expression>,
-    const_inits: &'a HandleMap<naga::Constant, naga::Handle<naga::Expression>>,
-}
-
-impl LiteralContext for GlobalLiteralContext<'_> {
-    fn arena(&self) -> &naga::Arena<naga::Expression> {
-        self.arena
-    }
-
-    fn resolve_constant(
-        &self,
-        handle: naga::Handle<naga::Constant>,
-        visiting: &mut HandleSet<naga::Expression>,
-    ) -> Option<naga::Literal> {
-        let init = *self.const_inits.get(handle)?;
-        resolve_literal(init, self, visiting)
     }
 }
 
@@ -605,68 +669,41 @@ impl ConstValue {
 /// never cached.
 type ConstValueMemo = Vec<Option<Option<ConstValue>>>;
 
-/// [`LiteralContext`] plus the type arena, which `Compose` / `Splat`
-/// resolution needs for the component type and vector size.
-trait ConstFoldContext {
-    fn arena(&self) -> &naga::Arena<naga::Expression>;
-    fn types(&self) -> &naga::UniqueArena<naga::Type>;
-    /// `memo` is threaded so the global context, which resolves a constant's
-    /// init in the SAME arena, keeps memoization; map-backed contexts ignore it.
-    fn resolve_constant_value(
-        &self,
-        handle: naga::Handle<naga::Constant>,
-        visiting: &mut HandleSet<naga::Expression>,
-        memo: &mut ConstValueMemo,
-    ) -> Option<ConstValue>;
+/// Where `Expression::Constant` resolves.  One enum rather than a trait with
+/// two impls: the resolver below is a seven-function mutual recursion, and a
+/// generic context monomorphised it twice for a single field's worth of
+/// difference.
+enum ConstSource<'a> {
+    /// Module scope: a constant resolves through its initializer, which lives
+    /// in the SAME arena, so the recursion continues and shares the memo.
+    Inits(&'a HandleMap<naga::Constant, naga::Handle<naga::Expression>>),
+    /// Function scope: constants were pre-resolved to literals by
+    /// [`build_constant_literal_cache`], so the lookup is terminal.
+    Literals(&'a HandleMap<naga::Constant, naga::Literal>),
 }
 
-struct GlobalConstFoldContext<'a> {
+/// Everything [`resolve_const_value`] reads: the arena it walks, the type
+/// arena `Compose` / `Splat` need for component type and vector size, and
+/// where a constant handle resolves.
+struct ConstFoldContext<'a> {
     arena: &'a naga::Arena<naga::Expression>,
     types: &'a naga::UniqueArena<naga::Type>,
-    const_inits: &'a HandleMap<naga::Constant, naga::Handle<naga::Expression>>,
+    constants: ConstSource<'a>,
 }
 
-impl ConstFoldContext for GlobalConstFoldContext<'_> {
-    fn arena(&self) -> &naga::Arena<naga::Expression> {
-        self.arena
-    }
-    fn types(&self) -> &naga::UniqueArena<naga::Type> {
-        self.types
-    }
+impl ConstFoldContext<'_> {
     fn resolve_constant_value(
         &self,
         handle: naga::Handle<naga::Constant>,
         visiting: &mut HandleSet<naga::Expression>,
         memo: &mut ConstValueMemo,
     ) -> Option<ConstValue> {
-        let init = *self.const_inits.get(handle)?;
-        resolve_const_value(init, self, visiting, memo)
-    }
-}
-
-struct LocalConstFoldContext<'a> {
-    arena: &'a naga::Arena<naga::Expression>,
-    types: &'a naga::UniqueArena<naga::Type>,
-    const_literals: &'a HandleMap<naga::Constant, naga::Literal>,
-}
-
-impl ConstFoldContext for LocalConstFoldContext<'_> {
-    fn arena(&self) -> &naga::Arena<naga::Expression> {
-        self.arena
-    }
-    fn types(&self) -> &naga::UniqueArena<naga::Type> {
-        self.types
-    }
-    fn resolve_constant_value(
-        &self,
-        handle: naga::Handle<naga::Constant>,
-        _visiting: &mut HandleSet<naga::Expression>,
-        _memo: &mut ConstValueMemo,
-    ) -> Option<ConstValue> {
-        self.const_literals
-            .get(handle)
-            .copied()
-            .map(ConstValue::Scalar)
+        match self.constants {
+            ConstSource::Inits(inits) => {
+                resolve_const_value(*inits.get(handle)?, self, visiting, memo)
+            }
+            ConstSource::Literals(lits) => lits.get(handle).copied().map(ConstValue::Scalar),
+        }
     }
 }
 
@@ -712,11 +749,11 @@ fn cast_width8_to(src: naga::Literal, target: naga::Scalar) -> Option<naga::Lite
     }
 }
 
-/// Resolve `handle` to a [`ConstValue`]: the composite-aware generalisation
-/// of [`resolve_literal`], cycle-guarded by `visiting` and memoised.
-fn resolve_const_value<C: ConstFoldContext>(
+/// Resolve `handle` to a [`ConstValue`], cycle-guarded by `visiting` and
+/// memoised; composites resolve componentwise.
+fn resolve_const_value(
     handle: Handle<naga::Expression>,
-    ctx: &C,
+    ctx: &ConstFoldContext<'_>,
     visiting: &mut HandleSet<naga::Expression>,
     memo: &mut ConstValueMemo,
 ) -> Option<ConstValue> {
@@ -736,13 +773,13 @@ fn resolve_const_value<C: ConstFoldContext>(
 
 /// `?` exits are safe here only because the wrapper owns `visiting.remove`
 /// and the memo store on every return path.
-fn resolve_const_value_uncached<C: ConstFoldContext>(
+fn resolve_const_value_uncached(
     handle: Handle<naga::Expression>,
-    ctx: &C,
+    ctx: &ConstFoldContext<'_>,
     visiting: &mut HandleSet<naga::Expression>,
     memo: &mut ConstValueMemo,
 ) -> Option<ConstValue> {
-    let expr = &ctx.arena()[handle];
+    let expr = &ctx.arena[handle];
     match expr {
         naga::Expression::Literal(lit) => Some(ConstValue::Scalar(*lit)),
         naga::Expression::Constant(ch) => ctx.resolve_constant_value(*ch, visiting, memo),
@@ -958,21 +995,21 @@ fn literal_index(lit: naga::Literal) -> Option<usize> {
 /// the base fully, which covers vectors (whose `Compose` components flatten,
 /// so cannot be picked positionally) and vector-valued chains like
 /// `arr[1][2]`.  Nested array-of-array picks decline.
-fn resolve_composite_element<C: ConstFoldContext>(
+fn resolve_composite_element(
     base: Handle<naga::Expression>,
     idx: usize,
-    ctx: &C,
+    ctx: &ConstFoldContext<'_>,
     visiting: &mut HandleSet<naga::Expression>,
     memo: &mut ConstValueMemo,
 ) -> Option<ConstValue> {
-    match &ctx.arena()[base] {
-        naga::Expression::Compose { ty, components } => match &ctx.types()[*ty].inner {
+    match &ctx.arena[base] {
+        naga::Expression::Compose { ty, components } => match &ctx.types[*ty].inner {
             naga::TypeInner::Array { .. } | naga::TypeInner::Matrix { .. } => {
                 resolve_const_value(*components.get(idx)?, ctx, visiting, memo)
             }
             _ => resolve_vector_component(base, idx, ctx, visiting, memo),
         },
-        naga::Expression::ZeroValue(ty) => match &ctx.types()[*ty].inner {
+        naga::Expression::ZeroValue(ty) => match &ctx.types[*ty].inner {
             naga::TypeInner::Array {
                 base: elem,
                 size: naga::ArraySize::Constant(n),
@@ -999,10 +1036,10 @@ fn resolve_composite_element<C: ConstFoldContext>(
 }
 
 /// Component `idx` of `base` once it resolves to a [`ConstValue::Vector`].
-fn resolve_vector_component<C: ConstFoldContext>(
+fn resolve_vector_component(
     base: Handle<naga::Expression>,
     idx: usize,
-    ctx: &C,
+    ctx: &ConstFoldContext<'_>,
     visiting: &mut HandleSet<naga::Expression>,
     memo: &mut ConstValueMemo,
 ) -> Option<ConstValue> {
@@ -1016,8 +1053,8 @@ fn resolve_vector_component<C: ConstFoldContext>(
 
 /// `ZeroValue(ty)` for a scalar or vector type; matrices, structs, and
 /// arrays return `None`.
-fn resolve_zero_value<C: ConstFoldContext>(ty: Handle<naga::Type>, ctx: &C) -> Option<ConstValue> {
-    match ctx.types()[ty].inner {
+fn resolve_zero_value(ty: Handle<naga::Type>, ctx: &ConstFoldContext<'_>) -> Option<ConstValue> {
+    match ctx.types[ty].inner {
         naga::TypeInner::Scalar(s) => naga::Literal::zero(s).map(ConstValue::Scalar),
         naga::TypeInner::Vector { size, scalar } => {
             let z = naga::Literal::zero(scalar)?;
@@ -1037,14 +1074,14 @@ fn resolve_zero_value<C: ConstFoldContext>(ty: Handle<naga::Type>, ctx: &C) -> O
 /// `Compose<vec4<f32>>` over `Literal::I32` handles, which naga's validator
 /// rejects; naga's frontend concretises first, so it fires only on
 /// hand-built IR.
-fn resolve_compose<C: ConstFoldContext>(
+fn resolve_compose(
     ty: Handle<naga::Type>,
     components: &[Handle<naga::Expression>],
-    ctx: &C,
+    ctx: &ConstFoldContext<'_>,
     visiting: &mut HandleSet<naga::Expression>,
     memo: &mut ConstValueMemo,
 ) -> Option<ConstValue> {
-    let inner = &ctx.types()[ty].inner;
+    let inner = &ctx.types[ty].inner;
     match inner {
         naga::TypeInner::Vector { size, scalar } => {
             let expected = *size as usize;
@@ -1326,68 +1363,6 @@ fn note_literal_in_cache(
             }
         })
         .or_insert(handle);
-}
-
-// MARK: Scalar evaluation
-
-/// Scalar-only [`resolve_const_value`]: declines any vector or composite.
-fn resolve_literal<C: LiteralContext>(
-    handle: naga::Handle<naga::Expression>,
-    context: &C,
-    visiting: &mut HandleSet<naga::Expression>,
-) -> Option<naga::Literal> {
-    if !visiting.insert(handle) {
-        return None;
-    }
-
-    let expr = &context.arena()[handle];
-    let out = match expr {
-        naga::Expression::Literal(lit) => Some(*lit),
-        naga::Expression::Constant(ch) => context.resolve_constant(*ch, visiting),
-        naga::Expression::Unary { op, expr } => {
-            let rhs = resolve_literal(*expr, context, visiting)?;
-            eval_unary(*op, rhs)
-        }
-        naga::Expression::Binary { op, left, right } => {
-            let l = resolve_literal(*left, context, visiting)?;
-            let r = resolve_literal(*right, context, visiting)?;
-            eval_binary(*op, l, r)
-        }
-        naga::Expression::Math {
-            fun,
-            arg,
-            arg1,
-            arg2,
-            arg3: _,
-        } => {
-            let a = resolve_literal(*arg, context, visiting)?;
-            let b = match arg1 {
-                Some(h) => Some(resolve_literal(*h, context, visiting)?),
-                None => None,
-            };
-            let c = match arg2 {
-                Some(h) => Some(resolve_literal(*h, context, visiting)?),
-                None => None,
-            };
-            eval_math_scalar(*fun, a, b, c)
-        }
-        naga::Expression::Select {
-            condition,
-            accept,
-            reject,
-        } => {
-            let cond = resolve_literal(*condition, context, visiting)?;
-            match cond {
-                naga::Literal::Bool(true) => resolve_literal(*accept, context, visiting),
-                naga::Literal::Bool(false) => resolve_literal(*reject, context, visiting),
-                _ => None,
-            }
-        }
-        _ => None,
-    };
-
-    visiting.remove(handle);
-    out
 }
 
 /// Per-scalar unary evaluator; declines operator / type pairs whose fold

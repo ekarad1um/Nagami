@@ -14,6 +14,7 @@
 //! when the value is benign.
 
 use super::core::FunctionCtx;
+use crate::config::FloatPrecision;
 
 /// `Some` when `h` renders as one const-expression: literal / `const` leaves
 /// under `@const` operators and builtins, nothing bound to a name (a `let` is
@@ -137,13 +138,17 @@ fn lanes_in(
     }
 }
 
-/// Numeric value of a lane; `None` for bool.
-fn lane_f64(l: naga::Literal) -> Option<f64> {
+/// Numeric value of a lane as the emitter will PRINT it: `precision`
+/// rounding is applied here because the rules below judge the const
+/// expression the consumer parses, not the one the IR holds.  Rounding two
+/// distinct `smoothstep` edges together is a shader-creation error that
+/// exists only in the output.  `None` for bool.
+fn lane_f64(l: naga::Literal, precision: &FloatPrecision) -> Option<f64> {
     use naga::Literal as L;
     Some(match l {
-        L::F64(v) => v,
-        L::F32(v) => v as f64,
-        L::F16(v) => v.to_f64(),
+        L::F64(v) => super::syntax::round_f64(v, precision.f64),
+        L::F32(v) => super::syntax::round_f32(v, precision.f32) as f64,
+        L::F16(v) => super::syntax::round_f16(f32::from(v), precision.f16) as f64,
         L::U16(v) => v as f64,
         L::I16(v) => v as f64,
         L::U32(v) => v as f64,
@@ -151,7 +156,7 @@ fn lane_f64(l: naga::Literal) -> Option<f64> {
         L::U64(v) => v as f64,
         L::I64(v) => v as f64,
         L::AbstractInt(v) => v as f64,
-        L::AbstractFloat(v) => v,
+        L::AbstractFloat(v) => super::syntax::round_f64(v, precision.abstract_float),
         L::Bool(_) => return None,
     })
 }
@@ -303,6 +308,7 @@ pub(super) fn creation_error_operand(
     module: &naga::Module,
     ctx: &FunctionCtx<'_, '_>,
     h: naga::Handle<naga::Expression>,
+    precision: &FloatPrecision,
 ) -> Option<naga::Handle<naga::Expression>> {
     use naga::Expression as E;
     let exprs = &ctx.exprs;
@@ -328,8 +334,9 @@ pub(super) fn creation_error_operand(
                 None => bitcast_non_finite(&src, width),
                 Some(_) => {
                     let max = float_max(Some(width));
-                    src.iter()
-                        .any(|&l| lane_f64(l).is_some_and(|v| !v.is_finite() || v.abs() > max))
+                    src.iter().any(|&l| {
+                        lane_f64(l, precision).is_some_and(|v| !v.is_finite() || v.abs() > max)
+                    })
                 }
             };
             hazard.then_some(*expr)
@@ -341,7 +348,7 @@ pub(super) fn creation_error_operand(
             // `-100i << (reverseBits(u32(-100i)) & 31u)` overflows at
             // const-evaluation.  Float add / sub / mul keep the residual.
             let hazard = match (lanes(*left), lanes(*right)) {
-                (Some(l), Some(r)) => binary_hazard(*op, &l, &r, width),
+                (Some(l), Some(r)) => binary_hazard(*op, &l, &r, width, precision),
                 _ => {
                     let integer_op = matches!(
                         op,
@@ -365,7 +372,10 @@ pub(super) fn creation_error_operand(
             let width = result_float_width(module, ctx, h);
             let values = |e: Option<naga::Handle<naga::Expression>>| -> Option<Vec<f64>> {
                 let e = e.filter(|&e| tree(e).is_some())?;
-                lanes(e)?.into_iter().map(lane_f64).collect()
+                lanes(e)?
+                    .into_iter()
+                    .map(|l| lane_f64(l, precision))
+                    .collect()
             };
             // Argument rules first: they name the operand tint checks, and an
             // all-constant call must bind that one (`extractBits(a,40,1)` stays
@@ -492,11 +502,11 @@ fn pair_lanes(
 
 /// Products of up to four such lanes (matrix product, determinant) stay
 /// finite.
-fn moderate(lanes: &[naga::Literal], max: f64) -> bool {
+fn moderate(lanes: &[naga::Literal], max: f64, precision: &FloatPrecision) -> bool {
     let bound = max.powf(0.25);
     lanes
         .iter()
-        .all(|&l| lane_f64(l).is_none_or(|v| v.is_finite() && v.abs() <= bound))
+        .all(|&l| lane_f64(l, precision).is_none_or(|v| v.is_finite() && v.abs() <= bound))
 }
 
 /// Operators [`binary_hazard`] can ever reject, for an operand whose value
@@ -519,16 +529,17 @@ fn binary_hazard(
     l: &[naga::Literal],
     r: &[naga::Literal],
     width: Option<u8>,
+    precision: &FloatPrecision,
 ) -> bool {
     use naga::BinaryOperator as B;
     let max = float_max(width);
     let Some(pairs) = pair_lanes(l, r) else {
         return matches!(op, B::Multiply | B::Add | B::Subtract)
-            && !(moderate(l, max) && moderate(r, max));
+            && !(moderate(l, max, precision) && moderate(r, max, precision));
     };
     pairs.into_iter().any(|(a, b)| {
         if is_float_lane(a) || is_float_lane(b) {
-            let (Some(x), Some(y)) = (lane_f64(a), lane_f64(b)) else {
+            let (Some(x), Some(y)) = (lane_f64(a, precision), lane_f64(b, precision)) else {
                 return false;
             };
             let res = match op {
@@ -657,6 +668,20 @@ fn math_hazard(fun: naga::MathFunction, args: &[Vec<f64>], width: Option<u8>) ->
 
 #[cfg(test)]
 mod tests {
+    /// The rules are precision-independent; these fixtures exercise them at
+    /// full precision, so one shim keeps the call sites free of the argument.
+    fn prec() -> FloatPrecision {
+        FloatPrecision::default()
+    }
+    fn bh(
+        op: naga::BinaryOperator,
+        l: &[naga::Literal],
+        r: &[naga::Literal],
+        width: Option<u8>,
+    ) -> bool {
+        binary_hazard(op, l, r, width, &prec())
+    }
+
     use super::*;
     use naga::BinaryOperator as B;
     use naga::Literal as L;
@@ -675,105 +700,45 @@ mod tests {
 
     #[test]
     fn integer_binary_rules_are_exact() {
-        assert!(binary_hazard(B::Divide, &[L::U32(5)], &[L::U32(0)], None));
-        assert!(binary_hazard(
-            B::Divide,
-            &[L::I32(i32::MIN)],
-            &[L::I32(-1)],
-            None
-        ));
-        assert!(!binary_hazard(
-            B::Divide,
-            &[L::I32(i32::MIN)],
-            &[L::I32(1)],
-            None
-        ));
-        assert!(binary_hazard(
-            B::ShiftLeft,
-            &[L::U32(1)],
-            &[L::U32(32)],
-            None
-        ));
-        assert!(binary_hazard(
-            B::ShiftLeft,
-            &[L::U32(0xF000_0000)],
-            &[L::U32(4)],
-            None
-        ));
-        assert!(!binary_hazard(
+        assert!(bh(B::Divide, &[L::U32(5)], &[L::U32(0)], None));
+        assert!(bh(B::Divide, &[L::I32(i32::MIN)], &[L::I32(-1)], None));
+        assert!(!bh(B::Divide, &[L::I32(i32::MIN)], &[L::I32(1)], None));
+        assert!(bh(B::ShiftLeft, &[L::U32(1)], &[L::U32(32)], None));
+        assert!(bh(B::ShiftLeft, &[L::U32(0xF000_0000)], &[L::U32(4)], None));
+        assert!(!bh(
             B::ShiftLeft,
             &[L::U32(0x0F00_0000)],
             &[L::U32(4)],
             None
         ));
-        assert!(binary_hazard(
-            B::ShiftLeft,
-            &[L::I32(1)],
-            &[L::U32(31)],
-            None
-        ));
-        assert!(!binary_hazard(
-            B::ShiftLeft,
-            &[L::I32(-1)],
-            &[L::U32(31)],
-            None
-        ));
-        assert!(!binary_hazard(
-            B::ShiftRight,
-            &[L::U32(u32::MAX)],
-            &[L::U32(31)],
-            None
-        ));
+        assert!(bh(B::ShiftLeft, &[L::I32(1)], &[L::U32(31)], None));
+        assert!(!bh(B::ShiftLeft, &[L::I32(-1)], &[L::U32(31)], None));
+        assert!(!bh(B::ShiftRight, &[L::U32(u32::MAX)], &[L::U32(31)], None));
         // Wrapping arithmetic is never a creation error.
-        assert!(!binary_hazard(
-            B::Multiply,
-            &[L::I32(i32::MAX)],
-            &[L::I32(2)],
-            None
-        ));
+        assert!(!bh(B::Multiply, &[L::I32(i32::MAX)], &[L::I32(2)], None));
         // i64 is exact past f64's 53 bits.
-        assert!(!binary_hazard(
+        assert!(!bh(
             B::ShiftLeft,
             &[L::I64(1 << 52 | 1)],
             &[L::U32(10)],
             None
         ));
-        assert!(binary_hazard(
-            B::ShiftLeft,
-            &[L::U64(1 << 63 | 1)],
-            &[L::U32(1)],
-            None
-        ));
+        assert!(bh(B::ShiftLeft, &[L::U64(1 << 63 | 1)], &[L::U32(1)], None));
     }
 
     #[test]
     fn float_binary_rules_track_the_result_width() {
-        assert!(binary_hazard(
-            B::Multiply,
-            &[L::F32(1e38)],
-            &[L::F32(10.0)],
-            Some(4)
-        ));
-        assert!(!binary_hazard(
-            B::Multiply,
-            &[L::F32(1e37)],
-            &[L::F32(10.0)],
-            Some(4)
-        ));
-        assert!(binary_hazard(
-            B::Divide,
-            &[L::F32(1.0)],
-            &[L::F32(0.0)],
-            Some(4)
-        ));
+        assert!(bh(B::Multiply, &[L::F32(1e38)], &[L::F32(10.0)], Some(4)));
+        assert!(!bh(B::Multiply, &[L::F32(1e37)], &[L::F32(10.0)], Some(4)));
+        assert!(bh(B::Divide, &[L::F32(1.0)], &[L::F32(0.0)], Some(4)));
         // Broadcast scalar against a vector's lanes; f16 range applies.
-        assert!(binary_hazard(
+        assert!(bh(
             B::Multiply,
             &[L::F32(1000.0), L::F32(1.0)],
             &[L::F32(100.0)],
             Some(2)
         ));
-        assert!(!binary_hazard(
+        assert!(!bh(
             B::Multiply,
             &[L::F32(2.0), L::F32(3.0)],
             &[L::F32(4.0)],

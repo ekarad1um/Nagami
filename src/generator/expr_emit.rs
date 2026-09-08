@@ -8,8 +8,8 @@ use crate::passes::expr_util::literal_bit_eq;
 
 use super::core::{FunctionCtx, Generator};
 use super::syntax::{
-    literal_extract_key, literal_to_wgsl, literal_to_wgsl_bare, math_name, scalar_zero,
-    type_inner_name, type_resolution_name,
+    expression_kind, literal_extract_key, literal_to_wgsl, literal_to_wgsl_bare, math_name,
+    scalar_zero, type_inner_kind, type_inner_name, type_resolution_name,
 };
 
 /// `true` when the bare (suffix-less) spelling of `literal` would re-parse as
@@ -1257,6 +1257,45 @@ impl<'a> Generator<'a> {
                     fun,
                     naga::MathFunction::ExtractBits | naga::MathFunction::InsertBits
                 );
+                // Only a float SCALAR loses its type this way: a vector renders
+                // through a constructor naming the element type, and an integer
+                // literal's bare form re-infers the integer it is.
+                let float_scalar = match ctx.ty(*arg).inner_with(&self.module.types) {
+                    naga::TypeInner::Scalar(s) if s.kind == naga::ScalarKind::Float => Some(*s),
+                    _ => None,
+                };
+                // The runtime sibling above pins nothing when EVERY argument is
+                // a whole-valued float literal: `mix(1.f,2.f,1.f)` renders
+                // `mix(1,2,1)`, three AbstractInt tokens typing the call
+                // AbstractInt.  tint accepts that, naga does not, and naga is
+                // the self-check, so one such call drops the WHOLE module to
+                // naga's emitter; typing one argument re-pins the float.  Every
+                // shared-type builtin, not just the two that fail today (5
+                // corpus files at -110 bytes, 10 at +1).
+                //
+                // An extracted literal renders as its `const` name, which
+                // carries a declared type and so pins on its own.  Treating
+                // that as pinning is also what keeps the forced text off
+                // `literal_extract`'s books: it only ever replaces a literal
+                // that was going to render bare.
+                let float_needs_pin = !pins_alone
+                    && float_scalar.is_some_and(|scalar| {
+                        [Some(*arg), *arg1, *arg2, *arg3]
+                            .into_iter()
+                            .flatten()
+                            .all(|h| {
+                                self.inline_scalar_literal(h, ctx).is_some_and(|lit| {
+                                    let key =
+                                        literal_extract_key(lit, &self.options.float_precision);
+                                    !self.extracted_literals.contains_key(&key)
+                                        && !literal_bare_form_pins_scalar(
+                                            lit,
+                                            scalar,
+                                            &self.options.float_precision,
+                                        )
+                                })
+                            })
+                    });
                 let typed_if_literal = |g: &Self,
                                         h: naga::Handle<naga::Expression>,
                                         ctx: &mut FunctionCtx<'a, '_>|
@@ -1270,7 +1309,11 @@ impl<'a> Generator<'a> {
                         g.emit_expr(h, ctx)
                     }
                 };
-                s.push_str(&typed_if_literal(self, *arg, ctx)?);
+                if float_needs_pin && let Some(lit) = self.inline_scalar_literal(*arg, ctx) {
+                    s.push_str(&literal_to_wgsl(lit, &self.options.float_precision));
+                } else {
+                    s.push_str(&typed_if_literal(self, *arg, ctx)?);
+                }
                 if let Some(v) = arg1 {
                     s.push_str(sep);
                     if *fun == naga::MathFunction::InsertBits {
@@ -1308,10 +1351,10 @@ impl<'a> Generator<'a> {
                     if convert.is_none() {
                         return Err(Error::Emit(format!(
                             "matrix bitcast (As {{ convert: None }}) is not representable in WGSL \
-                             in function '{}' (expr {}): source type {:?}",
+                             in function '{}' (expr {}): source type {}",
                             ctx.display_name,
                             expr.index(),
-                            src_inner,
+                            type_inner_kind(src_inner),
                         )));
                     }
                     let target_width = convert.unwrap_or(src_scalar.width);
@@ -1336,8 +1379,9 @@ impl<'a> Generator<'a> {
                     naga::TypeInner::Vector { size, scalar } => (Some(*size), scalar.width),
                     _ => {
                         return Err(Error::Emit(format!(
-                            "unsupported cast source type in function '{}': {:?}",
-                            ctx.display_name, src_inner,
+                            "unsupported cast source type in function '{}': {}",
+                            ctx.display_name,
+                            type_inner_kind(src_inner),
                         )));
                     }
                 };
@@ -1470,10 +1514,10 @@ impl<'a> Generator<'a> {
             E::ArrayLength(e) => format!("arrayLength({})", self.emit_pointer_operand(*e, ctx)?),
             _ => {
                 return Err(Error::Emit(format!(
-                    "unsupported expression in function '{}' (expr {}): {:?}",
+                    "unsupported expression in function '{}' (expr {}): {}",
                     ctx.display_name,
                     expr.index(),
-                    ctx.exprs[expr],
+                    expression_kind(&ctx.exprs[expr]),
                 )));
             }
         })
@@ -1681,7 +1725,13 @@ impl<'a> Generator<'a> {
     /// WGSL name of `inner`, through the alias table.
     pub(super) fn type_name_for_inner(&self, inner: &naga::TypeInner) -> Result<String, Error> {
         let res = naga::proc::TypeResolution::Value(inner.clone());
-        type_resolution_name(&res, self.module, &self.type_names, &self.override_names)
+        type_resolution_name(
+            &res,
+            self.module,
+            &self.type_names,
+            &self.override_names,
+            &self.shadowed_type_aliases,
+        )
     }
 
     /// WGSL name of `expr`'s resolved type.
@@ -1691,7 +1741,13 @@ impl<'a> Generator<'a> {
         ctx: &FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
         let res = &ctx.ty(expr);
-        type_resolution_name(res, self.module, &self.type_names, &self.override_names)
+        type_resolution_name(
+            res,
+            self.module,
+            &self.type_names,
+            &self.override_names,
+            &self.shadowed_type_aliases,
+        )
     }
 
     /// WGSL name of a type handle, alias first.
@@ -1704,6 +1760,7 @@ impl<'a> Generator<'a> {
             self.module,
             &self.type_names,
             &self.override_names,
+            &self.shadowed_type_aliases,
         )
     }
 

@@ -2394,7 +2394,7 @@ fn select_different_arms_not_simplified() {
         &naga::UniqueArena::new(),
         &Default::default(),
     );
-    // `resolve_literal` needs literal arms, so the Select stays.
+    // `resolve_const_value` needs literal arms, so the Select stays.
     assert!(
         matches!(arena[sel], naga::Expression::Select { .. }),
         "select with different arms should not be simplified by the simplify loop, got {:?}",
@@ -5163,6 +5163,71 @@ fn build_constant_literal_cache_skips_abstract_literals() {
     );
 }
 
+/// `build_constant_literal_cache` reads literals straight out of the arena,
+/// which is complete only because `fold_global_expressions` ran first and
+/// collapsed initializer chains.  naga's frontend concretises every constant,
+/// so only hand-built IR (via `run_module`) or a pass that rewrites
+/// `global_expressions` reaches an unfolded chain - and reordering the two
+/// would silently stop inlining those constants.
+#[test]
+fn build_constant_literal_cache_needs_global_folding_first() {
+    let mut module = naga::Module::default();
+    let i32_ty = module.types.insert(
+        naga::Type {
+            name: None,
+            inner: naga::TypeInner::Scalar(naga::Scalar::I32),
+        },
+        naga::Span::UNDEFINED,
+    );
+    let konst = |module: &mut naga::Module, name: &str, init| {
+        let init = module
+            .global_expressions
+            .append(init, naga::Span::UNDEFINED);
+        module.constants.append(
+            naga::Constant {
+                name: Some(name.into()),
+                ty: i32_ty,
+                init,
+            },
+            naga::Span::UNDEFINED,
+        )
+    };
+    // const A = 7;  const B = A;  const C = B + 1;
+    let a = konst(
+        &mut module,
+        "A",
+        naga::Expression::Literal(naga::Literal::I32(7)),
+    );
+    let b = konst(&mut module, "B", naga::Expression::Constant(a));
+    let b_init = module.constants[b].init;
+    let one = module.global_expressions.append(
+        naga::Expression::Literal(naga::Literal::I32(1)),
+        naga::Span::UNDEFINED,
+    );
+    let c = konst(
+        &mut module,
+        "C",
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::Add,
+            left: b_init,
+            right: one,
+        },
+    );
+
+    let unfolded = build_constant_literal_cache(&module);
+    assert_eq!(unfolded.get(a), Some(&naga::Literal::I32(7)));
+    assert!(
+        !unfolded.contains_key(b) && !unfolded.contains_key(c),
+        "without the global fold a chained initializer is not yet a Literal",
+    );
+
+    let vector_type_cache = build_vector_type_cache(&module.types);
+    fold_global_expressions(&mut module, &vector_type_cache);
+    let folded = build_constant_literal_cache(&module);
+    assert_eq!(folded.get(b), Some(&naga::Literal::I32(7)));
+    assert_eq!(folded.get(c), Some(&naga::Literal::I32(8)));
+}
+
 /// naga materialises a dynamically-indexed function-scope `const` array as a
 /// full composite at the use site and load_dedup forwards the index literal;
 /// without this fold the emitter ships the whole array inline and only the
@@ -5309,5 +5374,73 @@ fn float_modulo_boundary_crossing_within_cap_declines() {
     assert_eq!(
         eval_binary(B::Modulo, L::F32(7.0), L::F32(2.0)),
         Some(L::F32(1.0))
+    );
+}
+
+/// Folding a divisor to a literal zero manufactures IR naga's validator
+/// rejects, and the driver's rollback then discards every OTHER fold the
+/// same run made - permanently, since the pass is deterministic and re-runs
+/// to the same failure.  The guard declines that one fold, so the rest of
+/// the module still folds.
+#[test]
+fn a_foldable_zero_divisor_does_not_cost_the_whole_fold() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<i32>;\n\
+        @compute @workgroup_size(1) fn f() {\n\
+          var a = 1;\n  var b = 0;\n\
+          out[0] = 2 + 3 * 4 - 1;\n  out[1] = (7 * 8) / 2;\n  out[2] = a / (b + b);\n}";
+    let output = crate::run(src, &Config::default()).expect("must minify");
+    let rolled_back: Vec<_> = output
+        .report
+        .pass_reports
+        .iter()
+        .filter(|p| p.pass_name == "constant_folding" && p.rolled_back)
+        .collect();
+    assert!(
+        rolled_back.is_empty(),
+        "constant_folding must not manufacture a static division by zero: \
+         {} rollback(s) in {}",
+        rolled_back.len(),
+        output.source
+    );
+}
+
+/// The same guard for shift amounts: `x << (n + n)` with `n` forwarded to 20
+/// is a shift past the bit width, which naga rejects the same way.
+#[test]
+fn a_foldable_out_of_range_shift_amount_does_not_roll_back() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: i32;\n\
+        @compute @workgroup_size(1) fn f() {\n\
+          var a = 1i;\n  var n = 20u;\n  out = a << (n + n);\n}";
+    let output = crate::run(src, &Config::default()).expect("must minify");
+    assert!(
+        !output
+            .report
+            .pass_reports
+            .iter()
+            .any(|p| p.pass_name == "constant_folding" && p.rolled_back),
+        "constant_folding must not manufacture an out-of-range shift: {}",
+        output.source
+    );
+}
+
+/// The guard must cover every arm that narrows an expression to one of its
+/// operands, not just the literal fold: `select(z, z, c)` with both branches
+/// the same handle clones that operand over the `Select`, which put a literal
+/// zero straight into the divisor slot the fold had just declined.
+#[test]
+fn narrowing_a_select_does_not_reopen_the_zero_divisor() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<i32>;\n\
+        @compute @workgroup_size(1) fn f() {\n\
+          var a = 7;\n  var c = true;\n  let z = 0;\n\
+          out[0] = 2 + 3 * 4 - 1;\n  out[1] = a / select(z, z, c);\n}";
+    let output = crate::run(src, &Config::default()).expect("must minify");
+    assert!(
+        !output
+            .report
+            .pass_reports
+            .iter()
+            .any(|p| p.pass_name == "constant_folding" && p.rolled_back),
+        "narrowing `select(z, z, c)` must not manufacture a zero divisor: {}",
+        output.source
     );
 }

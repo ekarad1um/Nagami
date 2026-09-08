@@ -1787,3 +1787,102 @@ fn switch_meet_keeps_stores_when_case_breaks() {
         "the post-switch read must consult the local, not a forwarded value: {out}"
     );
 }
+
+/// Every argument of a shared-type float builtin rendering as a bare
+/// whole-number literal leaves the call typed AbstractInt (`mix(1,2,1)`),
+/// which naga rejects even though tint accepts it - and the rejection is the
+/// self-check's, so ONE such call dropped the whole module to naga's emitter.
+#[test]
+fn all_literal_float_builtin_args_keep_a_typed_pin() {
+    for call in ["mix(1.f, 2.f, 1.f)", "smoothstep(2.f, 4.f, 3.f)"] {
+        let src = format!(
+            "@group(0) @binding(0) var<storage, read_write> out: f32;\n\
+             fn helper() -> f32 {{ return {call}; }}\n\
+             @compute @workgroup_size(1) fn main() {{ out = helper(); }}"
+        );
+        let output = crate::run(&src, &Config::default()).expect("must minify");
+        let gen_report = output
+            .report
+            .pass_reports
+            .iter()
+            .find(|p| p.pass_name == "generator_emit")
+            .expect("generator_emit pass must exist");
+        assert!(
+            !gen_report.rolled_back,
+            "{call} must not drop the module to naga's emitter: {}",
+            output.source
+        );
+        assert_valid_wgsl(&output.source);
+    }
+}
+
+/// A declaration that survives renaming may take a predeclared alias
+/// spelling (`fn vec4f()` is legal WGSL and entry-point names are always
+/// preserved).  Emitting the short form then names the user's symbol, so the
+/// long form must stand.
+#[test]
+fn a_shadowed_predeclared_alias_falls_back_to_the_long_form() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: vec4<f32>;\n\
+        @compute @workgroup_size(1) fn vec4f() { out = vec4<f32>(1.0, 2.0, 3.0, 4.0); }";
+    let output = crate::run(src, &Config::default()).expect("must minify");
+    let gen_report = output
+        .report
+        .pass_reports
+        .iter()
+        .find(|p| p.pass_name == "generator_emit")
+        .expect("generator_emit pass must exist");
+    assert!(
+        !gen_report.rolled_back,
+        "an entry point named `vec4f` must not cost the custom generator: {}",
+        output.source
+    );
+    assert!(
+        output.source.contains("vec4<f32>"),
+        "the shadowed short alias must not spell the type: {}",
+        output.source
+    );
+    assert_valid_wgsl(&output.source);
+}
+
+/// The same collision through a preamble used to be a hard error: the
+/// preamble path has no fallback emitter, so the self-check failure escaped
+/// as `emit error` (exit 2) on valid input.
+#[test]
+fn a_preamble_shadowing_an_alias_still_minifies() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: vec4<f32>;\n\
+        @compute @workgroup_size(1) fn main() {\n\
+          var s: vec4f;\n  s.i = 3;\n  out = vec4<f32>(f32(s.i), 1.0, 1.0, 1.0);\n}";
+    let config = Config {
+        preamble: Some("struct vec4f { i : i32, }".to_string()),
+        ..Default::default()
+    };
+    let output = crate::run(src, &config).expect("a shadowed alias must not hard-error");
+    assert!(
+        output.source.contains("vec4<f32>"),
+        "the preamble's `vec4f` must not spell the builtin type: {}",
+        output.source
+    );
+}
+
+/// Lossy float rounding is applied when the literal is PRINTED, so a rule
+/// judged on the IR's values can be violated only in the output: rounding
+/// `smoothstep(0.01, 0.02, x)` to one decimal collapses both edges to `0`,
+/// which tint rejects and naga - the emit self-check - does not.
+#[test]
+fn rounded_literals_are_judged_by_the_printed_value() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: f32;\n\
+        @compute @workgroup_size(1) fn main() { out = smoothstep(0.01, 0.02, out); }";
+    let config = Config {
+        float_precision: crate::config::FloatPrecision::all(
+            crate::config::PrecisionMode::DecimalPlaces(1),
+        ),
+        ..Default::default()
+    };
+    let output = crate::run(src, &config).expect("must minify");
+    assert!(
+        !output.source.contains("smoothstep(0,0,"),
+        "both edges rounded together; one must be bound to keep the call runtime: {}",
+        output.source
+    );
+    assert_valid_wgsl(&output.source);
+}
