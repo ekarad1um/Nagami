@@ -5,10 +5,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PKG="$ROOT/pkg"
 
-RUSTFLAGS="--remap-path-prefix=$HOME=~ --remap-path-prefix=$(rustc --print sysroot)=rustc" \
-CARGO_PROFILE_RELEASE_OPT_LEVEL=z \
-  wasm-pack build "$ROOT" --release \
-    --target web -- --no-default-features --features wasm
+RUSTFLAGS="--remap-path-prefix=$HOME=~ --remap-path-prefix=$(rustc --print sysroot)=rustc" CARGO_PROFILE_RELEASE_OPT_LEVEL=z \
+  wasm-pack build "$ROOT" --release --target web -- --no-default-features --features wasm
 
 node -e "
 const fs = require('fs');
@@ -21,6 +19,10 @@ pkg.files = ['nagami_bg.wasm','nagami_bg.wasm.d.ts','nagami.js','nagami.d.ts'];
 pkg.exports = { '.': { types: './nagami.d.ts', import: './nagami.js' } };
 pkg.sideEffects = false;
 pkg.engines = { node: '>=16' };
+
+if (pkg.repository && /^https?:\/\//.test(pkg.repository.url || '')) {
+  pkg.repository.url = 'git+' + pkg.repository.url;
+}
 
 delete pkg._dependencies;
 
