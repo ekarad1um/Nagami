@@ -99,13 +99,15 @@ impl Pass for ConstFoldPass {
         for (_, function) in module.functions.iter_mut() {
             // The identity gate keys on the pre-fold graph, not on mid-loop
             // partial rewrites.
-            let refcounts = count_handle_refs(function);
+            let census = reference_census(function);
             let emit_ranges = build_emit_range_map(&function.body, function.expressions.len());
+            let zero_locals = zero_init_locals(function, &census);
             let (folded, simplified) = fold_local_expressions(
                 &mut function.expressions,
-                &refcounts,
+                &census.counts,
                 &emit_ranges,
                 &const_literals,
+                &zero_locals,
                 &module.types,
                 &vector_type_cache,
             );
@@ -116,14 +118,16 @@ impl Pass for ConstFoldPass {
             }
         }
         for entry in module.entry_points.iter_mut() {
-            let refcounts = count_handle_refs(&entry.function);
+            let census = reference_census(&entry.function);
             let emit_ranges =
                 build_emit_range_map(&entry.function.body, entry.function.expressions.len());
+            let zero_locals = zero_init_locals(&entry.function, &census);
             let (folded, simplified) = fold_local_expressions(
                 &mut entry.function.expressions,
-                &refcounts,
+                &census.counts,
                 &emit_ranges,
                 &const_literals,
+                &zero_locals,
                 &module.types,
                 &vector_type_cache,
             );
@@ -162,6 +166,7 @@ fn fold_global_expressions(
 
     let mut visiting = HandleSet::default();
     let mut memo: ConstValueMemo = vec![None; module.global_expressions.len()];
+    let no_locals = HandleMap::default();
     for handle in handles {
         visiting.clear();
         let value = {
@@ -169,6 +174,7 @@ fn fold_global_expressions(
                 arena: &module.global_expressions,
                 types: &module.types,
                 constants: ConstSource::Inits(&const_inits),
+                zero_locals: &no_locals,
             };
             resolve_const_value(handle, &ctx, &mut visiting, &mut memo)
         };
@@ -235,18 +241,32 @@ fn build_constant_literal_cache(module: &naga::Module) -> HandleMap<naga::Consta
 
 // MARK: Per-function folding
 
-/// Data-flow reference count per handle: expression-as-child uses, statement
-/// operands and results, `named_expressions`, and local initializers.  `Emit`
-/// ranges are NOT counted: they fix execution order, not consumption, and an
-/// expression whose only "use" is its Emit entry is dead.  The identity gate
+/// One walk serving both folding gates: the walk, not the tallying, is the
+/// cost.
+struct RefCensus {
+    counts: Vec<u32>,
+    /// Deferred rather than tallied: a mention's `counts` entry is only
+    /// final once the walk is.
+    local_var_exprs: Vec<(Handle<naga::Expression>, Handle<naga::LocalVariable>)>,
+    /// `Load`s of a whole local, per local index.
+    local_loads: Vec<u32>,
+}
+
+/// `counts` is the data-flow reference count per handle: expression-as-child
+/// uses, statement operands and results, `named_expressions`, and local
+/// initializers.  `Emit` ranges are NOT counted: they fix execution order,
+/// not consumption, and an expression whose only "use" is its Emit entry is
+/// dead.  The identity gate
 /// tests `== 1` for impure operands whose Emit entry can go after cloning,
 /// so `saturating_add` is indistinguishable from exact.
 ///
 /// Counting statement RESULTS is load-bearing: statement-attached expressions
 /// (`CallResult`, `AtomicResult`, ...) are uncloneable, and their producer
 /// bump pushes any consumed one to `>= 2` so the `== 1` escape never fires.
-fn count_handle_refs(function: &naga::Function) -> Vec<u32> {
+fn reference_census(function: &naga::Function) -> RefCensus {
     let mut counts = vec![0u32; function.expressions.len()];
+    let mut local_var_exprs = Vec::with_capacity(function.local_variables.len());
+    let mut local_loads = vec![0u32; function.local_variables.len()];
 
     fn bump(counts: &mut [u32], h: naga::Handle<naga::Expression>) {
         let i = h.index();
@@ -255,7 +275,16 @@ fn count_handle_refs(function: &naga::Function) -> Vec<u32> {
         }
     }
 
-    for (_, expr) in function.expressions.iter() {
+    for (handle, expr) in function.expressions.iter() {
+        match expr {
+            naga::Expression::LocalVariable(l) => local_var_exprs.push((handle, *l)),
+            naga::Expression::Load { pointer } => {
+                if let naga::Expression::LocalVariable(l) = function.expressions[*pointer] {
+                    local_loads[l.index()] = local_loads[l.index()].saturating_add(1);
+                }
+            }
+            _ => {}
+        }
         super::expr_util::visit_expression_children(expr, |child| bump(&mut counts, child));
     }
 
@@ -277,7 +306,45 @@ fn count_handle_refs(function: &naga::Function) -> Vec<u32> {
         }
     }
 
-    counts
+    RefCensus {
+        counts,
+        local_var_exprs,
+        local_loads,
+    }
+}
+
+/// Locals still holding the zero WGSL initialised them with, mapped to the
+/// type that names it: no initialiser, and every mention of the variable
+/// being one of the `Load`s that read it, so no store, pointer argument or
+/// element pointer reached it first.  A count can only exceed the loads (it
+/// also covers named expressions and inits), and an over-count declines.
+///
+/// The language guarantees this, but no pass carries it: `load_dedup` seeds
+/// forwards from an EXPLICIT init, and `dead_branch` deletes the `d = false`
+/// stores that made the value knowable.  Unstated, a provably false `a && b`
+/// survives as a runtime branch - dead code, and a const-expression demoted
+/// to a runtime one, which loses the sign of zero under fast math.
+fn zero_init_locals(
+    function: &naga::Function,
+    census: &RefCensus,
+) -> HandleMap<naga::LocalVariable, Handle<naga::Type>> {
+    let nlocals = function.local_variables.len();
+    if nlocals == 0 {
+        return Default::default();
+    }
+    let mut mentions = vec![0u32; nlocals];
+    for &(handle, l) in &census.local_var_exprs {
+        mentions[l.index()] = mentions[l.index()].saturating_add(census.counts[handle.index()]);
+    }
+    function
+        .local_variables
+        .iter()
+        .filter(|(lh, lvar)| {
+            let loads = census.local_loads[lh.index()];
+            lvar.init.is_none() && loads > 0 && mentions[lh.index()] == loads
+        })
+        .map(|(lh, lvar)| (lh, lvar.ty))
+        .collect()
 }
 
 const NO_EMIT: u32 = u32::MAX;
@@ -310,6 +377,12 @@ fn build_emit_range_map(body: &naga::Block, expression_count: usize) -> Vec<u32>
 /// Roles that make a folded literal a WGSL shader-creation error.
 const ROLE_DIVISOR: u8 = 1;
 const ROLE_SHIFT_AMOUNT: u8 = 2;
+/// Anywhere inside a failable operator's right operand, however deep.  The
+/// roles above ask whether the literal written HERE is an error; this one
+/// asks whether a fold here makes the whole slot const, the question a
+/// `Load` poses: `5u / u32(b)` is legal until `b` folds to `false`, and the
+/// error lands on the cast, which no fold touched.
+const ROLE_IN_FAILABLE_SLOT: u8 = 4;
 
 /// Per-handle roles: the right operand of an integer `/` `%` or of a shift,
 /// reached through `Splat` / `Compose` since any offending lane condemns a
@@ -317,16 +390,20 @@ const ROLE_SHIFT_AMOUNT: u8 = 2;
 /// post-pass validation, and the rollback discards every OTHER fold of the
 /// same run - permanently, the pass being deterministic - so declining is
 /// free.
+///
+/// [`ROLE_IN_FAILABLE_SLOT`] rides the same walk but descends through every
+/// operand: const-ness propagates up through any pure operation, not just
+/// the two that carry a lane.
 fn static_error_roles(arena: &naga::Arena<naga::Expression>) -> Vec<u8> {
     let mut stack: Vec<(Handle<naga::Expression>, u8)> = arena
         .iter()
         .filter_map(|(_, expr)| match expr {
             naga::Expression::Binary { op, right, .. } => match op {
                 naga::BinaryOperator::Divide | naga::BinaryOperator::Modulo => {
-                    Some((*right, ROLE_DIVISOR))
+                    Some((*right, ROLE_DIVISOR | ROLE_IN_FAILABLE_SLOT))
                 }
                 naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight => {
-                    Some((*right, ROLE_SHIFT_AMOUNT))
+                    Some((*right, ROLE_SHIFT_AMOUNT | ROLE_IN_FAILABLE_SLOT))
                 }
                 _ => None,
             },
@@ -340,7 +417,9 @@ fn static_error_roles(arena: &naga::Arena<naga::Expression>) -> Vec<u8> {
     }
     let mut roles = vec![0u8; arena.len()];
     while let Some((h, role)) = stack.pop() {
-        if roles[h.index()] & role != 0 {
+        // Every bit, not any: a push carries two roles, so being marked
+        // INSIDE a slot must not swallow the push that makes it BE one.
+        if roles[h.index()] & role == role {
             continue;
         }
         roles[h.index()] |= role;
@@ -349,7 +428,11 @@ fn static_error_roles(arena: &naga::Arena<naga::Expression>) -> Vec<u8> {
             naga::Expression::Compose { components, .. } => {
                 stack.extend(components.iter().map(|&c| (c, role)));
             }
-            _ => {}
+            _ => {
+                super::expr_util::visit_expression_children(&arena[h], |child| {
+                    stack.push((child, role & ROLE_IN_FAILABLE_SLOT));
+                });
+            }
         }
     }
     roles
@@ -396,6 +479,7 @@ fn fold_local_expressions(
     refcounts: &[u32],
     emit_ranges: &[u32],
     const_literals: &HandleMap<naga::Constant, naga::Literal>,
+    zero_locals: &HandleMap<naga::LocalVariable, Handle<naga::Type>>,
     types: &naga::UniqueArena<naga::Type>,
     vector_type_cache: &FxHashMap<(naga::VectorSize, naga::Scalar), naga::Handle<naga::Type>>,
 ) -> (HandleSet<naga::Expression>, usize) {
@@ -428,11 +512,20 @@ fn fold_local_expressions(
                 arena: &*arena,
                 types,
                 constants: ConstSource::Literals(const_literals),
+                zero_locals,
             };
             resolve_const_value(handle, &ctx, &mut visiting, &mut memo)
         };
 
         let role = role_of(&roles, handle);
+        // A `Load` is where const-ness ENTERS the slot, so it answers to
+        // the whole-slot role, not to what it holds.  Above the match: a
+        // vector local reaches the same cliff through the other arm.
+        if role & ROLE_IN_FAILABLE_SLOT != 0
+            && matches!(arena[handle], naga::Expression::Load { .. })
+        {
+            continue;
+        }
         match value {
             Some(ConstValue::Scalar(literal)) => {
                 // An abstract result (both operands abstract) trips naga's
@@ -689,6 +782,8 @@ struct ConstFoldContext<'a> {
     arena: &'a naga::Arena<naga::Expression>,
     types: &'a naga::UniqueArena<naga::Type>,
     constants: ConstSource<'a>,
+    /// See [`zero_init_locals`]; empty at module scope, which has no locals.
+    zero_locals: &'a HandleMap<naga::LocalVariable, Handle<naga::Type>>,
 }
 
 impl ConstFoldContext<'_> {
@@ -708,6 +803,24 @@ impl ConstFoldContext<'_> {
 }
 
 // MARK: Resolver entry points
+
+/// `u32(false)` and friends: dead weight while naga's frontend folded every
+/// one, live now that [`zero_init_locals`] hands the resolver a `false` naga
+/// never saw.  Bool is what join lowering produces, and without this a
+/// never-written one ships as `u32(false)` - six of those cost more than the
+/// variable they replaced.
+fn cast_bool_to(src: bool, target: naga::Scalar) -> Option<naga::Literal> {
+    use naga::Literal as L;
+    use naga::ScalarKind as K;
+    match (target.kind, target.width) {
+        (K::Uint, 4) => Some(L::U32(src.into())),
+        (K::Sint, 4) => Some(L::I32(src.into())),
+        (K::Float, 4) => Some(L::F32(if src { 1.0 } else { 0.0 })),
+        (K::Bool, _) => Some(L::Bool(src)),
+        // f16 and the 8-byte kinds decline, which only forfeits a fold.
+        _ => None,
+    }
+}
 
 /// Convert a width-8 literal (`F64` / `U64` / `I64`) to `target` (f32 / i32 /
 /// u32 / bool), or `None` for any other pair.  naga's frontend refuses to
@@ -785,6 +898,13 @@ fn resolve_const_value_uncached(
         naga::Expression::Constant(ch) => ctx.resolve_constant_value(*ch, visiting, memo),
 
         naga::Expression::ZeroValue(ty) => resolve_zero_value(*ty, ctx),
+
+        // A never-written local still holds its zero init; `zero_locals`
+        // is the proof.
+        naga::Expression::Load { pointer } => match ctx.arena[*pointer] {
+            naga::Expression::LocalVariable(l) => resolve_zero_value(*ctx.zero_locals.get(l)?, ctx),
+            _ => None,
+        },
 
         naga::Expression::Splat { size, value } => {
             let inner = resolve_const_value(*value, ctx, visiting, memo)?;
@@ -908,16 +1028,19 @@ fn resolve_const_value_uncached(
                 return None;
             };
             match convert {
-                Some(width) => match lit {
-                    naga::Literal::F64(_) | naga::Literal::U64(_) | naga::Literal::I64(_) => {
-                        let target = naga::Scalar {
-                            kind: *kind,
-                            width: *width,
-                        };
-                        cast_width8_to(lit, target).map(ConstValue::Scalar)
+                Some(width) => {
+                    let target = naga::Scalar {
+                        kind: *kind,
+                        width: *width,
+                    };
+                    match lit {
+                        naga::Literal::F64(_) | naga::Literal::U64(_) | naga::Literal::I64(_) => {
+                            cast_width8_to(lit, target).map(ConstValue::Scalar)
+                        }
+                        naga::Literal::Bool(b) => cast_bool_to(b, target).map(ConstValue::Scalar),
+                        _ => None,
                     }
-                    _ => None,
-                },
+                }
                 None => bitcast_literal(lit, *kind).map(ConstValue::Scalar),
             }
         }

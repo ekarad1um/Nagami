@@ -4,7 +4,8 @@ use crate::handle_set::{HandleMap, HandleSet};
 
 /// Shim for [`fold_local_expressions`]: bare arenas have no `Emit` ranges,
 /// so mapping every handle to one shared range models the safe co-located
-/// case and the store-aware relocation guard is a no-op.  Cross-range tests
+/// case and the store-aware relocation guard is a no-op; they have no
+/// locals either, so nothing reads as a zero initialiser.  Cross-range tests
 /// call [`fold_local_expressions`] with their own map.
 fn fold_local(
     arena: &mut naga::Arena<naga::Expression>,
@@ -19,6 +20,7 @@ fn fold_local(
         refcounts,
         &ranges,
         const_literals,
+        /*zero_locals=*/ &Default::default(),
         types,
         vector_type_cache,
     )
@@ -1657,9 +1659,10 @@ fn identity_fold_unique_impure_cross_emit_range_blocked() {
         &mut arena,
         &refcounts,
         &ranges,
-        &Default::default(),
+        /*const_literals=*/ &Default::default(),
+        /*zero_locals=*/ &Default::default(),
         &naga::UniqueArena::new(),
-        &Default::default(),
+        /*vector_type_cache=*/ &Default::default(),
     );
     assert_eq!(
         identity, 0,
@@ -1720,9 +1723,10 @@ fn involution_fold_unique_impure_cross_emit_range_blocked() {
         &mut arena,
         &refcounts,
         &ranges,
-        &Default::default(),
+        /*const_literals=*/ &Default::default(),
+        /*zero_locals=*/ &Default::default(),
         &naga::UniqueArena::new(),
-        &Default::default(),
+        /*vector_type_cache=*/ &Default::default(),
     );
     assert_eq!(
         identity, 0,
@@ -5441,6 +5445,151 @@ fn narrowing_a_select_does_not_reopen_the_zero_divisor() {
             .iter()
             .any(|p| p.pass_name == "constant_folding" && p.rolled_back),
         "narrowing `select(z, z, c)` must not manufacture a zero divisor: {}",
+        output.source
+    );
+}
+
+/// naga lowers `a && b` through a local whose stores `dead_branch` then
+/// deletes as redundant, so the join survives only if a never-written local
+/// reads as its zero init.  Not merely a size bug: GPU fuzz seed 960009
+/// shipped `-select(-0.0, 2.0, d)` as `-0.0` where the input's
+/// const-expression gave `+0.0`, the sign of zero being lost once a
+/// const-expression is demoted to a runtime one under fast math.
+#[test]
+fn a_never_written_local_reads_as_its_zero_initialiser() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+        @compute @workgroup_size(1) fn f() {\n\
+          out[0] = bitcast<u32>(-(select(-0.0, floor(2.0), (false && false))));\n\
+          if (false && false) { out[1] = 1u; }\n}";
+    let output = crate::run(src, &Config::default()).expect("must minify");
+    assert!(
+        !output.source.contains("select("),
+        "the short-circuit join must fold to a constant, not a runtime select: {}",
+        output.source
+    );
+    assert!(
+        !output.source.contains("out[1]") && !output.source.contains("if "),
+        "a provably false condition must not survive as a branch: {}",
+        output.source
+    );
+}
+
+/// Neither write is a whole-variable `Store`, which is why the census
+/// demands that every reference to the local BE one of its loads; relaxing
+/// that ships `out[0] = 0` for both.
+#[test]
+fn a_local_written_through_a_pointer_does_not_read_as_zero() {
+    for body in [
+        // Written through a pointer argument; `out[0]` is 9.
+        "var v: u32;\n  w(&v);\n  out[0] = v;",
+        // Written through an element pointer, then read whole; `out[0]` is 7.
+        "var a: array<u32, 2>;\n  a[inp[0] & 1u] = 7u;\n  let b = a;\n  \
+         out[0] = b[0] + b[1];",
+    ] {
+        let src = format!(
+            "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+             @group(0) @binding(1) var<storage, read> inp: array<u32>;\n\
+             fn w(p: ptr<function, u32>) {{ *p = 9u; }}\n\
+             @compute @workgroup_size(1) fn f() {{\n  {body}\n}}"
+        );
+        let output = crate::run(&src, &Config::default()).expect("must minify");
+        assert!(
+            !output.source.contains("]=0;"),
+            "a local something else can write must not fold to its initialiser: \
+             {body} -> {}",
+            output.source
+        );
+    }
+}
+
+/// A read before the only store is the zero init, a read after it is the
+/// stored value; one `=0` is the former, two would be the miscompile.
+#[test]
+fn folding_a_pre_store_read_leaves_the_post_store_read_alone() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+        @group(0) @binding(1) var<storage, read> inp: array<u32>;\n\
+        @compute @workgroup_size(1) fn f() {\n\
+          var v: u32;\n  out[0] = v;\n  v = inp[0];\n  out[1] = v;\n}";
+    let output = crate::run(src, &Config::default()).expect("must minify");
+    assert_eq!(
+        output.source.matches("=0;").count(),
+        1,
+        "only the pre-store read is zero: {}",
+        output.source
+    );
+}
+
+/// The fold only pays if the evaluator can finish the const-expression it
+/// creates.  `u32(false)` is one naga's frontend would have folded and this
+/// one would not, so it was extracted to a `const` and each use paid more
+/// than the variable it replaced: six of them GREW the output by 20 bytes.
+#[test]
+fn folding_a_bool_local_does_not_grow_its_casts() {
+    let uses = (0..6)
+        .map(|i| format!("out[{i}u] = u32(b);"))
+        .collect::<Vec<_>>()
+        .join("");
+    let src = format!(
+        "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+         @compute @workgroup_size(1) fn f() {{\n  var b: bool;\n  {uses}\n}}"
+    );
+    let output = crate::run(&src, &Config::default()).expect("must minify");
+    assert!(
+        !output.source.contains("u32("),
+        "a cast of a folded bool must fold too: {}",
+        output.source
+    );
+}
+
+/// The fold is where const-ness ENTERS an expression, so the guard has to
+/// cover the whole failable slot, not the operand the literal lands in:
+/// `5u / u32(b)` is legal until `b` folds to `false`, and the error lands on
+/// the cast.  Missing it cost the whole module - emit fails and the run
+/// ships the lexically compacted INPUT.
+#[test]
+fn folding_a_local_under_a_failable_operator_does_not_lose_the_module() {
+    for body in [
+        // Scalar, through a cast: the divisor becomes a const zero.
+        "var b: bool;\n  out[0] = 5u / u32(b);\n  out[1] = 2u + 3u;",
+        // Vector, through the componentwise arm: lane 0 becomes a const zero.
+        "out[8] = 0u;\n  var v: vec2u;\n  \
+         out[0] = dot(vec2u(4u, 6u) / (v + vec2u(0u, 1u)), vec2u(1u));\n  \
+         out[1] = 2u + 3u;",
+        // Vector, shift amount past the bit width.
+        "out[8] = 0u;\n  var v: vec2u;\n  \
+         out[0] = dot(vec2u(4u, 6u) >> (v + vec2u(40u, 1u)), vec2u(1u));\n  \
+         out[1] = 2u + 3u;",
+    ] {
+        let src = format!(
+            "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+             @compute @workgroup_size(1) fn f() {{\n  {body}\n}}"
+        );
+        let output = crate::run(&src, &Config::default()).expect("must minify");
+        assert!(
+            output.report.bailout.is_none(),
+            "the slot must stay a runtime read: {body} -> {:?}",
+            output.report.bailout
+        );
+        // The rest of the module still folds, which is what a bailout costs.
+        assert!(
+            output.source.contains("=5;"),
+            "unrelated folding must survive: {body} -> {}",
+            output.source
+        );
+    }
+}
+
+/// The guard is about const-ness reaching the slot, not about refusing every
+/// fold under one: a divisor that stays safe keeps folding.
+#[test]
+fn a_safe_divisor_still_folds_through_the_guard() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+        @compute @workgroup_size(1) fn f() {\n\
+          var b: bool;\n  out[0] = 5u / (u32(b) | 1u);\n  out[1] = 5u << u32(b);\n}";
+    let output = crate::run(src, &Config::default()).expect("must minify");
+    assert!(
+        !output.source.contains("var "),
+        "a divisor forced non-zero, and a shift amount, must still fold: {}",
         output.source
     );
 }
