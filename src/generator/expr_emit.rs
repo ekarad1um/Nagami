@@ -24,7 +24,10 @@ use super::syntax::{
 /// A NON-pinning position breaks the `U32` case: a bare switch selector
 /// re-parses as i32 while its case labels carry `u`, so every new top-level
 /// literal position must force the typed form or hint the scalar through
-/// [`Generator::emit_expr_with_scalar_hint`].
+/// [`Generator::emit_expr_with_scalar_hint`].  A literal PAIR pins nothing
+/// either - bare `-1*0` is AbstractInt, not the `f32` the operands were - so
+/// an operand that only becomes a literal mid-pipeline must keep whatever
+/// left it runtime; see [`i32_binary_widens`] for the arithmetic half.
 /// `true` when both operands are `i32` literals whose concrete (wrapping)
 /// result differs from the exact one an AbstractInt evaluation would give -
 /// exactly the cases the checked operation rejects.  `u32` literals keep
@@ -42,6 +45,26 @@ fn i32_binary_widens(op: naga::BinaryOperator, left: naga::Literal, right: naga:
         B::Modulo => l.checked_rem(r).is_none(),
         _ => false,
     }
+}
+
+/// `true` when both operands are float literals whose bare spellings are
+/// integer-shaped (`-1`, `0`), so the pair re-parses as AbstractInt: `-1*0` is
+/// the integer 0, not the float `-0.0` the operands held.  The float analogue
+/// of [`i32_binary_widens`] - a pair pins nothing, and here it loses the type
+/// family, not just the width.  A float-shaped partner (`1.5`, `1e3`) already
+/// pins AbstractFloat, so only an all-integer-shaped pair qualifies.
+fn float_pair_reinfers_int(
+    left: naga::Literal,
+    right: naga::Literal,
+    precision: &crate::config::FloatPrecision,
+) -> bool {
+    let int_shaped = |l: naga::Literal| {
+        matches!(l, naga::Literal::F32(_) | naga::Literal::AbstractFloat(_)) && {
+            let bare = literal_to_wgsl_bare(l, precision);
+            !bare.is_empty() && bare.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+        }
+    };
+    int_shaped(left) && int_shaped(right)
 }
 
 fn literal_needs_typed_form_outside_constructor(literal: naga::Literal) -> bool {
@@ -114,42 +137,6 @@ fn literal_bare_form_pins_scalar(
             !bare.bytes().all(|b| b.is_ascii_digit() || b == b'-')
         }
         _ => false,
-    }
-}
-
-/// Convert a width-8 literal (`F64`/`U64`/`I64`) to `target` (f32/i32/u32/
-/// bool) with naga's value-conversion semantics - f64 sources CLAMP on int
-/// narrowing, u64/i64 sources WRAP - or `None` for any other pair or a
-/// non-finite f32.  Must agree with `const_fold::cast_width8_to`; it exists
-/// because const_fold cannot fold the VECTOR narrowing (`materialize_vector`
-/// needs the converted component literals as arena handles), which
-/// [`Generator::try_emit_const_width8_vector_narrow`] does at emission.
-fn cast_width8_to_literal(src: naga::Literal, target: naga::Scalar) -> Option<naga::Literal> {
-    use naga::Literal as L;
-    use naga::ScalarKind as K;
-    if let L::F64(v) = src {
-        return match (target.kind, target.width) {
-            (K::Float, 4) => {
-                let r = v as f32;
-                r.is_finite().then_some(L::F32(r))
-            }
-            (K::Sint, 4) => Some(L::I32(v.clamp(i32::MIN as f64, i32::MAX as f64) as i32)),
-            (K::Uint, 4) => Some(L::U32(v.clamp(u32::MIN as f64, u32::MAX as f64) as u32)),
-            (K::Bool, _) => Some(L::Bool(v != 0.0)),
-            _ => None,
-        };
-    }
-    let v: i128 = match src {
-        L::U64(v) => v as i128,
-        L::I64(v) => v as i128,
-        _ => return None,
-    };
-    match (target.kind, target.width) {
-        (K::Float, 4) => Some(L::F32(v as f32)),
-        (K::Sint, 4) => Some(L::I32(v as i32)),
-        (K::Uint, 4) => Some(L::U32(v as u32)),
-        (K::Bool, _) => Some(L::Bool(v != 0)),
-        _ => None,
     }
 }
 
@@ -367,17 +354,7 @@ impl<'a> Generator<'a> {
             }
             E::AccessIndex { base, index } => {
                 let mut s = self.emit_lvalue_or_value(*base, ctx)?;
-                if let Some(field_name) = self.struct_field_name(*base, *index, ctx) {
-                    s.push('.');
-                    s.push_str(&field_name);
-                } else if let Some(c) = self.vector_component_name(*base, *index, ctx) {
-                    s.push('.');
-                    s.push(c);
-                } else {
-                    s.push('[');
-                    s.push_str(&index.to_string());
-                    s.push(']');
-                }
+                self.push_access_index(&mut s, *base, *index, ctx);
                 s
             }
             _ => {
@@ -733,17 +710,7 @@ impl<'a> Generator<'a> {
             }
             E::AccessIndex { base, index } => {
                 let mut s = self.emit_postfix_base(*base, ctx)?;
-                if let Some(field_name) = self.struct_field_name(*base, *index, ctx) {
-                    s.push('.');
-                    s.push_str(&field_name);
-                } else if let Some(c) = self.vector_component_name(*base, *index, ctx) {
-                    s.push('.');
-                    s.push(c);
-                } else {
-                    s.push('[');
-                    s.push_str(&index.to_string());
-                    s.push(']');
-                }
+                self.push_access_index(&mut s, *base, *index, ctx);
                 s
             }
             E::Splat { size: _, value } => 'splat: {
@@ -1028,6 +995,20 @@ impl<'a> Generator<'a> {
                 let cached = ctx.expr_names.contains_key(expr);
                 let wrap = unary_child_needs_parens(*expr, ctx.exprs, cached);
                 let mut s = self.emit_expr(*expr, ctx)?;
+                // A float zero renders bare as `0` where a sibling pins the
+                // type, and `-0` re-parses as the ABSTRACT INTEGER zero, which
+                // has no sign bit (`1.0 / -0` is `+inf`).  Abstract floats
+                // count: this emitter also renders module-scope
+                // const-expressions, which naga has not concretised.
+                if matches!(op, naga::UnaryOperator::Negate)
+                    && s == "0"
+                    && matches!(
+                        ctx.ty(*expr).inner_with(&self.module.types).scalar_kind(),
+                        Some(naga::ScalarKind::Float | naga::ScalarKind::AbstractFloat)
+                    )
+                {
+                    s.push('.');
+                }
                 if wrap {
                     s.insert(0, '(');
                     s.push(')');
@@ -1103,13 +1084,16 @@ impl<'a> Generator<'a> {
                 // Two bare literals pin nothing, so the operation evaluates
                 // as AbstractInt: 64-bit and exact where the concrete i32 form
                 // wraps, which both changes the value and turns an overflow
-                // into a shader-creation error.  Typing the left operand pins
-                // the pair back to i32.
+                // into a shader-creation error, and for a float pair spelled
+                // `-1*0` it is the wrong type family outright.  Typing the
+                // left operand pins the pair back.
                 let widening_left = (!elide_l && !elide_r)
                     .then(|| {
                         let l = self.inline_scalar_literal(*left, ctx)?;
                         let r = self.inline_scalar_literal(*right, ctx)?;
-                        i32_binary_widens(*op, l, r).then_some(l)
+                        (i32_binary_widens(*op, l, r)
+                            || float_pair_reinfers_int(l, r, &self.options.float_precision))
+                        .then_some(l)
                     })
                     .flatten();
                 let ls = if let Some(lit) = widening_left {
@@ -1691,7 +1675,7 @@ impl<'a> Generator<'a> {
         };
         let mut converted = Vec::with_capacity(lits.len());
         for l in lits {
-            match cast_width8_to_literal(l, target) {
+            match crate::passes::expr_util::cast_width8_to(l, target) {
                 Some(lit) => converted.push(lit),
                 None => return Ok(None),
             }
@@ -2004,6 +1988,30 @@ impl<'a> Generator<'a> {
             naga::TypeInner::Vector { .. }
         ));
         is_vec.then(|| COMPONENTS[index as usize])
+    }
+
+    /// Append an `AccessIndex`'s suffix - struct field, vector component or
+    /// numeric index - to an already-rendered base.  Shared by the lvalue and
+    /// rvalue emitters: a place and a read of it must spell the same access,
+    /// or a store lands where its matching load does not.
+    fn push_access_index(
+        &self,
+        out: &mut String,
+        base: naga::Handle<naga::Expression>,
+        index: u32,
+        ctx: &FunctionCtx<'a, '_>,
+    ) {
+        if let Some(field_name) = self.struct_field_name(base, index, ctx) {
+            out.push('.');
+            out.push_str(&field_name);
+        } else if let Some(c) = self.vector_component_name(base, index, ctx) {
+            out.push('.');
+            out.push(c);
+        } else {
+            out.push('[');
+            out.push_str(&index.to_string());
+            out.push(']');
+        }
     }
 
     pub(super) fn struct_field_name(

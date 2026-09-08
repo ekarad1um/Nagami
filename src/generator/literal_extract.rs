@@ -351,35 +351,35 @@ impl<'a> Generator<'a> {
                 }
             };
 
-        // `cache_idx` follows the order `compute_expression_ref_counts` filled
-        // `ref_count_cache`: functions, then entry points.
+        // `all_functions` is also the order `compute_expression_ref_counts`
+        // filled `ref_count_cache` in; `ModuleInfo` has no iterator spanning
+        // both arenas, so the two are zipped rather than indexed apart.
+        let (module, info) = (self.module, self.info);
+        debug_assert_eq!(
+            self.ref_count_cache.len(),
+            module.functions.len() + module.entry_points.len(),
+            "a cache built over a different function set would zip short"
+        );
+        let infos = module
+            .functions
+            .iter()
+            .map(|(handle, _)| &info[handle])
+            .chain((0..module.entry_points.len()).map(|i| info.get_entry_point(i)));
         let mut literal_counts: FxHashMap<LiteralExtractKey, (usize, bool)> = Default::default();
-        let mut cache_idx: usize = 0;
-        for (handle, func) in self.module.functions.iter() {
+        for (cache_idx, (func, fn_info)) in crate::passes::expr_util::all_functions(module)
+            .zip(infos)
+            .enumerate()
+        {
             let live = std::mem::take(&mut self.ref_count_cache[cache_idx].live);
             count_literals(
                 func,
-                &self.info[handle],
+                fn_info,
                 &self.ref_count_cache[cache_idx].ref_counts,
                 &live,
                 &self.defer_cache[cache_idx].0,
                 &mut literal_counts,
             );
-            cache_idx += 1;
         }
-        for (ep_idx, ep) in self.module.entry_points.iter().enumerate() {
-            let live = std::mem::take(&mut self.ref_count_cache[cache_idx].live);
-            count_literals(
-                &ep.function,
-                self.info.get_entry_point(ep_idx),
-                &self.ref_count_cache[cache_idx].ref_counts,
-                &live,
-                &self.defer_cache[cache_idx].0,
-                &mut literal_counts,
-            );
-            cache_idx += 1;
-        }
-        debug_assert_eq!(cache_idx, self.ref_count_cache.len());
 
         // Names the extracted `const` must avoid: every module-scope name and,
         // since function-scope names shadow them, every argument and local.
@@ -407,7 +407,7 @@ impl<'a> Generator<'a> {
         // consumer's spliced document.
         forbidden.extend(self.options.preserve_symbols.iter().cloned());
         forbidden.extend(
-            super::core::all_functions(self.module)
+            crate::passes::expr_util::all_functions(self.module)
                 .flat_map(crate::name_gen::function_local_names)
                 .map(str::to_owned),
         );

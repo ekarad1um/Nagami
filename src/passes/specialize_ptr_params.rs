@@ -21,6 +21,7 @@
 //! argument - stays a pointer parameter and validates through
 //! [`validation_stand_in`] instead.
 
+use super::expr_util::for_each_function_mut;
 use crate::handle_set::{HandleMap, HandleSet};
 use rustc_hash::FxHashMap;
 
@@ -552,20 +553,19 @@ pub fn validation_stand_in(module: &naga::Module) -> Option<naga::Module> {
         }
         retarget_params_to_globals(&mut clone.functions[fh], &roots);
     }
-    let callers = clone
-        .functions
-        .iter_mut()
-        .map(|(_, f)| f)
-        .chain(clone.entry_points.iter_mut().map(|ep| &mut ep.function));
-    for caller in callers {
-        let naga::Function {
-            body,
-            expressions,
-            arguments,
-            ..
-        } = caller;
-        drop_pointer_arguments(body, expressions, arguments, &module.types, &banned);
-    }
+    for_each_function_mut(
+        &mut clone.functions,
+        &mut clone.entry_points,
+        &mut |caller| {
+            let naga::Function {
+                body,
+                expressions,
+                arguments,
+                ..
+            } = caller;
+            drop_pointer_arguments(body, expressions, arguments, &module.types, &banned);
+        },
+    );
     // Retargeting removed every banned position, so validation sees no
     // pointer parameter and the caller never needs a second stand-in.
     debug_assert!(banned_functions(&clone).is_empty());

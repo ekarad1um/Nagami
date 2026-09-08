@@ -175,40 +175,70 @@ fn preprocess_source_for_naga(source: &str) -> Cow<'_, str> {
 /// where the tail provably diverges is semantics-preserving, and the
 /// generator re-synthesises the return on the same predicate, so the
 /// round-trip is unchanged.
+///
+/// `naga::proc::ensure_block_returns` descends into the LAST statement's
+/// nested blocks - a `Block`, both arms of an `If`, every non-fall-through
+/// `Switch` case - and appends there, so a diverging loop inside a branch
+/// carries the dead return inside the arm, never at the function tail.
+/// Mirrored exactly: stripping only the tail left those modules failing
+/// validation on their own INPUT and bailing out to lexical compaction.
 fn strip_front_end_appended_returns(module: &mut naga::Module) {
+    /// The blocks `ensure_block_returns` would have appended to, in its own
+    /// order: the tail first, then whatever the new tail nests.
+    fn strip_block(block: &mut naga::Block) {
+        if matches!(block.last(), Some(naga::Statement::Return { value: None })) {
+            // Nothing before it means no diverging construct to justify the
+            // removal; a bare `return;` is invalid WGSL in a non-void
+            // function, so what is left is always naga's.
+            if block.len() < 2 {
+                return;
+            }
+            let last_span = block
+                .span_iter()
+                .last()
+                .map_or(naga::Span::UNDEFINED, |(_, s)| *s);
+            let len = block.len();
+            block.cull(len - 1..);
+            strip_nested(block);
+            // Restore the return when the new tail does not provably diverge:
+            // a genuine fall-through stays invalid and takes the bailout.
+            if !crate::passes::dead_branch::block_definitely_terminates(block) {
+                block.push(naga::Statement::Return { value: None }, last_span);
+            }
+            return;
+        }
+        strip_nested(block);
+    }
+
+    fn strip_nested(block: &mut naga::Block) {
+        match block.last_mut() {
+            Some(naga::Statement::Block(inner)) => strip_block(inner),
+            Some(naga::Statement::If { accept, reject, .. }) => {
+                strip_block(accept);
+                strip_block(reject);
+            }
+            Some(naga::Statement::Switch { cases, .. }) => {
+                for case in cases.iter_mut() {
+                    if !case.fall_through {
+                        strip_block(&mut case.body);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn strip(func: &mut naga::Function) {
         if func.result.is_none() {
             return; // void function: a bare `return;` tail is legitimate
         }
-        if func.body.len() < 2 {
-            return; // need a diverging construct BEFORE the appended return
-        }
-        if !matches!(
-            func.body.last(),
-            Some(naga::Statement::Return { value: None })
-        ) {
-            return;
-        }
-        let last_span = func
-            .body
-            .span_iter()
-            .last()
-            .map_or(naga::Span::UNDEFINED, |(_, s)| *s);
-        let len = func.body.len();
-        func.body.cull(len - 1..);
-        // Restore the return when the new tail does not provably diverge: a
-        // genuine fall-through stays invalid and takes the bailout.
-        if !crate::passes::dead_branch::block_definitely_terminates(&func.body) {
-            func.body
-                .push(naga::Statement::Return { value: None }, last_span);
-        }
+        strip_block(&mut func.body);
     }
-    for (_, func) in module.functions.iter_mut() {
-        strip(func);
-    }
-    for ep in module.entry_points.iter_mut() {
-        strip(&mut ep.function);
-    }
+    passes::expr_util::for_each_function_mut(
+        &mut module.functions,
+        &mut module.entry_points,
+        &mut strip,
+    );
 }
 
 /// naga-only `enable wgpu_*;` directives naga needs to parse a feature and
@@ -414,51 +444,6 @@ fn collect_module_names(module: &naga::Module) -> HashSet<String> {
         .collect()
 }
 
-// MARK: Naga error-message coupling
-
-/// First-line keys of the parse errors naga raises for a directive it
-/// declines: `unknown enable-extension`, `unknown language extension`, and
-/// the "the `x` ... extension is not {yet supported, enabled, supported in
-/// the current environment}" forms.  Every key spans a space because naga
-/// quotes user identifiers on that line ("no definition in scope for
-/// identifier: `extension_of_life`"); a bare word would file an invalid
-/// shader as a bailout.  Coupled to naga's wording: a test parses real
-/// shaders so a rewording fails at test time, not as a hard error in the
-/// field.
-const UNSUPPORTED_EXTENSION_PATTERNS: &[&str] = &[
-    "extension is not",
-    "unknown enable-extension",
-    "unknown language extension",
-];
-
-/// Text-validation errors that are naga limitations, not generator bugs:
-/// the `subgroups` enable naga's text front-end rejects even though its IR
-/// emitter produces it.
-const KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS: &[&str] =
-    &["`subgroups` enable-extension is not yet supported"];
-
-/// First line only: naga's codespan rendering quotes user source below the
-/// message, where a shader comment could contain a pattern.
-fn first_line_matches(err: &Error, patterns: &[&str]) -> bool {
-    let msg = err.to_string();
-    let first_line = msg.lines().next().unwrap_or("");
-    patterns.iter().any(|p| first_line.contains(p))
-}
-
-/// `Parse` only: a validation or emit error quoting the same text must stay
-/// a hard error, not take the compacted-input bailout.
-fn is_unsupported_extension_parse_error(err: &Error) -> bool {
-    matches!(err, Error::Parse(_)) && first_line_matches(err, UNSUPPORTED_EXTENSION_PATTERNS)
-}
-
-/// `validate_wgsl_text` reports the unsupported `enable` as `Parse` or
-/// `Validation` depending on whether tokenisation or semantics trips; no
-/// other variant opts into the fallback bypass.
-fn is_known_text_validation_limitation(err: &Error) -> bool {
-    matches!(err, Error::Parse(_) | Error::Validation(_))
-        && first_line_matches(err, KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS)
-}
-
 /// One emission attempt after the fallback ladder; [`run`] may still veto
 /// it with the never-grow guard.
 struct EmitOutcome {
@@ -558,22 +543,7 @@ fn resolve_generator_output(
             } else {
                 io::validate_wgsl_text(&emitted.source)
             };
-            let valid = match &validation_result {
-                Ok(()) => true,
-                // Keyed on the validator's message, not the output text:
-                // forward defence for a naga that rejects its own valid
-                // subgroup-builtin round-trip; inert today.
-                Err(e) if is_known_text_validation_limitation(e) => {
-                    if trace_enabled {
-                        eprintln!(
-                            "warning: skipping text-validation rollback due to known naga subgroup parser limitation"
-                        );
-                    }
-                    true
-                }
-                Err(_) => false,
-            };
-            if valid {
+            if validation_result.is_ok() {
                 // Before `emitted.source` may be moved.
                 let differs_from_baseline = naga_output.as_deref() != Some(emitted.source.as_str());
                 let final_source = if has_preamble {
@@ -690,8 +660,9 @@ fn resolve_generator_output(
 /// optimise, and emit via the custom generator, falling back to naga's
 /// emitter when the generator fails or its output does not round-trip -
 /// except with a preamble active, where the fallback is unusable and the
-/// error propagates.  A directive naga's front-end declines ships the input
-/// lexically compacted with [`Report::bailout`] set instead of an error.
+/// error propagates.  Input naga parses but rejects, and IR with no WGSL text
+/// form, ship the input lexically compacted with [`Report::bailout`] set;
+/// both are typed outcomes of a naga call, never a match on its message.
 /// Fails with [`Error::Parse`], [`Error::Validation`] or [`Error::Emit`]
 /// from the underlying stages.
 pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
@@ -707,21 +678,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     if let Some(normalized_preamble) = normalized_preamble.as_deref() {
         // The preamble gets the body's preprocessing, or `f16` in a preamble
         // would fail at parse time while the same text in the body succeeds.
-        let preamble_module = match io::parse_wgsl_with_path(normalized_preamble, "<preamble>") {
-            Ok(m) => m,
-            // The consumer's own preamble carries the directive, so the
-            // compacted body still concatenates into a shader their compiler
-            // accepts.
-            Err(e) if is_unsupported_extension_parse_error(&e) => {
-                return bailout_output(
-                    format!("naga cannot parse the preamble: {e}"),
-                    source,
-                    effective_preamble,
-                    Report::new(source.len()),
-                );
-            }
-            Err(e) => return Err(e),
-        };
+        let preamble_module = io::parse_wgsl_with_path(normalized_preamble, "<preamble>")?;
         preamble_names = collect_module_names(&preamble_module);
         // Directives must precede declarations, so both sides' leading
         // directives go ahead of the preamble body.
@@ -738,21 +695,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         full_source = normalized_source;
     }
 
-    let mut module = match io::parse_wgsl(&full_source) {
-        Ok(m) => m,
-        Err(e) if is_unsupported_extension_parse_error(&e) => {
-            // A directive naga declines (`enable subgroups;`, `requires
-            // texel_buffers;`): the compacted source still runs on backends
-            // that understand it.
-            return bailout_output(
-                format!("naga cannot parse the input: {e}"),
-                source,
-                effective_preamble,
-                Report::new(source.len()),
-            );
-        }
-        Err(e) => return Err(e),
-    };
+    let mut module = io::parse_wgsl(&full_source)?;
     let mut report = Report::new(source.len());
 
     // Preamble names must survive rename and mangle: user-source accesses

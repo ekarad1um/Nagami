@@ -792,33 +792,16 @@ fn run_keeps_the_binding_array_enable_the_output_still_needs() {
     );
 }
 
-/// Unparseable extension: ship the input compacted, no pass reports,
-/// naga's error in `report.bailout`.  `subgroups` is naga 30's sole
-/// `UnimplementedEnableExtension`; a release that lands it needs a new
-/// trigger.
+/// A directive naga's front end declines fails the run.  Deciding otherwise
+/// would take reading naga's prose, and a message it never promised to keep
+/// cannot be allowed to choose between "ship" and "fail".
 #[test]
-fn unsupported_extension_bailout_sets_reason() {
-    let src = "enable subgroups; // naga cannot parse this extension\n\
-                   @compute @workgroup_size(1) fn m() {}";
-    let output = run(src, &Config::default()).expect("bailout returns Ok");
-    // Compacted, not verbatim: comments stripped, token-fusing joins kept.
-    assert_eq!(
-        output.source, "enable subgroups;@compute@workgroup_size(1)fn m(){}",
-        "bailout must ship the lexically compacted source"
-    );
-    assert!(
-        output.report.pass_reports.is_empty(),
-        "the IR pipeline must not have run"
-    );
-    let reason = output
-        .report
-        .bailout
-        .as_deref()
-        .expect("bailout runs must carry the triggering naga error");
-    assert!(
-        reason.starts_with("naga cannot parse the input: "),
-        "reason must name the stage that gave up: {reason}"
-    );
+fn a_directive_naga_cannot_parse_is_a_hard_error() {
+    let src = "enable subgroups;\n@compute @workgroup_size(1) fn m() {}";
+    let Err(err) = run(src, &Config::default()) else {
+        panic!("naga 30 declines `subgroups`");
+    };
+    assert!(matches!(err, Error::Parse(_)), "{err:?}");
 }
 
 /// Validator-reject twin: const division by zero parses but fails
@@ -1094,11 +1077,10 @@ fn compact_keeps_space_before_non_ascii_identifier() {
     );
 }
 
-/// A directive naga declines inside the PREAMBLE takes the same bailout as
-/// one in a single file: the consumer's preamble carries it, so the compacted
-/// body concatenates into a shader their compiler accepts.
+/// The preamble parses at its own call site, which fails the run the same way
+/// the body's does.
 #[test]
-fn preamble_declared_unknown_directive_bails_out_with_body_compacted() {
+fn a_directive_naga_cannot_parse_in_the_preamble_is_a_hard_error() {
     let config = Config {
         preamble: Some(
             "enable chromium_experimental_subgroup_matrix;\n\
@@ -1107,44 +1089,12 @@ fn preamble_declared_unknown_directive_bails_out_with_body_compacted() {
         ),
         ..Config::default()
     };
-    let body = "@compute @workgroup_size(64) fn m() { // uses the preamble's extension\n\
+    let body = "@compute @workgroup_size(64) fn m() { \
                 subgroupMatrixStore(&buf, 0, subgroup_matrix_left<i8, 8, 8>(), false, 64); }";
-    let output = run(body, &config).expect("bailout returns Ok");
-    assert_eq!(
-        output.source,
-        "@compute@workgroup_size(64)fn m(){subgroupMatrixStore(&buf,0,subgroup_matrix_left<i8,8,8>(),false,64);}"
-    );
-    let reason = output.report.bailout.as_deref().expect("reason carried");
-    assert!(
-        reason.starts_with("naga cannot parse the preamble: "),
-        "{reason}"
-    );
-    assert!(output.name_map.is_none());
-}
-
-#[test]
-fn preamble_plus_bailout_with_directives_hard_errors() {
-    // The bailout ships the body compacted with its leading `enable
-    // subgroups;`, misplaced in the consumer's [preamble, body] order, so
-    // preamble mode must refuse rather than ship a poisoned document with
-    // exit 0.
-    let body = "enable subgroups;\n@compute @workgroup_size(64)\n\
-        fn m(@builtin(subgroup_invocation_id) sid: u32) { _ = subgroupAdd(f32(sid)); }";
-    let config = Config {
-        preamble: Some("@group(0) @binding(9) var<uniform> pre_u: f32;".to_string()),
-        ..Config::default()
+    let Err(err) = run(body, &config) else {
+        panic!("naga declines the preamble's directive");
     };
-    let err = match run(body, &config) {
-        Err(e) => e,
-        Ok(out) => panic!(
-            "directive-carrying bailout must not ship, got: {}",
-            out.source
-        ),
-    };
-    assert!(
-        err.to_string().contains("preamble"),
-        "error should name the preamble conflict: {err}"
-    );
+    assert!(matches!(err, Error::Parse(_)), "{err:?}");
 }
 
 #[test]
@@ -1295,118 +1245,6 @@ fn preprocess_does_not_duplicate_enable_f16_with_extra_whitespace() {
         !out.contains("enable f16;\nenable  f16;"),
         "must not inject a second enable f16 directive: {out}"
     );
-}
-
-// MARK: Naga error-message coupling tests
-
-// Fail when `UNSUPPORTED_EXTENSION_PATTERNS` or
-// `KNOWN_TEXT_VALIDATION_LIMITATION_PATTERNS` drift from naga's phrasings.
-
-/// Real parses, so a naga rewording fails here instead of silently turning
-/// a bailout into a hard error.  `EnableExtensionNotSupported` is unreachable
-/// through `parse_str` (every capability granted) and shares the
-/// `extension is not` key by construction.
-#[test]
-fn unsupported_extension_patterns_track_naga_phrasings() {
-    let declined = [
-        "enable no_such_extension;",
-        "requires no_such_extension;",
-        "enable subgroups;",
-        "requires unrestricted_pointer_parameters;",
-        "@fragment fn m() -> @location(0) @blend_src(0) vec4f { return vec4f(); }",
-    ];
-    for src in declined {
-        let err = io::parse_wgsl(src).expect_err("naga declines the directive");
-        assert!(is_unsupported_extension_parse_error(&err), "{err}");
-    }
-    // naga quotes user identifiers on the first line: the bare word is no key.
-    let err =
-        io::parse_wgsl("fn m() { let x = extension_of_life; }").expect_err("unknown identifier");
-    assert!(!is_unsupported_extension_parse_error(&err), "{err}");
-}
-
-/// A codespan snippet quoting a user comment that contains the phrasing must
-/// not trigger the bailout; matching the whole rendered message swallows
-/// real failures.
-#[test]
-fn unsupported_extension_patterns_ignore_quoted_source_lines() {
-    let rendered = "error: expected identifier, found `{`\n  \
-                        ┌─ wgsl:5:1\n  │\n5 │ // TODO: enable extension is not enabled \
-                        on our backend\n  │ ^^\n";
-    let err = Error::Parse(rendered.into());
-    assert!(
-        !is_unsupported_extension_parse_error(&err),
-        "pattern in a quoted source line must NOT trigger the bailout"
-    );
-
-    // Same for the subgroups text-validation limitation.
-    let rendered = "error: expected `;`\n  \
-                        ┌─ wgsl:3:1\n  │\n3 │ // subgroups enable-extension is not yet supported\n";
-    let err = Error::Parse(rendered.into());
-    assert!(
-        !is_known_text_validation_limitation(&err),
-        "pattern in a quoted source line must NOT trigger the validation bypass"
-    );
-}
-
-#[test]
-fn unsupported_extension_patterns_only_match_parse_errors() {
-    // A validator/emit/IO error quoting the phrasing must not short-circuit
-    // `run` into the return-input branch and swallow a real failure.
-    for ctor in [
-        Error::Validation as fn(String) -> Error,
-        Error::Emit as fn(String) -> Error,
-        Error::Io as fn(String) -> Error,
-    ] {
-        let err = ctor("error: enable extension is not enabled".to_string());
-        assert!(
-            !is_unsupported_extension_parse_error(&err),
-            "non-Parse error variants must not be treated as \
-                 unsupported-extension even when the message matches: {err:?}"
-        );
-    }
-}
-
-#[test]
-fn known_text_validation_limitation_only_matches_parse_or_validation() {
-    // Only `Parse` and `Validation` may opt into the round-trip bypass.
-    for ctor in [
-        Error::Emit as fn(String) -> Error,
-        Error::Io as fn(String) -> Error,
-    ] {
-        let err = ctor("error: `subgroups` enable-extension is not yet supported".to_string());
-        assert!(
-            !is_known_text_validation_limitation(&err),
-            "non-Parse/Validation error variants must not opt into the \
-                 subgroup text-validation bypass: {err:?}"
-        );
-    }
-}
-
-/// Real parse, so a naga rewording (or subgroup support landing) fails here.
-#[test]
-fn known_text_validation_limitation_matches_subgroup_phrasing() {
-    let err = io::parse_wgsl("enable subgroups;").expect_err("naga 30 declines subgroups");
-    assert!(is_known_text_validation_limitation(&err), "{err}");
-}
-
-#[test]
-fn known_text_validation_limitation_matches_validation_variant_too() {
-    // `io::validate_wgsl_text` reports a not-yet-supported `enable` through
-    // either `parse_wgsl` (Parse) or `validate_module_with_source`
-    // (Validation); pins the Validation branch against a "Parse only"
-    // tightening.
-    let err = Error::Validation("error: `subgroups` enable-extension is not yet supported".into());
-    assert!(
-        is_known_text_validation_limitation(&err),
-        "subgroup limitation phrasing must also be recognized when wrapped as Validation: {err}"
-    );
-}
-
-#[test]
-fn known_text_validation_limitation_rejects_unrelated_errors() {
-    let err = Error::Validation("error: mismatched types".into());
-    assert!(!is_known_text_validation_limitation(&err));
 }
 
 #[test]

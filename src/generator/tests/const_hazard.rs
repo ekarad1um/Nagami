@@ -312,19 +312,102 @@ fn ldexp_limit_follows_the_float_width() {
     );
 }
 
-/// A forwarded literal can make both shift operands constant while the
+/// An inlined argument can make both shift operands constant while the
 /// amount hides behind a builtin the hazard evaluator does not model; the
 /// signed overflow is rejected at const-evaluation, so the operand binds.
+/// The literal arrives by inlining: `load_dedup` declines every forward
+/// inside a shift-AMOUNT slot, so the `var v = -100i;` spelling of this
+/// never reaches the hazard.
 #[test]
 fn unmodeled_constant_shift_amount_binds_the_shifted_literal() {
     let out: String = compact_with_passes(
-        &body("var v = -100i; out[0] = u32(v << (reverseBits(u32(v)) & 31u));"),
+        "@group(0)@binding(0) var<storage,read_write> out: array<u32>;\
+         fn f(v: i32) -> u32 { return u32(v << (reverseBits(u32(v)) & 31u)); }\
+         @compute @workgroup_size(1) fn main() { out[0] = f(-100i); }",
         Profile::Max,
     )
     .split_whitespace()
     .collect();
     assert!(out.contains("let"), "{out}");
     assert!(!out.contains("-100i<<"), "{out}");
+}
+
+/// Const-ness entering a failable slot must be declined for the WHOLE slot:
+/// the top declines (its value IS the error) and an interior node then folds
+/// anyway, leaving `5u / (1u - 1u)`, which no emitter can spell, so the
+/// module ships lexically compacted.  `const_fold` reaches this through a
+/// never-written local, `load_dedup` through a forwarded initialiser.
+#[test]
+fn interior_fold_under_a_divisor_keeps_the_slot_runtime() {
+    for stmts in [
+        "var s: u32; out[0] = 5u / (s + 1u - 1u);",
+        "var s: u32; out[0] = 5u % (s + 1u - 1u);",
+        "var s: u32; out[0] = 5u >> (s + 40u - 4u);",
+        "var s: u32; out[0] = 5u / ((s + 2u) * 3u - 6u);",
+        "var v: vec2u; out[0] = (vec2u(5u) / (v + vec2u(1u) - vec2u(1u))).x;",
+    ] {
+        // `minify` rejects a bailout, which is the regression; the local
+        // surviving says the slot stayed runtime rather than the statement
+        // dying.
+        let out = minify(&body(stmts));
+        assert!(out.contains("var "), "{out}");
+    }
+}
+
+#[test]
+fn interior_forward_under_a_divisor_keeps_the_slot_runtime() {
+    // The forwarded literal's own value proves nothing: `0u` errors one
+    // slot away through `+ 1u - 1u`, `1u` errors through `- 1u`.
+    for stmts in [
+        "var s: u32 = 0u; out[0] = 5u / (s + 1u - 1u);",
+        "var s: u32 = 1u; out[0] = 5u / (s - 1u);",
+        "var s: u32 = 40u; out[0] = 5u >> (s - 4u);",
+    ] {
+        minify(&body(stmts));
+    }
+}
+
+/// The forward walk must read the slot AS IT WILL BE after the rewrite.
+/// Stopping at the root hid every forward whose target is COMPOUND: `d`
+/// inlines to `a - 1u` and `a` to `1u` in the SAME pass, shipping
+/// `inp[0] / (1u - 1u)`.  A compound target is also unjudgeable in itself -
+/// `u32(length(vec2f()))` is const the moment it is inlined, with no literal
+/// anywhere and the evaluator that would fold it living in naga - so the
+/// forward AT the slot is what has to go.
+#[test]
+fn forward_of_a_compound_into_a_divisor_keeps_the_slot_runtime() {
+    for stmts in [
+        "var a: u32 = 1u; var d: u32; d = a - 1u; out[0] = inp[0] / d; out[1] = d;",
+        "var a: u32 = 1u; var d: u32; d = a - 1u; out[0] = inp[0] % d; out[1] = d;",
+        "var a: u32 = 40u; var d: u32; d = a - 4u; out[0] = inp[0] >> d; out[1] = d;",
+        "var a: u32 = 40u; var d: u32; d = a - 4u; out[0] = inp[0] << d; out[1] = d;",
+        "var d: u32; d = u32(length(vec2f(0.0, 0.0))); out[0] = inp[0] / d; out[1] = d;",
+        // A lane of a forwarded `Compose` is a value position one hop past
+        // where the walk used to stop.
+        "var a: u32 = 1u; var d: vec2u; d = vec2u(a - 1u, 3u); \
+         out[0] = (vec2u(inp[0]) / d).x; out[1] = d.y;",
+    ] {
+        let out = minify(&body(stmts));
+        assert!(out.contains("var "), "{out}");
+    }
+}
+
+/// The half the fix must not trade away: in the value position the slot IS
+/// the forwarded literal, so a safe one survives.
+#[test]
+fn a_safe_literal_still_forwards_into_a_divisor() {
+    let out = minify(&body("var k: u32 = 5u; out[0] = inp[0] / k;"));
+    assert!(out.contains("/5"), "{out}");
+    assert!(!out.contains("var "), "{out}");
+}
+
+/// A runtime slot is never walked: `inp[i]` is a global load, so no forward
+/// under it can raise a creation error and the index must still fold.
+#[test]
+fn a_runtime_divisor_keeps_the_forwards_under_it() {
+    let out = minify(&body("var i: u32 = 1u; out[0] = inp[0] / (inp[i] + 1u);"));
+    assert!(out.contains("inp[1]") || out.contains("[1]"), "{out}");
+    assert!(!out.contains("var "), "{out}");
 }
 
 /// Dawn's MSL for `~u32(i32(x))` is `(~(uint(int(v))) & 3u)`, which Metal

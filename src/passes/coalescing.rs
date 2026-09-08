@@ -29,6 +29,7 @@
 //! intersection; `Switch` and `Loop` never propagate writes, since case
 //! fall-through and early-`break` paths would otherwise be mis-classified.
 
+use super::expr_util::for_each_function_mut;
 use crate::error::Error;
 use crate::handle_set::{HandleMap, HandleSet};
 use crate::pipeline::{Pass, PassContext};
@@ -241,12 +242,10 @@ impl Pass for CoalescingPass {
     fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
         let mut changed = 0usize;
 
-        for (_, function) in module.functions.iter_mut() {
-            changed += coalesce_function_locals(function, &module.types);
-        }
-        for entry in module.entry_points.iter_mut() {
-            changed += coalesce_function_locals(&mut entry.function, &module.types);
-        }
+        let types = &module.types;
+        for_each_function_mut(&mut module.functions, &mut module.entry_points, &mut |f| {
+            changed += coalesce_function_locals(f, types);
+        });
 
         Ok(changed > 0)
     }

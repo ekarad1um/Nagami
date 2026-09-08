@@ -137,20 +137,19 @@ fn is_f16_type_token(tok: &[u8]) -> bool {
     )
 }
 
-/// `true` when `source` needs `enable f16;`: the `f16` keyword, a
-/// half-precision alias (`vec2h`..`mat4x4h`) or an `h`-suffixed literal
-/// (`1.0h`, `0x1p2h`), matched token-wise on comment-stripped text so
-/// `myf16var`, `mesh` and comments never trigger.  A spurious positive is
-/// harmless: naga tolerates a redundant `enable f16;` and the emitter drops
-/// the directive when the final module uses no f16, so detection errs broad.
-/// Production strips comments once and calls the `cleaned_` form; this
-/// wrapper keeps the comment handling under test.
+/// [`cleaned_references_f16_token`] with the comment stripping production
+/// does once up front, kept here so that handling stays under test.
 #[cfg(test)]
 pub(crate) fn references_f16_token(source: &str) -> bool {
     cleaned_references_f16_token(&strip_wgsl_comments(source))
 }
 
-/// [`references_f16_token`] over already comment-stripped text.
+/// `true` when comment-stripped `cleaned` needs `enable f16;`: the `f16`
+/// keyword, a half-precision alias (`vec2h`..`mat4x4h`) or an `h`-suffixed
+/// literal (`1.0h`, `0x1p2h`), matched token-wise so `myf16var` and `mesh`
+/// never trigger.  A spurious positive is harmless - naga tolerates a
+/// redundant `enable f16;` and the emitter drops it when the final module uses
+/// no f16 - so detection errs broad.
 pub(crate) fn cleaned_references_f16_token(cleaned: &str) -> bool {
     let bytes = cleaned.as_bytes();
     let len = bytes.len();
@@ -194,16 +193,13 @@ pub(crate) fn cleaned_references_f16_token(cleaned: &str) -> bool {
     false
 }
 
-/// [`has_enable_directive`] for `f16`.
+/// [`cleaned_has_enable_directive`] for `f16`, comments included.
 #[cfg(test)]
 pub(crate) fn has_enable_f16_directive(source: &str) -> bool {
     has_enable_directive(source, "f16")
 }
 
-/// `true` when `source` declares `enable <ext>;`, also as one entry of a
-/// comma-separated list and however the directives are split across lines.
-/// A false negative becomes a hard error on valid input at the preamble
-/// guard, so every directive is scanned, not just the first on a line.
+/// [`cleaned_has_enable_directive`] with comment stripping.
 #[cfg(test)]
 fn has_enable_directive(source: &str, ext: &str) -> bool {
     cleaned_has_enable_directive(&strip_wgsl_comments(source), ext)
@@ -227,7 +223,11 @@ fn is_ascii_blankspace(b: u8) -> bool {
     b == b' ' || (0x09..=0x0D).contains(&b)
 }
 
-/// [`has_enable_directive`] over already comment-stripped text.
+/// `true` when comment-stripped `cleaned` declares `enable <ext>;`, also as
+/// one entry of a comma-separated list and however the directives are split
+/// across lines.  A false negative becomes a hard error on valid input at the
+/// preamble guard, so every directive is scanned, not just the first on a
+/// line.
 pub(crate) fn cleaned_has_enable_directive(cleaned: &str, ext: &str) -> bool {
     // One `;`-terminated segment per directive, however many share a line.
     for segment in cleaned.split(';') {

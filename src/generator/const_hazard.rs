@@ -23,8 +23,8 @@ use crate::config::FloatPrecision;
 /// computes, so the caller can only bind on the operator's ability to fail.
 /// Any other constant tree the folder left alone (a matrix product, say) was
 /// evaluated by tint in the input too, so an unknown value there binds
-/// nothing; binding those as well cost 7 tint-corpus files 67 bytes for a
-/// hazard no shader writes (`var v = m * u; v * 1e38`), the accepted residual.
+/// nothing; binding those as well costs 9 bytes on 1 corpus file for a hazard
+/// no shader writes (`var v = m * u; v * 1e38`), the accepted residual.
 /// `override` leaves are excluded: an override-expression fails at pipeline
 /// creation exactly as the input's own would.
 fn const_tree(

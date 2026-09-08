@@ -209,6 +209,19 @@ fn precision_from_cli(
     }
 }
 
+/// What a bailout earns the caller: `Err` under `--strict-fallback`, otherwise
+/// the warning text.  Split out to be testable - `cargo test` does not rebuild
+/// this binary, so a spawn test would assert against a stale one.
+fn bailout_notice(bailout: Option<&str>, strict: bool) -> Result<Option<String>, String> {
+    match bailout {
+        None => Ok(None),
+        Some(reason) if strict => Err(format!("--strict-fallback: {reason}")),
+        Some(reason) => Ok(Some(format!(
+            "warning: output is lexically compacted only, the IR pipeline did not apply:\n{reason}"
+        ))),
+    }
+}
+
 fn main() -> ExitCode {
     // Forward-substitution builds expression trees as deep as the input's
     // statement count and several IR walks recurse per level: the 8 MiB
@@ -364,13 +377,10 @@ fn run_cli() -> Result<u8, Box<dyn std::error::Error>> {
     let changed = output.source != input;
 
     // Not gated on --quiet, which silences only the success summary.
-    if let Some(reason) = &output.report.bailout {
-        if args.strict_fallback {
-            return Err(format!("--strict-fallback: {reason}").into());
-        }
-        eprintln!(
-            "warning: output is lexically compacted only, the IR pipeline did not apply:\n{reason}"
-        );
+    match bailout_notice(output.report.bailout.as_deref(), args.strict_fallback) {
+        Err(reason) => return Err(reason.into()),
+        Ok(Some(warning)) => eprintln!("{warning}"),
+        Ok(None) => {}
     }
 
     if args.check {
@@ -558,6 +568,32 @@ mod tests {
 
     /// Clap's `debug_assert` catches arg-name drift in `conflicts_with` /
     /// `requires` lists, which otherwise panics only at user invocation.
+    /// Without the escalation a build ships input-shaped output on exit 0.
+    /// Only the decision is covered; the process-level half (exit 2, no output
+    /// file) needs a rebuilt binary.
+    #[test]
+    fn strict_fallback_escalates_a_bailout_that_otherwise_only_warns() {
+        assert!(matches!(bailout_notice(None, false), Ok(None)));
+        assert!(matches!(bailout_notice(None, true), Ok(None)));
+
+        let warning = bailout_notice(Some("naga cannot parse the input"), false)
+            .expect("the default must not fail the run")
+            .expect("a bailout must still be announced");
+        assert!(
+            warning.contains("lexically compacted only"),
+            "the warning must say the IR pipeline did not apply: {warning}"
+        );
+        assert!(warning.contains("naga cannot parse the input"));
+
+        let err = bailout_notice(Some("naga cannot parse the input"), true)
+            .expect_err("--strict-fallback must escalate");
+        assert!(err.contains("--strict-fallback"), "{err}");
+        assert!(
+            err.contains("naga cannot parse the input"),
+            "the reason must survive into the error: {err}"
+        );
+    }
+
     #[test]
     fn args_command_definition_is_internally_consistent() {
         Args::command().debug_assert();

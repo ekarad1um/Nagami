@@ -32,6 +32,21 @@ fn collect_block_local_refs(
     });
 }
 
+/// Per-expression: the local a `Load` reads through.  Both scans below index
+/// by expression and building it is a whole pass over the arena, so it is
+/// built once here.
+fn load_source_locals(func: &naga::Function) -> Vec<Option<naga::Handle<naga::LocalVariable>>> {
+    let mut expr_reads = vec![None; func.expressions.len()];
+    for (eh, expr) in func.expressions.iter() {
+        if let naga::Expression::Load { pointer } = *expr
+            && let Some(lh) = root_local_var(pointer, &func.expressions)
+        {
+            expr_reads[eh.index()] = Some(lh);
+        }
+    }
+    expr_reads
+}
+
 /// `(deferrable, dead)` bitmaps indexed by local handle: locals whose
 /// declaration can defer to their first `Store` (at any depth), and locals never
 /// referenced.  A local defers when its first reference in a block (reads,
@@ -42,19 +57,8 @@ fn collect_block_local_refs(
 /// deferred `var` drops the init; a live init means the first reference is a
 /// read, which fails it.
 pub(in crate::generator) fn find_deferrable_vars(func: &naga::Function) -> (Vec<bool>, Vec<bool>) {
-    use naga::Expression as E;
-
-    let expr_len = func.expressions.len();
     let local_len = func.local_variables.len();
-
-    let mut expr_reads: Vec<Option<naga::Handle<naga::LocalVariable>>> = vec![None; expr_len];
-    for (eh, expr) in func.expressions.iter() {
-        if let E::Load { pointer } = *expr
-            && let Some(lh) = root_local_var(pointer, &func.expressions)
-        {
-            expr_reads[eh.index()] = Some(lh);
-        }
-    }
+    let expr_reads = load_source_locals(func);
 
     let candidates = vec![true; local_len];
 
@@ -231,19 +235,8 @@ pub(super) fn find_for_loop_vars(
     func: &naga::Function,
     must_bind_loads: &HandleSet<naga::Expression>,
 ) -> Vec<bool> {
-    use naga::Expression as E;
-
-    let expr_len = func.expressions.len();
     let local_len = func.local_variables.len();
-
-    let mut expr_reads: Vec<Option<naga::Handle<naga::LocalVariable>>> = vec![None; expr_len];
-    for (eh, expr) in func.expressions.iter() {
-        if let E::Load { pointer } = *expr
-            && let Some(lh) = root_local_var(pointer, &func.expressions)
-        {
-            expr_reads[eh.index()] = Some(lh);
-        }
-    }
+    let expr_reads = load_source_locals(func);
 
     // A local without an explicit init is zero-initialised and still a counter
     // candidate.

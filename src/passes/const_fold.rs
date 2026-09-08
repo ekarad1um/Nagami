@@ -383,6 +383,14 @@ const ROLE_SHIFT_AMOUNT: u8 = 2;
 /// `Load` poses: `5u / u32(b)` is legal until `b` folds to `false`, and the
 /// error lands on the cast, which no fold touched.
 const ROLE_IN_FAILABLE_SLOT: u8 = 4;
+/// Anywhere inside an operand of a float `-x`, `x * y` or `x / y`, however
+/// deep: those three read the SIGN of a zero operand, so making one const
+/// when the input's was not changes the value the GPU stores.  `+` / `-` are
+/// absent - their zero has one determined sign whatever the operands' were.
+const ROLE_IN_SIGN_SENSITIVE_SLOT: u8 = 8;
+
+/// Roles describing a whole subtree, so they survive the descent to children.
+const PROPAGATING_ROLES: u8 = ROLE_IN_FAILABLE_SLOT | ROLE_IN_SIGN_SENSITIVE_SLOT;
 
 /// Per-handle roles: the right operand of an integer `/` `%` or of a shift,
 /// reached through `Splat` / `Compose` since any offending lane condemns a
@@ -391,27 +399,45 @@ const ROLE_IN_FAILABLE_SLOT: u8 = 4;
 /// same run - permanently, the pass being deterministic - so declining is
 /// free.
 ///
-/// [`ROLE_IN_FAILABLE_SLOT`] rides the same walk but descends through every
+/// [`PROPAGATING_ROLES`] ride the same walk but descend through every
 /// operand: const-ness propagates up through any pure operation, not just
-/// the two that carry a lane.
+/// the two that carry a lane.  That is why a float `*` `/` or unary `-` seeds
+/// at all - its role marks the whole operand subtree, not the handle.
 fn static_error_roles(arena: &naga::Arena<naga::Expression>) -> Vec<u8> {
-    let mut stack: Vec<(Handle<naga::Expression>, u8)> = arena
-        .iter()
-        .filter_map(|(_, expr)| match expr {
-            naga::Expression::Binary { op, right, .. } => match op {
-                naga::BinaryOperator::Divide | naga::BinaryOperator::Modulo => {
-                    Some((*right, ROLE_DIVISOR | ROLE_IN_FAILABLE_SLOT))
+    let mut stack: Vec<(Handle<naga::Expression>, u8)> = Vec::new();
+    for (_, expr) in arena.iter() {
+        match expr {
+            naga::Expression::Binary { op, left, right } => match op {
+                naga::BinaryOperator::Divide => {
+                    stack.push((*right, ROLE_DIVISOR | ROLE_IN_FAILABLE_SLOT));
+                    // A float divide reads the sign of a zero numerator as
+                    // well; an integer slot never folds to a float, so the
+                    // untyped seed is inert there.
+                    stack.push((*left, ROLE_IN_SIGN_SENSITIVE_SLOT));
+                    stack.push((*right, ROLE_IN_SIGN_SENSITIVE_SLOT));
+                }
+                naga::BinaryOperator::Modulo => {
+                    stack.push((*right, ROLE_DIVISOR | ROLE_IN_FAILABLE_SLOT));
                 }
                 naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight => {
-                    Some((*right, ROLE_SHIFT_AMOUNT | ROLE_IN_FAILABLE_SLOT))
+                    stack.push((*right, ROLE_SHIFT_AMOUNT | ROLE_IN_FAILABLE_SLOT));
                 }
-                _ => None,
+                naga::BinaryOperator::Multiply => {
+                    stack.push((*left, ROLE_IN_SIGN_SENSITIVE_SLOT));
+                    stack.push((*right, ROLE_IN_SIGN_SENSITIVE_SLOT));
+                }
+                _ => {}
             },
-            _ => None,
-        })
-        .collect();
-    // Most arenas hold no `/` `%` `<<` `>>`; an empty map costs no allocation
-    // and reads as no role.
+            naga::Expression::Unary {
+                op: naga::UnaryOperator::Negate,
+                expr,
+            } => stack.push((*expr, ROLE_IN_SIGN_SENSITIVE_SLOT)),
+            _ => {}
+        }
+    }
+    // Most arenas still seed nothing - no `*` `/` `%` `<<` `>>` and no unary
+    // `-` at all, 87% of corpus calls - and an empty vector costs no
+    // allocation and reads through `role_of` as no role.
     if stack.is_empty() {
         return Vec::new();
     }
@@ -430,12 +456,44 @@ fn static_error_roles(arena: &naga::Arena<naga::Expression>) -> Vec<u8> {
             }
             _ => {
                 super::expr_util::visit_expression_children(&arena[h], |child| {
-                    stack.push((child, role & ROLE_IN_FAILABLE_SLOT));
+                    stack.push((child, role & PROPAGATING_ROLES));
                 });
             }
         }
     }
     roles
+}
+
+/// Handles with a [`zero_init_locals`] `Load` under them: the only
+/// const-ness this pass adds that naga's front-end could not already see,
+/// and so the only kind whose fold can make a slot newly const.  Children
+/// precede their parent in a naga arena, so one forward pass fills it;
+/// empty when no local qualifies, so read it through [`is_tainted`].
+fn zero_local_taint(
+    arena: &naga::Arena<naga::Expression>,
+    zero_locals: &HandleMap<naga::LocalVariable, Handle<naga::Type>>,
+) -> Vec<bool> {
+    if zero_locals.is_empty() {
+        return Vec::new();
+    }
+    let mut taint = vec![false; arena.len()];
+    for (handle, expr) in arena.iter() {
+        let mut tainted = matches!(expr, naga::Expression::Load { pointer }
+            if matches!(arena[*pointer], naga::Expression::LocalVariable(l)
+                if zero_locals.get(l).is_some()));
+        if !tainted {
+            super::expr_util::visit_expression_children(expr, |child| {
+                tainted |= taint[child.index()];
+            });
+        }
+        taint[handle.index()] = tainted;
+    }
+    taint
+}
+
+/// Taint bit for `h`; an empty vector is "no zero-init local here".
+fn is_tainted(taint: &[bool], h: Handle<naga::Expression>) -> bool {
+    taint.get(h.index()).copied().unwrap_or(false)
 }
 
 /// Role bits for `h`; an empty map is "no failable operator in the arena".
@@ -449,23 +507,165 @@ fn literal_is_static_error(roles: u8, literal: naga::Literal) -> bool {
         || (roles & ROLE_SHIFT_AMOUNT != 0 && shift_amount_is_static_error(&literal))
 }
 
+/// Per-handle "already reads as a const-expression", over the arena as THIS
+/// RUN found it: a slot true here is const whatever this run does, so folding
+/// inside it crosses nothing.  Not the ORIGINAL module's const-ness - an
+/// earlier sweep may have supplied some, which this run then reads as given;
+/// the accretion entry in `docs/KNOWN_ISSUES.md` bounds the gap.
+fn const_at_entry(arena: &naga::Arena<naga::Expression>) -> Vec<bool> {
+    let mut is_const = vec![false; arena.len()];
+    for (handle, expr) in arena.iter() {
+        is_const[handle.index()] = match super::expr_util::const_expression_leaf(expr) {
+            Some(known) => known,
+            None => {
+                let mut all = true;
+                super::expr_util::visit_expression_children(expr, |child| {
+                    all &= is_const[child.index()];
+                });
+                all
+            }
+        };
+    }
+    is_const
+}
+
+/// Role bits a failable operator puts on its right operand.
+fn failable_op_role(op: naga::BinaryOperator) -> Option<u8> {
+    match op {
+        naga::BinaryOperator::Divide | naga::BinaryOperator::Modulo => Some(ROLE_DIVISOR),
+        naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight => {
+            Some(ROLE_SHIFT_AMOUNT)
+        }
+        _ => None,
+    }
+}
+
+/// The first `/` `%` `<<` `>>` in `arena` whose right operand reads as a
+/// const-expression evaluating to a shader-creation error - integer divide /
+/// modulo by zero, a shift amount at or past the bit width - rendered for a
+/// diagnostic.
+///
+/// naga's validator checks the LITERAL spelling only (`5u / 0u`), so the
+/// const-EXPRESSION one (`5u / (1u - 1u)`) validates yet has no valid WGSL
+/// text at all, dropping the run to lexical compaction.  A parsed module
+/// cannot carry the shape, so a pass always manufactured it (inlining an
+/// argument that zeroes a divisor, on either side of the call); reporting it
+/// through the validator makes the driver's existing rollback undo that pass.
+fn arena_static_error_slot(
+    arena: &naga::Arena<naga::Expression>,
+    types: &naga::UniqueArena<naga::Type>,
+    const_literals: &HandleMap<naga::Constant, naga::Literal>,
+) -> Option<String> {
+    // Failable operators are rare: an arena without one allocates nothing.
+    let mut memo: Option<ConstValueMemo> = None;
+    let mut visiting = HandleSet::default();
+    let no_zero_locals = HandleMap::default();
+    for (_, expr) in arena.iter() {
+        let naga::Expression::Binary { op, right, .. } = expr else {
+            continue;
+        };
+        let Some(role) = failable_op_role(*op) else {
+            continue;
+        };
+        let memo = memo.get_or_insert_with(|| vec![None; arena.len()]);
+        visiting.clear();
+        let ctx = ConstFoldContext {
+            arena,
+            types,
+            constants: ConstSource::Literals(const_literals),
+            // A never-written local is NOT a const-expression to the WGSL
+            // front-end; only what it can see itself counts here.
+            zero_locals: &no_zero_locals,
+        };
+        let offending = match resolve_const_value(*right, &ctx, &mut visiting, memo) {
+            Some(ConstValue::Scalar(lit)) => literal_is_static_error(role, lit),
+            // One offending lane condemns the componentwise operation.
+            Some(ConstValue::Vector { ref components, .. }) => components
+                .iter()
+                .any(|&lane| literal_is_static_error(role, lane)),
+            None => false,
+        };
+        if offending {
+            // Spelled out, not formatted: `{:?}` on a naga IR type links its
+            // `Debug` impls, the single biggest size lever this crate has.
+            return Some(
+                if role == ROLE_DIVISOR {
+                    "divisor is a const-expression evaluating to zero, which \
+                     WGSL rejects at shader creation"
+                } else {
+                    "shift amount is a const-expression at or past the \
+                     operand's bit width, which WGSL rejects at shader creation"
+                }
+                .to_string(),
+            );
+        }
+    }
+    None
+}
+
+/// [`arena_static_error_slot`] over every arena in `module`.
+pub(crate) fn module_static_error_slot(module: &naga::Module) -> Option<String> {
+    let const_literals = build_constant_literal_cache(module);
+    let arenas = module
+        .functions
+        .iter()
+        .map(|(_, f)| (f.name.as_deref(), &f.expressions))
+        .chain(
+            module
+                .entry_points
+                .iter()
+                .map(|ep| (Some(ep.name.as_str()), &ep.function.expressions)),
+        )
+        .chain(std::iter::once((None, &module.global_expressions)));
+    for (name, arena) in arenas {
+        if let Some(detail) = arena_static_error_slot(arena, &module.types, &const_literals) {
+            let where_ =
+                name.map_or_else(|| "module scope".to_string(), |n| format!("function `{n}`"));
+            return Some(format!("{where_}: {detail}"));
+        }
+    }
+    None
+}
+
 /// Clone `source` over `target`, declining (and writing nothing) when that
 /// would leave an offender where a runtime operation stood.  Every arm that
 /// narrows an expression to one of its operands writes through here, so the
 /// guard is structural rather than a rule each new arm must remember.
+///
+/// Narrowing is the other way a slot crosses runtime -> const, so the
+/// sign-sensitive decline lands here as well as on the literal walk.  Only
+/// `select(x, x, c)` reaches it, dropping a runtime condition; the other arms
+/// match a literal in the SIBLING slot, so a const `source` had already made
+/// `target` const at entry.
 fn clone_over(
     arena: &mut naga::Arena<naga::Expression>,
     roles: &[u8],
+    const_at_entry: &[bool],
     target: Handle<naga::Expression>,
     source: Handle<naga::Expression>,
 ) -> bool {
+    let role = role_of(roles, target);
     if matches!(arena[source], naga::Expression::Literal(lit)
-        if literal_is_static_error(role_of(roles, target), lit))
+        if literal_is_static_error(role, lit))
+    {
+        return false;
+    }
+    // Untyped like the role: an integer slot has no signed zero, but none the
+    // corpus narrows either, so one rule beats two that can drift.
+    if role & ROLE_IN_SIGN_SENSITIVE_SLOT != 0
+        && is_const_at_entry(const_at_entry, source)
+        && !is_const_at_entry(const_at_entry, target)
     {
         return false;
     }
     arena[target] = arena[source].clone();
     true
+}
+
+/// Entry const-ness of `h`.  An absent entry - including the empty vector an
+/// arena with no sign-sensitive slot gets - reads as runtime, which declines.
+fn is_const_at_entry(const_at_entry: &[bool], h: Handle<naga::Expression>) -> bool {
+    const_at_entry.get(h.index()).copied().unwrap_or(false)
 }
 
 /// Fold `arena` in place, returning the handles that must leave their `Emit`
@@ -499,6 +699,20 @@ fn fold_local_expressions(
     // values, never a `Binary`'s operand slots, so a role can retire but
     // never appear.
     let roles = static_error_roles(arena);
+    // Compute-once: a fold retires a taint but never creates one, and a stale
+    // value only declines.  Each gates on its OWN role bit, not on `roles`
+    // being non-empty - any `*` `/` or unary `-` now makes it non-empty.
+    let has_role = |bit: u8| roles.iter().any(|r| r & bit != 0);
+    let zero_local_taint = if has_role(ROLE_IN_FAILABLE_SLOT) {
+        zero_local_taint(arena, zero_locals)
+    } else {
+        Vec::new()
+    };
+    let const_at_entry = if has_role(ROLE_IN_SIGN_SENSITIVE_SLOT) {
+        const_at_entry(arena)
+    } else {
+        Vec::new()
+    };
     let mut folded = HandleSet::default();
 
     let mut literal_cache = build_literal_cache(arena);
@@ -518,12 +732,15 @@ fn fold_local_expressions(
         };
 
         let role = role_of(&roles, handle);
-        // A `Load` is where const-ness ENTERS the slot, so it answers to
-        // the whole-slot role, not to what it holds.  Above the match: a
-        // vector local reaches the same cliff through the other arm.
-        if role & ROLE_IN_FAILABLE_SLOT != 0
-            && matches!(arena[handle], naga::Expression::Load { .. })
-        {
+        // Const-ness the front-end could see was already there when it
+        // validated this slot, so folding inside one invents no error.  A
+        // zero-local's was invisible to it, and declining only the `Load`
+        // where it enters leaves the INTERIOR free to fold and make the slot
+        // const anyway: `5u / (s + 1u - 1u)` ships `5u / (1u - 1u)`, which
+        // no WGSL emitter can spell, dropping the module to lexical
+        // compaction.  Checked before the match because a vector local
+        // reaches the same cliff through the `Vector` arm.
+        if role & ROLE_IN_FAILABLE_SLOT != 0 && is_tainted(&zero_local_taint, handle) {
             continue;
         }
         match value {
@@ -539,6 +756,24 @@ fn fold_local_expressions(
                 }
                 // Same rollback, different cause; see `static_error_roles`.
                 if literal_is_static_error(role, literal) {
+                    continue;
+                }
+                // Manufacturing a `-0.0` where the shader computed one
+                // changes what the GPU reads back.  A handle already holding
+                // this literal is not rewritten below, so the input's own
+                // survives.
+                if crate::passes::expr_util::is_negative_zero_literal(&literal) {
+                    continue;
+                }
+                // One level up: a float that only becomes const-foldable
+                // here hands the enclosing `-x` / `x * y` / `x / y` a
+                // const-expression the input did not have.  Any float, not
+                // just a zero - the zero can be the SIBLING, already const,
+                // waiting on this operand to make the operator const.
+                if role & ROLE_IN_SIGN_SENSITIVE_SLOT != 0
+                    && crate::passes::expr_util::is_float_literal(&literal)
+                    && !is_const_at_entry(&const_at_entry, handle)
+                {
                     continue;
                 }
                 if !matches!(arena[handle], naga::Expression::Literal(existing) if existing == literal)
@@ -557,6 +792,21 @@ fn fold_local_expressions(
                 if components
                     .iter()
                     .any(|&lane| literal_is_static_error(role, lane))
+                {
+                    continue;
+                }
+                // One manufactured `-0.0` lane is enough, as for a scalar.
+                if components
+                    .iter()
+                    .any(crate::passes::expr_util::is_negative_zero_literal)
+                {
+                    continue;
+                }
+                if role & ROLE_IN_SIGN_SENSITIVE_SLOT != 0
+                    && components
+                        .iter()
+                        .any(crate::passes::expr_util::is_float_literal)
+                    && !is_const_at_entry(&const_at_entry, handle)
                 {
                     continue;
                 }
@@ -602,7 +852,7 @@ fn fold_local_expressions(
                 );
                 if (is_logical_op || both_literal)
                     && let Some(absorb) = check_absorbing_operand(op, left, right, arena)
-                    && clone_over(arena, &roles, handle, absorb)
+                    && clone_over(arena, &roles, &const_at_entry, handle, absorb)
                 {
                     simplify_count += 1;
                     folded.insert(handle); // result is a Literal, declarative.
@@ -622,7 +872,7 @@ fn fold_local_expressions(
                         && refcounts.get(other.index()).copied() == Some(1)
                         && same_emit_range(other, handle);
                     if (other_pure || other_uniquely_owned)
-                        && clone_over(arena, &roles, handle, other)
+                        && clone_over(arena, &roles, &const_at_entry, handle, other)
                     {
                         simplify_count += 1;
                         if !crate::passes::expr_util::expression_needs_emit(&arena[handle]) {
@@ -657,7 +907,7 @@ fn fold_local_expressions(
                         && refcounts.get(inner.index()).copied() == Some(1)
                         && same_emit_range(inner, handle);
                     if (inner_pure || inner_uniquely_owned)
-                        && clone_over(arena, &roles, handle, inner)
+                        && clone_over(arena, &roles, &const_at_entry, handle, inner)
                     {
                         simplify_count += 1;
                         if !crate::passes::expr_util::expression_needs_emit(&arena[handle]) {
@@ -703,7 +953,7 @@ fn fold_local_expressions(
             naga::Expression::Select { accept, reject, .. }
                 if accept == reject && is_pure_to_clone(&arena[accept]) =>
             {
-                if clone_over(arena, &roles, handle, accept) {
+                if clone_over(arena, &roles, &const_at_entry, handle, accept) {
                     simplify_count += 1;
                     if !crate::passes::expr_util::expression_needs_emit(&arena[handle]) {
                         folded.insert(handle);
@@ -818,46 +1068,6 @@ fn cast_bool_to(src: bool, target: naga::Scalar) -> Option<naga::Literal> {
         (K::Float, 4) => Some(L::F32(if src { 1.0 } else { 0.0 })),
         (K::Bool, _) => Some(L::Bool(src)),
         // f16 and the 8-byte kinds decline, which only forfeits a fold.
-        _ => None,
-    }
-}
-
-/// Convert a width-8 literal (`F64` / `U64` / `I64`) to `target` (f32 / i32 /
-/// u32 / bool), or `None` for any other pair.  naga's frontend refuses to
-/// const-fold these casts (f64 / u64 / i64 are non-standard WGSL), so the
-/// `As` node survives and the emitter's `f32(<F64 literal>)` is rejected on
-/// re-parse; folding fixes the round-trip.  Semantics mirror
-/// `naga::proc::ConstantEvaluator::cast`: a float source rounds to nearest
-/// (declined when non-finite) and CLAMPS to integer range; an integer source
-/// WRAPS (`i64(-1) -> u32` is `4294967295u`); `-> bool` is `v != 0`.  Other
-/// targets (f16 / f64 / i64 / u64) return `None`; naga accepts those forms.
-/// `generator::expr_emit::cast_width8_to_literal` covers the vector form:
-/// keep the two conversions in sync (the round-trip tests catch divergence).
-fn cast_width8_to(src: naga::Literal, target: naga::Scalar) -> Option<naga::Literal> {
-    use naga::Literal as L;
-    use naga::ScalarKind as K;
-    if let L::F64(v) = src {
-        return match (target.kind, target.width) {
-            (K::Float, 4) => {
-                let r = v as f32;
-                r.is_finite().then_some(L::F32(r))
-            }
-            (K::Sint, 4) => Some(L::I32(v.clamp(i32::MIN as f64, i32::MAX as f64) as i32)),
-            (K::Uint, 4) => Some(L::U32(v.clamp(u32::MIN as f64, u32::MAX as f64) as u32)),
-            (K::Bool, _) => Some(L::Bool(v != 0.0)),
-            _ => None,
-        };
-    }
-    let v: i128 = match src {
-        L::U64(v) => v as i128,
-        L::I64(v) => v as i128,
-        _ => return None,
-    };
-    match (target.kind, target.width) {
-        (K::Float, 4) => Some(L::F32(v as f32)),
-        (K::Sint, 4) => Some(L::I32(v as i32)),
-        (K::Uint, 4) => Some(L::U32(v as u32)),
-        (K::Bool, _) => Some(L::Bool(v != 0)),
         _ => None,
     }
 }
@@ -1035,7 +1245,7 @@ fn resolve_const_value_uncached(
                     };
                     match lit {
                         naga::Literal::F64(_) | naga::Literal::U64(_) | naga::Literal::I64(_) => {
-                            cast_width8_to(lit, target).map(ConstValue::Scalar)
+                            super::expr_util::cast_width8_to(lit, target).map(ConstValue::Scalar)
                         }
                         naga::Literal::Bool(b) => cast_bool_to(b, target).map(ConstValue::Scalar),
                         _ => None,
@@ -1277,6 +1487,26 @@ fn is_relational_op(op: naga::BinaryOperator) -> bool {
     )
 }
 
+/// Assemble a lane-wise fold's result: a relational operator narrows the
+/// element type to `bool`, every other keeps the operand's - in one place, so
+/// the element-wise and two broadcast arms cannot disagree about it.
+fn vector_fold_result(
+    op: naga::BinaryOperator,
+    lanes: Option<Vec<naga::Literal>>,
+    size: naga::VectorSize,
+    scalar: naga::Scalar,
+) -> Option<ConstValue> {
+    Some(ConstValue::Vector {
+        components: lanes?,
+        size,
+        scalar: if is_relational_op(op) {
+            naga::Scalar::BOOL
+        } else {
+            scalar
+        },
+    })
+}
+
 /// [`eval_binary`] over scalar / same-size vector / broadcast scalar-vector
 /// operand pairs.
 fn eval_const_binary(
@@ -1299,24 +1529,17 @@ fn eval_const_binary(
                 size: rs,
                 ..
             },
-        ) if ls == rs => {
-            let folded: Option<Vec<_>> = lc
-                .into_iter()
+        ) if ls == rs => vector_fold_result(
+            op,
+            lc.into_iter()
                 .zip(rc)
                 .map(|(l, r)| eval_binary(op, l, r))
-                .collect();
-            let components = folded?;
-            let out_scalar = if is_relational_op(op) {
-                naga::Scalar::BOOL
-            } else {
-                lscalar
-            };
-            Some(ConstValue::Vector {
-                components,
-                size: ls,
-                scalar: out_scalar,
-            })
-        }
+                .collect(),
+            ls,
+            lscalar,
+        ),
+        // The two broadcast directions: `eval_binary` is not commutative
+        // (`-`, `/`, `%`, the shifts), so each keeps the scalar on its side.
         (
             ConstValue::Scalar(l),
             ConstValue::Vector {
@@ -1324,23 +1547,15 @@ fn eval_const_binary(
                 size,
                 scalar,
             },
-        ) => {
-            let folded: Option<Vec<_>> = components
+        ) => vector_fold_result(
+            op,
+            components
                 .into_iter()
                 .map(|r| eval_binary(op, l, r))
-                .collect();
-            let components = folded?;
-            let out_scalar = if is_relational_op(op) {
-                naga::Scalar::BOOL
-            } else {
-                scalar
-            };
-            Some(ConstValue::Vector {
-                components,
-                size,
-                scalar: out_scalar,
-            })
-        }
+                .collect(),
+            size,
+            scalar,
+        ),
         (
             ConstValue::Vector {
                 components,
@@ -1348,23 +1563,15 @@ fn eval_const_binary(
                 scalar,
             },
             ConstValue::Scalar(r),
-        ) => {
-            let folded: Option<Vec<_>> = components
+        ) => vector_fold_result(
+            op,
+            components
                 .into_iter()
                 .map(|l| eval_binary(op, l, r))
-                .collect();
-            let components = folded?;
-            let out_scalar = if is_relational_op(op) {
-                naga::Scalar::BOOL
-            } else {
-                scalar
-            };
-            Some(ConstValue::Vector {
-                components,
-                size,
-                scalar: out_scalar,
-            })
-        }
+                .collect(),
+            size,
+            scalar,
+        ),
         _ => None,
     }
 }

@@ -4,6 +4,7 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::expr_util::for_each_function_mut;
 use crate::error::Error;
 use crate::handle_set::{HandleMap, HandleSet};
 use crate::pipeline::{Pass, PassContext};
@@ -99,12 +100,15 @@ impl Pass for DeadParamPass {
             }
         }
 
-        for (_, func) in module.functions.iter_mut() {
-            remove_call_args_in_block(&mut func.body, &removals)?;
-        }
-        for entry in module.entry_points.iter_mut() {
-            remove_call_args_in_block(&mut entry.function.body, &removals)?;
-        }
+        // A callback cannot `?`: hold the first error, skip the rest of the
+        // walk, and raise it after.
+        let mut result = Ok(());
+        for_each_function_mut(&mut module.functions, &mut module.entry_points, &mut |f| {
+            if result.is_ok() {
+                result = remove_call_args_in_block(&mut f.body, &removals);
+            }
+        });
+        result?;
 
         Ok(true)
     }

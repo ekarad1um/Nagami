@@ -3,7 +3,7 @@
 //! binding in the WGSL writer, blocking single-use inlining at the use
 //! site; one `Emit` over the union range restores it.
 
-use super::expr_util::nested_blocks_mut;
+use super::expr_util::{for_each_function_mut, nested_blocks_mut};
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
 
@@ -19,12 +19,9 @@ impl Pass for EmitMergePass {
 
     fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
         let mut changed = false;
-        for (_, function) in module.functions.iter_mut() {
-            changed |= merge_emits_in_block(&mut function.body);
-        }
-        for entry in module.entry_points.iter_mut() {
-            changed |= merge_emits_in_block(&mut entry.function.body);
-        }
+        for_each_function_mut(&mut module.functions, &mut module.entry_points, &mut |f| {
+            changed |= merge_emits_in_block(&mut f.body);
+        });
         Ok(changed)
     }
 }

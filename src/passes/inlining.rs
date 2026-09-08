@@ -12,10 +12,116 @@ use crate::handle_set::{HandleMap, HandleSet};
 use crate::pipeline::{Pass, PassContext};
 
 use super::expr_util::{
-    const_index_value, expression_needs_emit, has_negative_zero_leaf,
-    is_disallowed_inline_expression, nested_blocks_mut, rebuild_function_expressions,
-    remap_statement_handles, try_map_expression_handles_in_place, visit_expression_children,
+    const_expression_leaf, const_index_value, expression_needs_emit, for_each_function_mut,
+    has_negative_zero_leaf, is_disallowed_inline_expression, is_float_zero_literal,
+    nested_blocks_mut, rebuild_function_expressions, remap_statement_handles,
+    try_map_expression_handles_in_place, visit_expression_children, zero_value_is_float,
 };
+
+/// Const-ness and zero-reachability of a caller argument, in one walk.  A
+/// `Constant` / `Override` hides its value from this pass, so it counts as a
+/// possible zero, exactly as [`has_negative_zero_leaf`] treats it.
+fn argument_facts(
+    caller: &naga::Arena<naga::Expression>,
+    types: &naga::UniqueArena<naga::Type>,
+    root: naga::Handle<naga::Expression>,
+) -> (bool, bool) {
+    let (mut is_const, mut reaches_zero) = (true, false);
+    let mut seen = HandleSet::default();
+    let mut stack = vec![root];
+    while let Some(h) = stack.pop() {
+        if !seen.insert(h) {
+            continue;
+        }
+        let expr = &caller[h];
+        match expr {
+            naga::Expression::Literal(lit) => reaches_zero |= is_float_zero_literal(lit),
+            naga::Expression::ZeroValue(ty) => reaches_zero |= zero_value_is_float(types, *ty),
+            naga::Expression::Constant(_) | naga::Expression::Override(_) => reaches_zero = true,
+            _ => {}
+        }
+        match const_expression_leaf(expr) {
+            Some(true) => {}
+            Some(false) => is_const = false,
+            None => visit_expression_children(expr, |c| stack.push(c)),
+        }
+    }
+    (is_const, reaches_zero)
+}
+
+/// `true` when substituting `arguments` turns a float `-x`, `x * y` or
+/// `x / y` the CALLEE left runtime into a const-expression with a zero in it.
+/// A parameter read is runtime by construction, so inlining is the moment
+/// that const-ness can appear; Dawn on Metal then flushes the `-0.0` the call
+/// computed.  Same crossing test as `load_dedup`, rooted at the operator so a
+/// zero already const in one operand is seen when the OTHER is what crosses -
+/// `fn g(a: f32) -> f32 { return a * 0.; }` called as `g(-1.)`.
+fn inlining_crosses_sign_sensitive(
+    template: &InlineTemplate,
+    arguments: &[naga::Handle<naga::Expression>],
+    caller: &naga::Arena<naga::Expression>,
+    types: &naga::UniqueArena<naga::Type>,
+) -> bool {
+    if template.sign_sensitive_ops.is_empty() {
+        return false;
+    }
+    let n = template.expressions.len();
+    // Const-ness with every parameter read left runtime (the call's own
+    // meaning) against const-ness after substitution, plus whether a zero the
+    // operator could re-sign is reachable.
+    let (mut before, mut after, mut zero) = (vec![false; n], vec![false; n], vec![false; n]);
+    for (handle, expr) in template.expressions.iter() {
+        let i = handle.index();
+        match expr {
+            naga::Expression::FunctionArgument(idx) => {
+                let (is_const, reaches_zero) = arguments
+                    .get(*idx as usize)
+                    .map_or((true, true), |&a| argument_facts(caller, types, a));
+                (before[i], after[i], zero[i]) = (false, is_const, reaches_zero);
+            }
+            _ => match const_expression_leaf(expr) {
+                Some(known) => {
+                    (before[i], after[i]) = (known, known);
+                    // A `ZeroValue` IS a zero; a `Constant` / `Override`
+                    // hides its value, so both count, as in `load_dedup`.
+                    zero[i] = match expr {
+                        naga::Expression::Literal(lit) => is_float_zero_literal(lit),
+                        naga::Expression::ZeroValue(ty) => zero_value_is_float(types, *ty),
+                        naga::Expression::Constant(_) | naga::Expression::Override(_) => true,
+                        _ => false,
+                    };
+                }
+                None => {
+                    let (mut b, mut a, mut z) = (true, true, false);
+                    visit_expression_children(expr, |c| {
+                        b &= before[c.index()];
+                        a &= after[c.index()];
+                        z |= zero[c.index()];
+                    });
+                    (before[i], after[i], zero[i]) = (b, a, z);
+                }
+            },
+        }
+    }
+    template
+        .sign_sensitive_ops
+        .iter()
+        .any(|op| after[op.index()] && !before[op.index()] && zero[op.index()])
+}
+
+/// The three operators whose zero result takes its sign from the operands.
+fn is_sign_sensitive_op(expr: &naga::Expression) -> bool {
+    matches!(
+        expr,
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::Multiply | naga::BinaryOperator::Divide,
+            ..
+        } | naga::Expression::Unary {
+            op: naga::UnaryOperator::Negate,
+            ..
+        }
+    )
+}
 
 /// Default inlining budgets (used by [`super::Profile::Aggressive`]).
 pub const DEFAULT_MAX_INLINE_NODE_COUNT: usize = 24;
@@ -71,6 +177,10 @@ struct InlineTemplate {
     argument_types: Vec<naga::Handle<naga::Type>>,
     return_expr: naga::Handle<naga::Expression>,
     expressions: naga::Arena<naga::Expression>,
+    /// Float `-x` / `x * y` / `x / y` REACHABLE from `return_expr`: the only
+    /// ones a clone reproduces, and empty for most callees, which is what
+    /// keeps the per-call-site crossing test off the hot path.
+    sign_sensitive_ops: Vec<naga::Handle<naga::Expression>>,
 }
 
 impl Pass for InliningPass {
@@ -97,12 +207,10 @@ impl Pass for InliningPass {
         }
 
         let mut inlined = 0usize;
-        for (_, function) in module.functions.iter_mut() {
-            inlined += inline_in_function(function, &templates, &module.types);
-        }
-        for entry in module.entry_points.iter_mut() {
-            inlined += inline_in_function(&mut entry.function, &templates, &module.types);
-        }
+        let types = &module.types;
+        for_each_function_mut(&mut module.functions, &mut module.entry_points, &mut |f| {
+            inlined += inline_in_function(f, &templates, types);
+        });
         changed |= inlined > 0;
 
         Ok(changed)
@@ -134,12 +242,9 @@ fn delete_calls_to_empty_functions(module: &mut naga::Module, preserve: &[String
     }
 
     let mut changed = false;
-    for (_, function) in module.functions.iter_mut() {
-        changed |= drop_empty_calls_in_block(&mut function.body, &empty);
-    }
-    for entry in module.entry_points.iter_mut() {
-        changed |= drop_empty_calls_in_block(&mut entry.function.body, &empty);
-    }
+    for_each_function_mut(&mut module.functions, &mut module.entry_points, &mut |f| {
+        changed |= drop_empty_calls_in_block(&mut f.body, &empty);
+    });
     changed
 }
 
@@ -237,10 +342,11 @@ fn collect_inline_templates(
                 continue;
             }
             // Node counts undercount TEXT: a `Math` node renders its full
-            // builtin name (`faceForward(` is 12 characters for one node),
-            // so duplicating one across sites grows bytes inside the node
-            // budget (the corpus faceForward / reflect class loses ~10 B per
-            // extra site); image accessors share the long spelling.
+            // builtin name (`faceForward(` is 12 characters), so duplicating
+            // one across sites grows bytes inside the node budget.  The
+            // minority case though - the veto measures net-negative on both
+            // corpora, and wants replacing by a per-node text-cost estimate
+            // rather than a veto on the node KIND.
             let has_char_heavy_node = function.expressions.iter().any(|(h, e)| {
                 visited[h.index()]
                     && matches!(
@@ -261,6 +367,12 @@ fn collect_inline_templates(
             InlineTemplate {
                 argument_types: function.arguments.iter().map(|a| a.ty).collect(),
                 return_expr,
+                sign_sensitive_ops: function
+                    .expressions
+                    .iter()
+                    .filter(|(h, e)| visited[h.index()] && is_sign_sensitive_op(e))
+                    .map(|(h, _)| h)
+                    .collect(),
                 expressions: function.expressions.clone(),
             },
         );
@@ -432,6 +544,7 @@ fn inline_in_block(
                     && !arguments
                         .iter()
                         .any(|&a| has_negative_zero_leaf(expressions, a))
+                    && !inlining_crosses_sign_sensitive(template, &arguments, expressions, types)
                 {
                     let old_len = expressions.len();
                     // Indexed by template handle: the template arena is the

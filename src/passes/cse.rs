@@ -12,7 +12,9 @@ use std::hash::{Hash, Hasher};
 
 use crate::error::Error;
 
-use super::expr_util::{flatten_replacement_chains, try_map_expression_handles_in_place};
+use super::expr_util::{
+    flatten_replacement_chains, for_each_function_mut, try_map_expression_handles_in_place,
+};
 use crate::handle_set::HandleMap;
 
 /// Replace duplicate pure expressions with the first dominating evaluation.
@@ -26,12 +28,9 @@ impl Pass for CSEPass {
 
     fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
         let mut changed = false;
-        for (_, function) in module.functions.iter_mut() {
-            changed |= cse_function(function);
-        }
-        for entry in module.entry_points.iter_mut() {
-            changed |= cse_function(&mut entry.function);
-        }
+        for_each_function_mut(&mut module.functions, &mut module.entry_points, &mut |f| {
+            changed |= cse_function(f);
+        });
         Ok(changed)
     }
 }

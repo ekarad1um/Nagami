@@ -19,7 +19,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::error::Error;
 use crate::handle_set::HandleMap;
-use crate::passes::expr_util::root_local_var;
+use crate::passes::expr_util::{for_each_function_mut, root_local_var};
 use crate::pipeline::{Pass, PassContext};
 
 /// Collapses member-wise struct builds into one constructor store.
@@ -71,12 +71,10 @@ impl Pass for StructBuildPass {
 
     fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
         let mut changed = false;
-        for (_, f) in module.functions.iter_mut() {
-            changed |= collapse_in_function(f, &module.types);
-        }
-        for ep in module.entry_points.iter_mut() {
-            changed |= collapse_in_function(&mut ep.function, &module.types);
-        }
+        let types = &module.types;
+        for_each_function_mut(&mut module.functions, &mut module.entry_points, &mut |f| {
+            changed |= collapse_in_function(f, types);
+        });
         Ok(changed)
     }
 }

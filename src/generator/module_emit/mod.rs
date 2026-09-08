@@ -218,7 +218,7 @@ fn any_expression(module: &naga::Module, pred: impl Fn(&naga::Expression) -> boo
     module
         .global_expressions
         .iter()
-        .chain(super::core::all_functions(module).flat_map(|f| f.expressions.iter()))
+        .chain(crate::passes::expr_util::all_functions(module).flat_map(|f| f.expressions.iter()))
         .any(|(_, e)| pred(e))
 }
 
@@ -266,17 +266,8 @@ impl<'a> Generator<'a> {
     pub(super) fn generate_module(&mut self) -> Result<(), Error> {
         let mut has_prev_section = false;
 
-        self.ref_count_cache = self
-            .module
-            .functions
-            .iter()
-            .map(|(_, f)| compute_expression_ref_counts(f))
-            .chain(
-                self.module
-                    .entry_points
-                    .iter()
-                    .map(|ep| compute_expression_ref_counts(&ep.function)),
-            )
+        self.ref_count_cache = crate::passes::expr_util::all_functions(self.module)
+            .map(compute_expression_ref_counts)
             .collect();
 
         self.pure_functions = compute_pure_functions(self.module);
@@ -1049,7 +1040,7 @@ impl<'a> Generator<'a> {
 /// would not inject an implicit `return;` at this block's tail.  naga appends
 /// one whenever the tail is not a returning terminator, a `loop` included
 /// (never proven non-falling-through, even when its body always returns), so
-/// unlike `dead_branch::definitely_terminates` the `Loop` arm is `false`.
+/// unlike `dead_branch::tail_terminates` the `Loop` arm is `false`.
 fn block_naga_terminates(block: &naga::Block) -> bool {
     match block.last() {
         Some(

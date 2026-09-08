@@ -7,6 +7,37 @@
 
 use crate::handle_set::{HandleMap, HandleSet};
 
+// MARK: Module traversal
+
+/// Every function body: free functions, then entry points - the order the
+/// generator's per-function caches are indexed by, and one walk so a pass
+/// cannot optimise one arena and silently skip the other.
+pub(crate) fn all_functions(module: &naga::Module) -> impl Iterator<Item = &naga::Function> {
+    module
+        .functions
+        .iter()
+        .map(|(_, f)| f)
+        .chain(module.entry_points.iter().map(|ep| &ep.function))
+}
+
+/// Mutable [`all_functions`].  A callback, not an iterator: a `Chain` leaves
+/// one call site per pass, which tips LLVM into inlining each per-function
+/// worker into the pass body (+6,080 bytes of text, measured).  Takes the
+/// arenas rather than the module so a caller can hold `&module.types` across
+/// the walk.
+pub(crate) fn for_each_function_mut(
+    functions: &mut naga::Arena<naga::Function>,
+    entry_points: &mut [naga::EntryPoint],
+    visit: &mut dyn FnMut(&mut naga::Function),
+) {
+    for (_, function) in functions.iter_mut() {
+        visit(function);
+    }
+    for entry in entry_points.iter_mut() {
+        visit(&mut entry.function);
+    }
+}
+
 // MARK: Expression classifiers
 
 /// Whether `expression` must sit inside an `Emit` range: declarative
@@ -1118,6 +1149,48 @@ pub(crate) fn rebuild_emit_ranges_after_removal(
 
 // MARK: Literal predicates
 
+/// Convert a width-8 literal (`F64` / `U64` / `I64`) to `target` (f32 / i32 /
+/// u32 / bool), `None` otherwise - f16 / f64 / i64 / u64 targets included,
+/// since naga accepts those forms.  naga's frontend refuses to const-fold these casts
+/// (f64 / u64 / i64 are non-standard WGSL), so the `As` node survives and an
+/// emitted `f32(<F64 literal>)` is rejected on re-parse.  Semantics mirror
+/// `naga::proc::ConstantEvaluator::cast`: a float source rounds to nearest
+/// (declined when non-finite) and CLAMPS to integer range; an integer source
+/// WRAPS (`i64(-1) -> u32` is `4294967295u`); `-> bool` is `v != 0`.
+///
+/// Shared because both sides of the round-trip need it: `const_fold` folds
+/// the scalar `As`, and the generator converts the components of a vector
+/// narrowing `materialize_vector` cannot, needing each converted literal as
+/// an arena handle.
+pub(crate) fn cast_width8_to(src: naga::Literal, target: naga::Scalar) -> Option<naga::Literal> {
+    use naga::Literal as L;
+    use naga::ScalarKind as K;
+    if let L::F64(v) = src {
+        return match (target.kind, target.width) {
+            (K::Float, 4) => {
+                let r = v as f32;
+                r.is_finite().then_some(L::F32(r))
+            }
+            (K::Sint, 4) => Some(L::I32(v.clamp(i32::MIN as f64, i32::MAX as f64) as i32)),
+            (K::Uint, 4) => Some(L::U32(v.clamp(u32::MIN as f64, u32::MAX as f64) as u32)),
+            (K::Bool, _) => Some(L::Bool(v != 0.0)),
+            _ => None,
+        };
+    }
+    let v: i128 = match src {
+        L::U64(v) => v as i128,
+        L::I64(v) => v as i128,
+        _ => return None,
+    };
+    match (target.kind, target.width) {
+        (K::Float, 4) => Some(L::F32(v as f32)),
+        (K::Sint, 4) => Some(L::I32(v as i32)),
+        (K::Uint, 4) => Some(L::U32(v as u32)),
+        (K::Bool, _) => Some(L::Bool(v != 0)),
+        _ => None,
+    }
+}
+
 pub(crate) fn is_bool_true(
     arena: &naga::Arena<naga::Expression>,
     h: naga::Handle<naga::Expression>,
@@ -1138,28 +1211,119 @@ pub(crate) fn is_bool_false(
     )
 }
 
-/// `true` when `h` may carry a `-0.0` that only a const-evaluator sees: a
-/// literal, a splat / compose of one, or a module-scope value this arena
-/// cannot resolve.  WGSL leaves the sign of a zero to the implementation,
-/// and Dawn on Metal exercises that licence one way for a CONSTANT and the
-/// other for a runtime negation, so substituting such a value for a runtime
-/// read (forwarding, inlining) flips the sign the input shipped; the passes
-/// leave those reads in place.  `Constant` / `Override` leaves resolve
-/// through `module.global_expressions`, which the mutating passes do not
-/// hold, and an override has no fixed value at all - both are declined.
+/// Const-ness of `expr` itself as a WGSL const-expression: `Some` decides,
+/// `None` defers to the operands.  Children precede parents in a naga arena,
+/// so one forward pass makes it per-handle.  Exhaustive because no default is
+/// safe: `load_dedup` declines only where this says const and `const_fold`
+/// only where it says runtime, so either guess stops a decline that matters.
+pub(crate) fn const_expression_leaf(expr: &naga::Expression) -> Option<bool> {
+    use naga::Expression as E;
+    match expr {
+        // `Override` is not const, but a slot made of one moves the error
+        // to pipeline creation, which the runtime input did not have.
+        E::Literal(_) | E::Constant(_) | E::Override(_) | E::ZeroValue(_) => Some(true),
+
+        E::Compose { .. }
+        | E::Access { .. }
+        | E::AccessIndex { .. }
+        | E::Splat { .. }
+        | E::Swizzle { .. }
+        | E::Unary { .. }
+        | E::Binary { .. }
+        | E::Select { .. }
+        | E::Relational { .. }
+        | E::Math { .. }
+        | E::As { .. } => None,
+
+        E::FunctionArgument(_)
+        | E::GlobalVariable(_)
+        | E::LocalVariable(_)
+        | E::CallResult(_)
+        | E::AtomicResult { .. }
+        | E::WorkGroupUniformLoadResult { .. }
+        | E::RayQueryProceedResult
+        | E::SubgroupBallotResult
+        | E::SubgroupOperationResult { .. }
+        | E::Load { .. }
+        | E::Derivative { .. }
+        | E::ArrayLength(_)
+        | E::ImageSample { .. }
+        | E::ImageLoad { .. }
+        | E::ImageQuery { .. }
+        | E::RayQueryVertexPositions { .. }
+        | E::RayQueryGetIntersection { .. }
+        | E::CooperativeLoad { .. }
+        | E::CooperativeMultiplyAdd { .. } => Some(false),
+    }
+}
+
+/// `true` when a `ZeroValue` of `ty` is a FLOAT zero - the only kind a
+/// `-x` / `x * y` / `x / y` can re-sign.  An integer `vec4i()` must answer
+/// false or the untyped sign-sensitive roots stop being inert and the guard
+/// declines integer slots that have no signed zero at all.  Anything that is
+/// not a numeric scalar / vector / matrix cannot be such an operand, so the
+/// conservative answer costs nothing.
+pub(crate) fn zero_value_is_float(
+    types: &naga::UniqueArena<naga::Type>,
+    ty: naga::Handle<naga::Type>,
+) -> bool {
+    match types[ty].inner {
+        naga::TypeInner::Scalar(scalar) | naga::TypeInner::Vector { scalar, .. } => matches!(
+            scalar.kind,
+            naga::ScalarKind::Float | naga::ScalarKind::AbstractFloat
+        ),
+        naga::TypeInner::Matrix { .. } => true,
+        _ => true,
+    }
+}
+
+/// A float zero of either sign: what an enclosing `-x` / `x * y` / `x / y`
+/// is free to re-sign, whatever this literal's own sign is.
+pub(crate) fn is_float_zero_literal(lit: &naga::Literal) -> bool {
+    match *lit {
+        naga::Literal::F32(v) => v == 0.0,
+        naga::Literal::F64(v) | naga::Literal::AbstractFloat(v) => v == 0.0,
+        naga::Literal::F16(v) => v.to_f32() == 0.0,
+        _ => false,
+    }
+}
+
+/// Any float literal, of any width.
+pub(crate) fn is_float_literal(lit: &naga::Literal) -> bool {
+    matches!(
+        *lit,
+        naga::Literal::F32(_)
+            | naga::Literal::F64(_)
+            | naga::Literal::AbstractFloat(_)
+            | naga::Literal::F16(_)
+    )
+}
+
+/// A literal `-0.0` of any float width.  WGSL leaves a zero's sign to the
+/// implementation, and Dawn on Metal flushes a LITERAL `-0.0` to `+0.0` while
+/// keeping the sign of a runtime negation: the asymmetry every `-0.0` guard
+/// in the passes exists to respect.
+pub(crate) fn is_negative_zero_literal(lit: &naga::Literal) -> bool {
+    match *lit {
+        naga::Literal::F32(v) => v == 0.0 && v.is_sign_negative(),
+        naga::Literal::F64(v) | naga::Literal::AbstractFloat(v) => v == 0.0 && v.is_sign_negative(),
+        naga::Literal::F16(v) => v.to_bits() == 0x8000,
+        _ => false,
+    }
+}
+
+/// `true` when `h` may carry a `-0.0` only a const-evaluator sees: a literal,
+/// a splat / compose of one, or a module-scope value this arena cannot
+/// resolve.  Substituting one for a runtime read (forwarding, inlining) flips
+/// the sign the input shipped.  `Constant` / `Override` resolve through
+/// `module.global_expressions`, which the mutating passes do not hold, and an
+/// override has no fixed value at all - both decline.
 pub fn has_negative_zero_leaf(
     arena: &naga::Arena<naga::Expression>,
     h: naga::Handle<naga::Expression>,
 ) -> bool {
     match &arena[h] {
-        naga::Expression::Literal(lit) => match *lit {
-            naga::Literal::F32(v) => v == 0.0 && v.is_sign_negative(),
-            naga::Literal::F64(v) | naga::Literal::AbstractFloat(v) => {
-                v == 0.0 && v.is_sign_negative()
-            }
-            naga::Literal::F16(v) => v.to_bits() == 0x8000,
-            _ => false,
-        },
+        naga::Expression::Literal(lit) => is_negative_zero_literal(lit),
         naga::Expression::Constant(_) | naga::Expression::Override(_) => true,
         naga::Expression::Splat { value, .. } => has_negative_zero_leaf(arena, *value),
         naga::Expression::Compose { components, .. } => {
@@ -1435,26 +1599,7 @@ fn rebuild_block_expressions(
                 mapped_handles.push(mapped);
             }
 
-            if !mapped_handles.is_empty() {
-                let mut start = mapped_handles[0];
-                let mut end = mapped_handles[0];
-                for &h in &mapped_handles[1..] {
-                    if h.index() == end.index() + 1 {
-                        end = h;
-                    } else {
-                        rebuilt.push(
-                            naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
-                            span,
-                        );
-                        start = h;
-                        end = h;
-                    }
-                }
-                rebuilt.push(
-                    naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
-                    span,
-                );
-            }
+            push_emit_runs(&mut rebuilt, &mapped_handles, span);
             continue;
         }
 

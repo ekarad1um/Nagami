@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::Config;
 use crate::handle_set::{HandleMap, HandleSet};
+use crate::passes::expr_util::cast_width8_to;
 
 /// Shim for [`fold_local_expressions`]: bare arenas have no `Emit` ranges,
 /// so mapping every handle to one shared range models the safe co-located

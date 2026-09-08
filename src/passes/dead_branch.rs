@@ -119,7 +119,10 @@ fn hoist_leading_emits(rebuilt: &mut naga::Block, accept: naga::Block) {
 /// The dead `var t` and orphaned `Load(t)` are left for the downstream
 /// dead-local / dead-expression cleanup later in the fixpoint; without it a
 /// stray `var t;` survives (size, never correctness).
-fn forward_single_store_locals(function: &mut naga::Function) -> bool {
+fn forward_single_store_locals(
+    function: &mut naga::Function,
+    types: &naga::UniqueArena<naga::Type>,
+) -> bool {
     let nlocals = function.local_variables.len();
     if nlocals == 0 {
         return false;
@@ -199,6 +202,21 @@ fn forward_single_store_locals(function: &mut naga::Function) -> bool {
         &mut remove_store,
         &mut HandleSet::default(),
     );
+    // Substituting a const store value for a runtime local read crosses a
+    // float `-x` / `x * y` / `x / y` slot exactly as `load_dedup`'s own
+    // forwarding does, so it answers to the same test.  A declined load still
+    // reads the local, so its store has to stay.
+    for handle in super::load_dedup::decline_sign_sensitive_forwards(
+        &function.expressions,
+        types,
+        &mut redirects,
+    ) {
+        if let naga::Expression::Load { pointer } = function.expressions[handle]
+            && let naga::Expression::LocalVariable(l) = function.expressions[pointer]
+        {
+            remove_store[l.index()] = false;
+        }
+    }
     if redirects.is_empty() {
         return false;
     }
@@ -382,12 +400,13 @@ impl Pass for DeadBranchPass {
         // Built once: the mutable function walk below cannot re-borrow
         // `module.constants`.
         let const_lits = build_const_literal_cache(module);
+        let types = &module.types;
 
         for (_, function) in module.functions.iter_mut() {
             // Order is load-bearing: the re-sugar matches the frontend shape
             // the later phases destroy.
             changed += resugar_short_circuits(function);
-            changed += usize::from(forward_single_store_locals(function));
+            changed += usize::from(forward_single_store_locals(function, types));
             changed += eliminate_redundant_else_stores_in_function(function, &const_lits);
             changed += eliminate_dead_branches(
                 &mut function.body,
@@ -399,7 +418,7 @@ impl Pass for DeadBranchPass {
         }
         for entry in module.entry_points.iter_mut() {
             changed += resugar_short_circuits(&mut entry.function);
-            changed += usize::from(forward_single_store_locals(&mut entry.function));
+            changed += usize::from(forward_single_store_locals(&mut entry.function, types));
             changed +=
                 eliminate_redundant_else_stores_in_function(&mut entry.function, &const_lits);
             changed += eliminate_dead_branches(
@@ -809,20 +828,25 @@ fn eliminate_dead_branches(
                 accept,
                 reject,
             } => match resolve_to_literal(expressions, condition, const_lits) {
-                Some(naga::Literal::Bool(true)) => {
-                    // Keep the `if` when dropping `reject` would orphan a
-                    // statement result (invalid IR: whole-pass rollback every
-                    // sweep) or lose a loop exit under tint's analysis, which
-                    // never const-evaluates conditions but does sequence
-                    // reachability: (a) the dropped arm may carry the loop's
-                    // only exit; (b) splicing a kept arm that never falls
-                    // through (e.g. `continue`) makes every statement after
-                    // the `if` unreachable to tint, un-crediting a trailing
-                    // `break` / `return` whose text survives.
-                    if block_has_result_producer(&reject)
-                        || (in_loop && contains_return(&reject))
-                        || (break_binds_to_loop && contains_bare_break(&reject))
-                        || (in_loop && splice_loses_tint_loop_exit(&accept, break_binds_to_loop))
+                Some(naga::Literal::Bool(taken)) => {
+                    // One arm for both conditions so the hazard list cannot
+                    // drift between them.  Keep the `if` when dropping the
+                    // untaken arm would orphan a statement result (invalid IR:
+                    // whole-pass rollback every sweep) or lose a loop exit
+                    // under tint's analysis, which sequences reachability
+                    // without const-evaluating conditions: the dropped arm may
+                    // carry the loop's only exit, and splicing a kept arm that
+                    // never falls through strands the rest of the block,
+                    // un-crediting a trailing `break` / `return`.
+                    let (kept, dropped) = if taken {
+                        (&accept, &reject)
+                    } else {
+                        (&reject, &accept)
+                    };
+                    if block_has_result_producer(dropped)
+                        || (in_loop && contains_return(dropped))
+                        || (break_binds_to_loop && contains_bare_break(dropped))
+                        || (in_loop && splice_loses_tint_loop_exit(kept, break_binds_to_loop))
                     {
                         rebuilt.push(
                             naga::Statement::If {
@@ -833,27 +857,7 @@ fn eliminate_dead_branches(
                             span,
                         );
                     } else {
-                        splice_block(&mut rebuilt, accept);
-                        changed += 1;
-                    }
-                }
-                Some(naga::Literal::Bool(false)) => {
-                    // Same hazards as the `true` arm.
-                    if block_has_result_producer(&accept)
-                        || (in_loop && contains_return(&accept))
-                        || (break_binds_to_loop && contains_bare_break(&accept))
-                        || (in_loop && splice_loses_tint_loop_exit(&reject, break_binds_to_loop))
-                    {
-                        rebuilt.push(
-                            naga::Statement::If {
-                                condition,
-                                accept,
-                                reject,
-                            },
-                            span,
-                        );
-                    } else {
-                        splice_block(&mut rebuilt, reject);
+                        splice_block(&mut rebuilt, if taken { accept } else { reject });
                         changed += 1;
                     }
                 }
@@ -1042,7 +1046,7 @@ fn eliminate_dead_branches(
         // above: an unreachable result producer must stay (orphaned result:
         // whole-pass rollback), and then the WHOLE tail stays, since dropping
         // its neighbours could strip an `Emit` covering its operands.
-        if rebuilt.last().is_some_and(definitely_terminates) {
+        if block_definitely_terminates(&rebuilt) {
             let tail: Vec<_> = statements.by_ref().collect();
             if tail
                 .iter()
@@ -1068,29 +1072,46 @@ fn splice_block(target: &mut naga::Block, source: naga::Block) {
     }
 }
 
-/// No path through `stmt` falls through to the next statement.
-fn definitely_terminates(stmt: &naga::Statement) -> bool {
+/// Control never falls off the end of `stmt`.  `bare_break_terminates` is the
+/// ONE thing the two callers answer differently: in a plain block a `Break`
+/// leaves the construct, in a switch case it only resumes after the switch.
+/// Everything else - `Return`, `Continue`, the `Loop` exit analysis, the
+/// switch's exhaustiveness test - is the same either way, and one copy of it
+/// is what stops a fix landing on one side only.
+///
+/// `Kill` is NOT a terminator: under demote-to-helper execution continues
+/// past `discard`, and tint requires the statements after it (a trailing
+/// `return`, a loop's exit) to stay; treating it as terminating strips
+/// reachable code and yields "missing return" / "loop does not exit"
+/// rejections.
+fn tail_terminates(stmt: &naga::Statement, bare_break_terminates: bool) -> bool {
+    let block = |b: &naga::Block| block_tail_terminates(b, bare_break_terminates);
     match stmt {
-        // `Kill` is NOT a terminator: under demote-to-helper execution
-        // continues past `discard`, and tint requires the statements after
-        // it (a trailing `return`, a loop's exit) to stay; treating it as
-        // terminating strips reachable code and yields "missing return" /
-        // "loop does not exit" rejections.
-        naga::Statement::Return { .. } | naga::Statement::Break | naga::Statement::Continue => true,
-        naga::Statement::Block(inner) => block_definitely_terminates(inner),
-        naga::Statement::If { accept, reject, .. } => {
-            block_definitely_terminates(accept) && block_definitely_terminates(reject)
-        }
-        // A body that always exits, never via this loop's Break / Continue,
-        // never falls through.
-        naga::Statement::Loop { body, .. } => {
-            block_definitely_terminates(body) && !contains_bare_loop_control(body)
+        naga::Statement::Return { .. } | naga::Statement::Continue => true,
+        naga::Statement::Break => bare_break_terminates,
+        naga::Statement::Block(inner) => block(inner),
+        naga::Statement::If { accept, reject, .. } => block(accept) && block(reject),
+        // naga admits exactly two exits: a bare `Break` in `body`, or
+        // `break_if` - `continuing` may carry neither by IR contract, and
+        // `Return` / `Kill` leave the function, not the loop.  `break_if` is
+        // armed only from the end of `body` or a bare `Continue`, so a body
+        // that reaches neither disarms it; the body's tail is otherwise
+        // irrelevant, falling off its end going around again.  Demanding it
+        // unconditionally kept naga's appended `return` on every
+        // `fn f() -> T { loop { ... return v; ... } }`, failing validation
+        // and shipping uncompiled.  A `Break` here binds to THIS loop
+        // whatever construct the caller asked about, so the flag is moot.
+        naga::Statement::Loop { body, break_if, .. } => {
+            !contains_bare_break(body)
+                && (break_if.is_none()
+                    || (block_definitely_terminates(body) && !contains_bare_continue(body)))
         }
         // Terminates iff every non-fall-through case exits BEYOND the switch
         // (a bare Break only resumes after it), a Default exists, and the
         // last case does not fall through - a shape naga's frontend never
         // emits but the inlining / CSE rebuilders can, and falling off the
-        // end is Break-equivalent.
+        // end is Break-equivalent.  Cases are always asked the beyond-switch
+        // question, so the flag is moot here as well.
         naga::Statement::Switch { cases, .. } => {
             let last_falls_through = cases.last().is_some_and(|c| c.fall_through);
             cases
@@ -1107,45 +1128,26 @@ fn definitely_terminates(stmt: &naga::Statement) -> bool {
     }
 }
 
+fn block_tail_terminates(block: &naga::Block, bare_break_terminates: bool) -> bool {
+    block
+        .last()
+        .is_some_and(|stmt| tail_terminates(stmt, bare_break_terminates))
+}
+
 /// Control never falls off the end of `block`.  `pub(crate)`: the generator
 /// synthesises a trailing zero-value return only when the body provably
 /// never falls through, and sharing the predicate keeps that guard in
 /// lockstep with the return-stripping here.
 pub(crate) fn block_definitely_terminates(block: &naga::Block) -> bool {
-    block.last().is_some_and(definitely_terminates)
+    block_tail_terminates(block, /*bare_break_terminates=*/ true)
 }
+
 /// The case body's tail exits BEYOND the switch (function or enclosing
 /// loop): `Break` only exits the switch and resumes after it, so it does not
 /// count; `Continue` jumps past the switch to the loop's continuing block,
 /// so it does.
 fn case_body_terminates_beyond_switch(block: &naga::Block) -> bool {
-    block.last().is_some_and(|stmt| match stmt {
-        // `Kill` is absent on purpose: demote-to-helper continues past it.
-        naga::Statement::Return { .. } | naga::Statement::Continue => true,
-        naga::Statement::Break => false,
-        naga::Statement::Block(inner) => case_body_terminates_beyond_switch(inner),
-        naga::Statement::If { accept, reject, .. } => {
-            case_body_terminates_beyond_switch(accept) && case_body_terminates_beyond_switch(reject)
-        }
-        // With no bare loop control the only way out of the loop is Return,
-        // which exits beyond the switch.
-        naga::Statement::Loop { body, .. } => {
-            block_definitely_terminates(body) && !contains_bare_loop_control(body)
-        }
-        // A fall-through last case falls out of the switch, which is
-        // Break-equivalent and so does not terminate beyond.
-        naga::Statement::Switch { cases, .. } => {
-            let last_falls_through = cases.last().is_some_and(|c| c.fall_through);
-            cases
-                .iter()
-                .all(|c| c.fall_through || case_body_terminates_beyond_switch(&c.body))
-                && cases.iter().any(|c| c.value == naga::SwitchValue::Default)
-                && !last_falls_through
-                // A bare `break` anywhere in a case resumes after this switch.
-                && !cases.iter().any(|c| contains_bare_break(&c.body))
-        }
-        _ => false,
-    })
+    block_tail_terminates(block, /*bare_break_terminates=*/ false)
 }
 
 fn resolve_switch_value(
@@ -1216,6 +1218,14 @@ fn contains_loop_control(block: &naga::Block, want_break: bool, want_continue: b
         _ => nested_blocks(stmt)
             .any(|nested| contains_loop_control(nested, want_break, want_continue)),
     })
+}
+
+/// A bare `Continue` targeting the enclosing loop, which reaches its
+/// `continuing` block and so arms `break_if`.
+fn contains_bare_continue(block: &naga::Block) -> bool {
+    contains_loop_control(
+        block, /*want_break=*/ false, /*want_continue=*/ true,
+    )
 }
 
 /// A bare `Break` or `Continue` targeting the immediately enclosing loop.
@@ -1574,6 +1584,8 @@ fn eliminate_redundant_else_stores(
                 // for the redundancy check, then roll back to the pre-if
                 // state.  `cond_fresh` is decided once, up front: an
                 // accept-arm store must not perturb the reject decision.
+                // Written out per arm: one shared body needs the narrowing as
+                // a function pointer, which stops it inlining (+1,836 B).
                 let cond_fresh = condition_load_is_fresh(condition, expressions, fresh_loads);
                 let cp_pre_if = known_values.checkpoint();
 
@@ -1598,6 +1610,8 @@ fn eliminate_redundant_else_stores(
                     );
                 known_values.rollback_to(cp_pre_if);
 
+                // Same shape for `reject`, and the same order for the same
+                // reason.
                 if cond_fresh {
                     narrow_for_reject(condition, expressions, known_values);
                 }

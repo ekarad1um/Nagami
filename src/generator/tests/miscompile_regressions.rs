@@ -1698,10 +1698,11 @@ fn manufactured_min_div_rem_shl_fold_to_defined_values() {
     );
 }
 
-/// A pass-manufactured float division by literal zero has no valid
-/// const-expression spelling (inf), so the hazard guard `let`-binds one
-/// operand and ships a runtime division: neither the compacted-input bailout
-/// nor a hard error on valid input.
+/// A float division by literal zero has no valid const-expression spelling
+/// (inf), so it must ship as a RUNTIME division: neither the compacted-input
+/// bailout nor a hard error on valid input.  The DIVISOR is what stays
+/// runtime - the sign-sensitive guard declines forwarding a float zero into a
+/// `/` slot, `5f / +0.0` and `5f / -0.0` differing.
 #[test]
 fn float_div_zero_ships_as_runtime_division() {
     let src = "@group(0) @binding(0) var<storage, read_write> out: f32;\n\
@@ -1715,8 +1716,8 @@ fn float_div_zero_ships_as_runtime_division() {
         result.source
     );
     assert!(
-        result.source.contains("let a=5f;A=a/0;"),
-        "one operand must be let-bound so the division stays runtime: {}",
+        result.source.contains("var a=0f;A=5/a;"),
+        "the divisor must stay a variable so the division stays runtime: {}",
         result.source
     );
     assert_valid_wgsl(&result.source);
@@ -1885,4 +1886,327 @@ fn rounded_literals_are_judged_by_the_printed_value() {
         output.source
     );
     assert_valid_wgsl(&output.source);
+}
+
+/// Inlining can make a divisor or shift amount a const-expression the input's
+/// was not: `5u % (d + 1u - 1u)` called as `f(0u)`.  naga's validator checks
+/// only the LITERAL spelling (`5u % 0u`), so the module validates yet has no
+/// valid WGSL text at all, and the run used to ship lexically compacted with
+/// every optimization lost.  The failable-slot check in `io::validate_module`
+/// reports it so the driver rolls only the inlining back.
+#[test]
+fn inlined_argument_never_manufactures_a_static_error_slot() {
+    // (source, a token proving the IR pipeline ran)
+    let cases = [
+        (
+            "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\n\
+             fn f(d: u32) -> u32 { return 5u / (d + 1u - 1u); }\n\
+             @compute @workgroup_size(1) fn main() { o[0] = f(0u); }",
+            "5/(B+1-1)",
+        ),
+        (
+            "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\n\
+             fn f(s: u32) -> u32 { return 5u << (s + 1u); }\n\
+             @compute @workgroup_size(1) fn main() { o[0] = f(63u); }",
+            "5u<<(B+1)",
+        ),
+        // The failable operator on the CALLER's side, fed by the inlined
+        // return value: a decline inside the callee's clone cannot see it.
+        (
+            "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\n\
+             fn f(x: u32) -> u32 { return x - 1u; }\n\
+             @compute @workgroup_size(1) fn main() { o[0] = 5u / f(1u); }",
+            "5/a(1)",
+        ),
+        // The zero arrives through a module `const`, not a literal argument.
+        (
+            "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\n\
+             const Z: u32 = 1u;\n\
+             fn f(d: u32) -> u32 { return 5u / (d - Z); }\n\
+             @compute @workgroup_size(1) fn main() { o[0] = f(1u); }",
+            "5/(B-1)",
+        ),
+    ];
+    for (src, marker) in cases {
+        let result = crate::run(src, &Config::default()).expect("must minify");
+        assert!(
+            result.report.bailout.is_none(),
+            "must not degrade to the lexical bailout: {:?}\n{}",
+            result.report.bailout,
+            result.source
+        );
+        assert!(
+            result.source.contains(marker),
+            "expected the un-inlined, renamed form containing {marker}: {}",
+            result.source
+        );
+        assert_valid_wgsl(&result.source);
+    }
+}
+
+/// `-x`, `x * y` and `x / y` must keep the const-ness the input gave their
+/// operands.  `const_fold` used to narrow `select(0f, v, false)` to `0f`,
+/// turning `-select(...)` const: the input stored `-0.0` and the output
+/// `+0.0`, found by the GPU differential fuzzer.  `load_dedup` reaches the
+/// same shape by forwarding the variable's initializer.
+#[test]
+fn a_sign_sensitive_float_slot_keeps_the_input_const_ness() {
+    let cases = [
+        // const_fold's narrowing: the other operand is a storage read, so
+        // nothing can be forwarded and only the `select` fold is at fault.
+        "let rt = bitcast<f32>(o[1]);\n  let res = -(select(0.0f, rt, false));",
+        // load_dedup's forwarding: `v`'s initializer completes the slot.
+        "var v = 1.0f;\n  v = -(select(0.0f, v, false));\n  let res = v;",
+        "var v = 1.0f;\n  v = select(-0.25f, v, false) * select(0.0f, v, false);\n  let res = v;",
+    ];
+    for body in cases {
+        let src = format!(
+            "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\n\
+             @compute @workgroup_size(1) fn main() {{\n  {body}\n  o[0] = bitcast<u32>(res);\n}}"
+        );
+        let result = crate::run(&src, &Config::default()).expect("must minify");
+        assert!(
+            result.source.contains("select("),
+            "the select must survive so the slot stays runtime: {}",
+            result.source
+        );
+        assert_valid_wgsl(&result.source);
+    }
+}
+
+/// `select(x, x, c) -> x` drops a RUNTIME condition, so the slot turns const
+/// with no literal folded anywhere - the crossing the value guard on the
+/// literal walk cannot see.  `-select(z, z, c)` shipped as `-0.`, device-read
+/// as `+0.0` where the input gave `-0.0`.  `clone_over` carries the guard.
+#[test]
+fn narrowing_a_select_keeps_a_sign_sensitive_slot_runtime() {
+    let cases = [
+        // `accept == reject` needs ONE handle, which a `let` supplies; two
+        // spellings of `0.0` are two handles and never reach the arm.
+        "let z = 0.0;\n  let res = -(select(z, z, c));",
+        // A `ZeroValue` source, so the guard cannot key on the literal.
+        "let zv = vec2f();\n  let res = (-(select(zv, zv, c))).y;",
+        // The `*` slot, not just the negation.
+        "let z = 0.0;\n  let res = select(z, z, c) * bitcast<f32>(o[3]);",
+    ];
+    for body in cases {
+        let src = format!(
+            "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\n\
+             @compute @workgroup_size(1) fn main() {{\n  let c = o[2] > 0u;\n  {body}\n  \
+             o[0] = bitcast<u32>(res);\n}}"
+        );
+        let result = crate::run(&src, &Config::default()).expect("must minify");
+        assert!(
+            result.source.contains("select("),
+            "the select must survive so the slot stays runtime: {}",
+            result.source
+        );
+        assert_valid_wgsl(&result.source);
+    }
+}
+
+/// The SIBLING half: a sign-sensitive operator re-signs a zero, so the operand
+/// that completes the crossing need not be the zero itself.  In
+/// `(v - 1.) * 0.` the zero is const from the start and `v - 1.` crosses when
+/// the never-written local reads as zero, shipping the const-expression
+/// `-1. * 0.`; device-read `+0.0` against the input's `-0.0`.  Pinning only a
+/// folded ZERO left this open.
+#[test]
+fn a_sibling_crossing_keeps_a_sign_sensitive_slot_runtime() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\n\
+               @compute @workgroup_size(1) fn main() {\n  var v: f32;\n  \
+               o[0] = bitcast<u32>((v - 1.0) * 0.0);\n}";
+    let result = crate::run(src, &Config::default()).expect("must minify");
+    // The local must survive as a runtime read; every all-literal spelling of
+    // the product is the miscompile.
+    assert!(
+        result.source.contains("var "),
+        "the zero-init local must survive: {}",
+        result.source
+    );
+    assert!(
+        !result.source.contains("bitcast<u32>(-1"),
+        "`v - 1.` must not fold into the product: {}",
+        result.source
+    );
+    assert_valid_wgsl(&result.source);
+}
+
+/// The three passes that substitute a value for a runtime BINDING - register
+/// promotion, load forwarding, inlining - each cross a sign-sensitive slot the
+/// same way, and each guard used to key on the value being a literal `-0.0`
+/// rather than on the crossing.  So `t = -1.` forwarded into `t * 0.` shipped
+/// the const `-1. * 0.`, device-read `+0.0` against the input's `-0.0`; a
+/// parameter read is runtime by construction, which is why `g(-1.)` does it
+/// too.  Rooting the test at the OPERATOR is what sees the zero sibling.
+#[test]
+fn substituting_a_binding_keeps_a_sign_sensitive_slot_runtime() {
+    // (body, the text that proves the binding survived)
+    let cases = [
+        ("var t: f32;\n  t = -1.0;\n  let res = t * 0.0;", "var "),
+        ("var t: f32;\n  t = 0.0;\n  let res = -t;", "var "),
+        ("var v = -1.0;\n  let res = v * 0.0;", "var "),
+        ("var t: f32;\n  t = -1.0;\n  let res = 0.0 / t;", "var "),
+        // A `ZeroValue` is a zero the operator re-signs, and it is not a
+        // `Literal`, so a zero test that only reads literals misses it.
+        (
+            "var t: f32;\n  t = -1.0;\n  let res = (vec2f(t, 1.0) * vec2f()).x;",
+            "var ",
+        ),
+    ];
+    for (body, keeps) in cases {
+        let src = format!(
+            "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\n\
+             @compute @workgroup_size(1) fn main() {{\n  {body}\n  \
+             o[0] = bitcast<u32>(res);\n}}"
+        );
+        let result = crate::run(&src, &Config::default()).expect("must minify");
+        assert!(
+            result.source.contains(keeps),
+            "the binding must survive so the slot stays runtime: {}",
+            result.source
+        );
+        assert_valid_wgsl(&result.source);
+    }
+}
+
+/// The inlining half: a callee's parameter read is runtime, so substituting a
+/// const argument is itself the crossing.  `g(-1.)` into `a * 0.` needs the
+/// operator-rooted test - the zero is in the CALLEE and the crossing operand
+/// is the argument.  The no-zero and runtime-argument calls must still inline,
+/// or the guard is just a veto on floats.
+#[test]
+fn inlining_a_const_argument_keeps_a_sign_sensitive_slot_runtime() {
+    // (callee, call, must the call survive?)
+    let cases = [
+        ("fn c(a: f32) -> f32 { return -a; }", "c(0.0)", true),
+        ("fn c(a: f32) -> f32 { return a * 0.0; }", "c(-1.0)", true),
+        (
+            "fn c(a: f32, b: f32) -> f32 { return a * b; }",
+            "c(-1.0, 0.0)",
+            true,
+        ),
+        ("fn c(a: f32) -> f32 { return a / -1.0; }", "c(0.0)", true),
+        // No zero anywhere: inlining must still happen.
+        ("fn c(a: f32) -> f32 { return a * 2.0; }", "c(3.0)", false),
+        // A runtime argument leaves the slot runtime either way.
+        (
+            "fn c(a: f32) -> f32 { return -a; }",
+            "c(bitcast<f32>(o[1]))",
+            false,
+        ),
+        // A float `ZeroValue` counts as the zero...
+        (
+            "fn c(a: vec2f) -> vec2f { return a * vec2f(); }",
+            "c(vec2f(-1.0, 1.0)).x",
+            true,
+        ),
+        // ...but an INTEGER one has no signed zero, and the untyped roots
+        // stop being inert if it is counted: this must still inline.
+        (
+            "fn c(a: vec4i) -> vec4i { return -a; }",
+            "c(vec4i()).x",
+            false,
+        ),
+    ];
+    for (callee, call, keeps_call) in cases {
+        let src = format!(
+            "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\n\
+             {callee}\n\
+             @compute @workgroup_size(1) fn main() {{\n  \
+             o[0] = bitcast<u32>({call});\n}}"
+        );
+        let result = crate::run(&src, &Config::default()).expect("must minify");
+        // Only `fn main` is left once the callee is inlined: nothing else
+        // keeps a single-use function alive.
+        let inlined = result.source.matches("fn ").count() == 1;
+        assert_eq!(
+            inlined, !keeps_call,
+            "call {call} into {callee}: inlined={inlined}: {}",
+            result.source
+        );
+        assert_valid_wgsl(&result.source);
+    }
+}
+
+/// A `Binary`'s operands pin each other's type, but a LITERAL pair pins
+/// nothing: two f32 whose bare spellings are integer-shaped re-parse as
+/// AbstractInt, so `-2. * 0.` shipped as `-2*0` - the integer 0, in a
+/// `bitcast` the wrong type family, not just the wrong zero.  Reached
+/// wherever a wholly const float product survives const_fold's `-0.0`
+/// decline, which the input's own elided `let` still allows.
+#[test]
+fn a_float_literal_pair_keeps_its_type() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\n\
+               @compute @workgroup_size(1) fn main() {\n  let a = -2.0;\n  \
+               let b = 0.0;\n  o[0] = bitcast<u32>(a * b);\n}";
+    let result = crate::run(src, &Config::default()).expect("must minify");
+    assert!(
+        result.source.contains("-2f*0"),
+        "one operand must carry its type so the pair stays f32: {}",
+        result.source
+    );
+    assert_valid_wgsl(&result.source);
+}
+
+/// naga's `ensure_block_returns` appends its dead `return;` inside the LAST
+/// statement's nested blocks, so a diverging loop in an `if` / `else` /
+/// `switch` arm carries one where nothing at the function tail does.  The
+/// validator then rejects the module on its own INPUT (`InvalidReturnType`)
+/// and it bails out to lexical compaction; `graphicsfuzz/do-while-false-loops`
+/// was losing 354 bytes to this.
+#[test]
+fn a_diverging_loop_inside_a_branch_still_minifies() {
+    let cases = [
+        "fn h(a: u32, i: u32) -> u32 {\n  var v = a;\n\
+         if ((v ^ i) > 9u) {\n    loop { v = v + 7u; if (v > 25u) { return v; } }\n\
+         } else {\n    return v * 3u;\n  }\n}",
+        "fn h(a: u32, i: u32) -> u32 {\n  var v = a;\n\
+         switch (v & 1u) {\n\
+         case 0u: { loop { v = v + 7u; if (v > 25u) { return v; } } }\n\
+         default: { return v + i; }\n  }\n}",
+        // A `Block` tail, the third arm of naga's descent.
+        "fn h(a: u32, i: u32) -> u32 {\n  var v = a;\n\
+         { loop { v = v + 7u; if (v > 25u) { return v + i; } } }\n}",
+    ];
+    for helper in cases {
+        let src = format!(
+            "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\n\
+             {helper}\n\
+             @compute @workgroup_size(1) fn main() {{ o[0] = h(o[1], 2u); }}"
+        );
+        let result = crate::run(&src, &Config::default()).expect("must minify");
+        assert!(
+            result.report.bailout.is_none(),
+            "the input must validate, not bail out: {:?}",
+            result.report.bailout
+        );
+        assert!(
+            !result.source.contains("var v = a"),
+            "the IR pipeline must have run, not just lexical compaction: {}",
+            result.source
+        );
+        assert_valid_wgsl(&result.source);
+    }
+}
+
+/// `-0` re-parses as the ABSTRACT INTEGER zero, which has no sign bit, so a
+/// float zero under a `Negate` must keep its float marker.  The literal's own
+/// `-0.0` always did; a `+0.0` whose minus comes from an enclosing `Negate`
+/// reaches the emitter only now that `const_fold` declines to fold `-(0.0)`
+/// into a literal, and rendered as `-0` it turned `-0.0 * x` into `+0.0 * x`.
+#[test]
+fn a_negated_float_zero_keeps_its_float_marker() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+        @group(0) @binding(1) var<storage, read> inp: array<u32>;\n\
+        @compute @workgroup_size(1) fn main() {\n\
+          let z = select(0.0, 0.0, true) * 7.216;\n\
+          out[0] = bitcast<u32>(-(z) * bitcast<f32>(inp[1]));\n\
+        }";
+    let out = minify(src);
+    assert!(
+        out.contains("-0.*") || out.contains("-0f*"),
+        "the negated zero must stay float-typed, not the abstract int `-0`: {out}"
+    );
+    assert_valid_wgsl(&out);
 }

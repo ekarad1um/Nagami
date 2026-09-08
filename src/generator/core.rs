@@ -12,6 +12,7 @@ use crate::config::FloatPrecision;
 
 use super::syntax::LiteralExtractKey;
 use crate::handle_set::{HandleMap, HandleSet};
+use crate::passes::expr_util::all_functions;
 
 // MARK: Options
 
@@ -112,23 +113,63 @@ pub(super) struct Generator<'a> {
     /// return value); keeps impure single-use calls bound rather than inlined
     /// past a read of what they write.
     pub(super) pure_functions: Vec<bool>,
-    // Format tokens fixed at construction from `options.beautify`, so the hot
-    // path never branches per character.
-    tok_separator: &'static str,
-    tok_assign: &'static str,
-    tok_colon: &'static str,
-    tok_arrow: &'static str,
-    tok_open_brace: &'static str,
-    tok_newline: &'static str,
-    tok_bin_op_sep: &'static str,
-    tok_binding_sep: &'static str,
-    tok_attr_end: &'static str,
-    tok_angle_end: &'static str,
-    tok_else: &'static str,
-    tok_for_open: &'static str,
-    tok_for_sep: &'static str,
+    /// Format tokens fixed at construction from `options.beautify`, so the
+    /// hot path never branches per character.
+    tok: &'static Tokens,
     indent_unit: &'static str,
 }
+
+/// The two spellings of every token `beautify` alone decides, so adding one
+/// is a field and two entries.  `indent_unit` is not here: its width comes
+/// from `options.indent`, which would force these tables to be built at run
+/// time.
+struct Tokens {
+    separator: &'static str,
+    assign: &'static str,
+    colon: &'static str,
+    arrow: &'static str,
+    open_brace: &'static str,
+    newline: &'static str,
+    bin_op_sep: &'static str,
+    binding_sep: &'static str,
+    attr_end: &'static str,
+    angle_end: &'static str,
+    else_kw: &'static str,
+    for_open: &'static str,
+    for_sep: &'static str,
+}
+
+static COMPACT_TOKENS: Tokens = Tokens {
+    separator: ",",
+    assign: "=",
+    colon: ":",
+    arrow: "->",
+    open_brace: "{",
+    newline: "",
+    bin_op_sep: "",
+    binding_sep: ")@binding(",
+    attr_end: ")",
+    angle_end: ">",
+    else_kw: "else",
+    for_open: "for(",
+    for_sep: ";",
+};
+
+static PRETTY_TOKENS: Tokens = Tokens {
+    separator: ", ",
+    assign: " = ",
+    colon: ": ",
+    arrow: " -> ",
+    open_brace: " {\n",
+    newline: "\n",
+    bin_op_sep: " ",
+    binding_sep: ") @binding(",
+    attr_end: ") ",
+    angle_end: "> ",
+    else_kw: " else",
+    for_open: "for (",
+    for_sep: "; ",
+};
 
 // MARK: Function context
 
@@ -411,16 +452,6 @@ fn count_type_handle_refs(
     counts
 }
 
-/// Function bodies in `ref_count_cache` / `defer_cache` order: functions, then
-/// entry points.
-pub(super) fn all_functions(module: &naga::Module) -> impl Iterator<Item = &naga::Function> {
-    module
-        .functions
-        .iter()
-        .map(|(_, f)| f)
-        .chain(module.entry_points.iter().map(|ep| &ep.function))
-}
-
 // MARK: Liveness analyses
 
 /// Constants transitively reachable from function / entry-point expressions,
@@ -447,12 +478,7 @@ fn compute_live_constants(
         }
     }
 
-    let all_funcs = module
-        .functions
-        .iter()
-        .map(|(_, f)| f)
-        .chain(module.entry_points.iter().map(|ep| &ep.function));
-    for func in all_funcs {
+    for func in all_functions(module) {
         for (_, expr) in func.expressions.iter() {
             if let naga::Expression::Constant(h) = expr {
                 live.insert(*h);
@@ -856,61 +882,20 @@ impl<'a> Generator<'a> {
             function_names.push(f.name.clone().unwrap_or_else(|| format!("f{}", h.index())));
         }
 
-        let (
-            tok_separator,
-            tok_assign,
-            tok_colon,
-            tok_arrow,
-            tok_open_brace,
-            tok_newline,
-            tok_bin_op_sep,
-            tok_binding_sep,
-            tok_attr_end,
-            tok_angle_end,
-            tok_else,
-            tok_for_open,
-            tok_for_sep,
-            indent_unit,
-        ) = if options.beautify {
+        let tok = if options.beautify {
+            &PRETTY_TOKENS
+        } else {
+            &COMPACT_TOKENS
+        };
+        let indent_unit = if options.beautify {
             // `options.indent` is a `u8`, so the 256-byte buffer always yields
             // an in-bounds all-ASCII slice; a `&'static str` keeps `indent_unit`
             // borrow-free.
             static SPACES: [u8; 256] = [b' '; 256];
-            let unit = std::str::from_utf8(&SPACES[..options.indent as usize])
-                .expect("ASCII spaces are valid UTF-8");
-            (
-                ", ",
-                " = ",
-                ": ",
-                " -> ",
-                " {\n",
-                "\n",
-                " ",
-                ") @binding(",
-                ") ",
-                "> ",
-                " else",
-                "for (",
-                "; ",
-                unit,
-            )
+            std::str::from_utf8(&SPACES[..options.indent as usize])
+                .expect("ASCII spaces are valid UTF-8")
         } else {
-            (
-                ",",
-                "=",
-                ":",
-                "->",
-                "{",
-                "",
-                "",
-                ")@binding(",
-                ")",
-                ">",
-                "else",
-                "for(",
-                ";",
-                "",
-            )
+            ""
         };
 
         let mut layouter = naga::proc::Layouter::default();
@@ -1046,19 +1031,7 @@ impl<'a> Generator<'a> {
             ref_count_cache: Vec::new(),
             defer_cache,
             pure_functions: Vec::new(),
-            tok_separator,
-            tok_assign,
-            tok_colon,
-            tok_arrow,
-            tok_open_brace,
-            tok_newline,
-            tok_bin_op_sep,
-            tok_binding_sep,
-            tok_attr_end,
-            tok_angle_end,
-            tok_else,
-            tok_for_open,
-            tok_for_sep,
+            tok,
             indent_unit,
         }
     }
@@ -1078,7 +1051,7 @@ impl<'a> Generator<'a> {
 
     #[inline]
     pub(super) fn open_brace(&mut self) {
-        self.out.push_str(self.tok_open_brace);
+        self.out.push_str(self.tok.open_brace);
         self.indent_depth += 1;
     }
 
@@ -1091,71 +1064,71 @@ impl<'a> Generator<'a> {
 
     #[inline]
     pub(super) fn push_separator(&mut self) {
-        self.out.push_str(self.tok_separator);
+        self.out.push_str(self.tok.separator);
     }
 
     #[inline]
     pub(super) fn push_assign(&mut self) {
-        self.out.push_str(self.tok_assign);
+        self.out.push_str(self.tok.assign);
     }
 
     #[inline]
     pub(super) fn push_colon(&mut self) {
-        self.out.push_str(self.tok_colon);
+        self.out.push_str(self.tok.colon);
     }
 
     #[inline]
     pub(super) fn push_arrow(&mut self) {
-        self.out.push_str(self.tok_arrow);
+        self.out.push_str(self.tok.arrow);
     }
 
     #[inline]
     pub(super) fn push_newline(&mut self) {
-        self.out.push_str(self.tok_newline);
+        self.out.push_str(self.tok.newline);
     }
 
     #[inline]
     pub(super) fn comma_sep(&self) -> &'static str {
-        self.tok_separator
+        self.tok.separator
     }
 
     #[inline]
     pub(super) fn bin_op_sep(&self) -> &'static str {
-        self.tok_bin_op_sep
+        self.tok.bin_op_sep
     }
 
     #[inline]
     pub(super) fn assign_sep(&self) -> &'static str {
-        self.tok_assign
+        self.tok.assign
     }
 
     #[inline]
     pub(super) fn push_binding_sep(&mut self) {
-        self.out.push_str(self.tok_binding_sep);
+        self.out.push_str(self.tok.binding_sep);
     }
 
     #[inline]
     pub(super) fn push_attr_end(&mut self) {
-        self.out.push_str(self.tok_attr_end);
+        self.out.push_str(self.tok.attr_end);
     }
 
     #[inline]
     pub(super) fn push_angle_end(&mut self) {
-        self.out.push_str(self.tok_angle_end);
+        self.out.push_str(self.tok.angle_end);
     }
 
     #[inline]
     pub(super) fn push_else(&mut self) {
-        self.out.push_str(self.tok_else);
+        self.out.push_str(self.tok.else_kw);
     }
 
     #[inline]
     pub(super) fn push_for_open(&mut self) {
-        self.out.push_str(self.tok_for_open);
+        self.out.push_str(self.tok.for_open);
     }
 
     #[inline]
     pub(super) fn push_for_sep(&mut self) {
-        self.out.push_str(self.tok_for_sep);
+        self.out.push_str(self.tok.for_sep);
     }
 }

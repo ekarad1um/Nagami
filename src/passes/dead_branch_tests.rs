@@ -1490,7 +1490,7 @@ fn switch_break_cases_not_terminator_of_outer_block() {
     assert!(store_count >= 1, "stores after switch must not be removed");
 }
 
-// MARK: Switch fall-through edge in definitely_terminates
+// MARK: Switch fall-through edge in tail_terminates
 //
 // naga's frontend never emits a final case with `fall_through: true`, so the
 // shape is hand-built.
@@ -1502,7 +1502,7 @@ fn build_terminating_default_switch(fall_through: bool) -> naga::Statement {
         naga::Span::UNDEFINED,
     );
     naga::Statement::Switch {
-        // `definitely_terminates` ignores the selector; a throwaway arena
+        // `tail_terminates` ignores the selector; a throwaway arena
         // yields a handle.
         selector: {
             let mut arena: naga::Arena<naga::Expression> = naga::Arena::new();
@@ -1523,7 +1523,7 @@ fn build_terminating_default_switch(fall_through: bool) -> naga::Statement {
 fn switch_with_default_terminator_and_no_fallthrough_definitely_terminates() {
     let stmt = build_terminating_default_switch(false);
     assert!(
-        definitely_terminates(&stmt),
+        tail_terminates(&stmt, /*bare_break_terminates=*/ true),
         "Default case with terminating body and no fall-through must terminate"
     );
 }
@@ -1534,7 +1534,7 @@ fn switch_with_last_case_fallthrough_does_not_terminate() {
     // after the switch); the inliner or CSE could produce this shape.
     let stmt = build_terminating_default_switch(true);
     assert!(
-        !definitely_terminates(&stmt),
+        !tail_terminates(&stmt, /*bare_break_terminates=*/ true),
         "last-case fall-through must not classify the switch as terminating \
              (fall-through past the last case is Break-equivalent and execution \
              resumes after the switch)"
@@ -1698,7 +1698,7 @@ fn nested_switch_with_last_case_fallthrough_does_not_terminate_beyond() {
         }],
     };
     assert!(
-        !definitely_terminates(&outer),
+        !tail_terminates(&outer, /*bare_break_terminates=*/ true),
         "nested switch whose inner switch has last-case fall-through must \
              propagate that non-termination through \
              `case_body_terminates_beyond_switch`, NOT classify the outer \

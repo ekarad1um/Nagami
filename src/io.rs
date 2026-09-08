@@ -36,7 +36,10 @@ pub fn validate_module(module: &naga::Module) -> Result<naga::valid::ModuleInfo,
     VALIDATOR.with(|validator| {
         let result = validator.borrow_mut().validate(module);
         match result {
-            Ok(info) => Ok(info),
+            Ok(info) => match crate::passes::const_fold::module_static_error_slot(module) {
+                Some(detail) => Err(Error::Validation(detail)),
+                None => Ok(info),
+            },
             // naga's `reset` misses the ray-pipeline pins (`trace_rays_*`):
             // a payload-type handle pinned by an earlier module can
             // false-reject a valid one whose handles shifted.  A failure is
@@ -77,12 +80,16 @@ pub fn validate_module_with_source(
 ) -> Result<naga::valid::ModuleInfo, Error> {
     let stand_in = crate::passes::specialize_ptr_params::validation_stand_in(module);
     let module = stand_in.as_ref().unwrap_or(module);
-    naga::valid::Validator::new(
+    let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::all(),
     )
     .validate(module)
-    .map_err(|e| Error::Validation(e.emit_to_string(source)))
+    .map_err(|e| Error::Validation(e.emit_to_string(source)))?;
+    match crate::passes::const_fold::module_static_error_slot(module) {
+        Some(detail) => Err(Error::Validation(detail)),
+        None => Ok(info),
+    }
 }
 
 pub fn validate_wgsl_text(source: &str) -> Result<(), Error> {

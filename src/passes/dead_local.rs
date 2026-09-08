@@ -15,6 +15,7 @@
 //! that the next compact culls; if the sweep cap lands first it sits
 //! outside every `Emit` range and is never rendered.
 
+use super::expr_util::for_each_function_mut;
 use crate::error::Error;
 use crate::handle_set::HandleSet;
 use crate::pipeline::{Pass, PassContext};
@@ -30,12 +31,9 @@ impl Pass for DeadLocalPass {
 
     fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
         let mut changed = false;
-        for (_, func) in module.functions.iter_mut() {
-            changed |= remove_dead_locals(func);
-        }
-        for entry in module.entry_points.iter_mut() {
-            changed |= remove_dead_locals(&mut entry.function);
-        }
+        for_each_function_mut(&mut module.functions, &mut module.entry_points, &mut |f| {
+            changed |= remove_dead_locals(f);
+        });
         Ok(changed)
     }
 }
