@@ -286,14 +286,30 @@ fn enumerate_locals(
     targets: &mut Vec<(Target, usize, usize)>,
     seq: &mut usize,
 ) {
+    // naga gives each block-scoped shadowing `var` its own handle under the
+    // shared source name, so a preserved name is kept by its FIRST
+    // declaration only: keeping both would put two `var t` in one scope
+    // (invalid) or, once `defer_vars` sinks one, silently re-bind reads to
+    // the wrong one.
+    fn keeps_name<'n>(
+        kept: &mut HashSet<&'n str>,
+        preserve: &HashSet<String>,
+        name: Option<&'n str>,
+    ) -> bool {
+        match name {
+            Some(n) if preserve.contains(n) => kept.insert(n),
+            _ => false,
+        }
+    }
+    let mut kept = HashSet::new();
     for (i, argument) in function.arguments.iter().enumerate() {
-        if matches!(argument.name.as_deref(), Some(n) if preserve.contains(n)) {
+        if keeps_name(&mut kept, preserve, argument.name.as_deref()) {
             continue;
         }
         push_target(targets, seq, Target::Arg(fref, i), weights);
     }
     for (lh, local) in function.local_variables.iter() {
-        if matches!(local.name.as_deref(), Some(n) if preserve.contains(n)) {
+        if keeps_name(&mut kept, preserve, local.name.as_deref()) {
             continue;
         }
         push_target(targets, seq, Target::Local(fref, lh), weights);
@@ -1022,6 +1038,30 @@ struct A { x: f32 }
         assert!(
             reserved.contains("x"),
             "source struct member name must be reserved even under mangle"
+        );
+    }
+
+    /// naga gives each block-scoped shadowing `var` its own handle under the
+    /// shared source name; a preserved name is kept by the first declaration
+    /// only, or both keep it and one scope ends up declaring it twice.
+    #[test]
+    fn a_preserved_name_is_kept_by_one_declaration_only() {
+        let source = r#"
+fn f(x: f32) -> f32 {
+    var t: f32 = x;
+    if (x > 1.0) {
+        var t: f32 = 5.0;
+        t = t + 1.0;
+    }
+    return t;
+}
+"#;
+        let (_, module) = run_pass(source, &["t"]);
+        assert_eq!(
+            count_declaration_name(&module, "t"),
+            1,
+            "exactly one local keeps the preserved name: {:?}",
+            collect_declaration_names(&module)
         );
     }
 }

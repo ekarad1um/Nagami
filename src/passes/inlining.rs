@@ -12,21 +12,21 @@ use crate::handle_set::{HandleMap, HandleSet};
 use crate::pipeline::{Pass, PassContext};
 
 use super::expr_util::{
-    const_expression_leaf, const_index_value, expression_needs_emit, for_each_function_mut,
-    has_negative_zero_leaf, is_disallowed_inline_expression, is_float_zero_literal,
-    nested_blocks_mut, rebuild_function_expressions, remap_statement_handles,
+    LEAF_FLOAT, LEAF_FLOAT_ZERO, const_expression_leaf, const_index_value, expression_needs_emit,
+    float_leaf_bits, for_each_function_mut, has_negative_zero_leaf,
+    is_disallowed_inline_expression, is_sign_sensitive_op, nested_blocks_mut,
+    rebuild_function_expressions, remap_statement_handles, sensitive_leaves,
     try_map_expression_handles_in_place, visit_expression_children, zero_value_is_float,
 };
 
-/// Const-ness and zero-reachability of a caller argument, in one walk.  A
-/// `Constant` / `Override` hides its value from this pass, so it counts as a
-/// possible zero, exactly as [`has_negative_zero_leaf`] treats it.
+/// Const-ness of a caller argument and the [`float_leaf_bits`] its cone
+/// reaches, in one walk.
 fn argument_facts(
     caller: &naga::Arena<naga::Expression>,
     types: &naga::UniqueArena<naga::Type>,
     root: naga::Handle<naga::Expression>,
-) -> (bool, bool) {
-    let (mut is_const, mut reaches_zero) = (true, false);
+) -> (bool, u8) {
+    let (mut is_const, mut leaves) = (true, 0);
     let mut seen = HandleSet::default();
     let mut stack = vec![root];
     while let Some(h) = stack.pop() {
@@ -34,28 +34,23 @@ fn argument_facts(
             continue;
         }
         let expr = &caller[h];
-        match expr {
-            naga::Expression::Literal(lit) => reaches_zero |= is_float_zero_literal(lit),
-            naga::Expression::ZeroValue(ty) => reaches_zero |= zero_value_is_float(types, *ty),
-            naga::Expression::Constant(_) | naga::Expression::Override(_) => reaches_zero = true,
-            _ => {}
-        }
+        leaves |= float_leaf_bits(expr, types);
         match const_expression_leaf(expr) {
             Some(true) => {}
             Some(false) => is_const = false,
             None => visit_expression_children(expr, |c| stack.push(c)),
         }
     }
-    (is_const, reaches_zero)
+    (is_const, leaves)
 }
 
-/// `true` when substituting `arguments` turns a float `-x`, `x * y` or
-/// `x / y` the CALLEE left runtime into a const-expression with a zero in it.
-/// A parameter read is runtime by construction, so inlining is the moment
-/// that const-ness can appear; Dawn on Metal then flushes the `-0.0` the call
-/// computed.  Same crossing test as `load_dedup`, rooted at the operator so a
-/// zero already const in one operand is seen when the OTHER is what crosses -
-/// `fn g(a: f32) -> f32 { return a * 0.; }` called as `g(-1.)`.
+/// `true` when substituting `arguments` turns an [`is_sign_sensitive_op`] the
+/// CALLEE left runtime into a const-expression reaching its
+/// [`sensitive_leaves`].  A parameter read is runtime by construction, so
+/// inlining is the moment const-ness can appear.  Same crossing test as
+/// `load_dedup`, rooted at the operator so a zero already const in one
+/// operand is seen when the OTHER crosses - `fn g(a: f32) -> f32 { return
+/// a * 0.; }` called as `g(-1.)`.
 fn inlining_crosses_sign_sensitive(
     template: &InlineTemplate,
     arguments: &[naga::Handle<naga::Expression>],
@@ -67,60 +62,49 @@ fn inlining_crosses_sign_sensitive(
     }
     let n = template.expressions.len();
     // Const-ness with every parameter read left runtime (the call's own
-    // meaning) against const-ness after substitution, plus whether a zero the
-    // operator could re-sign is reachable.
-    let (mut before, mut after, mut zero) = (vec![false; n], vec![false; n], vec![false; n]);
+    // meaning) against const-ness after substitution, plus the float leaves
+    // each operator can reach.
+    let (mut before, mut after) = (vec![false; n], vec![false; n]);
+    let mut leaves = vec![0u8; n];
     for (handle, expr) in template.expressions.iter() {
         let i = handle.index();
         match expr {
             naga::Expression::FunctionArgument(idx) => {
-                let (is_const, reaches_zero) = arguments
+                let (is_const, reached) = arguments
                     .get(*idx as usize)
-                    .map_or((true, true), |&a| argument_facts(caller, types, a));
-                (before[i], after[i], zero[i]) = (false, is_const, reaches_zero);
+                    .map_or((true, LEAF_FLOAT_ZERO), |&a| {
+                        argument_facts(caller, types, a)
+                    });
+                // "Float" comes from the parameter's declared type: an
+                // argument can spell a float value without a float leaf.
+                let typed_float = template
+                    .argument_types
+                    .get(*idx as usize)
+                    .is_none_or(|&ty| zero_value_is_float(types, ty));
+                (before[i], after[i]) = (false, is_const);
+                leaves[i] = (reached & LEAF_FLOAT_ZERO) | if typed_float { LEAF_FLOAT } else { 0 };
             }
             _ => match const_expression_leaf(expr) {
                 Some(known) => {
                     (before[i], after[i]) = (known, known);
-                    // A `ZeroValue` IS a zero; a `Constant` / `Override`
-                    // hides its value, so both count, as in `load_dedup`.
-                    zero[i] = match expr {
-                        naga::Expression::Literal(lit) => is_float_zero_literal(lit),
-                        naga::Expression::ZeroValue(ty) => zero_value_is_float(types, *ty),
-                        naga::Expression::Constant(_) | naga::Expression::Override(_) => true,
-                        _ => false,
-                    };
+                    leaves[i] = float_leaf_bits(expr, types);
                 }
                 None => {
-                    let (mut b, mut a, mut z) = (true, true, false);
+                    let (mut b, mut a, mut l) = (true, true, 0);
                     visit_expression_children(expr, |c| {
                         b &= before[c.index()];
                         a &= after[c.index()];
-                        z |= zero[c.index()];
+                        l |= leaves[c.index()];
                     });
-                    (before[i], after[i], zero[i]) = (b, a, z);
+                    (before[i], after[i], leaves[i]) = (b, a, l);
                 }
             },
         }
     }
-    template
-        .sign_sensitive_ops
-        .iter()
-        .any(|op| after[op.index()] && !before[op.index()] && zero[op.index()])
-}
-
-/// The three operators whose zero result takes its sign from the operands.
-fn is_sign_sensitive_op(expr: &naga::Expression) -> bool {
-    matches!(
-        expr,
-        naga::Expression::Binary {
-            op: naga::BinaryOperator::Multiply | naga::BinaryOperator::Divide,
-            ..
-        } | naga::Expression::Unary {
-            op: naga::UnaryOperator::Negate,
-            ..
-        }
-    )
+    template.sign_sensitive_ops.iter().any(|&op| {
+        let i = op.index();
+        after[i] && !before[i] && leaves[i] & sensitive_leaves(&template.expressions[op]) != 0
+    })
 }
 
 /// Default inlining budgets (used by [`super::Profile::Aggressive`]).
@@ -306,6 +290,12 @@ fn collect_inline_templates(
             .as_deref()
             .is_some_and(|n| preserve.iter().any(|p| p == n))
         {
+            continue;
+        }
+        // A helper with its own `@diagnostic(...)` filter is checked under
+        // it; its derivative / texture builtins cloned into a caller under
+        // another filter turn an accepted input into a uniformity error.
+        if function.diagnostic_filter_leaf.is_some() {
             continue;
         }
         let call_sites = call_counts.get(function_handle).copied().unwrap_or(0);
@@ -1282,6 +1272,58 @@ fn cs_main() {
             count_calls_to_function(body, limit),
             0,
             "the body call to limit must be inlined (result threads into break_if)"
+        );
+    }
+
+    /// Float `%` reads differently as a const-expression, so a const argument
+    /// into its slot is the crossing; the runtime-argument call still inlines.
+    #[test]
+    fn a_const_argument_into_a_float_modulo_is_not_inlined() {
+        let source = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+fn helper(a: f32) -> f32 {
+    return a % 3.0;
+}
+@compute @workgroup_size(1)
+fn cs_main() {
+    out[0] = helper(33554432.0) + helper(out[1]);
+}
+"#;
+        let (changed, module) = run_pass(source);
+        assert!(changed, "the runtime-argument call inlines");
+        let helper = find_function_handle_by_name(&module, "helper");
+        assert_eq!(
+            count_calls_to_function(&module.entry_points[0].function.body, helper),
+            1,
+            "the const-argument call must survive"
+        );
+    }
+
+    /// A helper with its own `@diagnostic(...)` scope is never a template: its
+    /// body is checked under that filter, not the caller's.
+    #[test]
+    fn a_helper_with_a_diagnostic_filter_is_not_a_template() {
+        let source = r#"
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
+@diagnostic(off, derivative_uniformity)
+fn helper(uv: vec2f) -> f32 {
+    return textureSample(t, s, uv).x;
+}
+@fragment
+fn fs_main(@location(0) uv: vec2f, @location(1) k: f32) -> @location(0) vec4f {
+    if (k > 0.5) {
+        return vec4f(helper(uv));
+    }
+    return vec4f(0.0);
+}
+"#;
+        let (changed, module) = run_pass(source);
+        assert!(!changed, "nothing to inline");
+        let helper = find_function_handle_by_name(&module, "helper");
+        assert_eq!(
+            count_calls_to_function(&module.entry_points[0].function.body, helper),
+            1
         );
     }
 }

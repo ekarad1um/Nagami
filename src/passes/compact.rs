@@ -28,7 +28,7 @@ impl Pass for CompactPass {
         "compact_dce"
     }
 
-    fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
+    fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
         fn arena_shape(
             module: &naga::Module,
         ) -> (usize, usize, usize, usize, usize, usize, Vec<usize>) {
@@ -53,13 +53,74 @@ impl Pass for CompactPass {
             )
         }
         let before = arena_shape(module);
-        let keep = if module.entry_points.is_empty() {
-            naga::compact::KeepUnused::Yes
+        if module.entry_points.is_empty() {
+            naga::compact::compact(module, naga::compact::KeepUnused::Yes);
         } else {
-            naga::compact::KeepUnused::No
-        };
-        naga::compact::compact(module, keep);
+            // naga roots nothing but the entry points, so the declarations
+            // the host names live through a synthetic one: a preserved
+            // resource stays in the pipeline's bind-group layout, a
+            // preserved function keeps its signature callable, and a named
+            // `override` stays a valid pipeline-constant key (Dawn validates
+            // the keys against every declared override, used or not).
+            module
+                .entry_points
+                .push(interface_anchor(module, &ctx.config.preserve_symbols));
+            naga::compact::compact(module, naga::compact::KeepUnused::No);
+            module.entry_points.pop();
+        }
         Ok(before != arena_shape(module))
+    }
+}
+
+/// An entry point whose statements reference every `preserve`d global and
+/// function and every named override.  The tracer follows statement operands
+/// (an `Emit` range alone is not a use) and never type-checks, so any
+/// statement carrying the handle roots it.
+fn interface_anchor(module: &naga::Module, preserve: &[String]) -> naga::EntryPoint {
+    let preserved = |name: Option<&str>| name.is_some_and(|n| preserve.iter().any(|p| p == n));
+    let span = naga::Span::default();
+    let mut function = naga::Function::default();
+    let reference = |function: &mut naga::Function, expr: naga::Expression| {
+        let handle = function.expressions.append(expr, span);
+        function.body.push(
+            naga::Statement::Return {
+                value: Some(handle),
+            },
+            span,
+        );
+    };
+    for (h, global) in module.global_variables.iter() {
+        if preserved(global.name.as_deref()) {
+            reference(&mut function, naga::Expression::GlobalVariable(h));
+        }
+    }
+    for (h, over) in module.overrides.iter() {
+        if over.name.is_some() {
+            reference(&mut function, naga::Expression::Override(h));
+        }
+    }
+    for (h, f) in module.functions.iter() {
+        if preserved(f.name.as_deref()) {
+            function.body.push(
+                naga::Statement::Call {
+                    function: h,
+                    arguments: Vec::new(),
+                    result: None,
+                },
+                span,
+            );
+        }
+    }
+    naga::EntryPoint {
+        name: String::new(),
+        stage: naga::ShaderStage::Compute,
+        early_depth_test: None,
+        workgroup_size: [1, 1, 1],
+        workgroup_size_overrides: None,
+        function,
+        mesh_info: None,
+        task_payload: None,
+        incoming_ray_payload: None,
     }
 }
 
@@ -151,5 +212,46 @@ fn another(y: f32) -> f32 {
             2,
             "both functions should be preserved in library module"
         );
+    }
+
+    /// The interface anchor: a preserved global and function and a named
+    /// override survive `KeepUnused::No`, an unpreserved dead global does not,
+    /// and the anchor itself leaves no trace.
+    #[test]
+    fn preserved_declarations_and_named_overrides_survive() {
+        let source = r#"
+@group(0) @binding(0) var<storage, read> b: array<u32>;
+@group(0) @binding(1) var<storage, read> dead: array<u32>;
+override unused_ov: f32 = 1.0;
+fn keep_me() -> f32 { return 1.0; }
+@compute @workgroup_size(1) fn main() {}
+"#;
+        let mut module = naga::front::wgsl::parse_str(source).expect("source should parse");
+        let config = Config {
+            preserve_symbols: vec!["b".to_string(), "keep_me".to_string()],
+            ..Config::default()
+        };
+        let ctx = PassContext {
+            config: &config,
+            name_log: None,
+        };
+        CompactPass
+            .run(&mut module, &ctx)
+            .expect("compact pass should run");
+        let globals: Vec<_> = module
+            .global_variables
+            .iter()
+            .filter_map(|(_, g)| g.name.clone())
+            .collect();
+        assert_eq!(globals, ["b"]);
+        assert_eq!(module.overrides.len(), 1, "the named override is interface");
+        assert_eq!(module.functions.len(), 1, "the preserved function is kept");
+        assert_eq!(module.entry_points.len(), 1, "the anchor is popped");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("module should remain valid after compact");
     }
 }

@@ -2034,3 +2034,79 @@ fn an_extracted_literal_never_takes_a_preserved_name() {
     io::validate_wgsl_text(&format!("{preamble}\n{}", output.source))
         .expect("the shipped concatenation must be valid");
 }
+
+/// A preamble struct MEMBER name lives in its struct's namespace; it must not
+/// hide a same-named user declaration.  An entry point is the silent case:
+/// nothing in the shader references it by name, so the self-check passed on
+/// the shortened body and the run reported a saving.
+#[test]
+fn preamble_member_names_do_not_hide_user_declarations() {
+    let preamble = "struct Inputs { main: f32, size: vec2f }\n\
+                    @group(0) @binding(0) var<uniform> inputs: Inputs;";
+    let source = "@fragment fn main() -> @location(0) vec4f { \
+                  return vec4f(inputs.main, inputs.size, 1.0); }";
+    let config = Config {
+        preamble: Some(preamble.to_string()),
+        ..Default::default()
+    };
+    let output = run(source, &config).unwrap();
+    assert!(
+        output.source.contains("fn main"),
+        "the entry point must survive: {}",
+        output.source
+    );
+}
+
+/// The preamble owns every directive, so a module-level `diagnostic(...)`
+/// only the body declares would be dropped with the directive block - and
+/// naga's validator has no uniformity analysis to notice.  It is an error;
+/// the same directive in the preamble is fine.
+#[test]
+fn preamble_run_rejects_a_body_only_diagnostic_directive() {
+    let decls = "@group(0) @binding(0) var t: texture_2d<f32>;\n\
+                 @group(0) @binding(1) var s: sampler;";
+    let body = "@fragment fn main(@location(0) uv: vec2f, @location(1) k: f32) -> @location(0) vec4f {\n\
+                  if (k > 0.5) { return textureSample(t, s, uv); }\n  return vec4f(0.0);\n}";
+    let directive = "diagnostic(off, derivative_uniformity);";
+    let config = |preamble: String| Config {
+        preamble: Some(preamble),
+        ..Default::default()
+    };
+    let err = run(&format!("{directive}\n{body}"), &config(decls.to_string()))
+        .err()
+        .expect("a body-only directive must be refused");
+    assert!(err.to_string().contains("diagnostic("), "{err}");
+    let output = run(body, &config(format!("{directive}\n{decls}"))).unwrap();
+    assert!(
+        !output.source.contains("diagnostic("),
+        "the preamble's directive is not re-emitted: {}",
+        output.source
+    );
+}
+
+/// A preserved resource stays in the entry point's interface after nagami's
+/// own passes kill its last read, and an unused named override stays a valid
+/// pipeline-constant key.
+#[test]
+fn preserved_resources_and_named_overrides_survive_dce() {
+    let source = "@group(0) @binding(0) var<storage, read_write> a: array<u32>;\n\
+                  @group(0) @binding(1) var<storage, read> b: array<u32>;\n\
+                  override unused_ov: f32 = 1.0;\n\
+                  @compute @workgroup_size(1) fn main() { let x = b[0]; a[0] = 1u; }";
+    let config = Config {
+        preserve_symbols: vec!["b".to_string()],
+        ..Default::default()
+    };
+    let output = run(source, &config).unwrap();
+    assert!(
+        output.source.contains("b:array<u32>") && output.source.contains("override unused_ov"),
+        "{}",
+        output.source
+    );
+    let output = run(source, &Config::default()).unwrap();
+    assert!(
+        !output.source.contains("binding(1)") && output.source.contains("override unused_ov"),
+        "{}",
+        output.source
+    );
+}

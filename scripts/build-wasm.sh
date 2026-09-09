@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PKG="$ROOT/pkg"
 
-RUSTFLAGS="--remap-path-prefix=$HOME=~ --remap-path-prefix=$(rustc --print sysroot)=rustc" CARGO_PROFILE_RELEASE_OPT_LEVEL=z \
+RUSTFLAGS="--remap-path-prefix=$HOME=~ --remap-path-prefix=$(rustc --print sysroot)=rustc -C link-arg=-zstack-size=16777216" CARGO_PROFILE_RELEASE_OPT_LEVEL=z \
   wasm-pack build "$ROOT" --release --target web -- --no-default-features --features wasm
 
 node -e "

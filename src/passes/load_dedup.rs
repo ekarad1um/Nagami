@@ -25,8 +25,9 @@ use crate::pipeline::{Pass, PassContext};
 use super::expr_util::for_each_function_mut;
 use super::expr_util::has_negative_zero_leaf;
 use super::expr_util::{
-    flatten_replacement_chains, for_each_statement, is_integer_zero_literal, nested_blocks,
-    nested_blocks_mut, remap_statement_handles, root_local_var, shift_amount_is_static_error,
+    LEAF_FLOAT, LEAF_FLOAT_ZERO, flatten_replacement_chains, float_leaf_bits, for_each_statement,
+    is_integer_zero_literal, is_sign_sensitive_op, nested_blocks, nested_blocks_mut,
+    remap_statement_handles, root_local_var, sensitive_leaves, shift_amount_is_static_error,
     try_map_expression_handles_in_place, visit_expression_children, visit_statement_write_pointers,
 };
 use super::scoped_map::ScopedMap;
@@ -558,12 +559,16 @@ fn remove_dead_stores_in_block(
                     pending_store.remove(local);
                 }
             }
-            // Nothing observes a local after Return / Kill.
-            naga::Statement::Return { .. } | naga::Statement::Kill => {
+            // Nothing observes a local after Return.
+            naga::Statement::Return { .. } => {
                 for (_, prev_idx) in pending_store.drain() {
                     dead_indices.push(prev_idx);
                 }
             }
+            // `discard` demotes the invocation to a helper and execution goes
+            // on: later reads, and the quad through derivatives, still see
+            // the local.
+            naga::Statement::Kill => {}
             // A boundary or jump may join paths that read the local.
             naga::Statement::If { .. }
             | naga::Statement::Switch { .. }
@@ -658,31 +663,15 @@ fn const_after_forwarding(
     is_const
 }
 
-/// Every float `-x`, `x * y` and `x / y`: the three whose zero result takes
-/// its sign from the operands.  `+` / `-` are absent - their zero has one
-/// determined sign either way.  The OPERATOR, not its operands: it is const
-/// only once every operand is, so rooting here is what lets the walk below
-/// see a zero sitting in the SIBLING of the operand that crosses.  Untyped on
-/// purpose: an integer slot never carries a float literal, so the zero test
-/// downstream makes the extra roots inert.
+/// Every [`is_sign_sensitive_op`] in the arena.
 fn sign_sensitive_slots(
     expressions: &naga::Arena<naga::Expression>,
 ) -> Vec<naga::Handle<naga::Expression>> {
-    let mut roots = Vec::new();
-    for (handle, expr) in expressions.iter() {
-        match expr {
-            naga::Expression::Binary {
-                op: naga::BinaryOperator::Multiply | naga::BinaryOperator::Divide,
-                ..
-            }
-            | naga::Expression::Unary {
-                op: naga::UnaryOperator::Negate,
-                ..
-            } => roots.push(handle),
-            _ => {}
-        }
-    }
-    roots
+    expressions
+        .iter()
+        .filter(|(_, expr)| is_sign_sensitive_op(expr))
+        .map(|(handle, _)| handle)
+        .collect()
 }
 
 /// Push every forward inside the operator at `root`, as the arena will read
@@ -712,54 +701,39 @@ fn collect_slot_forwards(
     }
 }
 
-/// Whether a zero the operator could re-sign is reachable from each handle,
-/// as the arena will read after the rewrite - the only thing that lets a slot
-/// carry a signed zero.  One forward pass, mirroring
-/// [`const_after_forwarding`] including its forward-reference case, so the
-/// per-slot walk only has to run where the guard actually declines.
-///
-/// A `ZeroValue` IS such a zero, and a `Constant` / `Override` hides its
-/// value from this pass, so all three count, as they do in
-/// [`has_negative_zero_leaf`].  A zero spelled by an unevaluated
-/// sub-expression (`f32(0u & 0xFFFFu)`) is missed - a bound on the guard, not
-/// on the class.
-fn zero_after_forwarding(
+/// The [`float_leaf_bits`] reachable from each handle, as the arena will read
+/// after the rewrite - the only thing that lets a slot carry a value the
+/// crossing changes.  One forward pass, mirroring [`const_after_forwarding`]
+/// including its forward-reference case, so the per-slot walk only has to run
+/// where the guard actually declines.
+fn float_leaves_after_forwarding(
     expressions: &naga::Arena<naga::Expression>,
     types: &naga::UniqueArena<naga::Type>,
     replacements: &HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
-) -> Vec<bool> {
-    let mut zero = vec![false; expressions.len()];
+) -> Vec<u8> {
+    let mut leaves = vec![0u8; expressions.len()];
     for (handle, _) in expressions.iter() {
         let target = forward_target(expressions, replacements, handle);
-        zero[handle.index()] = if target.index() > handle.index() {
-            true
+        leaves[handle.index()] = if target.index() > handle.index() {
+            LEAF_FLOAT_ZERO | LEAF_FLOAT
         } else if target != handle {
-            zero[target.index()]
+            leaves[target.index()]
         } else {
-            match expressions[target] {
-                naga::Expression::Literal(lit) => {
-                    crate::passes::expr_util::is_float_zero_literal(&lit)
-                }
-                naga::Expression::ZeroValue(ty) => {
-                    crate::passes::expr_util::zero_value_is_float(types, ty)
-                }
-                naga::Expression::Constant(_) | naga::Expression::Override(_) => true,
-                ref expr => {
-                    let mut any = false;
-                    visit_expression_children(expr, |child| any |= zero[child.index()]);
-                    any
-                }
-            }
+            let expr = &expressions[target];
+            let mut bits = float_leaf_bits(expr, types);
+            visit_expression_children(expr, |child| bits |= leaves[child.index()]);
+            bits
         };
     }
-    zero
+    leaves
 }
 
-/// Drop forwards that turn the operand of a float `-x`, `x * y` or `x / y`
-/// into a const-expression the input's was not: `var v = 1f;
+/// Drop forwards that turn an [`is_sign_sensitive_op`] operand into a
+/// const-expression the input's was not: `var v = 1f;
 /// v = -select(0f, v, false);` stores `-0.0`, and the same text with `v`
-/// forwarded to its init - now wholly const - stores `+0.0`.  The forwarding
-/// half of the guard `const_fold` applies through
+/// forwarded to its init - now wholly const - stores `+0.0`; `var a = 0x1p25f;
+/// var b = 3f; a % b` is `0` on the GPU and `2` once tint const-evaluates
+/// it.  The forwarding half of the guard `const_fold` applies through
 /// `ROLE_IN_SIGN_SENSITIVE_SLOT`.  Runs before the dead-local scan, as
 /// [`decline_static_error_forwards`] does: a declined load stays live.
 ///
@@ -781,11 +755,14 @@ pub(super) fn decline_sign_sensitive_forwards(
     // The same analysis with nothing forwarded is the input's own const-ness:
     // only a slot that CROSSES from runtime to const is a change of meaning.
     let before = const_after_forwarding(expressions, &HandleMap::default());
-    let zero = zero_after_forwarding(expressions, types, replacements);
+    let leaves = float_leaves_after_forwarding(expressions, types, replacements);
     let mut walk = SlotWalk::default();
     let mut to_decline = Vec::new();
     for root in roots {
-        if !after[root.index()] || before[root.index()] || !zero[root.index()] {
+        if !after[root.index()]
+            || before[root.index()]
+            || leaves[root.index()] & sensitive_leaves(&expressions[root]) == 0
+        {
             continue;
         }
         collect_slot_forwards(expressions, replacements, root, &mut walk, &mut to_decline);
@@ -1420,6 +1397,14 @@ fn collect_redundant_loads<'body>(
             naga::Statement::Emit(range) => {
                 for handle in range.clone() {
                     let naga::Expression::Load { pointer } = &expressions[handle] else {
+                        // A cooperative load reads through its pointer like a
+                        // `Load` but is never forwarded: it only keeps the
+                        // local's stores alive.
+                        if let naga::Expression::CooperativeLoad { data, .. } = &expressions[handle]
+                            && let Some(local) = root_local_var(data.pointer, expressions)
+                        {
+                            all_loads.entry(local).or_default().push(handle);
+                        }
                         continue;
                     };
                     // Every load rooted at a local feeds the liveness sets,

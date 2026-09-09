@@ -1,8 +1,7 @@
 //! Call purity and single-use call-inlining analysis.
 
 use crate::handle_set::{HandleMap, HandleSet};
-use crate::passes::expr_util::root_local_var;
-use crate::passes::expr_util::visit_expression_children;
+use crate::passes::expr_util::{root_local_var, short_circuit_rhs, visit_expression_children};
 use rustc_hash::FxHashSet;
 
 /// A single-use `Call` result that may still be inlined into a later use site,
@@ -438,22 +437,31 @@ fn impure_call_inlines_safely(
 /// hole that sets `*found`.  A `Load`, every effect-result expression and any
 /// future variant default to not memory-free, so the predicate is conservative
 /// by construction.
+///
+/// Memory-freedom answers "is a reorder observable"; the call ALSO needs its
+/// new position evaluated unconditionally, or its write is skipped on the
+/// lanes where a short-circuit `&&` / `||` never reaches the right operand,
+/// so a call under that operand makes the tree not memory-free.  Memoised
+/// per node as (memory-free, holds the call): both compose from the
+/// children, so a shared sub-DAG is walked once.
 fn expr_is_memory_free(
     root: naga::Handle<naga::Expression>,
     call_result: naga::Handle<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
     found: &mut bool,
-    memo: &mut HandleMap<naga::Expression, bool>,
+    memo: &mut HandleMap<naga::Expression, (bool, bool)>,
 ) -> bool {
     if root == call_result {
         // Reached on a unique path (`ref_count == 1`), so never memoised.
         *found = true;
         return true;
     }
-    if let Some(&m) = memo.get(root) {
-        return m;
+    if let Some(&(memory_free, holds_call)) = memo.get(root) {
+        *found |= holds_call;
+        return memory_free;
     }
     use naga::Expression as E;
+    let mut holds_call = false;
     let memory_free = match &expressions[root] {
         E::Literal(_)
         | E::Constant(_)
@@ -474,17 +482,26 @@ fn expr_is_memory_free(
         | E::As { .. }
         | E::Compose { .. }
         | E::Derivative { .. } => {
+            let conditional = short_circuit_rhs(&expressions[root]);
             let mut ok = true;
             visit_expression_children(&expressions[root], |child| {
-                if !expr_is_memory_free(child, call_result, expressions, found, memo) {
+                let mut under_child = false;
+                if !expr_is_memory_free(child, call_result, expressions, &mut under_child, memo) {
                     ok = false;
+                }
+                if under_child {
+                    holds_call = true;
+                    if Some(child) == conditional {
+                        ok = false;
+                    }
                 }
             });
             ok
         }
         _ => false,
     };
-    memo.insert(root, memory_free);
+    *found |= holds_call;
+    memo.insert(root, (memory_free, holds_call));
     memory_free
 }
 
@@ -514,6 +531,14 @@ fn consume_pending_for_statement(
             // Range order is topological (children precede parents), so the
             // carrier bubbles up to the outermost wrapper.
             for h in range.clone() {
+                // A wrapper evaluating the carrier conditionally cannot take
+                // it: the call would run on fewer lanes than the input's
+                // unconditional statement, and even a pure callee's
+                // derivative / texture sample moved under non-uniform control
+                // flow is a Dawn error.  The call stays `let`-bound.
+                if let Some(rhs) = short_circuit_rhs(&expressions[h]) {
+                    pending.retain(|p| p.carrier != rhs);
+                }
                 visit_expression_children(&expressions[h], |child| {
                     for p in pending.iter_mut() {
                         if p.carrier == child {

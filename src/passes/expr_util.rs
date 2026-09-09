@@ -130,6 +130,58 @@ pub fn is_disallowed_inline_expression(expression: &naga::Expression) -> bool {
     }
 }
 
+/// The operand of `expression` evaluated CONDITIONALLY: the right side of a
+/// short-circuit `&&` / `||`, skipped whenever the left side decides.  Any
+/// relocation that needs its landing position evaluated exactly once per
+/// evaluation of the parent (a single-use call sunk into its consumer, a
+/// barrier preload inlined into a `for` header) must refuse it; `Select` and
+/// every other operator evaluate all operands.
+pub fn short_circuit_rhs(expression: &naga::Expression) -> Option<naga::Handle<naga::Expression>> {
+    match expression {
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::LogicalAnd | naga::BinaryOperator::LogicalOr,
+            right,
+            ..
+        } => Some(*right),
+        _ => None,
+    }
+}
+
+/// The expression `stmt` binds, if any: a statement-attached result
+/// (`CallResult`, `AtomicResult`, ...) has no text of its own and can only be
+/// referenced by name AFTER its statement.
+pub fn statement_result(stmt: &naga::Statement) -> Option<naga::Handle<naga::Expression>> {
+    use naga::Statement as S;
+    match stmt {
+        S::Call { result, .. } | S::Atomic { result, .. } => *result,
+        S::WorkGroupUniformLoad { result, .. }
+        | S::SubgroupBallot { result, .. }
+        | S::SubgroupGather { result, .. }
+        | S::SubgroupCollectiveOperation { result, .. } => Some(*result),
+        S::RayQuery {
+            fun: naga::RayQueryFunction::Proceed { result },
+            ..
+        } => Some(*result),
+        S::RayQuery { .. }
+        | S::RayPipelineFunction(_)
+        | S::Emit(_)
+        | S::Block(_)
+        | S::If { .. }
+        | S::Switch { .. }
+        | S::Loop { .. }
+        | S::Break
+        | S::Continue
+        | S::Return { .. }
+        | S::Kill
+        | S::ControlBarrier(_)
+        | S::MemoryBarrier(_)
+        | S::Store { .. }
+        | S::ImageStore { .. }
+        | S::ImageAtomic { .. }
+        | S::CooperativeStore { .. } => None,
+    }
+}
+
 // MARK: Handle remapping
 
 /// Invoke `visit` for every child handle of `expression` in naga's IR order.
@@ -1333,6 +1385,75 @@ pub fn has_negative_zero_leaf(
     }
 }
 
+/// The operators whose value depends on being a const-expression: float
+/// `-x`, `x * y`, `x / y`, whose zero result takes its sign from the operands
+/// (Dawn on Metal flushes a const `-0.0`), and float `x % y`, exact `fmod`
+/// as a const-expression but the stepwise `x - y * trunc(x / y)` at run
+/// time, a full divisor apart when the rounded quotient crosses an integer
+/// the exact one does not.  `+` / `-` are absent: their zero has one
+/// determined sign either way.  Rooted at the OPERATOR: it is const only once
+/// every operand is, so a guard walking down from it sees a zero in the
+/// SIBLING of the operand that crosses.  Untyped on purpose: an integer slot
+/// carries no float leaf, so [`float_leaf_bits`] leaves the extra roots
+/// inert (a `Constant` / `Override` there costs a decline, never a
+/// miscompile).
+pub(crate) fn is_sign_sensitive_op(expr: &naga::Expression) -> bool {
+    matches!(
+        expr,
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::Multiply
+                | naga::BinaryOperator::Divide
+                | naga::BinaryOperator::Modulo,
+            ..
+        } | naga::Expression::Unary {
+            op: naga::UnaryOperator::Negate,
+            ..
+        }
+    )
+}
+
+/// Leaf classes a [`float_leaf_bits`] cone can carry.
+pub(crate) const LEAF_FLOAT_ZERO: u8 = 1;
+pub(crate) const LEAF_FLOAT: u8 = 2;
+
+/// The leaves an [`is_sign_sensitive_op`] slot must reach for its const-ness
+/// to change its value: a zero of either sign for `-x` / `x * y` / `x / y`,
+/// any float at all for `x % y`.
+pub(crate) fn sensitive_leaves(expr: &naga::Expression) -> u8 {
+    match expr {
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::Modulo,
+            ..
+        } => LEAF_FLOAT,
+        _ => LEAF_FLOAT_ZERO,
+    }
+}
+
+/// The leaf bits of `expr`: none for a non-leaf, so a cone's bits are the OR
+/// over its nodes.  A `ZeroValue` IS a zero and a `Constant` / `Override`
+/// hides its value from the passes, so both carry both bits, as
+/// [`has_negative_zero_leaf`] treats them.  A float spelled by an unevaluated
+/// sub-expression (`f32(0u & 0xFFFFu)`) is missed - a bound on the guards,
+/// not on the class.
+pub(crate) fn float_leaf_bits(
+    expr: &naga::Expression,
+    types: &naga::UniqueArena<naga::Type>,
+) -> u8 {
+    match expr {
+        naga::Expression::Literal(lit) if is_float_zero_literal(lit) => {
+            LEAF_FLOAT_ZERO | LEAF_FLOAT
+        }
+        naga::Expression::Literal(lit) if is_float_literal(lit) => LEAF_FLOAT,
+        naga::Expression::ZeroValue(ty) if zero_value_is_float(types, *ty) => {
+            LEAF_FLOAT_ZERO | LEAF_FLOAT
+        }
+        naga::Expression::Constant(_) | naga::Expression::Override(_) => {
+            LEAF_FLOAT_ZERO | LEAF_FLOAT
+        }
+        _ => 0,
+    }
+}
+
 /// Bitwise literal equality: `-0.0 != 0.0` and NaN equals itself, so a
 /// fold that treats two literals as the same value never merges IEEE
 /// values a shader can tell apart.
@@ -1675,11 +1796,10 @@ fn clone_expression_handle(
 /// so a wildcard-free match makes any new variant a build error HERE instead
 /// of a construct that existing walkers' `_ => {}` arms swallow and liveness
 /// / effect analysis never sees (a miscompile).  When it breaks on a naga
-/// upgrade: add the variant here, audit every walker with a wildcard arm
-/// (`_ =>` near `Statement` / `Expression` matches in `src/passes` and
-/// `src/generator`, the shared walkers in this file first) for handles,
-/// effects, or nested blocks it must handle, and extend the generator if the
-/// variant reaches emission.  Never called.
+/// upgrade: add the variant here, audit every wildcard arm on `Statement` /
+/// `Expression` across the passes and the generator (the shared walkers in
+/// this file first) for handles, effects, or nested blocks it must handle,
+/// and extend the generator if the variant reaches emission.  Never called.
 #[allow(dead_code)]
 fn naga_variant_tripwire(
     statement: &naga::Statement,

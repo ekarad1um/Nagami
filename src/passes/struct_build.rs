@@ -39,8 +39,14 @@ fn expr_loads_local(
     if let Some(&known) = memo.get(h) {
         return known;
     }
-    let mut found = matches!(arena[h], naga::Expression::Load { pointer }
-        if root_local_var(pointer, arena) == Some(g));
+    let mut found = match arena[h] {
+        naga::Expression::Load { pointer } => root_local_var(pointer, arena) == Some(g),
+        // A cooperative read goes through its pointer like a `Load`.
+        naga::Expression::CooperativeLoad { ref data, .. } => {
+            root_local_var(data.pointer, arena) == Some(g)
+        }
+        _ => false,
+    };
     if !found {
         crate::passes::expr_util::visit_expression_children(&arena[h], |child| {
             if !found {
@@ -312,7 +318,8 @@ fn statement_value_reads_local(
     found
 }
 
-/// A pointer rooting at `local` handed to a callee or an atomic.
+/// A pointer rooting at `local` handed to a callee, an atomic, a uniform
+/// load or a cooperative store.
 fn statement_escapes_local(
     stmt: &naga::Statement,
     local: naga::Handle<naga::LocalVariable>,
@@ -325,6 +332,9 @@ fn statement_escapes_local(
         naga::Statement::Atomic { pointer, .. }
         | naga::Statement::WorkGroupUniformLoad { pointer, .. } => {
             root_local_var(*pointer, arena) == Some(local)
+        }
+        naga::Statement::CooperativeStore { data, .. } => {
+            root_local_var(data.pointer, arena) == Some(local)
         }
         _ => false,
     }

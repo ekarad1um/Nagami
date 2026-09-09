@@ -214,6 +214,11 @@ fn parse_config(config: JsValue) -> Result<Config, JsError> {
     if config.is_undefined() || config.is_null() {
         return Ok(Config::default());
     }
+    // A string or number would read as an object with no fields and run the
+    // default profile in silence.
+    if !config.is_object() {
+        return Err(JsError::new("config must be an object"));
+    }
 
     let mut cfg = Config::default();
 

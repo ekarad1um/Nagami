@@ -2399,13 +2399,11 @@ fn f() {
     );
 }
 
-/// Dawn on Metal flushes a negative-zero LITERAL to +0 while a runtime
-/// negation keeps the sign, so `-0.0` never forwards into a load: the
-/// initializer form and the store form both keep their reads.
+/// `discard` drains nothing (execution continues past it); the first store
+/// is dead because the second overwrites it with no read between, and the
+/// scan runs on across the `Kill` to find that second store.
 #[test]
-fn dead_stores_clear_at_a_discard_and_the_scan_continues() {
-    // The terminator drains the pending-store map, and the block keeps
-    // storing afterwards: the scan must survive the reset.
+fn an_overwritten_store_is_dead_across_a_discard() {
     let (changed, module) = run_pass(
         "@fragment fn m(@location(0) x: f32) -> @location(0) vec4f {\n\
            var a: f32;\n\
@@ -2427,6 +2425,9 @@ fn dead_stores_clear_at_a_discard_and_the_scan_continues() {
     );
 }
 
+/// Dawn on Metal flushes a negative-zero LITERAL to +0 while a runtime
+/// negation keeps the sign, so `-0.0` never forwards into a load: the
+/// initializer form and the store form both keep their reads.
 #[test]
 fn module_scope_values_are_not_forwarded_into_a_runtime_read() {
     // An override has no value until pipeline creation and a constant's tree
@@ -2474,5 +2475,48 @@ fn negative_zero_literals_are_not_forwarded() {
             forwarded,
             "init {init} store {store:?}: {loads} loads"
         );
+    }
+}
+
+/// `discard` is not a terminator: the invocation continues as a helper, so a
+/// store pending at it is read by the helper's own later loads and, through
+/// derivatives, by the rest of the quad.
+#[test]
+fn a_store_pending_at_a_discard_is_live() {
+    let (_, module) = run_pass(
+        "@fragment fn m(@builtin(position) p: vec4f) -> @location(0) vec4f {\n\
+           var a: f32 = 0.0;\n\
+           if (p.y > 100.0) { a = p.x; discard; }\n\
+           return vec4f(dpdx(a));\n\
+         }",
+    );
+    let f = &module.entry_points[0].function;
+    let a = f
+        .local_variables
+        .iter()
+        .find_map(|(h, l)| (l.name.as_deref() == Some("a")).then_some(h))
+        .expect("local a");
+    assert_eq!(
+        count_stores_to_local(f, a),
+        1,
+        "the store before `discard` must survive"
+    );
+}
+
+/// Float `%` is sign-sensitive for ANY operand: forwarding both operands
+/// into it is declined; `*` with no zero is not.
+#[test]
+fn float_modulo_operands_are_not_forwarded_into_a_const_expression() {
+    for (op, forwarded) in [("%", false), ("*", true)] {
+        let source = format!(
+            "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+             @compute @workgroup_size(1) fn main() {{\n\
+               var a = 33554432.0;\n  var b = 3.0;\n\
+               out[0] = bitcast<u32>(a {op} b);\n\
+             }}"
+        );
+        let (_, module) = run_pass(&source);
+        let loads = count_loads_from_local(&module.entry_points[0].function);
+        assert_eq!(loads == 0, forwarded, "op {op}: {loads} loads");
     }
 }

@@ -1824,12 +1824,13 @@ impl<'a> Generator<'a> {
     }
 
     /// `array(...)` for an array `Compose` when shorter than the full/aliased
-    /// `array<T,N>` and inference is guaranteed to reproduce `base`: a bare
-    /// abstract literal would re-infer (`array<u32,2>(1,2)` ->
-    /// `array<i32,2>`, a silent retype), so at least one component must be a
-    /// `Compose`/`ZeroValue`/`Constant`/`Override` of exactly `base`, which
-    /// always emits concretely typed.  Rewrites the constructor name only,
-    /// never a type annotation.
+    /// `array<T,N>` and inference is guaranteed to reproduce `base`: naga
+    /// takes the element type from the FIRST component (after leaf-scalar
+    /// consensus), and a bare abstract literal there would re-infer
+    /// (`array<u32,2>(1,2)` -> `array<i32,2>`, a silent retype), so that
+    /// component must be a `Compose`/`ZeroValue`/`Constant`/`Override` of
+    /// exactly `base`, which always emits concretely typed.  Rewrites the
+    /// constructor name only, never a type annotation.
     fn array_ctor_name(
         &self,
         ty: naga::Handle<naga::Type>,
@@ -1843,7 +1844,7 @@ impl<'a> Generator<'a> {
         if components.is_empty() || "array".len() >= full_name.len() {
             return None;
         }
-        let pins = components.iter().any(|&c| match &arena[c] {
+        let pins = components.first().is_some_and(|&c| match &arena[c] {
             naga::Expression::Compose { ty: cty, .. } => *cty == base,
             naga::Expression::ZeroValue(zty) => *zty == base,
             naga::Expression::Constant(h) => self.module.constants[*h].ty == base,

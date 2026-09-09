@@ -2210,3 +2210,206 @@ fn a_negated_float_zero_keeps_its_float_marker() {
     );
     assert_valid_wgsl(&out);
 }
+
+/// The text a short-circuit `op` evaluates conditionally: from the operator
+/// to the brace that opens the consuming `if`.
+fn short_circuit_rhs_text<'a>(out: &'a str, op: &str) -> &'a str {
+    let start = out.find(op).unwrap_or_else(|| panic!("no `{op}` in {out}")) + op.len();
+    let rest = &out[start..];
+    &rest[..rest.find('{').expect("the condition opens a block")]
+}
+
+/// A single-use IMPURE call consumed by the right operand of `&&` / `||`
+/// must not be sunk there: the input ran it unconditionally, and the
+/// short-circuit skips its write on every lane where the left side decides
+/// (GPU-verified: the input reads back 1 through `out[0]`, the sunk form 0).
+/// The hole needs a memory-free left operand; a storage read there was
+/// already declined by the reorder test.
+#[test]
+fn an_impure_call_is_not_sunk_into_a_short_circuit_operand() {
+    for (cond, op) in [("g.x == 7u && t", "&&"), ("g.x == 7u || t", "||")] {
+        let src = format!(
+            "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+             var<private> c: u32;\n\
+             fn f() -> bool {{ c = 1u; return true; }}\n\
+             @compute @workgroup_size(1)\n\
+             fn main(@builtin(global_invocation_id) g: vec3<u32>) {{\n\
+               let t = f();\n  if ({cond}) {{ out[1] = 1u; }}\n  out[0] = c;\n}}"
+        );
+        let out = minify(&src);
+        assert!(
+            !short_circuit_rhs_text(&out, op).contains('('),
+            "the call must stay bound before the `if`: {out}"
+        );
+    }
+}
+
+/// The pure half of the same hole: a callee carrying a derivative or an
+/// implicit-LOD sample relocated under a non-uniform `&&` operand is a
+/// uniformity error Dawn rejects, so the carrier never bubbles through a
+/// short-circuit wrapper.  Baseline profile, so the IR inliner does not
+/// dissolve the call first.
+#[test]
+fn a_pure_call_with_a_derivative_is_not_sunk_into_a_short_circuit_operand() {
+    let src = "@group(0) @binding(0) var t: texture_2d<f32>;\n\
+               @group(0) @binding(1) var s: sampler;\n\
+               fn f(uv: vec2f) -> f32 { return textureSample(t, s, uv).x; }\n\
+               @fragment fn main(@location(0) uv: vec2f, @location(1) k: f32) -> @location(0) vec4f {\n\
+                 let v = f(uv);\n  if (k > 0.5 && v > 0.5) { return vec4f(1.0); }\n  return vec4f(0.0);\n}";
+    let config = Config {
+        profile: crate::config::Profile::Baseline,
+        ..Config::default()
+    };
+    let out = crate::run(src, &config).expect("run failed").source;
+    assert_valid_wgsl(&out);
+    assert!(
+        !short_circuit_rhs_text(&out, "&&").contains('('),
+        "the sampling call must stay bound before the `if`: {out}"
+    );
+}
+
+/// `discard` is not a terminator: execution continues as a helper
+/// invocation, so a store pending at it is still read - here by the quad
+/// neighbours through `dpdx`.  The store was deleted and the derivative
+/// const-folded to `dpdx(0f)`, a wrong colour on a real render target.
+#[test]
+fn a_store_pending_at_a_discard_survives() {
+    let src = "@fragment\n\
+               fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {\n\
+                 var x: f32 = 0.0;\n\
+                 if (p.y > 100.0) { x = p.x * 3.0; discard; }\n\
+                 let d = dpdx(x);\n  return vec4<f32>(d, 0.0, 0.0, 1.0);\n}";
+    let out = minify(src);
+    assert!(out.contains("*3;discard;"), "the store must survive: {out}");
+    assert!(
+        !out.contains("dpdx(0"),
+        "the derivative must read the local: {out}"
+    );
+}
+
+/// Float `%` reads differently as a const-expression (`0x1p25 % 3` is 2
+/// const-evaluated, 0 on the GPU), so every pass that can make the slot const
+/// must decline for ANY operand - forwarding, the zero-init fold, inlining;
+/// the `*` twin has no rule without a zero and must still fold.
+#[test]
+fn a_float_modulo_keeps_the_input_const_ness() {
+    let forwarded = |body: &str| {
+        let src = format!(
+            "@group(0) @binding(0) var<storage, read_write> o: array<f32>;\n\
+             @compute @workgroup_size(1) fn main() {{\n  {body}\n}}"
+        );
+        minify(&src)
+    };
+    let out = forwarded("var a = 33554432.0;\n  var b = 3.0;\n  o[0] = a % b;");
+    assert!(
+        out.contains("var ") && !out.contains("0x1p25%3"),
+        "load_dedup must not forward both operands: {out}"
+    );
+    let out = forwarded("var a: f32;\n  o[0] = 33554432.0 % (a + 3.0);");
+    assert!(
+        out.contains("var ") && !out.contains("0x1p25%3"),
+        "const_fold must not fold the zero-init local into the divisor: {out}"
+    );
+    let out = forwarded("var a = 33554432.0;\n  var b = 3.0;\n  o[0] = a * b;");
+    assert!(
+        !out.contains("var "),
+        "`*` without a zero still folds: {out}"
+    );
+
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<f32>;\n\
+               fn g(a: f32) -> f32 { return a % 3.0; }\n\
+               @compute @workgroup_size(1) fn main() { o[0] = g(33554432.0); }";
+    let out = minify(src);
+    assert!(
+        out.contains("fn ") && !out.contains("0x1p25%"),
+        "inlining must not substitute the const argument: {out}"
+    );
+}
+
+/// A `workgroupUniformLoad` preload carries a barrier and must run exactly
+/// once per iteration; inlined into a `for` guard's `&&` right operand it
+/// runs on the lanes the left side lets through.  The DAG path count said
+/// "one" and admitted it.
+#[test]
+fn a_preload_under_a_short_circuit_operand_keeps_the_plain_loop() {
+    let src = "var<workgroup> flag: u32;\n\
+               @group(0)@binding(0) var<storage,read_write> out: array<u32>;\n\
+               @compute @workgroup_size(4) fn main(@builtin(local_invocation_index) li: u32) {\n\
+                 var i: u32 = 0u;\n\
+                 loop {\n    let r = workgroupUniformLoad(&flag);\n\
+                   if (!(i < 4u && r == 0u)) { break; }\n    out[li] = i;\n\
+                   continuing { i = i + 1u; }\n  }\n}";
+    let out = minify(src);
+    assert!(
+        out.contains("loop{") && !out.contains("for("),
+        "the for-conversion must be declined: {out}"
+    );
+}
+
+/// A `continuing` clause referencing a result the BODY binds (an atomic here)
+/// cannot move into a `for` header, which renders before the body: it
+/// printed naga's `_e<n>` placeholder, and the counter's `var` suppression
+/// had to stay in lockstep with the decline or the loop lost its declaration.
+#[test]
+fn a_continuing_clause_reading_a_body_bound_result_keeps_the_plain_loop() {
+    let src = "@group(0)@binding(0) var<storage,read_write> out: array<atomic<u32>>;\n\
+               @compute @workgroup_size(1) fn main() {\n\
+                 var i: u32 = 0u;\n\
+                 loop {\n    if (i >= 10u) { break; }\n\
+                   let old = atomicAdd(&out[0], 1u);\n\
+                   continuing { i = i + old; }\n  }\n}";
+    let out = minify(src);
+    assert!(
+        out.contains("var ") && out.contains("loop{") && !out.contains("_e"),
+        "{out}"
+    );
+}
+
+/// A helper with its own `@diagnostic(...)` filter is checked under that
+/// filter; cloned into a caller governed by the module default, its
+/// non-uniform sample is an error Dawn rejects, so it is never a template.
+#[test]
+fn a_helper_with_a_diagnostic_filter_is_not_inlined() {
+    let src = "@group(0) @binding(0) var t: texture_2d<f32>;\n\
+               @group(0) @binding(1) var s: sampler;\n\
+               @diagnostic(off, derivative_uniformity)\n\
+               fn f(uv: vec2f) -> f32 { return textureSample(t, s, uv).x; }\n\
+               @fragment fn main(@location(0) uv: vec2f, @location(1) k: f32) -> @location(0) vec4f {\n\
+                 if (k > 0.5) { return vec4f(f(uv)); }\n  return vec4f(0.0);\n}";
+    let out = minify(src);
+    assert!(
+        out.contains("@diagnostic(off,derivative_uniformity)fn "),
+        "the filtered helper must survive with its attribute: {out}"
+    );
+}
+
+/// A single-use call stashed for inline emission is priced as a short NAME by
+/// the `let` threshold, so a multi-use `-a` over it needed ten uses to bind
+/// and was re-rendered per use instead - `-f()+-f()`, the callee's write
+/// repeated (a pure callee's texture sample multiplied the same way).  The
+/// wrapper must bind at two uses like any sub-expression.
+#[test]
+fn a_cheap_wrapper_over_a_stashed_call_binds_before_reuse() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<f32>;\n\
+               var<private> p: u32;\n\
+               fn f() -> f32 { p = p + 1u; return 1.0; }\n\
+               @compute @workgroup_size(1) fn main() {\n\
+                 let a = f();\n  let c = -a;\n  out[0] = c + c;\n  out[1] = f32(p);\n}";
+    for profile in [
+        crate::config::Profile::Baseline,
+        crate::config::Profile::Max,
+    ] {
+        let config = Config {
+            profile,
+            ..Config::default()
+        };
+        let out = crate::run(src, &config).expect("run failed").source;
+        assert_valid_wgsl(&out);
+        // `fn f()`, `fn main()`, and exactly one call.
+        assert_eq!(
+            out.matches("()").count(),
+            3,
+            "the call must render once: {out}"
+        );
+    }
+}

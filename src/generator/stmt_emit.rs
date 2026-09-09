@@ -100,7 +100,10 @@ const MAX_RENDER_DEPTH: u16 = 256;
 /// for-loop preload result bound to inline `workgroupUniformLoad(&p)` text:
 /// loop-body-dependent intermediates cannot be hoisted to a `let`, so every
 /// distinct DAG path to `target` re-emits it.  Paths-to-`target` is a per-node
-/// property, so memoising makes a shared sub-DAG count in linear time.
+/// property, so memoising makes a shared sub-DAG count in linear time.  A path
+/// through a short-circuit right operand runs zero or one times per
+/// evaluation, never exactly once, so it counts as two: the caller wants
+/// exactly one barrier per iteration and must decline it either way.
 fn count_inline_emissions(
     root: naga::Handle<naga::Expression>,
     target: naga::Handle<naga::Expression>,
@@ -113,9 +116,17 @@ fn count_inline_emissions(
     if let Some(&c) = cache.get(root) {
         return c;
     }
+    let conditional = crate::passes::expr_util::short_circuit_rhs(&expressions[root]);
+    // Saturating: a chain of shared diamonds has exponentially many paths,
+    // and a wrapped count could read as the one the caller accepts.
     let mut total = 0usize;
     crate::passes::expr_util::visit_expression_children(&expressions[root], |child| {
-        total += count_inline_emissions(child, target, expressions, cache);
+        let paths = count_inline_emissions(child, target, expressions, cache);
+        total = total.saturating_add(if Some(child) == conditional && paths > 0 {
+            2
+        } else {
+            paths
+        });
     });
     cache.insert(root, total);
     total
@@ -132,7 +143,7 @@ fn count_update_stmt_emissions(
     let mut total = 0usize;
     let mut add = |h: naga::Handle<naga::Expression>,
                    cache: &mut HandleMap<naga::Expression, usize>| {
-        total += count_inline_emissions(h, target, expressions, cache);
+        total = total.saturating_add(count_inline_emissions(h, target, expressions, cache));
     };
     match stmt {
         naga::Statement::Store { pointer, value } => {
@@ -370,7 +381,8 @@ pub(super) fn for_header_exceeds_depth_cap(
 /// within the condition / update would run the barrier twice; a result never
 /// referenced (including a `continuing` with preloads but no core update
 /// statement) would drop the barrier.  Each preload must count exactly one
-/// emission.
+/// emission.  The update clause relocates ahead of the body as well, so it
+/// may not read a must-bind `Load` or a result some loop statement binds.
 pub(super) fn for_loop_preload_inlining_is_safe(
     shape: &ForLoopShape,
     body: &naga::Block,
@@ -393,12 +405,34 @@ pub(super) fn for_loop_preload_inlining_is_safe(
     if !must_bind_loads.is_empty()
         && let Some(stmt) = shape.update_stmt
     {
-        let update_hazard = stmt_references_must_bind_load(stmt, must_bind_loads, expressions)
+        let update_hazard = stmt_references_any(stmt, must_bind_loads, expressions)
             || shape.update_preloads.iter().any(|&(pointer, _)| {
                 let mut visited = Default::default();
                 cone_intersects_set(pointer, must_bind_loads, expressions, &mut visited)
             });
         if update_hazard {
+            return false;
+        }
+    }
+
+    // The same relocation puts the update clause BEFORE every statement of
+    // the loop, so a result one of them binds (`CallResult`, `AtomicResult`,
+    // a body-side `workgroupUniformLoad`) has no name where the clause
+    // renders and would print as naga's `_e<n>` placeholder.  Only the
+    // `continuing` preloads relocate together with the clause.
+    if let Some(stmt) = shape.update_stmt {
+        let mut loop_bound = HandleSet::default();
+        for block in [body, continuing] {
+            crate::passes::expr_util::for_each_statement(block, &mut |s| {
+                if let Some(result) = crate::passes::expr_util::statement_result(s) {
+                    loop_bound.insert(result);
+                }
+            });
+        }
+        for &(_, result) in &shape.update_preloads {
+            loop_bound.remove(result);
+        }
+        if !loop_bound.is_empty() && stmt_references_any(stmt, &loop_bound, expressions) {
             return false;
         }
     }
@@ -464,15 +498,17 @@ pub(super) fn for_loop_preload_inlining_is_safe(
 // MARK: Expression use detection
 
 /// `true` when any handle in `set` lies in the operand cone (transitive
-/// children of every referenced expression) of `stmt`.
-fn stmt_references_must_bind_load(
+/// children of every expression `stmt` reads) of `stmt`.  A result the
+/// statement defines is not a read: a `Call` update clause whose value goes
+/// unused still carries one.
+fn stmt_references_any(
     stmt: &naga::Statement,
     set: &HandleSet<naga::Expression>,
     expressions: &naga::Arena<naga::Expression>,
 ) -> bool {
     let mut visited = Default::default();
     let mut found = false;
-    crate::passes::expr_util::visit_statement_expression_handles(stmt, false, &mut |root| {
+    crate::passes::expr_util::visit_statement_operands(stmt, false, &mut |root| {
         if !found {
             found = cone_intersects_set(root, set, expressions, &mut visited);
         }
@@ -570,7 +606,7 @@ impl<'a> Generator<'a> {
         block: &naga::Block,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<(), Error> {
-        self.generate_block_inner(block, ctx, false)
+        self.generate_block_inner(block, ctx, false, None)
     }
 
     /// Function-body variant: a trailing void `return;` is optional in WGSL.
@@ -579,7 +615,19 @@ impl<'a> Generator<'a> {
         block: &naga::Block,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<(), Error> {
-        self.generate_block_inner(block, ctx, true)
+        self.generate_block_inner(block, ctx, true, None)
+    }
+
+    /// `continuing` variant: `break if` is the block's last statement and
+    /// reads what the block bound (a const-hazard `let` for its condition),
+    /// so it renders inside the block's scope, before that scope is released.
+    fn generate_continuing(
+        &mut self,
+        block: &naga::Block,
+        break_if: Option<naga::Handle<naga::Expression>>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        self.generate_block_inner(block, ctx, false, break_if)
     }
 
     fn generate_block_inner(
@@ -587,6 +635,7 @@ impl<'a> Generator<'a> {
         block: &naga::Block,
         ctx: &mut FunctionCtx<'a, '_>,
         elide_trailing_void_return: bool,
+        break_if: Option<naga::Handle<naga::Expression>>,
     ) -> Result<(), Error> {
         let mut stmts: Vec<_> = block.iter().collect();
         let mut rewritten_tail: Option<naga::Statement> = None;
@@ -623,7 +672,18 @@ impl<'a> Generator<'a> {
             stmts.push(rewritten);
         }
         let hazard_mark = ctx.const_hazard_bindings.len();
-        let result = self.emit_stmts(&stmts, ctx);
+        let result = self.emit_stmts(&stmts, ctx).and_then(|()| match break_if {
+            Some(condition) => {
+                self.push_indent();
+                self.out.push_str("break if ");
+                let text = self.emit_expr(condition, ctx)?;
+                self.out.push_str(&text);
+                self.out.push(';');
+                self.push_newline();
+                Ok(())
+            }
+            None => Ok(()),
+        });
         release_hazard_scope(ctx, hazard_mark);
         result
     }
@@ -805,17 +865,7 @@ impl<'a> Generator<'a> {
                     self.push_indent();
                     self.out.push_str("continuing");
                     self.open_brace();
-                    if !continuing.is_empty() {
-                        self.generate_block(continuing, ctx)?;
-                    }
-                    // `break if` must be the last statement inside `continuing`.
-                    if let Some(expr) = break_if {
-                        self.push_indent();
-                        self.out.push_str("break if ");
-                        self.out.push_str(&self.emit_expr(*expr, ctx)?);
-                        self.out.push(';');
-                        self.push_newline();
-                    }
+                    self.generate_continuing(continuing, *break_if, ctx)?;
                     self.close_brace();
                     self.push_newline();
                 }
@@ -1598,14 +1648,18 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// Whether `h` renders as a short name (1-2 chars) rather than a sub-expression.
+    /// Whether `h` renders as a short name (1-2 chars) rather than a
+    /// sub-expression.  A stashed single-use call sits in `expr_names` as its
+    /// whole call text and is NOT one: a wrapper priced as cheap over it would
+    /// re-render per use, and each rendering runs the call again - an impure
+    /// callee's write repeated, a pure one's texture sample multiplied.
     fn expr_resolves_to_name(
         &self,
         h: naga::Handle<naga::Expression>,
         ctx: &FunctionCtx<'a, '_>,
     ) -> bool {
         if ctx.expr_names.contains_key(h) {
-            return true;
+            return !ctx.inlineable_calls.contains(h);
         }
         use naga::Expression as E;
         match &ctx.exprs[h] {
@@ -2165,7 +2219,10 @@ impl<'a> Generator<'a> {
                     ctx.expr_names.insert(handle, call.to_string());
                     return;
                 }
+                // Bound after all: `inlineable_calls` then means "stashed"
+                // for everything that prices or scans the result by it.
                 ctx.stashed_call_depth.remove(handle);
+                ctx.inlineable_calls.remove(handle);
             }
             let name = ctx.next_expr_name();
             self.out.push_str("let ");

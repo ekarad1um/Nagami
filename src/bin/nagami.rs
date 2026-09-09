@@ -385,8 +385,9 @@ fn run_cli() -> Result<u8, Box<dyn std::error::Error>> {
 
     if args.check {
         if args.format == OutputFormat::Json {
-            println!("{}", nagami::json::render_output(&output));
-        } else if args.stats {
+            write_json(&output)?;
+        }
+        if args.stats {
             print_summary(&output.report);
         }
         return Ok(u8::from(changed));
@@ -423,15 +424,27 @@ fn run_cli() -> Result<u8, Box<dyn std::error::Error>> {
     }
 
     if args.format == OutputFormat::Json {
-        println!("{}", nagami::json::render_output(&output));
-    } else {
-        let show_summary = args.stats || (!args.quiet && (args.in_place || args.output.is_some()));
-        if show_summary {
-            print_summary(&output.report);
-        }
+        write_json(&output)?;
+    }
+    // `--stats` is explicit; the implicit summary rides only a text run that
+    // wrote a file.
+    let show_summary = args.stats
+        || (args.format == OutputFormat::Text
+            && !args.quiet
+            && (args.in_place || args.output.is_some()));
+    if show_summary {
+        print_summary(&output.report);
     }
 
     Ok(0)
+}
+
+/// The JSON document on stdout through the same error path as the shader: a
+/// closed pipe is the documented I/O failure, not a panic.
+fn write_json(output: &nagami::Output) -> Result<(), io::Error> {
+    let mut document = nagami::json::render_output(output);
+    document.push('\n');
+    write_output(Path::new("-"), &document)
 }
 
 fn is_dash_path(path: &Path) -> bool {
@@ -489,6 +502,9 @@ fn write_output(path: &Path, content: &str) -> Result<(), io::Error> {
 /// nanos and opened `create_new`, so concurrent invocations cannot
 /// clobber each other.
 fn write_atomic(path: &Path, content: &str) -> Result<(), io::Error> {
+    // Through a symlink the real shader is what changes, not the link, and
+    // the temp lands beside it (`rename` needs one filesystem).
+    let path = &fs::canonicalize(path)?;
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let file_name = path
         .file_name()
@@ -520,6 +536,9 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), io::Error> {
             // contents never reached the disk.
             file.sync_all()?;
         }
+        // `create_new` used the default mode; the destination's permissions
+        // carry over so `--in-place` keeps a private shader private.
+        fs::set_permissions(&tmp_path, fs::metadata(path)?.permissions())?;
         fs::rename(&tmp_path, path)
     })();
     if result.is_err() {

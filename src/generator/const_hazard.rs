@@ -341,8 +341,27 @@ pub(super) fn creation_error_operand(
             };
             hazard.then_some(*expr)
         }
-        E::Binary { op, left, right } if let (Some(lo), Some(ro)) = (tree(*left), tree(*right)) => {
+        E::Binary { op, left, right } => {
             let width = result_float_width(module, ctx, h);
+            let (lo, ro) = (tree(*left), tree(*right));
+            // Integer `/` `%` `<<` `>>` fail on the RIGHT operand alone
+            // (`divisor_hazard`), whatever the left is: the right one binds
+            // (binding the left clears nothing) and a value out of reach binds
+            // like an opaque tree.  Rules needing both operands const (MIN /
+            // -1, a left shift losing bits) fall through to the pair below.
+            if ro.is_some() && width.is_none() && divisor_keyed(*op) {
+                let bits = scalar_bits(module, ctx, *left);
+                let hazard = lanes(*right).is_none_or(|r| {
+                    r.iter()
+                        .any(|&l| lane_int(l).is_some_and(|(y, _, _)| divisor_hazard(*op, y, bits)))
+                });
+                if hazard {
+                    return Some(*right);
+                }
+            }
+            let (Some(lo), Some(ro)) = (lo, ro) else {
+                return None;
+            };
             // A value `const_lanes` cannot compute (an unmodeled builtin in
             // the tree) binds like an opaque one for the integer operators:
             // `-100i << (reverseBits(u32(-100i)) & 31u)` overflows at
@@ -370,12 +389,13 @@ pub(super) fn creation_error_operand(
             arg3,
         } => {
             let width = result_float_width(module, ctx, h);
-            let values = |e: Option<naga::Handle<naga::Expression>>| -> Option<Vec<f64>> {
-                let e = e.filter(|&e| tree(e).is_some())?;
-                lanes(e)?
-                    .into_iter()
-                    .map(|l| lane_f64(l, precision))
-                    .collect()
+            let values = |e: Option<naga::Handle<naga::Expression>>| -> ConstArg {
+                let Some(e) = e.filter(|&e| tree(e).is_some()) else {
+                    return ConstArg::Runtime;
+                };
+                let known: Option<Vec<f64>> = lanes(e)
+                    .and_then(|ls| ls.into_iter().map(|l| lane_f64(l, precision)).collect());
+                known.map_or(ConstArg::Opaque, ConstArg::Known)
             };
             // Argument rules first: they name the operand tint checks, and an
             // all-constant call must bind that one (`extractBits(a,40,1)` stays
@@ -392,7 +412,13 @@ pub(super) fn creation_error_operand(
             let opaque = args
                 .iter()
                 .try_fold(false, |acc, &a| Some(acc | tree(a)?))?;
-            let all: Option<Vec<Vec<f64>>> = args.iter().map(|&a| values(Some(a))).collect();
+            let all: Option<Vec<Vec<f64>>> = args
+                .iter()
+                .map(|&a| match values(Some(a)) {
+                    ConstArg::Known(v) => Some(v),
+                    ConstArg::Runtime | ConstArg::Opaque => None,
+                })
+                .collect();
             let hazard = match all {
                 Some(all) => math_hazard(*fun, &all, width),
                 None => opaque && math_can_fail(*fun),
@@ -418,10 +444,21 @@ fn scalar_is_float(
     )
 }
 
+/// A builtin operand as tint's argument rules see it.
+enum ConstArg {
+    /// Not a const-expression: no rule reads it.
+    Runtime,
+    /// A const-expression tint evaluates and nagami cannot: it binds in any
+    /// position a rule would read.
+    Opaque,
+    Known(Vec<f64>),
+}
+
 /// tint's per-argument rules, enforced even with a runtime value operand:
 /// bit ranges (each constant bound against the width, their sum when both
 /// are constant), `clamp` bounds, `smoothstep` edges, `ldexp` exponents by
-/// float width. Returns the operand to bind.
+/// float width.  Returns the operand to bind: an offending known value, or
+/// an opaque one where the rule would read it.
 fn argument_rule_hazard(
     fun: naga::MathFunction,
     arg: naga::Handle<naga::Expression>,
@@ -429,7 +466,7 @@ fn argument_rule_hazard(
     arg2: Option<naga::Handle<naga::Expression>>,
     arg3: Option<naga::Handle<naga::Expression>>,
     width: Option<u8>,
-    values: &dyn Fn(Option<naga::Handle<naga::Expression>>) -> Option<Vec<f64>>,
+    values: &dyn Fn(Option<naga::Handle<naga::Expression>>) -> ConstArg,
 ) -> Option<naga::Handle<naga::Expression>> {
     use naga::MathFunction as M;
     match fun {
@@ -440,8 +477,11 @@ fn argument_rule_hazard(
                 (arg2, arg3)
             };
             let (o, c) = (values(offset), values(count));
-            let over =
-                |v: &Option<Vec<f64>>| v.as_ref().is_some_and(|v| v.iter().any(|&x| x > 32.0));
+            let over = |v: &ConstArg| match v {
+                ConstArg::Runtime => false,
+                ConstArg::Opaque => true,
+                ConstArg::Known(v) => v.iter().any(|&x| x > 32.0),
+            };
             if over(&o) {
                 return offset;
             }
@@ -449,27 +489,49 @@ fn argument_rule_hazard(
                 return count;
             }
             match (o, c) {
-                (Some(o), Some(c)) if o.iter().zip(&c).any(|(a, b)| a + b > 32.0) => offset,
+                (ConstArg::Known(o), ConstArg::Known(c))
+                    if o.iter().zip(&c).any(|(a, b)| a + b > 32.0) =>
+                {
+                    offset
+                }
                 _ => None,
             }
         }
-        M::Clamp => {
-            let (lo, hi) = (values(arg1)?, values(arg2)?);
-            lo.iter().zip(&hi).any(|(a, b)| a > b).then_some(arg1?)
-        }
-        M::SmoothStep => {
-            let (lo, hi) = (values(Some(arg))?, values(arg1)?);
-            lo.iter().zip(&hi).any(|(a, b)| a == b).then_some(arg)
-        }
+        M::Clamp => edge_rule(arg1?, arg2?, values, |lo, hi| lo > hi),
+        M::SmoothStep => edge_rule(arg, arg1?, values, |lo, hi| lo == hi),
         M::Ldexp => {
             let limit = match width {
                 Some(2) => 16.0,
                 Some(4) => 128.0,
                 _ => 1024.0,
             };
-            values(arg1)?.iter().any(|&e| e > limit).then_some(arg1?)
+            match values(arg1) {
+                ConstArg::Runtime => None,
+                ConstArg::Opaque => arg1,
+                ConstArg::Known(e) => e.iter().any(|&e| e > limit).then_some(arg1?),
+            }
         }
         _ => None,
+    }
+}
+
+/// A rule over two edges that tint checks only when both are const: an
+/// opaque edge binds, a known pair binds the low edge on `violates`.
+fn edge_rule(
+    lo: naga::Handle<naga::Expression>,
+    hi: naga::Handle<naga::Expression>,
+    values: &dyn Fn(Option<naga::Handle<naga::Expression>>) -> ConstArg,
+    violates: impl Fn(f64, f64) -> bool,
+) -> Option<naga::Handle<naga::Expression>> {
+    match (values(Some(lo)), values(Some(hi))) {
+        (ConstArg::Runtime, _) | (_, ConstArg::Runtime) => None,
+        (ConstArg::Opaque, _) => Some(lo),
+        (_, ConstArg::Opaque) => Some(hi),
+        (ConstArg::Known(l), ConstArg::Known(h)) => l
+            .iter()
+            .zip(&h)
+            .any(|(&a, &b)| violates(a, b))
+            .then_some(lo),
     }
 }
 
@@ -555,14 +617,13 @@ fn binary_hazard(
         let (Some((x, bits, signed)), Some((y, _, _))) = (lane_int(a), lane_int(b)) else {
             return false;
         };
+        if divisor_hazard(op, y, bits) {
+            return true;
+        }
         let min = -(1i128 << (bits - 1));
         match op {
-            B::Divide | B::Modulo => y == 0 || (signed && y == -1 && x == min),
-            B::ShiftRight => y < 0 || y >= bits as i128,
+            B::Divide | B::Modulo => signed && y == -1 && x == min,
             B::ShiftLeft => {
-                if y < 0 || y >= bits as i128 {
-                    return true;
-                }
                 let shifted = x << y;
                 if signed {
                     shifted < min || shifted > -min - 1
@@ -573,6 +634,35 @@ fn binary_hazard(
             _ => false,
         }
     })
+}
+
+/// The four operators with a rule on the right operand alone.
+fn divisor_keyed(op: naga::BinaryOperator) -> bool {
+    use naga::BinaryOperator as B;
+    matches!(op, B::Divide | B::Modulo | B::ShiftLeft | B::ShiftRight)
+}
+
+/// The right-operand rule of the [`divisor_keyed`] operators: a zero divisor,
+/// a shift amount at the shifted operand's bit width or beyond.
+fn divisor_hazard(op: naga::BinaryOperator, y: i128, bits: u32) -> bool {
+    use naga::BinaryOperator as B;
+    match op {
+        B::Divide | B::Modulo => y == 0,
+        B::ShiftLeft | B::ShiftRight => y < 0 || y >= i128::from(bits),
+        _ => false,
+    }
+}
+
+/// Bit width of `h`'s scalar; 32, WGSL's default, for anything without one.
+fn scalar_bits(
+    module: &naga::Module,
+    ctx: &FunctionCtx<'_, '_>,
+    h: naga::Handle<naga::Expression>,
+) -> u32 {
+    ctx.ty(h)
+        .inner_with(&module.types)
+        .scalar()
+        .map_or(32, |s| u32::from(s.width) * 8)
 }
 
 /// Builtins with a [`math_hazard`] arm, for arguments whose value is out of

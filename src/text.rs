@@ -217,12 +217,6 @@ pub(crate) fn is_wgsl_blankspace(c: char) -> bool {
         )
 }
 
-/// [`is_wgsl_blankspace`] restricted to one byte, for scans that must stay on
-/// a UTF-8 char boundary.
-fn is_ascii_blankspace(b: u8) -> bool {
-    b == b' ' || (0x09..=0x0D).contains(&b)
-}
-
 /// `true` when comment-stripped `cleaned` declares `enable <ext>;`, also as
 /// one entry of a comma-separated list and however the directives are split
 /// across lines.  A false negative becomes a hard error on valid input at the
@@ -400,12 +394,14 @@ pub(crate) fn split_directives(source: &str) -> (&str, &str) {
     let mut pos = 0usize;
     loop {
         // Trivia is skipped without committing the boundary, so trivia before
-        // a non-directive is not hoisted.  Only ASCII blankspace is skipped
-        // and a UTF-8 lead byte never is, so `scan` stays on a char boundary.
+        // a non-directive is not hoisted.  Blankspace is stepped by char, so
+        // `scan` stays on a char boundary through WGSL's non-ASCII members.
         let mut scan = pos;
         loop {
-            while scan < len && is_ascii_blankspace(bytes[scan]) {
-                scan += 1;
+            while let Some(c) = source[scan..].chars().next()
+                && is_wgsl_blankspace(c)
+            {
+                scan += c.len_utf8();
             }
             if let Some(next) = skip_comment(bytes, scan, len) {
                 scan = next;

@@ -427,3 +427,12 @@ fn vertical_tab_separates_a_requires_entry() {
         1
     );
 }
+
+#[test]
+fn split_directives_skips_non_ascii_blankspace() {
+    // U+2028 is WGSL blankspace; a directive behind it is still leading.
+    let src = "\u{2028}enable f16;\nfn f() {}\n";
+    let (dirs, rest) = split_directives(src);
+    assert!(dirs.contains("enable f16;"), "{dirs:?}");
+    assert_eq!(rest, "fn f() {}\n");
+}

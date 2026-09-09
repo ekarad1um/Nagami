@@ -489,3 +489,66 @@ fn unary_over_nested_conversion_of_an_identifier_binds_the_inner_cast() {
         .collect();
     assert!(inline.contains("~u32(i32("), "{inline}");
 }
+
+/// Integer `/` `%` `<<` `>>` are keyed on the RIGHT operand alone: a const
+/// divisor of zero or a shift amount at the width or beyond is rejected
+/// whatever the left operand is.  naga cannot evaluate `bitcast`, so the
+/// `let` survives lowering and the inlined text is exactly the rejected one;
+/// the right operand is what binds.
+#[test]
+fn a_const_divisor_under_a_runtime_dividend_binds_the_divisor() {
+    for (stmt, value, op) in [
+        (
+            "let z = bitcast<u32>(0.0); out[0] = inp[1] / z;",
+            "bitcast<u32>(0f)",
+            "/",
+        ),
+        (
+            "let z = bitcast<u32>(0.0); out[0] = inp[1] % z;",
+            "bitcast<u32>(0f)",
+            "%",
+        ),
+        (
+            "let s = bitcast<u32>(1e-40); out[1] = inp[2] << s;",
+            "bitcast<u32>(1e-40f)",
+            "<<",
+        ),
+    ] {
+        let out = minify(&body(stmt));
+        let n = bound_name(&out, value);
+        assert!(
+            out.contains(&format!("{op}{n};")),
+            "{stmt}\n  the right operand must bind: {out}"
+        );
+    }
+}
+
+/// An argument-rule operand tint evaluates but nagami cannot (`unpack4xU8`)
+/// binds where the rule would read it: `clamp` with an opaque `low` bound
+/// against a const `high` is rejected as `low > high`.
+#[test]
+fn an_opaque_argument_rule_operand_binds() {
+    let out = minify(&body(
+        "let lo = unpack4xU8(84215045u).x; out[0] = clamp(inp[1], lo, 1u);",
+    ));
+    let n = bound_name(&out, "unpack4xU8(84215045).x");
+    assert!(out.contains(&format!(",{n},1)")), "{out}");
+}
+
+/// `break if` is the last statement INSIDE `continuing`, so the hazard `let`
+/// its condition needs is still in scope when it renders; releasing the
+/// block's bindings first re-inlined the rejected const-expression next to a
+/// dead `let`.
+#[test]
+fn a_break_if_condition_uses_the_hazard_binding() {
+    let out = minify(&body(
+        "var i: u32 = 0u; let bits = 0x7f800000u; \
+         loop { i = i + 1u; continuing { break if bitcast<f32>(bits) < f32(i); } } \
+         out[0] = i;",
+    ));
+    let n = bound_name(&out, "2139095040u");
+    assert!(
+        out.contains(&format!("break if bitcast<f32>({n})")),
+        "{out}"
+    );
+}

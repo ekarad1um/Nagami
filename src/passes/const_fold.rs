@@ -401,8 +401,8 @@ const PROPAGATING_ROLES: u8 = ROLE_IN_FAILABLE_SLOT | ROLE_IN_SIGN_SENSITIVE_SLO
 ///
 /// [`PROPAGATING_ROLES`] ride the same walk but descend through every
 /// operand: const-ness propagates up through any pure operation, not just
-/// the two that carry a lane.  That is why a float `*` `/` or unary `-` seeds
-/// at all - its role marks the whole operand subtree, not the handle.
+/// the two that carry a lane.  That is why a float `*` `/` `%` or unary `-`
+/// seeds at all - its role marks the whole operand subtree, not the handle.
 fn static_error_roles(arena: &naga::Arena<naga::Expression>) -> Vec<u8> {
     let mut stack: Vec<(Handle<naga::Expression>, u8)> = Vec::new();
     for (_, expr) in arena.iter() {
@@ -418,6 +418,11 @@ fn static_error_roles(arena: &naga::Arena<naga::Expression>) -> Vec<u8> {
                 }
                 naga::BinaryOperator::Modulo => {
                     stack.push((*right, ROLE_DIVISOR | ROLE_IN_FAILABLE_SLOT));
+                    // Both operands: float `%` reads differently as a
+                    // const-expression for ANY operand, not only a zero
+                    // (`is_sign_sensitive_op`).
+                    stack.push((*left, ROLE_IN_SIGN_SENSITIVE_SLOT));
+                    stack.push((*right, ROLE_IN_SIGN_SENSITIVE_SLOT));
                 }
                 naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight => {
                     stack.push((*right, ROLE_SHIFT_AMOUNT | ROLE_IN_FAILABLE_SLOT));
@@ -510,8 +515,10 @@ fn literal_is_static_error(roles: u8, literal: naga::Literal) -> bool {
 /// Per-handle "already reads as a const-expression", over the arena as THIS
 /// RUN found it: a slot true here is const whatever this run does, so folding
 /// inside it crosses nothing.  Not the ORIGINAL module's const-ness - an
-/// earlier sweep may have supplied some, which this run then reads as given;
-/// the accretion entry in `docs/KNOWN_ISSUES.md` bounds the gap.
+/// earlier pass may have supplied some, which this run then reads as given,
+/// so const-ness that accretes across passes (each crossing nothing on its
+/// own) is the one gap; closing it needs the original const-ness carried
+/// through the whole pipeline to emission.
 fn const_at_entry(arena: &naga::Arena<naga::Expression>) -> Vec<bool> {
     let mut is_const = vec![false; arena.len()];
     for (handle, expr) in arena.iter() {
@@ -766,8 +773,8 @@ fn fold_local_expressions(
                     continue;
                 }
                 // One level up: a float that only becomes const-foldable
-                // here hands the enclosing `-x` / `x * y` / `x / y` a
-                // const-expression the input did not have.  Any float, not
+                // here hands the enclosing `-x` / `x * y` / `x / y` / `x % y`
+                // a const-expression the input did not have.  Any float, not
                 // just a zero - the zero can be the SIBLING, already const,
                 // waiting on this operand to make the operator const.
                 if role & ROLE_IN_SIGN_SENSITIVE_SLOT != 0

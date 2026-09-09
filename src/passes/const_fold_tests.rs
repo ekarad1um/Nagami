@@ -5452,10 +5452,10 @@ fn narrowing_a_select_does_not_reopen_the_zero_divisor() {
 
 /// naga lowers `a && b` through a local whose stores `dead_branch` then
 /// deletes as redundant, so the join survives only if a never-written local
-/// reads as its zero init.  Not merely a size bug: GPU fuzz seed 960009
-/// shipped `-select(-0.0, 2.0, d)` as `-0.0` where the input's
-/// const-expression gave `+0.0`, the sign of zero being lost once a
-/// const-expression is demoted to a runtime one under fast math.
+/// reads as its zero init.  Not merely a size bug: on the GPU
+/// `-select(-0.0, 2.0, d)` shipped `-0.0` where the input's const-expression
+/// gave `+0.0`, the sign of zero being lost once a const-expression is
+/// demoted to a runtime one under fast math.
 #[test]
 fn a_never_written_local_reads_as_its_zero_initialiser() {
     let src = "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\

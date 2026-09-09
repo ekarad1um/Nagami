@@ -434,14 +434,20 @@ fn emit_module_for_report(
     }
 }
 
-/// Every declaration name, module-scope plus types and struct members; a
-/// preamble's are hidden from the generator and preserved from renaming.
-fn collect_module_names(module: &naga::Module) -> HashSet<String> {
-    name_gen::module_scope_names(module)
+/// A preamble's declaration names (module scope plus types), which the
+/// generator hides from the output, and its struct member names.  Both are
+/// preserved from renaming; only the first can stand for "owned by the
+/// preamble", since a member name lives in its struct's own namespace and
+/// says nothing about a same-named module-scope declaration.
+fn collect_module_names(module: &naga::Module) -> (HashSet<String>, Vec<String>) {
+    let declarations = name_gen::module_scope_names(module)
         .chain(name_gen::type_names(module))
-        .chain(name_gen::struct_member_names(module))
         .map(str::to_owned)
-        .collect()
+        .collect();
+    let members = name_gen::struct_member_names(module)
+        .map(str::to_owned)
+        .collect();
+    (declarations, members)
 }
 
 /// One emission attempt after the fallback ladder; [`run`] may still veto
@@ -547,8 +553,30 @@ fn resolve_generator_output(
                 // Before `emitted.source` may be moved.
                 let differs_from_baseline = naga_output.as_deref() != Some(emitted.source.as_str());
                 let final_source = if has_preamble {
-                    // The preamble owns all directives, naga-only ones included.
-                    split_directives(&emitted.source).1.to_owned()
+                    // The preamble owns all directives, naga-only ones
+                    // included.  A module-level `diagnostic(...)` only the
+                    // body declared would vanish with them - unseen by the
+                    // self-check, whose validator has no uniformity analysis
+                    // - so each emitted one must be among the preamble's own
+                    // directives, blankspace aside (a `@diagnostic` attribute
+                    // on a preamble function is not one).
+                    let (directives, body) = split_directives(&emitted.source);
+                    let squeeze = |s: &str| s.split(text::is_wgsl_blankspace).collect::<String>();
+                    let preamble = strip_wgsl_comments(effective_preamble.unwrap_or(""));
+                    let owned: Vec<String> = split_directives(&preamble)
+                        .0
+                        .split(';')
+                        .map(squeeze)
+                        .collect();
+                    for directive in directives.split(';').map(squeeze) {
+                        if directive.starts_with("diagnostic") && !owned.contains(&directive) {
+                            return Err(Error::Emit(format!(
+                                "shader body declares `{directive};` but the preamble does \
+                                 not; move the directive into the preamble"
+                            )));
+                        }
+                    }
+                    body.to_owned()
                 } else {
                     strip_naga_only_enables(emitted.source, source)
                 };
@@ -674,12 +702,16 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     let effective_preamble = config.preamble.as_deref().filter(|s| !s.trim().is_empty());
     let normalized_preamble: Option<Cow<'_, str>> =
         effective_preamble.map(preprocess_source_for_naga);
-    let (preamble_names, full_source): (HashSet<String>, Cow<'_, str>);
+    let (preamble_names, preamble_members, full_source): (
+        HashSet<String>,
+        Vec<String>,
+        Cow<'_, str>,
+    );
     if let Some(normalized_preamble) = normalized_preamble.as_deref() {
         // The preamble gets the body's preprocessing, or `f16` in a preamble
         // would fail at parse time while the same text in the body succeeds.
         let preamble_module = io::parse_wgsl_with_path(normalized_preamble, "<preamble>")?;
-        preamble_names = collect_module_names(&preamble_module);
+        (preamble_names, preamble_members) = collect_module_names(&preamble_module);
         // Directives must precede declarations, so both sides' leading
         // directives go ahead of the preamble body.
         let (source_directives, source_body) = split_directives(&normalized_source);
@@ -692,6 +724,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         ]));
     } else {
         preamble_names = HashSet::new();
+        preamble_members = Vec::new();
         full_source = normalized_source;
     }
 
@@ -704,6 +737,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     effective_config
         .preserve_symbols
         .extend(preamble_names.iter().cloned());
+    effective_config.preserve_symbols.extend(preamble_members);
 
     // A function ending in a diverging loop is valid WGSL tint/Dawn accept;
     // naga's appended dead return would fail validation.
