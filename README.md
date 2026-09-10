@@ -1,48 +1,27 @@
 # Nagami[n]
 
-[Naga + Minify](https://nagami.0xfff8e7.dev/), shrinks your WGSL shaders - not by squishing text, but by understanding them.
+[Naga + Minify](https://nagami.0xfff8e7.dev/), a tiny and self-contained compiler that shrinks your WGSL shaders - not by squishing text, but by understanding them.
 
-Nagami lowers WGSL into [Naga IR](https://github.com/gfx-rs/wgpu/tree/trunk/naga), optimizes the IR in multiple passes, and emits the smallest valid WGSL it can.
+Nagami lowers WGSL into [Naga IR](https://github.com/gfx-rs/wgpu/tree/trunk/naga), optimizes the IR in multiple passes (typically converges in 3 sweeps), and emits the smallest valid WGSL it can.
 
-**What it does that grep-and-replace can't:**
+## What it does
 
-- Dead code elimination - unused declarations and parameters vanish
-- Constant folding - `1.0 + 2.0` -> `3.0`, `x * 1` -> `x`
-- Function inlining - small helpers absorbed into callers
-- CSE - duplicate pure expressions share one evaluation
-- Load dedup & dead stores - redundant reads merge, `var x = a; x = b` -> `var x = b`
-- Variable coalescing - non-overlapping locals share one slot
-- Struct construction - `t.a = x; t.b = y; return t` -> `return T(x, y)`
-- Vector-constant hoisting - a vector literal repeated across functions -> one shared `const`
-- Literal extraction - a repeated scalar constant -> one shared `const`
-- For-loop reconstruction - `loop`/`break`/`continuing` -> `for`
-- Branch flipping - `if c {} else { x; }` -> `if !c { x; }`
-- Short-circuit re-sugaring - Naga's lowered `if`/`else` chains fold back into `&&`/`||`
-- Else block elision - `if c { return; } else { x; }` -> `if c { return; } x;`
-- Dead code after terminators - unreachable past `return`/`break`/`discard` stripped
-- Empty construct removal - vacuous `if` and degenerate `switch` vanish
-- Compound assignment - `x = x + 1` -> `x += 1`
-- Splat elision - `vec3(x) * v` -> `x * v`
-- Swizzle coalescing - `vec3(v.x, v.y, v.z)` -> `v.xyz`
-- Identity-swizzle elision - `v.xy` on a `vec2` -> `v`
-- Zero-value construction - `vec3f(0, 0, 0)` -> `vec3f()`
-- Sub-vector splatting - `vec4f(0, 0, 0, 2)` -> `vec4f(vec3f(), 2)`
-- Matrix flattening - `mat2x2f(vec2f(a, b), vec2f(c, d))` -> `mat2x2f(a, b, c, d)`
-- Precedence-aware parens - only necessary parentheses survive
-- Identifier mangling - `myLongVariableName` -> `a`
-- Type aliasing - `vec3f` used five times -> `alias T = vec3f;`
-- Type elision - redundant `var`/`const` type annotations stripped
-- Shortest literal form - `1048576f` -> `0x1p20f`
-- Float precision trimming - cap decimal places or significant figures, per type (lossy, opt-in)
-- Preamble support - external declarations excluded from output
-- Library modules - shader fragments without entry points preserved
-- Name map - original -> final identifier mapping for hosts that address shaders by source names
+Working on typed IR rather than the source text lets Nagami run real compiler-level WGSL optimizations with correctness and integrity guarantees:
 
-Runs passes in fixed-point sweeps until the output stops shrinking. Typically converges in 3 sweeps.
+- **Dead code elimination** - unused declarations and parameters, dead stores (`var x = a; x = b` -> `var x = b`), dead branches, anything after `return`/`break`/`discard`, empty `if` and degenerate `switch`
+- **Constant folding and algebraic simplification** - constants (`1.0 + 2.0` -> `3`, `x * 1` -> `x`), splats (`vec3(x) * v` -> `x * v`), swizzles (`vec3(v.x, v.y, v.z)` -> `v.xyz`, `v.xy` on a `vec2` -> `v`), zero values (`vec3f(0, 0, 0)` -> `vec3f()`, `vec4f(0, 0, 0, 2)` -> `vec4f(vec3f(), 2)`), matrices (`mat2x2f(vec2f(a, b), vec2f(c, d))` -> `mat2x2f(a, b, c, d)`)
+- **Redundancy elimination** - duplicate pure expressions share one evaluation (CSE), redundant loads merge, non-overlapping locals share one slot, member-wise struct builds become one constructor (`t.a = x; t.b = y; return t` -> `return T(x, y)`), repeated vector literals and scalars become one shared `const`
+- **Inlining and forward substitution** - small helpers into their callers, single-use `let`s into their use
+- **Control-flow restructuring** - `for` loops rebuilt from `loop`/`continuing`, `&&`/`||` rebuilt from Naga's `if` chains, compound assignment (`x = x * y` -> `x *= y`, `x = x + 1` -> `x++`), flipped branches (`if c {} else { x; }` -> `if !c { x; }`), `else` dropped after a terminator
+- **Mangling and lexical minimization** - identifiers renamed by frequency (`myLongVariableName` -> `a`), `alias T = vec3f;` when it pays for itself, redundant type annotations dropped (`var`/`const` types, array constructor types), a `let` introduced only where binding is cheaper than repeating the expression, shortest literal form (`1048576f` -> `0x1p20f`), only the parentheses precedence requires
+- **Float precision reduction** - cap decimal places or significant figures, per type (lossy, opt-in)
+- **Preamble** - external declarations used for parsing and optimization, excluded from the output
+- **Library modules** - shader fragments without entry points keep every declaration
+- **Name map** - original -> final identifier mapping for hosts that address shaders by source names
 
-## CLI
+## Getting started
 
-Install with cargo:
+Install CLI with cargo (or use as a Rust/WASM library, see bottom):
 
 ```sh
 cargo install nagami
@@ -60,34 +39,27 @@ nagami shader.wgsl --preamble env.wgsl -o out.wgsl  # external declarations
 nagami shader.wgsl -o out.wgsl --name-map map.json  # original -> final identifier map
 nagami shader.wgsl --format json                    # one JSON document on stdout
 nagami shader.wgsl -o out.wgsl --strict-fallback    # fail instead of shipping a text-only bailout
-nagami shader.wgsl --decimal-places 6 -o out.wgsl   # lossy: cap fractional digits
-nagami shader.wgsl --sig-figs 4 -o out.wgsl         # lossy: cap significant figures
+nagami shader.wgsl --sig-figs 4 -o out.wgsl         # lossy: cap significant figures (or --decimal-places N)
 ```
 
 ## Profiles
 
-Three optimization profiles control which IR passes run. Generator-level optimizations (for-loop reconstruction, swizzle coalescing, identity-swizzle elision, splat elision, zero-value construction, matrix flattening, sub-vector splatting, array-type elision, compound assignment, type elision, branch flipping, precedence-aware parens, shortest literal form, cost-aware let binding, type aliasing, literal extraction) are always applied regardless of profile.
+Three profiles control which IR passes run. Generator-level rewrites (folding, control flow, naming and spelling) are applied in every profile.
 
-| Optimization | `baseline` | `aggressive` | **`max`** |
+| | `baseline` | `aggressive` | **`max`** |
 |---|:---:|:---:|:---:|
-| Dead code elimination | ✓ | ✓ | ✓ |
-| Constant folding | ✓ | ✓ | ✓ |
-| Dead parameter elimination | ✓ | ✓ | ✓ |
-| Emit merge | ✓ | ✓ | ✓ |
-| Identifier renaming (globals, functions, params, locals) | ✓ | ✓ | ✓ |
-| Function inlining | - | ✓ (24 nodes / 3 call sites) | ✓ (48 nodes / 6 call sites) |
-| Load dedup + dead stores | - | ✓ | ✓ |
-| Variable coalescing | - | ✓ | ✓ |
-| Struct-build coalescing | - | ✓ | ✓ |
-| Vector-constant hoisting | - | - | ✓ |
-| Common subexpression elim | - | - | ✓ |
-| Mangling (struct types/members, constants, overrides) | - | - | ✓ |
+| Dead code elimination, constant folding, dead parameters, emit merge | ✓ | ✓ | ✓ |
+| Renaming of globals, functions, params, locals | ✓ | ✓ | ✓ |
+| Function inlining (nodes / call sites) | - | 24 / 3 | 48 / 6 |
+| Load dedup, dead stores, variable coalescing, struct-build coalescing | - | ✓ | ✓ |
+| CSE, vector-constant hoisting | - | - | ✓ |
+| Mangling of struct types and members, constants, overrides | - | - | ✓ |
 
-The `baseline` is fast and safe; `aggressive` adds the full IR pipeline without mangling; `max` raises inlining limits and enables CSE and vector-constant hoisting (both only while mangling is on) for maximum compression. `--no-mangle` disables mangling in any profile.
+The `baseline` is fast and safe; `aggressive` adds the full IR pipeline without mangling; `max` raises the inlining limits and enables CSE and vector-constant hoisting (both only while mangling is on). `--no-mangle` disables mangling in any profile, `--mangle` enables it.
 
 ## Preamble
 
-Some shader playgrounds (Shadertoy-style) inject uniform bindings and structs at runtime. Your shader code references them but doesn't define them. Pass these external declarations as a **preamble** - Nagami will prepend them for parsing and optimization, then strip them from the final output.
+Some shader playgrounds (Shadertoy-style) inject uniform bindings and structs at runtime, so your shader references declarations it doesn't contain. Pass these external declarations as a *preamble*, Nagami prepends them for parsing and optimization, then strips them from the output.
 
 ```wgsl
 // preamble.wgsl
@@ -99,8 +71,6 @@ struct Inputs { time: f32, size: vec2f, mouse: vec4f, }
 nagami shader.wgsl --preamble preamble.wgsl -o out.wgsl
 ```
 
-Preamble names are automatically preserved from renaming so that member access expressions (e.g. `inputs.time`) remain valid.
-
 ## Use in Rust
 
 Install with cargo:
@@ -109,21 +79,13 @@ Install with cargo:
 cargo add nagami --no-default-features
 ```
 
-Run with default config:
-
-```rust
-let output = nagami::run(src, &nagami::config::Config::default())?;
-println!("{}", output.source);
-```
-
-With a preamble (external declarations excluded from output):
-
 ```rust
 let config = nagami::config::Config {
-    preamble: Some(preamble_src.to_string()),
+    preamble: Some(preamble_src.to_string()),  // optional
     ..Default::default()
 };
 let output = nagami::run(src, &config)?;
+println!("{}", output.source);
 ```
 
 ## Use in JavaScript / TypeScript
@@ -134,38 +96,24 @@ Install with npm:
 npm install nagami-rs
 ```
 
-Browser / bundler:
+Browser / bundler (config is optional, all fields have defaults):
 
 ```js
 import init, { run } from 'nagami-rs';
-await init();          // load the WASM module once
-const { source, report, nameMap } = run(shader);
-console.log(source);   // minified WGSL
-console.log(report);   // optimization report; report.bailout holds naga's
-                       // error when the output is text-compacted only
-console.log(nameMap);  // original -> final names for bindings, functions,
-                       // overrides, entry points, struct members; null when
-                       // the shipped text is not the generator's output
-                       // (bailout, emitter fallback, input already smaller)
-```
-
-With config (all fields optional):
-
-```js
-const { source, report } = run(shader, {
-  profile: 'max',             // "baseline" | "aggressive" | "max" (default)
-  mangle: true,               // also rename struct types/members, constants, overrides (default: on for "max")
-  preserveSymbols: ['main'],  // names to keep untouched
-  beautify: false,            // compact output (default: false)
-  indent: 2,                  // spaces per level when beautify is true
-  floatPrecision: 6,          // shorthand: N decimal places, all float kinds (lossy, opt-in)
-                              // also accepts { decimalPlaces: 6 }, { significantFigures: 4 },
-                              // or per-type: { f32: 6, f64: { significantFigures: 12 } }
-  maxInlineNodeCount: 48,     // inlining budget per function
-  maxInlineCallSites: 6,      // max call sites a function may have and still inline
-  preamble: preambleSrc,      // external decls prepended for parsing, stripped from output
-  validateEachPass: false,    // re-validate WGSL after every pass
+await init();                          // load the WASM module once
+const { source, report, nameMap } = run(shader, {
+  profile: 'max',                      // "baseline" | "aggressive" | "max" (default)
+  mangle: true,                        // also rename struct types/members, constants, overrides (default: on for "max")
+  preserveSymbols: ['main'],           // names to keep untouched
+  preamble: preambleSrc,               // external declarations, stripped from the output
+  floatPrecision: 6,                   // N decimal places for all float kinds (lossy, opt-in);
+                                       // also { decimalPlaces: 6 }, { significantFigures: 4 }, or per type { f32: 6 }
+  maxInlineNodeCount: 48,              // inlining budget per function
+  maxInlineCallSites: 6,               // max call sites a function may have and still inline
+  beautify: false, indent: 2,          // indented output
+  validateEachPass: false,             // re-validate WGSL after every pass
 });
+console.log(source);
 ```
 
 Node.js 20.6+ (synchronous init):
@@ -173,8 +121,7 @@ Node.js 20.6+ (synchronous init):
 ```js
 import { readFileSync } from 'node:fs';
 import { initSync, run } from 'nagami-rs';
-const wasm = readFileSync(new URL('nagami_bg.wasm', import.meta.resolve('nagami-rs')));
-initSync({ module: wasm });
+initSync({ module: readFileSync(new URL('nagami_bg.wasm', import.meta.resolve('nagami-rs'))) });
 const { source, report } = run(shader);
 ```
 
