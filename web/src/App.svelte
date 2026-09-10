@@ -13,6 +13,7 @@
     inputBytes: number;
     outputBytes: number;
     bailout: string | null;
+    fallback: string | null;
     nameMap: NameMap | null;
     wrap: boolean;
   }
@@ -21,6 +22,7 @@
     inputBytes: 0,
     outputBytes: 0,
     bailout: null,
+    fallback: null,
     nameMap: null,
     wrap: true,
   };
@@ -77,6 +79,10 @@
           inputBytes: r.output.report.inputBytes,
           outputBytes: r.output.report.outputBytes,
           bailout: r.output.report.bailout,
+          // Published `nagami-rs` packages before 2026.9.6 have no such
+          // field; the report is read structurally so both type-check.
+          fallback:
+            (r.output.report as { fallback?: string | null }).fallback ?? null,
           nameMap: r.output.nameMap,
           wrap: config.beautify !== true,
         }
@@ -183,6 +189,7 @@
   outputBytes={result.outputBytes}
   {error}
   bailout={result.bailout}
+  fallback={result.fallback}
   {loading}
   {optionsOpen}
   onToggleOptions={() => (optionsOpen = !optionsOpen)}

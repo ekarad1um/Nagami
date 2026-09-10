@@ -9,7 +9,7 @@ Notes for agents:
 - CLI: `cargo install nagami`, then `nagami shader.wgsl -o shader.min.wgsl` (`-p baseline|aggressive|max`).
 - Rust: `cargo add nagami --no-default-features`, then `nagami::run(src, &nagami::config::Config::default())`.
 - Profiles: baseline = dead code elimination, constant folding, dead-parameter elimination, renaming. aggressive = baseline + inlining, load dedup, dead stores, variable and struct-build coalescing. max (default) = aggressive with higher inlining limits + CSE, vector-constant hoisting, and mangling of struct types and members, constants, and overrides.
-- `report.bailout` holds naga's error when the input could only be text-compacted (comments stripped, whitespace collapsed). `nameMap` maps original -> final names for entry points, globals, functions, constants, overrides, and structs with their members; it is null when the shipped text is not the generator's output.
+- `report.bailout` holds naga's error when the input could only be text-compacted (comments stripped, whitespace collapsed); `report.fallback` holds the reason naga's emitter printed the module instead of nagami's generator (still IR-minified, larger). `nameMap` maps original -> final names for entry points, globals, functions, constants, overrides, and structs with their members; it is null when the shipped text carries no rename (bailout, input already smaller).
 - Shaders that use declarations injected by a host (Shadertoy-style uniforms) need them passed as `preamble`: parsed for optimization, stripped from the output, names preserved.
 
 ## Documentation

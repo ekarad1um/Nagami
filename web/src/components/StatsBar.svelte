@@ -4,6 +4,7 @@
     outputBytes: number;
     error: string | null;
     bailout: string | null;
+    fallback: string | null;
     loading: boolean;
     optionsOpen: boolean;
     onToggleOptions: () => void;
@@ -14,13 +15,15 @@
     outputBytes,
     error,
     bailout,
+    fallback,
     loading,
     optionsOpen,
     onToggleOptions,
   }: Props = $props();
 
-  // Error (red) or bailout (amber); a bailout ships the input compacted, so
-  // byte stats would overstate the win.
+  // Error (red), bailout or fallback (amber): a bailout ships the input
+  // compacted, so byte stats would overstate the win; a fallback ships naga's
+  // emitter text, which only the CLI otherwise warns about.
   let notice = $derived(
     error
       ? { text: error, amber: false }
@@ -29,7 +32,12 @@
             text: `Not optimized: ${bailout}\nThe output is the input with comments removed and whitespace collapsed.`,
             amber: true,
           }
-        : null,
+        : fallback
+          ? {
+              text: `Partially optimized: ${fallback}.\nThe output was minified by the IR passes but printed by naga's emitter, so it is larger than nagami's own text.`,
+              amber: true,
+            }
+          : null,
   );
 
   let noticeExpanded = $state(false);
