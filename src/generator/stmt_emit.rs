@@ -1219,6 +1219,11 @@ impl<'a> Generator<'a> {
             {
                 self.emit_zero_init_tail(ctx.func.local_variables[lh].ty)?;
             } else {
+                if ctx.needs_declared_type(lh, *value) {
+                    self.push_colon();
+                    self.out
+                        .push_str(&self.type_ref(ctx.func.local_variables[lh].ty)?);
+                }
                 self.push_assign();
                 // An uncached literal keeps its type suffix so the `var` gets the concrete type.
                 if !ctx.expr_names.contains_key(value) {
@@ -1514,26 +1519,16 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// Whether `h` must stay in uniform control flow: an implicit derivative or
-    /// an implicit-LOD (`Auto` / `Bias`, non-gather) texture sample.  Such an
-    /// expression is force-bound at its naga-placed `Emit` so single-use
-    /// inlining cannot sink it into a possibly non-uniform branch: naga's
-    /// validator does not enforce this, but Tint/Dawn reject the violation.
-    /// Explicit-LOD forms and gathers stay freely inlinable.
+    /// Force-bound at its naga-placed `Emit` so single-use inlining cannot
+    /// sink a [`crate::passes::expr_util::is_uniformity_constrained_expr`]
+    /// into a possibly non-uniform branch: naga's validator does not enforce
+    /// it, tint/Dawn reject it.
     fn is_uniformity_pinned(
         &self,
         h: naga::Handle<naga::Expression>,
         ctx: &FunctionCtx<'a, '_>,
     ) -> bool {
-        use naga::Expression as E;
-        match &ctx.exprs[h] {
-            E::Derivative { .. } => true,
-            E::ImageSample { gather, level, .. } => {
-                gather.is_none()
-                    && matches!(level, naga::SampleLevel::Auto | naga::SampleLevel::Bias(_))
-            }
-            _ => false,
-        }
+        crate::passes::expr_util::is_uniformity_constrained_expr(&ctx.exprs[h])
     }
 
     /// Rendered nesting cost of `h` if inlined at its use site now, in the frame
@@ -1809,6 +1804,11 @@ impl<'a> Generator<'a> {
             if let naga::Expression::LocalVariable(lh) = ctx.exprs[pointer] {
                 self.out.push_str("var ");
                 self.out.push_str(&ctx.local_names[&lh]);
+                if ctx.needs_declared_type(lh, value) {
+                    self.push_colon();
+                    self.out
+                        .push_str(&self.type_ref(ctx.func.local_variables[lh].ty)?);
+                }
                 self.push_assign();
                 if !ctx.expr_names.contains_key(value) {
                     if let naga::Expression::Literal(lit) = ctx.exprs[value] {

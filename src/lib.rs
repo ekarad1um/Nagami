@@ -383,9 +383,9 @@ pub struct Output {
     pub source: String,
     /// Aggregate report with input/output sizes and per-pass details.
     pub report: Report,
-    /// [`name_map::NameMap`], or `None` whenever the shipped text does not
-    /// carry the pipeline's renames (bailouts, the verbatim guard, the
-    /// naga-emitter fallback): names unchanged from the visible output.
+    /// [`name_map::NameMap`]; `None` when the shipped text carries no rename
+    /// (bailouts, the verbatim guard).  The naga-emitter fallback gets a map
+    /// spelled as that emitter prints.
     pub name_map: Option<name_map::NameMap>,
 }
 
@@ -467,6 +467,10 @@ struct EmitOutcome {
     duration_us: u64,
     /// Untextable-IR rung only; forwarded into [`Report::bailout`].
     untextable_reason: Option<String>,
+    /// naga's emitter printed the (renamed) module; the reason, forwarded
+    /// into [`Report::fallback`].  The name map is built from that emitter's
+    /// spelling.
+    naga_fallback: Option<String>,
 }
 
 /// Last rung: generator output and naga fallback both fail text
@@ -482,6 +486,7 @@ fn untextable_ir_bailout(source: &str, before_bytes: usize, reason: String) -> E
         rolled_back: true,
         duration_us: 0,
         untextable_reason: Some(reason),
+        naga_fallback: None,
     }
 }
 
@@ -512,14 +517,15 @@ fn ship_naga_fallback(
         rolled_back: true,
         duration_us,
         untextable_reason: None,
+        naga_fallback: Some(context.to_string()),
     }
 }
 
 /// The fallback ladder: naga's output when the generator errs or emits
-/// invalid WGSL, the compacted input when that text fails re-validation
-/// too.  With a preamble (`normalized_preamble` / `effective_preamble` are
-/// `Some` together) `naga_output` still embeds the preamble's declarations,
-/// which the consumer re-prepends, so the error propagates instead.
+/// invalid WGSL, the compacted input when that fails re-validation too.
+/// `fallback_blocked` names why naga's text cannot stand in; then the error
+/// propagates.
+#[allow(clippy::too_many_arguments)]
 fn resolve_generator_output(
     gen_result: Result<generator::Emission, Error>,
     naga_output: Option<String>,
@@ -528,6 +534,7 @@ fn resolve_generator_output(
     source: &str,
     before_bytes: usize,
     trace_enabled: bool,
+    fallback_blocked: &dyn Fn() -> Option<String>,
 ) -> Result<EmitOutcome, Error> {
     let has_preamble = effective_preamble.is_some();
     match gen_result {
@@ -619,24 +626,20 @@ fn resolve_generator_output(
                     rolled_back: false,
                     duration_us: emitted.duration_us,
                     untextable_reason: None,
+                    naga_fallback: None,
                 })
-            } else if has_preamble {
-                // Unusable fallback: it embeds the preamble's declarations.
+            } else if let Some(why) = fallback_blocked() {
                 let underlying = match validation_result {
                     Err(e) => e.to_string(),
                     Ok(()) => "(no underlying error)".to_string(),
                 };
                 Err(Error::Emit(format!(
-                    "generator output failed validation; \
-                         cannot fall back safely when a preamble is active: {underlying}",
+                    "generator output failed validation; cannot fall back safely: {why}: \
+                     {underlying}",
                 )))
             } else if let Some(naga_output) = naga_output {
-                // Ungated like the bailout warning; the codespan block stays
-                // trace-gated.
-                eprintln!(
-                    "warning: generator output failed text validation; \
-                     shipping naga emitter output (still IR-minified)"
-                );
+                // The CLI warns from `Report::fallback`; the codespan block
+                // stays trace-gated.
                 if trace_enabled && let Err(e) = &validation_result {
                     eprintln!("warning: generator WGSL validation error: {e}");
                 }
@@ -662,13 +665,9 @@ fn resolve_generator_output(
         }
         Err(e) => match naga_output {
             Some(naga_output) => {
-                if has_preamble {
-                    return Err(e);
+                if let Some(why) = fallback_blocked() {
+                    return Err(Error::Emit(format!("{e}; cannot fall back safely: {why}")));
                 }
-                eprintln!(
-                    "warning: generator emit failed ({e}); \
-                     shipping naga emitter output (still IR-minified)"
-                );
                 Ok(ship_naga_fallback(
                     naga_output,
                     source,
@@ -737,7 +736,6 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     effective_config
         .preserve_symbols
         .extend(preamble_names.iter().cloned());
-    effective_config.preserve_symbols.extend(preamble_members);
 
     // A function ending in a diverging loop is valid WGSL tint/Dawn accept;
     // naga's appended dead return would fail validation.
@@ -806,6 +804,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
             mangle: config.mangle(),
             float_precision: config.float_precision,
             preserve_symbols: effective_config.preserve_symbols.iter().cloned().collect(),
+            preserve_members: preamble_members.into_iter().collect(),
             preamble_names,
             type_alias: true,
             ..Default::default()
@@ -813,6 +812,16 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     );
 
     let has_preamble = effective_preamble.is_some();
+    // naga's text cannot stand in with a preamble (it embeds the preamble's
+    // declarations, which the consumer re-prepends) or when it would respell
+    // a host-visible name.  Evaluated only on a generator failure.
+    let fallback_blocked = || -> Option<String> {
+        if has_preamble {
+            return Some("a preamble is active (the fallback would embed its declarations)".into());
+        }
+        name_map::naga_respelled_interface_name(&module, &effective_config.preserve_symbols)
+            .map(|(ir, printed)| format!("naga's emitter would print `{ir}` as `{printed}`"))
+    };
 
     // Taken before `resolve_generator_output` consumes the result.
     let gen_name_tables = gen_result
@@ -826,6 +835,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         rolled_back,
         duration_us,
         untextable_reason,
+        naga_fallback,
     } = resolve_generator_output(
         gen_result,
         naga_output,
@@ -834,6 +844,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         source,
         before_bytes,
         config.trace.enabled,
+        &fallback_blocked,
     )?;
 
     // Same signal as the parse/validation bailouts.
@@ -862,10 +873,23 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     };
     let final_bytes = final_source.len();
 
-    let name_map = (!rolled_back && !shipped_input_verbatim).then(|| {
+    // The verbatim input carries neither the fallback's text nor any rename.
+    let naga_fallback = naga_fallback.filter(|_| !shipped_input_verbatim);
+    report.fallback = naga_fallback.clone();
+    let name_map = if naga_fallback.is_some() {
+        Some(name_map::NameMap::assemble_naga_spelled(&module, &name_log))
+    } else if !rolled_back && !shipped_input_verbatim {
         let (structs, live_const_names) = gen_name_tables.unwrap_or_default();
-        name_map::NameMap::assemble(&module, &name_log, structs, &live_const_names)
-    });
+        Some(name_map::NameMap::assemble(
+            &module,
+            &name_log,
+            structs,
+            Some(&live_const_names),
+            &|ir, _| ir.to_owned(),
+        ))
+    } else {
+        None
+    };
 
     report.pass_reports.push(PassReport {
         pass_name: "generator_emit".to_string(),

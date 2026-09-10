@@ -609,7 +609,12 @@ fn binary_hazard(
                 B::Subtract => x - y,
                 B::Multiply => x * y,
                 B::Divide => x / y,
-                B::Modulo => x % y,
+                // Const `%` is exact `fmod`; the GPU's stepwise f32
+                // `x - y * trunc(x / y)` is a whole divisor off when the rounded
+                // quotient crosses an integer (`0x1p25 % 3`: 2 vs 0), and the
+                // input's slot was runtime (naga folds a const pair first), so
+                // the pair always binds.  `/` is correctly rounded either way.
+                B::Modulo => return true,
                 _ => return false,
             };
             return !res.is_finite() || res.abs() > max;
@@ -683,6 +688,7 @@ fn math_can_fail(fun: naga::MathFunction) -> bool {
             | M::Exp2
             | M::Sinh
             | M::Cosh
+            | M::Ldexp
             | M::Pow
             | M::Atan2
             | M::Normalize
@@ -724,6 +730,12 @@ fn math_hazard(fun: naga::MathFunction, args: &[Vec<f64>], width: Option<u8>) ->
         M::Exp => any(a(0), &|x| x.exp() > max),
         M::Exp2 => any(a(0), &|x| x.exp2() > max),
         M::Sinh | M::Cosh => any(a(0), &|x| x.cosh() > max),
+        // `argument_rule_hazard` bounds e2 alone; the RESULT overflows well
+        // inside it (`ldexp(1f, 128)`).
+        M::Ldexp => a(0).iter().zip(a(1).iter().cycle()).any(|(&m, &e)| {
+            let r = m * e.exp2();
+            !r.is_finite() || r.abs() > max
+        }),
         M::Pow => a(0).iter().zip(a(1).iter().cycle()).any(|(&b, &e)| {
             let r = b.powf(e);
             b < 0.0 || (b == 0.0 && e <= 0.0) || !r.is_finite() || r.abs() > max

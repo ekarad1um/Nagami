@@ -214,9 +214,9 @@ fn parse_config(config: JsValue) -> Result<Config, JsError> {
     if config.is_undefined() || config.is_null() {
         return Ok(Config::default());
     }
-    // A string or number would read as an object with no fields and run the
-    // default profile in silence.
-    if !config.is_object() {
+    // A string, number or array would read as an object with no fields and
+    // run the default profile in silence (`is_object` is true for arrays).
+    if !config.is_object() || js_sys::Array::is_array(&config) {
         return Err(JsError::new("config must be an object"));
     }
 
@@ -329,6 +329,8 @@ export interface Report {
     sweeps: number;
     /** naga's error when the output is the input lexically compacted only. */
     bailout: string | null;
+    /** Why naga's emitter printed the module instead of nagami's generator (still IR-minified, larger). */
+    fallback: string | null;
     passReports: PassReport[];
 }
 

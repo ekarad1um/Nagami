@@ -2413,3 +2413,123 @@ fn a_cheap_wrapper_over_a_stashed_call_binds_before_reuse() {
         );
     }
 }
+
+/// A const float `%` pair is exact `fmod` (2.0) where the GPU computes the
+/// stepwise form (0.0 on Metal); the input's slot was runtime, so one
+/// operand stays `let`-bound.
+#[test]
+fn const_float_modulo_pair_stays_runtime() {
+    let src = "@group(0)@binding(0) var<storage,read_write> out: array<u32>;\
+        @compute @workgroup_size(1) fn main(){ let a = 33554432.0f; out[0] = bitcast<u32>(a % 3.0f); }";
+    let out = minify(src);
+    assert!(
+        !out.contains("0x1p25%3") && out.contains("=0x1p25f;") && out.contains("%3);"),
+        "the const pair must not become an abstract const-expression: {out}"
+    );
+}
+
+/// The anonymous override's positional `O<n>` name collided with a user
+/// `override O2`; it is minted from the generator's pool.
+#[test]
+fn anonymous_override_never_collides_with_a_user_name() {
+    let src = "override O2 : i32 = 3;\
+        override N : i32;\
+        var<workgroup> w : array<i32, N * 2>;\
+        @group(0) @binding(0) var<storage, read_write> out : array<i32>;\
+        @compute @workgroup_size(1) fn main() {\
+          w[0] = O2; out[0] = workgroupUniformLoad(&w[0]) + i32(arrayLength(&out)); }";
+    let out = minify(src);
+    assert!(
+        out.contains("override O2:i32=3;override N:i32;override ")
+            && !out.contains("override O2:i32=N"),
+        "user overrides keep their names and the anonymous one gets a free one: {out}"
+    );
+}
+
+/// A matrix local passed by address keeps `: T`: an inferred `var b = a * b`
+/// is the unnamed twin of the alias the pointer parameter is spelled with,
+/// and naga compares those by handle.
+#[test]
+fn matrix_local_passed_by_pointer_keeps_its_declared_type() {
+    let src = "struct S { m: mat3x3<f32>, n: mat3x3<f32> }\
+        @group(0) @binding(0) var<uniform> u: S;\
+        fn f(p: ptr<function, mat3x3<f32>>) -> f32 { return (*p)[0][0]; }\
+        @compute @workgroup_size(1) fn main() {\
+          var a: mat3x3<f32> = u.m;  var b: mat3x3<f32> = u.n;\
+          var p: mat3x3<f32> = a * b;  var q: mat3x3<f32> = b * a;  var r: mat3x3<f32> = a + b;\
+          _ = f(&p) + f(&q) + f(&r); }";
+    let out = on_big_stack(move || crate::run(src, &Config::default()).expect("run failed"));
+    assert!(
+        out.report.fallback.is_none() && !out.source.contains("_e"),
+        "the generator's text must survive the re-parse: {}",
+        out.source
+    );
+    assert!(
+        out.source.contains("var B:E=c*d;") || out.source.contains(":E="),
+        "the pointer-argument local is declared with its type: {}",
+        out.source
+    );
+}
+
+/// The copy `var b = a` and a `for`-header `var` are declaration sites too;
+/// without an alias both sides are the one unnamed type and no `: T` is
+/// spent.
+#[test]
+fn pointer_argument_locals_spell_the_alias_at_every_declaration_site() {
+    let head = "@group(0) @binding(0) var<storage, read_write> out: array<mat4x4<f32>>;\
+        @group(0) @binding(1) var<storage, read> inm: array<mat4x4<f32>>;\
+        fn f(p: ptr<function, mat4x4<f32>>) { (*p)[0][0] += 1.0; }\
+        fn g1(a: mat4x4<f32>, b: mat4x4<f32>) -> mat4x4<f32> { return a * b; }\
+        fn g2(a: mat4x4<f32>, b: mat4x4<f32>) -> mat4x4<f32> { return a + b; }\
+        fn g3(a: mat4x4<f32>, b: mat4x4<f32>) -> mat4x4<f32> { return a - b; }";
+    let copy = format!(
+        "{head} @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {{\
+           var a = inm[id.x] * inm[id.y]; var b = a; a[1][1] = 7.0; f(&b);\
+           out[0] = g1(a, b); out[1] = g2(a, b); out[2] = g3(a, b); out[4] = b; out[5] = a; }}"
+    );
+    let header = format!(
+        "{head} @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {{\
+           var acc = inm[0];\
+           for (var m = inm[id.x] * inm[id.y]; m[0][0] < 10.0; m = m * inm[1]) {{\
+             f(&m); acc = g2(acc, g3(m, m)); }}\
+           out[0] = acc; }}"
+    );
+    // No inlining keeps every `mat4x4<f32>` spelling, so an alias is minted.
+    let config = Config {
+        max_inline_node_count: Some(0),
+        ..Config::default()
+    };
+    for (src, site) in [(copy, "var "), (header, "for(var ")] {
+        let config = config.clone();
+        let out = on_big_stack(move || crate::run(&src, &config).expect("run failed"));
+        assert!(
+            out.report.fallback.is_none() && !out.source.contains("_e"),
+            "the generator's text must survive the re-parse: {}",
+            out.source
+        );
+        let alias = out
+            .source
+            .strip_prefix("alias ")
+            .and_then(|s| s.split('=').next())
+            .expect("an alias is minted");
+        assert!(
+            out.source.contains(site) && out.source.contains(&format!(":{alias}=")),
+            "the `{site}` declaration spells the alias: {}",
+            out.source
+        );
+    }
+    // Inlined, nothing is aliased: the copy stays untyped.
+    let plain = "@group(0) @binding(0) var<storage, read_write> out: array<mat4x4<f32>>;\
+        fn f(p: ptr<function, mat4x4<f32>>) { (*p)[0][0] += 1.0; }\
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {\
+          var a = mat4x4<f32>(vec4f(1.0), vec4f(2.0), vec4f(3.0), vec4f(f32(id.x)));\
+          var b = a; f(&b); out[0] = a * b; out[1] = b; }";
+    let out = on_big_stack(move || crate::run(plain, &Config::default()).expect("run failed"));
+    assert!(
+        out.report.fallback.is_none()
+            && !out.source.contains("alias ")
+            && !out.source.contains(":mat4x4f="),
+        "no alias, no declared type: {}",
+        out.source
+    );
+}

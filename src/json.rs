@@ -26,6 +26,11 @@ pub fn render_output(output: &Output) -> String {
         None => out.push_str("null"),
         Some(reason) => push_string(reason, &mut out),
     }
+    out.push_str(",\"fallback\":");
+    match &report.fallback {
+        None => out.push_str("null"),
+        Some(reason) => push_string(reason, &mut out),
+    }
     out.push_str(",\"passReports\":[");
     for (i, p) in report.pass_reports.iter().enumerate() {
         if i > 0 {
@@ -155,7 +160,9 @@ mod tests {
         assert!(doc.starts_with("{\"source\":\""), "{doc}");
         assert!(
             doc.contains(",\"report\":{\"inputBytes\":")
-                && doc.contains(",\"bailout\":null,\"passReports\":[{\"passName\":\""),
+                && doc.contains(
+                    ",\"bailout\":null,\"fallback\":null,\"passReports\":[{\"passName\":\""
+                ),
             "{doc}"
         );
         assert!(

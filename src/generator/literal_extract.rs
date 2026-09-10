@@ -198,11 +198,13 @@ impl<'a> Generator<'a> {
                         }
                         // Kept-suffix operands bypass `extracted_literals`.
                         naga::Expression::As {
-                            expr: src, convert, ..
+                            expr: src,
+                            kind,
+                            convert,
                         } => {
-                            if literal_lit(*src)
-                                .is_some_and(|l| as_operand_keeps_suffix(l, *convert))
-                            {
+                            if literal_lit(*src).is_some_and(|l| {
+                                as_operand_keeps_suffix(l, *kind, *convert, precision)
+                            }) {
                                 adjust[src.index()] += 1;
                             }
                         }

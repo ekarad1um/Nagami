@@ -20,6 +20,48 @@ pub(crate) fn all_functions(module: &naga::Module) -> impl Iterator<Item = &naga
         .chain(module.entry_points.iter().map(|ep| &ep.function))
 }
 
+/// An expression tint's uniformity analysis constrains: a derivative, or an
+/// implicit-LOD / bias non-gather sample.  One home for the list: the emitter
+/// pins these at their `Emit`, coalescing declines lane reuse that would
+/// change their gating variable's uniformity.
+pub(crate) fn is_uniformity_constrained_expr(expr: &naga::Expression) -> bool {
+    match expr {
+        naga::Expression::Derivative { .. } => true,
+        naga::Expression::ImageSample { gather, level, .. } => {
+            gather.is_none()
+                && matches!(level, naga::SampleLevel::Auto | naga::SampleLevel::Bias(_))
+        }
+        _ => false,
+    }
+}
+
+/// The module holds something tint's uniformity analysis can reject (a
+/// barrier, a workgroup-uniform load, a subgroup operation, a
+/// [`is_uniformity_constrained_expr`]): one walk gates a transformation whose
+/// only risk is that analysis.
+pub(crate) fn module_has_uniformity_constraint(module: &naga::Module) -> bool {
+    all_functions(module).any(|f| {
+        f.expressions
+            .iter()
+            .any(|(_, e)| is_uniformity_constrained_expr(e))
+            || {
+                let mut found = false;
+                for_each_statement(&f.body, &mut |s| {
+                    found |= matches!(
+                        s,
+                        naga::Statement::ControlBarrier(_)
+                            | naga::Statement::MemoryBarrier(_)
+                            | naga::Statement::WorkGroupUniformLoad { .. }
+                            | naga::Statement::SubgroupBallot { .. }
+                            | naga::Statement::SubgroupGather { .. }
+                            | naga::Statement::SubgroupCollectiveOperation { .. }
+                    );
+                });
+                found
+            }
+    })
+}
+
 /// Mutable [`all_functions`].  A callback, not an iterator: a `Chain` leaves
 /// one call site per pass, which tips LLVM into inlining each per-function
 /// worker into the pass body (+6,080 bytes of text, measured).  Takes the

@@ -33,6 +33,10 @@ pub struct GenerateOptions {
     pub initial_capacity: usize,
     /// Struct type / member names exempt from mangling.
     pub preserve_symbols: HashSet<String>,
+    /// Struct member names kept verbatim (a preamble struct's, accessed by
+    /// the body).  Members are their own namespace, so unlike
+    /// `preserve_symbols` this never freezes a same-named function or local.
+    pub preserve_members: HashSet<String>,
     /// Names of preamble (external) declarations to exclude from output.
     pub preamble_names: HashSet<String>,
     /// Emit `alias` declarations for repeated types when that shortens output.
@@ -48,6 +52,7 @@ impl Default for GenerateOptions {
             float_precision: FloatPrecision::default(),
             initial_capacity: 16 * 1024,
             preserve_symbols: HashSet::new(),
+            preserve_members: HashSet::new(),
             preamble_names: HashSet::new(),
             type_alias: false,
         }
@@ -196,6 +201,13 @@ pub(super) struct FunctionCtx<'a, 'm> {
     pub(super) ref_counts: Vec<usize>,
     pub(super) deferred_vars: Vec<bool>,
     pub(super) dead_vars: Vec<bool>,
+    /// Matrix / array locals passed by address to a call while their type
+    /// renders under a minted `alias`: their `var` declares `: ALIAS`.  naga
+    /// types an inferred matrix / array as the unnamed twin of the alias and
+    /// compares matrix / array pointer bases by HANDLE (scalar / vector ones
+    /// canonicalise, structs are always named), so `f(&b)` against
+    /// `ptr<function, ALIAS>` fails the re-parse.
+    pub(super) typed_pointer_arg_locals: Vec<bool>,
     /// Locals whose references stay inside one `Loop`, absorbable into a
     /// `for (var x = init; ...)` header.
     pub(super) for_loop_vars: Vec<bool>,
@@ -241,6 +253,23 @@ static EMPTY_FUNCTION: std::sync::LazyLock<naga::Function> =
 static NO_NAMES: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
 
 impl<'a, 'm> FunctionCtx<'a, 'm> {
+    /// `typed_pointer_arg_locals` entry whose initialiser is not a
+    /// constructor / zero value of its own type (those spell the alias).
+    pub(super) fn needs_declared_type(
+        &self,
+        local: naga::Handle<naga::LocalVariable>,
+        init: naga::Handle<naga::Expression>,
+    ) -> bool {
+        self.typed_pointer_arg_locals
+            .get(local.index())
+            .is_some_and(|&typed| typed)
+            && !matches!(
+                self.exprs[init],
+                naga::Expression::Compose { ty, .. } | naga::Expression::ZeroValue(ty)
+                    if ty == self.func.local_variables[local].ty
+            )
+    }
+
     pub(super) fn ty(
         &self,
         expr: naga::Handle<naga::Expression>,
@@ -348,6 +377,7 @@ impl<'a> Generator<'a> {
                 .collect(),
             ref_counts: vec![0; n],
             deferred_vars: Vec::new(),
+            typed_pointer_arg_locals: Vec::new(),
             dead_vars: Vec::new(),
             for_loop_vars: Vec::new(),
             expr_name_counter: 0,
@@ -765,13 +795,13 @@ impl<'a> Generator<'a> {
     ) -> Self {
         let mangle = options.mangle;
 
-        // Mangled struct / member names must not collide with any name in
-        // scope where the type is referenced: every module-scope name and,
-        // since function-scope names shadow module-scope type names, every
-        // argument and local anywhere.  Preserved names are reserved up front
-        // so the counter never mints one, whatever the arena order.
+        // Minted names (mangled struct / member names, the anonymous
+        // override's) must dodge every name in scope where they are
+        // referenced: all module-scope names, every argument and local
+        // (function scope shadows type names) and the preserve list.  Built
+        // only when something draws on it.
         let mut used_names = HashSet::new();
-        if mangle {
+        if mangle || module.overrides.iter().any(|(_, o)| o.name.is_none()) {
             used_names.extend(
                 crate::name_gen::module_scope_names(module)
                     .chain(all_functions(module).flat_map(crate::name_gen::function_local_names))
@@ -831,7 +861,7 @@ impl<'a> Generator<'a> {
                     }
                     for (idx, member) in members.iter().enumerate() {
                         if let Some(name) = member.name.as_deref() {
-                            if preserve.contains(name) {
+                            if preserve.contains(name) || options.preserve_members.contains(name) {
                                 member_names.insert((h, idx as u32), name.to_string());
                             } else {
                                 member_names.insert(
@@ -864,10 +894,18 @@ impl<'a> Generator<'a> {
             constant_names.push(c.name.clone().unwrap_or_else(|| format!("C{}", h.index())));
         }
 
+        // naga's anonymous override (an override-expression array size) is
+        // declared under a minted name: the positional `O<n>` collided with
+        // user, preserved and preamble names.  Named here rather than in the
+        // IR so a dead one still compacts away instead of being rooted as a
+        // host-visible override.
         let mut override_names = Vec::with_capacity(module.overrides.len());
+        let mut anonymous_counter = 0usize;
         for (h, ov) in module.overrides.iter() {
             debug_assert_eq!(h.index(), override_names.len());
-            override_names.push(ov.name.clone().unwrap_or_else(|| format!("O{}", h.index())));
+            override_names.push(ov.name.clone().unwrap_or_else(|| {
+                crate::name_gen::next_name_insert(&mut anonymous_counter, &mut used_names)
+            }));
         }
 
         let mut global_names = Vec::with_capacity(module.global_variables.len());

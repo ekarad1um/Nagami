@@ -2110,3 +2110,78 @@ fn preserved_resources_and_named_overrides_survive_dce() {
         output.source
     );
 }
+
+/// The naga-emitter fallback prints the RENAMED module: the name map applies
+/// and the report names the fallback (both were `null`; the web build had no
+/// signal).
+#[test]
+fn naga_fallback_reports_itself_and_keeps_the_name_map() {
+    // `@interpolate(per_vertex)` ships without its `enable`, so the
+    // generator's text fails the re-parse and naga's emitter prints the
+    // renamed IR (a known loss).
+    let src = "enable wgpu_per_vertex;\n\
+               @group(0) @binding(0) var<uniform> tint: vec4f;\n\
+               struct V { @builtin(position) p: vec4f, @location(0) @interpolate(per_vertex) c: array<vec3f, 3> }\n\
+               @fragment fn fs(v: V) -> @location(0) vec4f { return vec4f(v.c[0], 1.0) * tint; }\n";
+    let out = run(src, &Config::default()).expect("the module minifies via the fallback");
+    assert!(out.report.fallback.is_some(), "the fallback is reported");
+    let map = out.name_map.expect("the fallback text carries the renames");
+    let renamed = map.globals.get("tint").expect("the resource is mapped");
+    assert!(
+        out.source.contains(&format!("{renamed}:vec4<f32>")),
+        "the map names the declaration in the shipped text: {renamed} in {}",
+        out.source
+    );
+    assert_eq!(
+        map.structs.get("V").map(|s| s.name.as_str()),
+        Some("V"),
+        "the surviving struct has its entry"
+    );
+}
+
+/// naga's namer prints `fs1` as `fs1_`: a fallback that respells an entry
+/// point, a named override or a preserved symbol is refused.
+#[test]
+fn naga_fallback_never_respells_the_interface() {
+    let src = "enable wgpu_per_vertex;\n\
+               @group(0) @binding(0) var<uniform> tint: vec4f;\n\
+               struct V { @builtin(position) p: vec4f, @location(0) @interpolate(per_vertex) c: array<vec3f, 3> }\n\
+               @fragment fn fs1(v: V) -> @location(0) vec4f { return vec4f(v.c[0], 1.0) * tint; }\n";
+    let err = run(src, &Config::default())
+        .err()
+        .expect("no rung ships a respelled entry point");
+    assert!(err.to_string().contains("`fs1` as `fs1_`"), "{err}");
+    let with_override = src
+        .replace("* tint;", "* tint * o1;")
+        .replace("@group(0)", "override o1: f32 = 1.0;\n@group(0)");
+    let err = run(&with_override.replace("fs1", "fs"), &Config::default())
+        .err()
+        .expect("no rung ships a respelled override");
+    assert!(err.to_string().contains("`o1` as `o1_`"), "{err}");
+}
+
+/// Preamble member names are preserved as MEMBER names only: a body function
+/// sharing one is renamed and its pointer parameter still specialized.
+#[test]
+fn preamble_member_names_do_not_freeze_body_functions() {
+    let preamble = "struct Params { bump: f32, k: u32 }\n\
+                    @group(0) @binding(1) var<uniform> params: Params;\n";
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+               fn bump(q: ptr<storage, array<u32>, read_write>, k: u32) { (*q)[0] = k + params.k; }\n\
+               @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) g: vec3u) { bump(&out, g.x); }\n";
+    let config = Config {
+        preamble: Some(preamble.to_string()),
+        ..Config::default()
+    };
+    let out = run(src, &config).expect("run failed");
+    assert!(
+        !out.source.contains("fn bump(") && !out.source.contains("ptr<storage"),
+        "the body function is renamed and specialized: {}",
+        out.source
+    );
+    assert!(
+        out.source.contains("params.k"),
+        "the preamble member keeps its name: {}",
+        out.source
+    );
+}

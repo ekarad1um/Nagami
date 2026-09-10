@@ -90,6 +90,9 @@ impl Pass for RenamePass {
             push_target(&mut targets, &mut seq, Target::Global(h), &weights);
         }
 
+        let module_scope: HashSet<&str> = name_gen::module_scope_names(module)
+            .chain(name_gen::type_names(module))
+            .collect();
         for (fh, function) in module.functions.iter() {
             if !matches!(function.name.as_deref(), Some(n) if self.preserve.contains(n)) {
                 push_target(&mut targets, &mut seq, Target::Function(fh), &weights);
@@ -98,6 +101,7 @@ impl Pass for RenamePass {
                 function,
                 FuncRef::Function(fh),
                 &self.preserve,
+                &module_scope,
                 &weights,
                 &mut targets,
                 &mut seq,
@@ -110,6 +114,7 @@ impl Pass for RenamePass {
                 &entry.function,
                 FuncRef::Entry(ei),
                 &self.preserve,
+                &module_scope,
                 &weights,
                 &mut targets,
                 &mut seq,
@@ -282,34 +287,41 @@ fn enumerate_locals(
     function: &naga::Function,
     fref: FuncRef,
     preserve: &HashSet<String>,
+    module_scope: &HashSet<&str>,
     weights: &Weights,
     targets: &mut Vec<(Target, usize, usize)>,
     seq: &mut usize,
 ) {
     // naga gives each block-scoped shadowing `var` its own handle under the
     // shared source name, so a preserved name is kept by its FIRST
-    // declaration only: keeping both would put two `var t` in one scope
-    // (invalid) or, once `defer_vars` sinks one, silently re-bind reads to
-    // the wrong one.
+    // declaration only: two `var t` in one scope are invalid, and once
+    // `defer_vars` sinks one, reads silently re-bind.  A name a module-scope
+    // declaration or a struct type carries is never kept on a local: the IR
+    // has no declaration position, so a global read the source made before
+    // `var t` shadowed it (`let a = t; var t = 0u;`) re-binds to the kept
+    // local, and a constructor `S(..)` inlined into a kept `var S`'s scope
+    // calls the local.  Locals are not host-visible, so renaming one is
+    // always safe.
     fn keeps_name<'n>(
         kept: &mut HashSet<&'n str>,
         preserve: &HashSet<String>,
+        module_scope: &HashSet<&str>,
         name: Option<&'n str>,
     ) -> bool {
         match name {
-            Some(n) if preserve.contains(n) => kept.insert(n),
+            Some(n) if preserve.contains(n) && !module_scope.contains(n) => kept.insert(n),
             _ => false,
         }
     }
     let mut kept = HashSet::new();
     for (i, argument) in function.arguments.iter().enumerate() {
-        if keeps_name(&mut kept, preserve, argument.name.as_deref()) {
+        if keeps_name(&mut kept, preserve, module_scope, argument.name.as_deref()) {
             continue;
         }
         push_target(targets, seq, Target::Arg(fref, i), weights);
     }
     for (lh, local) in function.local_variables.iter() {
-        if keeps_name(&mut kept, preserve, local.name.as_deref()) {
+        if keeps_name(&mut kept, preserve, module_scope, local.name.as_deref()) {
             continue;
         }
         push_target(targets, seq, Target::Local(fref, lh), weights);
@@ -717,6 +729,63 @@ fn fs_main() -> @location(0) vec4f {
         assert!(
             !reserved.contains("A") && !reserved.contains("B") && !reserved.contains("C"),
             "non-coop module must not auto-reserve A/B/C: {reserved:?}"
+        );
+    }
+
+    /// The source read the global before the local shadowed it; a kept
+    /// `var t` re-binds that read to itself (`for(;t<t;)`).
+    #[test]
+    fn preserved_module_name_is_never_kept_on_a_local() {
+        let source = r#"
+var<private> t: u32 = 11u;
+fn f() -> u32 {
+    let a = t;
+    var t: u32 = 0u;
+    loop { if (t >= a) { break; } t = t + 3u; }
+    return t;
+}
+@compute @workgroup_size(1) fn main() { t = 15u; _ = f(); }
+"#;
+        let (_, renamed) = run_pass(source, &["t"]);
+        let global_names: Vec<_> = renamed
+            .global_variables
+            .iter()
+            .filter_map(|(_, g)| g.name.clone())
+            .collect();
+        assert_eq!(global_names, ["t"], "the preserved global keeps its name");
+        let (_, f) = renamed.functions.iter().next().expect("f survives");
+        let local_names: Vec<_> = f
+            .local_variables
+            .iter()
+            .filter_map(|(_, l)| l.name.clone())
+            .collect();
+        assert!(
+            !local_names.iter().any(|n| n == "t"),
+            "the local must not capture the module-scope name: {local_names:?}"
+        );
+    }
+
+    /// A local sharing a preserved STRUCT TYPE name shadows the type; a
+    /// constructor inlining moves into its scope would call the local.
+    #[test]
+    fn preserved_type_name_is_never_kept_on_a_local() {
+        let source = r#"
+struct S { v: f32 }
+fn mk(x: f32) -> S { return S(x * 2.0); }
+fn f() -> f32 { var S: S = S(1.0); let q = mk(S.v); S.v = q.v; return S.v; }
+@fragment fn fs_main() -> @location(0) vec4f { return vec4f(f()); }
+"#;
+        let (_, renamed) = run_pass(source, &["S"]);
+        let (_, f) = renamed
+            .functions
+            .iter()
+            .find(|(_, f)| f.local_variables.len() == 1)
+            .expect("f has one local");
+        let local = f.local_variables.iter().next().unwrap().1.name.clone();
+        assert_ne!(
+            local.as_deref(),
+            Some("S"),
+            "the local must not shadow the type"
         );
     }
 

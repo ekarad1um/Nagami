@@ -427,7 +427,10 @@ pub fn specialize_ptr_params(
         restore_call_order(module);
     }
     let functions_before = module.functions.len();
-    naga::compact::compact(module, naga::compact::KeepUnused::No);
+    // A raw compaction deleted every named override and preserved global the
+    // entry points do not reach, and the anchored pass downstream cannot
+    // restore them.
+    crate::passes::compact::compact_behind_anchor(module, &|name| frozen_fn_names.contains(name));
     rewrote || module.functions.len() != functions_before
 }
 
@@ -762,6 +765,41 @@ mod tests {
             touch.arguments.len(),
             2,
             "the advertised arity is a contract"
+        );
+    }
+
+    /// A raw `KeepUnused::No` deleted every unreferenced named override and
+    /// preserved global; the anchored pass downstream never saw them.
+    #[test]
+    fn specialization_compaction_keeps_overrides_and_preserved_globals() {
+        let mut module = parse(
+            "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\n\
+             @group(0) @binding(1) var<storage, read> keepme: array<u32>;\n\
+             @id(7) override ov: f32 = 1.0;\n\
+             override scale: u32;\n\
+             fn bump(q: ptr<storage, array<u32>, read_write>, k: u32) { (*q)[0] = k; }\n\
+             @compute @workgroup_size(1) fn m(@builtin(global_invocation_id) g: vec3u) {\n\
+               bump(&out, g.x);\n\
+             }",
+        );
+        let preserved = ["keepme".to_string()].into_iter().collect();
+        assert!(specialize_ptr_params(&mut module, &preserved));
+        let overrides: Vec<_> = module
+            .overrides
+            .iter()
+            .filter_map(|(_, o)| o.name.clone())
+            .collect();
+        assert_eq!(
+            overrides,
+            ["ov", "scale"],
+            "named overrides are pipeline-constant keys"
+        );
+        assert!(
+            module
+                .global_variables
+                .iter()
+                .any(|(_, g)| g.name.as_deref() == Some("keepme")),
+            "a preserved resource stays in the bind-group layout"
         );
     }
 

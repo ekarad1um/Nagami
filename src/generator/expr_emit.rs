@@ -90,16 +90,30 @@ pub(super) fn literal_bare_form_changes_type(literal: naga::Literal) -> bool {
     )
 }
 
-/// A bitcast operand always keeps its suffix (bits); a conversion's only
-/// when the abstract value converts differently: a u32 above i32::MAX or a
-/// negative i32 into the other integer type (rejected where the typed form
-/// wraps), a width with no abstract spelling, or an f16 target (`f16(.1)`
-/// double-rounds). Shared with `literal_extract`.
-pub(super) fn as_operand_keeps_suffix(literal: naga::Literal, convert: Option<u8>) -> bool {
+/// A bitcast operand always keeps its suffix (bits); a conversion's only when
+/// the bare token would convert differently: u32 above i32::MAX into i32 or
+/// negative i32 into u32 (range errors where the typed form wraps); a whole
+/// f32 as an integer token when negative into u32 (`u32(-3)` errors,
+/// `u32(-3f)` saturates) or at or above 2^24, where its shortest digits are
+/// exact only as an f32 (`2147483520f` prints `2147483500`); a width with no
+/// abstract spelling; an f16 target (`f16(.1)` double-rounds).
+/// `literal_extract` mirrors this.
+pub(super) fn as_operand_keeps_suffix(
+    literal: naga::Literal,
+    kind: naga::ScalarKind,
+    convert: Option<u8>,
+    precision: &crate::config::FloatPrecision,
+) -> bool {
+    use naga::ScalarKind as K;
     let differs = match literal {
-        naga::Literal::U32(v) => v > i32::MAX as u32,
-        naga::Literal::I32(v) => v < 0,
-        naga::Literal::F32(_) | naga::Literal::Bool(_) => false,
+        naga::Literal::U32(v) => kind == K::Sint && v > i32::MAX as u32,
+        naga::Literal::I32(v) => kind == K::Uint && v < 0,
+        naga::Literal::F32(v) => {
+            matches!(kind, K::Sint | K::Uint)
+                && ((kind == K::Uint && v < 0.0) || v.abs() >= 16777216.0)
+                && !literal_bare_form_pins_scalar(literal, naga::Scalar::F32, precision)
+        }
+        naga::Literal::Bool(_) => false,
         _ => true,
     };
     convert.is_none() || differs || convert == Some(2)
@@ -1249,37 +1263,25 @@ impl<'a> Generator<'a> {
                     _ => None,
                 };
                 // The runtime sibling above pins nothing when EVERY argument is
-                // a whole-valued float literal: `mix(1.f,2.f,1.f)` renders
-                // `mix(1,2,1)`, three AbstractInt tokens typing the call
-                // AbstractInt.  tint accepts that, naga does not, and naga is
-                // the self-check, so one such call drops the WHOLE module to
-                // naga's emitter; typing one argument re-pins the float.  Every
-                // shared-type builtin, not just the two that fail today (5
-                // corpus files at -110 bytes, 10 at +1).
-                //
-                // An extracted literal renders as its `const` name, which
-                // carries a declared type and so pins on its own.  Treating
-                // that as pinning is also what keeps the forced text off
-                // `literal_extract`'s books: it only ever replaces a literal
-                // that was going to render bare.
-                let float_needs_pin = !pins_alone
-                    && float_scalar.is_some_and(|scalar| {
-                        [Some(*arg), *arg1, *arg2, *arg3]
-                            .into_iter()
-                            .flatten()
-                            .all(|h| {
-                                self.inline_scalar_literal(h, ctx).is_some_and(|lit| {
-                                    let key =
-                                        literal_extract_key(lit, &self.options.float_precision);
-                                    !self.extracted_literals.contains_key(&key)
-                                        && !literal_bare_form_pins_scalar(
-                                            lit,
-                                            scalar,
-                                            &self.options.float_precision,
-                                        )
-                                })
+                // a bare literal: the call is then an abstract const-expression
+                // (AbstractInt for `mix(1,2,1)`, AbstractFloat for
+                // `mix(0,1,.25)`) that naga's evaluator cannot concretise for
+                // `mix` / `smoothstep`, and naga is the self-check, so the
+                // WHOLE module drops to naga's emitter; one typed argument makes
+                // it concrete.  An extracted literal renders as its typed
+                // `const` name and pins on its own, which also keeps the forced
+                // text off `literal_extract`'s books.
+                let float_needs_pin = !pins_alone && float_scalar.is_some() && {
+                    [Some(*arg), *arg1, *arg2, *arg3]
+                        .into_iter()
+                        .flatten()
+                        .all(|h| {
+                            self.inline_scalar_literal(h, ctx).is_some_and(|lit| {
+                                let key = literal_extract_key(lit, &self.options.float_precision);
+                                !self.extracted_literals.contains_key(&key)
                             })
-                    });
+                        })
+                };
                 let typed_if_literal = |g: &Self,
                                         h: naga::Handle<naga::Expression>,
                                         ctx: &mut FunctionCtx<'a, '_>|
@@ -1436,7 +1438,7 @@ impl<'a> Generator<'a> {
                 }
                 let target = self.type_name_for_inner(&target_inner)?;
                 let source = if let Some(lit) = self.inline_scalar_literal(*expr, ctx)
-                    && as_operand_keeps_suffix(lit, *convert)
+                    && as_operand_keeps_suffix(lit, *kind, *convert, &self.options.float_precision)
                 {
                     literal_to_wgsl(lit, &self.options.float_precision)
                 } else {

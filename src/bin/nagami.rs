@@ -382,6 +382,9 @@ fn run_cli() -> Result<u8, Box<dyn std::error::Error>> {
         Ok(Some(warning)) => eprintln!("{warning}"),
         Ok(None) => {}
     }
+    if let Some(reason) = output.report.fallback.as_deref() {
+        eprintln!("warning: {reason}; shipping naga emitter output (still IR-minified)");
+    }
 
     if args.check {
         if args.format == OutputFormat::Json {

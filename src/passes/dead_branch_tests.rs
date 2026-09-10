@@ -124,6 +124,48 @@ fn main() {
     );
 }
 
+/// A result-less `Call` has no expression a collapse could orphan: a
+/// constant-false `if` around one and a tail after a folded `return` holding
+/// one are deleted.
+#[test]
+fn result_less_call_does_not_keep_dead_code_alive() {
+    let source = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+fn log() { out[1] = 7u; }
+@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) gid: vec3u) {
+    if (false) {
+        switch (gid.x & 3u) {
+            case 1u, 2u: { log(); }
+            default: { return; }
+        }
+    }
+    switch (gid.x & 3u) {
+        case 1u: { if (true) { return; } log(); out[2] = 5u; }
+        default: { out[3] = 1u; }
+    }
+    out[0] = 2u;
+}
+"#;
+    let (changed, module) = run_pass(source);
+    assert!(changed);
+    let body = &module.entry_points[0].function.body;
+    assert_eq!(
+        count_ifs(body),
+        0,
+        "the constant-false if and the folded if are gone"
+    );
+    let calls = |block: &naga::Block| {
+        let mut n = 0;
+        crate::passes::expr_util::for_each_statement(block, &mut |s| {
+            if matches!(s, naga::Statement::Call { .. }) {
+                n += 1;
+            }
+        });
+        n
+    };
+    assert_eq!(calls(body), 0, "no dead call survives: {body:?}");
+}
+
 /// The dead-tail drop after a definite terminator needs the same
 /// result-producer guard: dropping an unreachable `Call { result: Some }`
 /// orphans its expression, and one poisoned function rolls the whole pass

@@ -47,6 +47,11 @@ pub struct Report {
     /// the input shipped compacted instead of the pipeline's output;
     /// `None` on every normal path.
     pub bailout: Option<String>,
+    /// Why naga's emitter printed the module instead of nagami's generator:
+    /// still IR-minified and renamed, without the generator's spelling
+    /// (aliases, elisions), so larger.  The CLI warns on stderr, which the
+    /// web build cannot show.
+    pub fallback: Option<String>,
 }
 
 impl Report {
@@ -66,6 +71,7 @@ impl Report {
             converged: true,
             sweeps: 0,
             bailout: None,
+            fallback: None,
         }
     }
 }

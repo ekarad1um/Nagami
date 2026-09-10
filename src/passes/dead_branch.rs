@@ -698,12 +698,13 @@ fn unwrap_logical_not(
 
 // MARK: Constant-condition elimination
 
-/// `block` (recursively) holds a statement that produces a result
-/// expression (`Call` / `Atomic` / `WorkGroupUniformLoad` / `RayQuery` /
-/// `Subgroup*`).  Constant-condition collapses keep such branches intact:
-/// dropping the producer orphans its result expression, which fails
-/// validation and rolls the whole pass back every sweep.  Variant-only, so a
-/// result-less `Call` also trips it at the cost of one kept-but-dead branch.
+/// `block` (recursively) holds a statement producing a result expression
+/// (`Call` / `Atomic` with a result, `WorkGroupUniformLoad`, `RayQuery`,
+/// `Subgroup*`).  Constant-condition collapses keep such branches: dropping
+/// the producer orphans its result, which fails validation and rolls the
+/// whole pass back every sweep.  A result-less `Call` / `Atomic` produces
+/// nothing and is deleted like any dead code (vetoing it kept every
+/// `if (DEBUG) { log(); }` and its callee alive).
 fn block_has_result_producer(block: &naga::Block) -> bool {
     block.iter().any(statement_has_result_producer)
 }
@@ -721,9 +722,13 @@ fn statement_has_result_producer(stmt: &naga::Statement) -> bool {
     use naga::Statement as S;
     matches!(
         stmt,
-        S::Call { .. }
-            | S::Atomic { .. }
-            | S::WorkGroupUniformLoad { .. }
+        S::Call {
+            result: Some(_),
+            ..
+        } | S::Atomic {
+            result: Some(_),
+            ..
+        } | S::WorkGroupUniformLoad { .. }
             | S::RayQuery { .. }
             | S::SubgroupBallot { .. }
             | S::SubgroupGather { .. }

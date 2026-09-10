@@ -886,6 +886,8 @@ impl<'a> Generator<'a> {
             &func.expressions,
             &self.pure_functions,
         );
+        let typed_pointer_arg_locals =
+            typed_pointer_arg_locals(func, &self.module.types, &self.type_names);
         let mut ctx = FunctionCtx {
             func,
             exprs: &func.expressions,
@@ -898,6 +900,7 @@ impl<'a> Generator<'a> {
             ref_counts,
             deferred_vars,
             dead_vars,
+            typed_pointer_arg_locals,
             for_loop_vars,
             expr_name_counter: 0,
             module_names: module_used_names,
@@ -984,7 +987,7 @@ impl<'a> Generator<'a> {
                     ),
                     _ => false,
                 };
-                if !can_elide_type {
+                if !can_elide_type || ctx.needs_declared_type(h, init) {
                     self.push_colon();
                     self.out.push_str(&self.type_ref(local.ty)?);
                 }
@@ -1034,6 +1037,35 @@ impl<'a> Generator<'a> {
         self.close_brace();
         Ok(())
     }
+}
+
+/// `FunctionCtx::typed_pointer_arg_locals`; `type_names` holds every type
+/// spelled by a name (struct or minted alias).
+fn typed_pointer_arg_locals(
+    func: &naga::Function,
+    types: &naga::UniqueArena<naga::Type>,
+    type_names: &crate::handle_set::HandleMap<naga::Type, String>,
+) -> Vec<bool> {
+    let mut out = vec![false; func.local_variables.len()];
+    crate::passes::expr_util::for_each_statement(&func.body, &mut |stmt| {
+        if let naga::Statement::Call { arguments, .. } = stmt {
+            for &arg in arguments {
+                let naga::Expression::LocalVariable(lh) = func.expressions[arg] else {
+                    continue;
+                };
+                let ty = func.local_variables[lh].ty;
+                if type_names.contains_key(ty)
+                    && matches!(
+                        types[ty].inner,
+                        naga::TypeInner::Matrix { .. } | naga::TypeInner::Array { .. }
+                    )
+                {
+                    out[lh.index()] = true;
+                }
+            }
+        }
+    });
+    out
 }
 
 /// Mirror of naga's `proc::ensure_block_returns`: `true` when naga's front-end

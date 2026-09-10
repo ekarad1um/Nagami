@@ -62,22 +62,32 @@ impl Pass for CompactPass {
             // preserved function keeps its signature callable, and a named
             // `override` stays a valid pipeline-constant key (Dawn validates
             // the keys against every declared override, used or not).
-            module
-                .entry_points
-                .push(interface_anchor(module, &ctx.config.preserve_symbols));
-            naga::compact::compact(module, naga::compact::KeepUnused::No);
-            module.entry_points.pop();
+            compact_behind_anchor(module, &|name| {
+                ctx.config.preserve_symbols.iter().any(|p| p == name)
+            });
         }
         Ok(before != arena_shape(module))
     }
 }
 
-/// An entry point whose statements reference every `preserve`d global and
+/// `KeepUnused::No` compaction behind the interface anchor: the ONE door for
+/// it, so no second call site can drop what the anchor roots (the pre-pipeline
+/// pointer specialization did).  `preserved` answers for globals and
+/// functions; named overrides are always kept.
+pub(crate) fn compact_behind_anchor(module: &mut naga::Module, preserved: &dyn Fn(&str) -> bool) {
+    module
+        .entry_points
+        .push(interface_anchor(module, preserved));
+    naga::compact::compact(module, naga::compact::KeepUnused::No);
+    module.entry_points.pop();
+}
+
+/// An entry point whose statements reference every `preserved` global and
 /// function and every named override.  The tracer follows statement operands
 /// (an `Emit` range alone is not a use) and never type-checks, so any
 /// statement carrying the handle roots it.
-fn interface_anchor(module: &naga::Module, preserve: &[String]) -> naga::EntryPoint {
-    let preserved = |name: Option<&str>| name.is_some_and(|n| preserve.iter().any(|p| p == n));
+fn interface_anchor(module: &naga::Module, preserved: &dyn Fn(&str) -> bool) -> naga::EntryPoint {
+    let preserved = |name: Option<&str>| name.is_some_and(preserved);
     let span = naga::Span::default();
     let mut function = naga::Function::default();
     let reference = |function: &mut naga::Function, expr: naga::Expression| {

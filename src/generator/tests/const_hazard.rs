@@ -552,3 +552,79 @@ fn a_break_if_condition_uses_the_hazard_binding() {
         "{out}"
     );
 }
+
+/// `ldexp(1f, 128)` passes the exponent rule (e2 <= 128) yet overflows to
+/// inf, a shader-creation error tint reports and naga does not evaluate.
+#[test]
+fn ldexp_result_overflow_binds() {
+    let out = minify(&body(
+        "var a = 1.0; var e = 128; out[0] = bitcast<u32>(ldexp(a, e));",
+    ));
+    assert!(
+        !out.contains("ldexp(1f,128)") && out.contains("=1f;"),
+        "the overflowing pair must not ship as a const-expression: {out}"
+    );
+    let ok = minify(&body(
+        "var a = 1.0; var e = 127; out[0] = bitcast<u32>(ldexp(a, e));",
+    ));
+    assert!(ok.contains("ldexp(1f,127)"), "in range stays inline: {ok}");
+}
+
+/// A whole f32 into an integer type keeps its suffix when the bare token
+/// converts differently: `u32(-1)` errors where `u32(-1f)` saturates, and
+/// at or above 2^24 the digits are not the f32's value.
+#[test]
+fn whole_float_into_integer_keeps_suffix() {
+    let out = crate::run(
+        &body(
+            "var x = -1.0; out[0] = u32(x); var y = -2147483904.0; out[1] = bitcast<u32>(i32(y));",
+        ),
+        &Config::default(),
+    )
+    .expect("run failed");
+    assert!(out.report.fallback.is_none(), "no fallback: {}", out.source);
+    assert!(
+        out.source.contains("u32(-1f)") && out.source.contains("i32(-2147484000f)"),
+        "the conversions keep a typed operand: {}",
+        out.source
+    );
+    // `i32(2147483500)` is not `i32(2147483520f)` (GPU-proven).
+    let big = minify(&body(
+        "var x = 2147483520.0; out[0] = bitcast<u32>(i32(x)); var y = 33554436.0; out[1] = u32(y);",
+    ));
+    assert!(
+        big.contains("i32(2147483500f)") && big.contains("u32(33554436f)"),
+        "large whole values keep the f32 spelling: {big}"
+    );
+    // Below 2^24 the token is the value; negative into i32 and whole into
+    // f32 convert the same either way.
+    let bare = minify(&body(
+        "var x = 3.0; out[0] = u32(x); var y = -3.0; out[1] = bitcast<u32>(i32(y)); \
+         var z = 3000000000u; out[2] = bitcast<u32>(f32(z));",
+    ));
+    assert!(
+        bare.contains("u32(3)") && bare.contains("i32(-3)") && bare.contains("f32(3000000000)"),
+        "no needless suffix: {bare}"
+    );
+}
+
+/// An all-literal `mix` / `smoothstep` is an abstract const-expression naga
+/// cannot concretise; one typed argument keeps the module on the generator's
+/// text.
+#[test]
+fn all_literal_math_call_pins_one_argument() {
+    let out = crate::run(
+        &body(
+            "var t = 0.25f; out[0] = bitcast<u32>(mix(0.0, 1.0, t)); \
+               var h = 0.5f; out[1] = bitcast<u32>(smoothstep(0.0f, 1.0f, h));",
+        ),
+        &Config::default(),
+    )
+    .expect("run failed");
+    assert!(out.report.fallback.is_none(), "no fallback: {}", out.source);
+    assert!(
+        out.source.contains("mix(0f,1,.25)") && out.source.contains("smoothstep(0f,1,.5)"),
+        "one argument typed: {}",
+        out.source
+    );
+}

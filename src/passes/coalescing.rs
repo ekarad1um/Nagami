@@ -52,6 +52,14 @@ struct LocalUse {
     used: bool,
     init_is_none: bool,
     coalesce_safe: bool,
+    /// A store writes only part of the local.  tint's uniformity analysis
+    /// keys on the VARIABLE and a member / index store depends on its current
+    /// value, so such an aggregate placed on a lane whose previous occupant
+    /// was non-uniform inherits that non-uniformity and a barrier or
+    /// derivative it gates is rejected: in a module holding anything that
+    /// analysis constrains it may open a lane but never joins one.  Values
+    /// are unaffected (the coverage gate is exact).
+    partially_stored: bool,
 }
 
 /// Elements tracked per aggregate (one `u64` bit each).  Larger aggregates
@@ -232,6 +240,8 @@ struct LocalSpan {
     ty: naga::Handle<naga::Type>,
     first: usize,
     last: usize,
+    /// May take an existing lane (see `LocalUse::partially_stored`).
+    joins: bool,
 }
 
 impl Pass for CoalescingPass {
@@ -243,8 +253,9 @@ impl Pass for CoalescingPass {
         let mut changed = 0usize;
 
         let types = &module.types;
+        let uniformity = super::expr_util::module_has_uniformity_constraint(module);
         for_each_function_mut(&mut module.functions, &mut module.entry_points, &mut |f| {
-            changed += coalesce_function_locals(f, types);
+            changed += coalesce_function_locals(f, types, uniformity);
         });
 
         Ok(changed > 0)
@@ -254,13 +265,14 @@ impl Pass for CoalescingPass {
 fn coalesce_function_locals(
     function: &mut naga::Function,
     types: &naga::UniqueArena<naga::Type>,
+    uniformity_constrained: bool,
 ) -> usize {
     if function.local_variables.is_empty() {
         return 0;
     }
 
     let usage = collect_local_usage(function, types);
-    let alias = build_alias_map(&usage);
+    let alias = build_alias_map(&usage, uniformity_constrained);
     if alias.is_empty() {
         return 0;
     }
@@ -301,6 +313,7 @@ fn collect_local_usage(
                     used: false,
                     init_is_none: local.init.is_none(),
                     coalesce_safe: true,
+                    partially_stored: false,
                 },
             )
         })
@@ -377,6 +390,41 @@ fn mark_block_first(
     }
 }
 
+/// A store into `local`.  Only a whole-local store claims the slot for
+/// `block_writes`; a partial one leaves the other bytes as they were, yet
+/// still counts as a store-first touch: the gate exists for reads of
+/// zero-init / loop-carried bytes, and the coverage check at the next read
+/// decides whether the partial stores suffice (else `v.x=..; v.y=..; v.z=..;`
+/// before a read would be refused).
+#[allow(clippy::too_many_arguments)]
+fn mark_store(
+    usage: &mut HandleMap<naga::LocalVariable, LocalUse>,
+    block_seen: &mut HandleSet<naga::LocalVariable>,
+    block_writes: &mut HandleSet<naga::LocalVariable>,
+    local_init: &mut HandleMap<naga::LocalVariable, ElementInit>,
+    local_element_count: &[Option<u32>],
+    local: naga::Handle<naga::LocalVariable>,
+    spec: ElementSpec,
+    pos: usize,
+) {
+    mark_used(usage, local, pos);
+    let element_count = local_element_count
+        .get(local.index())
+        .and_then(|o| *o)
+        .unwrap_or(0);
+    let init = local_init
+        .entry(local)
+        .or_insert_with(|| ElementInit::new(element_count));
+    let is_full_store = update_init_for_store(init, spec);
+    if !is_full_store && let Some(info) = usage.get_mut(local) {
+        info.partially_stored = true;
+    }
+    mark_block_first(usage, block_seen, local, /*is_store=*/ true);
+    if is_full_store {
+        block_writes.insert(local);
+    }
+}
+
 /// A read of `local`'s existing bytes - every non-`Store` pointer use is one:
 /// widen the live range, run the first-touch gate, and refuse coalescing
 /// unless the bytes `spec` names are written on every reaching path, since
@@ -440,29 +488,17 @@ fn scan_block_usage(
                 }
             }
             naga::Statement::Store { pointer, .. } => {
-                // Only a whole-local store claims the slot for
-                // `block_writes`; an access-chained store leaves the other
-                // bytes as they were.
                 if let Some((local, spec)) = resolve_local_and_element(*pointer, expressions) {
-                    mark_used(usage, local, current);
-                    let element_count = local_element_count
-                        .get(local.index())
-                        .and_then(|o| *o)
-                        .unwrap_or(0);
-                    let init = local_init
-                        .entry(local)
-                        .or_insert_with(|| ElementInit::new(element_count));
-                    let is_full_store = update_init_for_store(init, spec);
-                    // A partial store still counts as a store-first touch:
-                    // the gate exists for reads of zero-init / loop-carried
-                    // bytes, and the coverage check at the next read decides
-                    // whether the partial stores suffice (otherwise
-                    // `v.x=..; v.y=..; v.z=..;` before a read would be
-                    // refused).
-                    mark_block_first(usage, &mut block_seen, local, /*is_store=*/ true);
-                    if is_full_store {
-                        block_writes.insert(local);
-                    }
+                    mark_store(
+                        usage,
+                        &mut block_seen,
+                        &mut block_writes,
+                        local_init,
+                        local_element_count,
+                        local,
+                        spec,
+                        current,
+                    );
                 }
             }
             naga::Statement::Call { arguments, .. } => {
@@ -505,19 +541,16 @@ fn scan_block_usage(
                     mark_covered_read(usage, &mut block_seen, local_init, local, spec, current);
                 }
                 if let Some((local, spec)) = resolve_local_and_element(data.pointer, expressions) {
-                    mark_used(usage, local, current);
-                    let element_count = local_element_count
-                        .get(local.index())
-                        .and_then(|o| *o)
-                        .unwrap_or(0);
-                    let init = local_init
-                        .entry(local)
-                        .or_insert_with(|| ElementInit::new(element_count));
-                    let is_full_store = update_init_for_store(init, spec);
-                    mark_block_first(usage, &mut block_seen, local, /*is_store=*/ true);
-                    if is_full_store {
-                        block_writes.insert(local);
-                    }
+                    mark_store(
+                        usage,
+                        &mut block_seen,
+                        &mut block_writes,
+                        local_init,
+                        local_element_count,
+                        local,
+                        spec,
+                        current,
+                    );
                 }
             }
             naga::Statement::If { accept, reject, .. } => {
@@ -735,6 +768,7 @@ fn merge_inits_into(
 /// before its `first`, greedily reusing hot lanes.
 fn build_alias_map(
     usage: &HandleMap<naga::LocalVariable, LocalUse>,
+    uniformity_constrained: bool,
 ) -> HandleMap<naga::LocalVariable, naga::Handle<naga::LocalVariable>> {
     let mut locals = usage
         .iter()
@@ -744,6 +778,7 @@ fn build_alias_map(
                 ty: info.ty,
                 first: info.first,
                 last: info.last,
+                joins: !(uniformity_constrained && info.partially_stored),
             })
         })
         .collect::<Vec<_>>();
@@ -756,12 +791,16 @@ fn build_alias_map(
     for local in locals {
         let lanes = lanes_by_type.entry(local.ty).or_default();
 
-        let selected = lanes
-            .iter()
-            .enumerate()
-            .filter(|(_, lane)| lane.last < local.first)
-            .max_by_key(|(_, lane)| lane.last)
-            .map(|(idx, _)| idx);
+        let selected = if local.joins {
+            lanes
+                .iter()
+                .enumerate()
+                .filter(|(_, lane)| lane.last < local.first)
+                .max_by_key(|(_, lane)| lane.last)
+                .map(|(idx, _)| idx)
+        } else {
+            None
+        };
 
         if let Some(idx) = selected {
             let representative = lanes[idx].representative;
@@ -852,6 +891,45 @@ fn fs_main() -> @location(0) vec4f {
             1,
             "non-overlapping locals with same type should coalesce"
         );
+    }
+
+    /// A member-built uniform aggregate on a dead non-uniform lane makes the
+    /// barrier it gates non-uniform for tint (Dawn rejects, naga cannot see
+    /// it): such a local keeps its own declaration.
+    #[test]
+    fn partially_stored_aggregate_never_joins_a_lane() {
+        let source = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@group(0) @binding(1) var<uniform> U: vec2<u32>;
+@compute @workgroup_size(64) fn main(@builtin(local_invocation_id) lid: vec3u) {
+    var a: vec2u; a.x = lid.x; a.y = lid.y;
+    out[lid.x] = a.x + a.y;
+    var b: vec2u; b.x = U.x; b.y = U.y;
+    if (b.x + b.y > 1u) { workgroupBarrier(); out[lid.x] += 1u; }
+}
+"#;
+        let (_, module) = run_pass(source);
+        assert_eq!(
+            entry_local_ref_count(&module),
+            2,
+            "a partially stored aggregate must not take the earlier local's lane"
+        );
+
+        // Whole-value stores carry only their right-hand side: those still
+        // coalesce.
+        let whole = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@group(0) @binding(1) var<uniform> U: vec2<u32>;
+@compute @workgroup_size(64) fn main(@builtin(local_invocation_id) lid: vec3u) {
+    var a: vec2u; a = lid.xy;
+    out[lid.x] = a.x + a.y;
+    var b: vec2u; b = U;
+    if (b.x + b.y > 1u) { workgroupBarrier(); out[lid.x] += 1u; }
+}
+"#;
+        let (changed, module) = run_pass(whole);
+        assert!(changed);
+        assert_eq!(entry_local_ref_count(&module), 1);
     }
 
     #[test]
@@ -1480,7 +1558,7 @@ fn fs_main(@location(0) cond: f32) -> @location(0) vec4f {
             info_b.first,
         );
 
-        let alias = build_alias_map(&usage);
+        let alias = build_alias_map(&usage, false);
         assert!(
             alias.is_empty(),
             "overlapping locals should not be coalesced when TraceRay extends the range"
@@ -1627,7 +1705,7 @@ fn fs_main(@location(0) cond: f32) -> @location(0) vec4f {
             info_b.first,
         );
 
-        let alias = build_alias_map(&usage);
+        let alias = build_alias_map(&usage, false);
         assert!(
             alias.is_empty(),
             "overlapping locals should not be coalesced when CooperativeStore extends the range"
@@ -1787,7 +1865,7 @@ fn fs_main(@location(0) cond: f32) -> @location(0) vec4f {
             info_other.first,
         );
 
-        let alias = build_alias_map(&usage);
+        let alias = build_alias_map(&usage, false);
         assert!(
             !alias.contains_key(local_other) && !alias.contains_key(local_dest),
             "data.pointer-as-local must extend that local's live range so an overlapping \

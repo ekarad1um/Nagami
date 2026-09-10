@@ -9,6 +9,7 @@
 //! declaration has an entry (identity included), so an absent key means
 //! eliminated, never unchanged.
 
+use naga::proc::NameKey;
 use std::collections::{BTreeMap, HashMap};
 
 /// Module-scope renames composed across sweeps (`a -> b` then `b -> c`
@@ -54,9 +55,9 @@ pub struct StructRename {
     pub members: BTreeMap<String, String>,
 }
 
-/// Original-to-final map for every surviving module-scope symbol; produced
-/// only when the custom generator's output shipped (the naga-emitter
-/// fallback and the verbatim guard ship names this map would misreport).
+/// Original-to-final map for every surviving module-scope symbol; `None`
+/// when the shipped text carries no rename (a bailout, the verbatim guard).
+/// The naga-emitter fallback gets one spelled as that emitter prints.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NameMap {
     /// Entry-point names, always identity (pipeline-bound, never renamed).
@@ -76,50 +77,134 @@ pub struct NameMap {
 }
 
 impl NameMap {
-    /// From the FINAL module: module-scope names resolved back through
-    /// `log`, struct names from `structs`, constants filtered by
-    /// `live_const_names` (a constant can survive the IR with every use
-    /// folded away, leaving no declaration).  Preamble-owned symbols appear
-    /// as identity: their declarations live in the consumer's preamble.
+    /// From the FINAL module: names resolved back through `log` and printed
+    /// by `spell` (identity for the generator, naga's namer for its fallback);
+    /// `live_const_names` drops constants whose every use folded away and
+    /// left no declaration (`None`: all declared).  Preamble-owned symbols
+    /// appear as identity.
     pub(crate) fn assemble(
         module: &naga::Module,
         log: &NameLog,
         structs: BTreeMap<String, StructRename>,
-        live_const_names: &std::collections::HashSet<String>,
+        live_const_names: Option<&std::collections::HashSet<String>>,
+        spell: &dyn Fn(&str, NameKey) -> String,
     ) -> Self {
         let mut map = NameMap {
             structs,
             ..Default::default()
         };
-        let insert = |bucket: &mut BTreeMap<String, String>, current: &Option<String>| {
-            if let Some(current) = current {
-                let original = log.original_of(current).unwrap_or(current);
-                bucket.insert(original.to_string(), current.clone());
+        let insert = |bucket: &mut BTreeMap<String, String>, ir: &Option<String>, key: NameKey| {
+            if let Some(ir) = ir {
+                let original = log.original_of(ir).unwrap_or(ir);
+                bucket.insert(original.to_owned(), spell(ir, key));
             }
         };
-        for (_, gv) in module.global_variables.iter() {
-            insert(&mut map.globals, &gv.name);
+        for (h, gv) in module.global_variables.iter() {
+            insert(&mut map.globals, &gv.name, NameKey::GlobalVariable(h));
         }
-        for (_, f) in module.functions.iter() {
-            insert(&mut map.functions, &f.name);
+        for (h, f) in module.functions.iter() {
+            insert(&mut map.functions, &f.name, NameKey::Function(h));
         }
-        for (_, c) in module.constants.iter() {
-            if c.name
-                .as_deref()
-                .is_some_and(|n| live_const_names.contains(n))
+        for (h, c) in module.constants.iter() {
+            if live_const_names
+                .is_none_or(|live| c.name.as_deref().is_some_and(|n| live.contains(n)))
             {
-                insert(&mut map.constants, &c.name);
+                insert(&mut map.constants, &c.name, NameKey::Constant(h));
             }
         }
-        for (_, o) in module.overrides.iter() {
-            insert(&mut map.overrides, &o.name);
+        for (h, o) in module.overrides.iter() {
+            insert(&mut map.overrides, &o.name, NameKey::Override(h));
         }
-        for entry in module.entry_points.iter() {
-            map.entry_points
-                .insert(entry.name.clone(), entry.name.clone());
+        for (i, entry) in module.entry_points.iter().enumerate() {
+            map.entry_points.insert(
+                entry.name.clone(),
+                spell(&entry.name, NameKey::EntryPoint(i as u16)),
+            );
         }
         map
     }
+
+    /// The map for naga's emitter output: [`NameMap::assemble`] printed as
+    /// [`naga_spelling`] spells it, structs and members included (that
+    /// emitter keeps the IR's struct names and declares every constant).
+    pub(crate) fn assemble_naga_spelled(module: &naga::Module, log: &NameLog) -> Self {
+        let names = naga_spelling(module);
+        let spelled =
+            |ir: &str, key: NameKey| names.get(&key).cloned().unwrap_or_else(|| ir.to_owned());
+        let mut structs = BTreeMap::new();
+        for (h, ty) in module.types.iter() {
+            if let (Some(name), naga::TypeInner::Struct { members, .. }) =
+                (ty.name.as_deref(), &ty.inner)
+            {
+                // Inserts, not `collect`: a `BTreeMap` built from an iterator
+                // sorts first, a code path nothing else instantiates.
+                let mut member_map = BTreeMap::new();
+                for (i, m) in members.iter().enumerate() {
+                    if let Some(n) = m.name.as_deref() {
+                        member_map
+                            .insert(n.to_owned(), spelled(n, NameKey::StructMember(h, i as u32)));
+                    }
+                }
+                structs.insert(
+                    name.to_owned(),
+                    StructRename {
+                        name: spelled(name, NameKey::Type(h)),
+                        members: member_map,
+                    },
+                );
+            }
+        }
+        Self::assemble(module, log, structs, None, &spelled)
+    }
+}
+
+/// The names naga's WGSL back-end prints, keyed like the IR: its `Namer`
+/// suffixes reserved words and trailing digits (`fs1` -> `fs1_`) and numbers
+/// repeats.  The seeding must mirror `naga::back::wgsl::Writer`'s exactly.
+fn naga_spelling(module: &naga::Module) -> naga::FastHashMap<NameKey, String> {
+    let mut names = naga::FastHashMap::default();
+    naga::proc::Namer::default().reset(
+        module,
+        &naga::keywords::wgsl::RESERVED_SET,
+        &naga::keywords::wgsl::BUILTIN_IDENTIFIER_SET,
+        naga::proc::CaseInsensitiveKeywordSet::empty(),
+        &["__", "_naga"],
+        &mut names,
+    );
+    names
+}
+
+/// The first host-addressed name (entry point, named override, preserved
+/// global / function / constant / struct / member) naga's emitter would print
+/// differently from the IR, as `(ir, printed)`: such a fallback breaks the
+/// host's contract and never ships.  Under an identity log the spelled map's
+/// keys are the IR names (nagami never renames these kinds).
+pub(crate) fn naga_respelled_interface_name(
+    module: &naga::Module,
+    preserve: &[String],
+) -> Option<(String, String)> {
+    let map = NameMap::assemble_naga_spelled(module, &NameLog::default());
+    let differs = |(k, v): (&String, &String)| (k != v).then(|| (k.clone(), v.clone()));
+    let preserved = |(k, _): &(&String, &String)| preserve.contains(k);
+    map.entry_points
+        .iter()
+        .chain(map.overrides.iter())
+        .find_map(differs)
+        .or_else(|| {
+            map.globals
+                .iter()
+                .chain(map.functions.iter())
+                .chain(map.constants.iter())
+                .filter(preserved)
+                .find_map(differs)
+        })
+        .or_else(|| {
+            map.structs.iter().find_map(|(k, s)| {
+                (preserve.contains(k) && &s.name != k)
+                    .then(|| (k.clone(), s.name.clone()))
+                    .or_else(|| s.members.iter().filter(preserved).find_map(differs))
+            })
+        })
 }
 
 #[cfg(test)]
@@ -144,6 +229,39 @@ mod tests {
         log.record_batch(&[("a".into(), "b".into()), ("x".into(), "a".into())]);
         assert_eq!(log.original_of("b"), Some("orig"));
         assert_eq!(log.original_of("a"), Some("x"));
+    }
+
+    /// The fallback's map says what naga's namer printed (`A1` -> `A1_`), and
+    /// a respelled host-visible name blocks the fallback.
+    #[test]
+    fn naga_spelled_map_reads_the_emitter_suffixes() {
+        let module = naga::front::wgsl::parse_str(
+            "struct S1 { m1: f32 }\n\
+             @group(0) @binding(0) var<uniform> A1: S1;\n\
+             fn f1() -> f32 { return A1.m1; }\n\
+             @fragment fn fs() -> @location(0) vec4f { return vec4f(f1()); }",
+        )
+        .expect("parses");
+        let mut log = NameLog::default();
+        log.record_batch(&[("tint".into(), "A1".into())]);
+        let map = NameMap::assemble_naga_spelled(&module, &log);
+        assert_eq!(map.globals["tint"], "A1_");
+        assert_eq!(map.functions["f1"], "f1_");
+        assert_eq!(map.structs["S1"].name, "S1_");
+        assert_eq!(map.structs["S1"].members["m1"], "m1_");
+        assert_eq!(map.entry_points["fs"], "fs");
+        let info = crate::io::validate_module(&module).expect("valid");
+        let text =
+            naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
+                .expect("naga prints it");
+        for printed in ["A1_", "fn f1_", "struct S1_", "m1_"] {
+            assert!(text.contains(printed), "{printed} in {text}");
+        }
+        assert_eq!(
+            naga_respelled_interface_name(&module, &["A1".to_owned()]),
+            Some(("A1".to_owned(), "A1_".to_owned()))
+        );
+        assert_eq!(naga_respelled_interface_name(&module, &[]), None);
     }
 
     #[test]
