@@ -9,6 +9,7 @@ export function registerPWA(): void {
     immediate: true,
     onRegisteredSW(_swUrl, registration) {
       if (!registration) return;
+      caches.delete("nagami-wasm").catch(() => {});
       // update() rejects offline; expected.
       const check = () => registration.update().catch(() => {});
       check();

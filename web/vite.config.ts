@@ -44,19 +44,30 @@ export default defineConfig({
       workbox: {
         skipWaiting: true,
         clientsClaim: false,
-        globPatterns: ["**/*.{js,css,html,svg,wgsl}"],
+        globPatterns: ["**/*.{js,css,html,svg,wgsl,wasm}"],
+        maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
+        manifestTransforms: [
+          (entries) => {
+            if (!entries.some((e) => e.url.endsWith(".wasm")))
+              throw new Error("wasm missing from the precache manifest");
+            return { manifest: entries };
+          },
+        ],
         cleanupOutdatedCaches: true,
-        // Single route: the precache already serves / offline, and a fallback
-        // would answer /llms.txt, /robots.txt and friends with the app shell.
+        directoryIndex: null,
+        navigationPreload: true,
         navigateFallback: null,
         runtimeCaching: [
           {
-            urlPattern: ({ url }) => url.pathname.endsWith(".wasm"),
-            handler: "CacheFirst",
+            urlPattern: ({ request, url }) =>
+              request.mode === "navigate" &&
+              (url.pathname === "/" || url.pathname === "/index.html"),
+            handler: "NetworkFirst",
             options: {
-              cacheName: "nagami-wasm",
-              expiration: { maxEntries: 4, maxAgeSeconds: 60 * 60 * 24 },
-              cacheableResponse: { statuses: [200] },
+              cacheName: "nagami-shell",
+              networkTimeoutSeconds: 3,
+              expiration: { maxEntries: 4 },
+              precacheFallback: { fallbackURL: "index.html" },
             },
           },
         ],

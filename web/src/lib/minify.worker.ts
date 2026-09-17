@@ -60,7 +60,10 @@ ctx.onmessage = (e: MessageEvent<RunRequest | InitMessage>) => {
       await ready;
     } catch (err) {
       // Fatal so the host retries the load with a fresh worker.
-      return die(id, `Minifier failed to start: ${message(err)}`);
+      return die(
+        id,
+        `Minifier failed to start: ${message(err)}\nReload the page if this persists.`,
+      );
     }
     try {
       const output = wasmRun(source, config);
