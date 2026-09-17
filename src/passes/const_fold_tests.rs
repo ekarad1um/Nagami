@@ -1431,7 +1431,8 @@ fn fs_main() -> @location(0) vec4f {
     // validator cannot analyse; the pass reads no info, so an empty one
     // stands in.
     let config = Config::default();
-    let info = naga::valid::ModuleInfo::default();
+    let info = crate::pipeline::ModuleInfoCell::new(naga::valid::ModuleInfo::default());
+    let analyses = crate::pipeline::AnalysisCache::default();
     let changed = ConstFoldPass
         .run(
             &mut module,
@@ -1440,6 +1441,7 @@ fn fs_main() -> @location(0) vec4f {
                 info: &info,
                 name_log: None,
                 tail: None,
+                analyses: &analyses,
             },
         )
         .expect("const fold pass should run");

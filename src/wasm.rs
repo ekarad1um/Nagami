@@ -346,12 +346,16 @@ export interface NagamiError extends Error {
 
 export interface PassReport {
     passName: string;
+    /** naga's rendering of the module before the pass, in bytes; null unless `trace` or `validateEachPass` is on. */
     beforeBytes: number | null;
+    /** The same after the pass; for `generator_emit` the output's size, always. */
     afterBytes: number | null;
+    /** The pass changed the module; for `generator_emit`, the output differs from the input. */
     changed: boolean;
     durationUs: number;
     validationOk: boolean;
     textValidationOk: boolean | null;
+    /** The pipeline reverted the pass; for `generator_emit`, a fallback shipped instead of the generator's text. */
     rolledBack: boolean;
 }
 

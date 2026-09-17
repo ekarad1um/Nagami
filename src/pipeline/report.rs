@@ -8,13 +8,17 @@
 pub struct PassReport {
     /// Stable pass identifier (e.g. `constant_folding`, `generator_emit`).
     pub pass_name: String,
-    /// Emitted WGSL byte size before the pass ran.  `None` when tracing
-    /// is off (no text is emitted on the hot path).
+    /// Emitted WGSL byte size before the pass ran: naga's rendering of the
+    /// module, for `generator_emit` of the optimized module it prints.
+    /// `None` off the trace and validate-each-pass paths (no text is
+    /// emitted on the hot path).
     pub before_bytes: Option<usize>,
-    /// Emitted WGSL byte size after the pass ran; `None` when tracing is off.
+    /// Emitted WGSL byte size after the pass ran; `None` off those paths,
+    /// except for `generator_emit`, whose text is the output.
     pub after_bytes: Option<usize>,
     /// `true` when the pass modified the module (either declared a
-    /// change or produced different output text).
+    /// change or produced different output text); for `generator_emit`,
+    /// when the output differs from the input.
     pub changed: bool,
     /// Wall-clock time spent in the pass, in microseconds.  Zero on
     /// the wasm target where no high-resolution clock is available.
@@ -25,7 +29,9 @@ pub struct PassReport {
     /// when `validate_each_pass` is off.
     pub text_validation_ok: Option<bool>,
     /// `true` when the pipeline reverted the pass after a validation
-    /// failure (only possible when `validate_each_pass` is off).
+    /// failure (only possible when `validate_each_pass` is off); for
+    /// `generator_emit`, when naga's text or the compacted input shipped
+    /// instead of the generator's.
     pub rolled_back: bool,
 }
 

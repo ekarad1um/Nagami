@@ -2,11 +2,12 @@
 //! bindings regardless of byte cost - loads whose place is written before a
 //! use, and work a use would drag into a loop.
 
+use super::twins::Twins;
 use crate::analysis::{Effect, FnEffects, statement_effects};
 use crate::handle_set::{HandleMap, HandleSet};
 use crate::ir::visit::visit_expression_children;
 use crate::ir::visit::{Scope, Slot, Visitor, walk_block};
-use crate::passes::expr_util::{const_index_value, is_expensive_expr};
+use crate::passes::expr_util::{RefCount, const_index_value, is_expensive_expr};
 use rustc_hash::FxHashMap;
 
 /// A pointer's memory location: a root variable plus one level of refinement.
@@ -486,7 +487,7 @@ pub(super) fn compute_must_bind(
     func: &naga::Function,
     module: &naga::Module,
     fn_effects: &[FnEffects],
-    ref_counts: &[usize],
+    ref_counts: &[RefCount],
 ) -> HandleSet<naga::Expression> {
     let mut analysis = LoadAnalysis {
         expressions: &func.expressions,
@@ -561,14 +562,14 @@ pub(super) enum Bindings<'a> {
     /// chain rooted at a variable never binds and is walked through.  The
     /// bytes may still inline such a consumer, so work it holds is pinned
     /// when reached from a loop all the same.
-    Modelled { ref_counts: &'a [usize] },
+    Modelled { ref_counts: &'a [RefCount] },
     /// After it rendered: the names the emitter gave, a stashed call's
     /// text (`stashed`) being no name.  Exact, so what renders as a name
     /// is never reported.
     Rendered {
         names: &'a HandleMap<naga::Expression, String>,
         stashed: &'a HandleSet<naga::Expression>,
-        twins: &'a HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
+        twins: &'a Twins,
     },
 }
 
@@ -588,9 +589,7 @@ impl Bindings<'_> {
     fn reuses(&self, h: naga::Handle<naga::Expression>) -> bool {
         match self {
             Bindings::Modelled { .. } => false,
-            Bindings::Rendered { names, twins, .. } => {
-                twins.contains_key(h) && names.contains_key(h)
-            }
+            Bindings::Rendered { names, twins, .. } => twins.is_twin(h) && names.contains_key(h),
         }
     }
 

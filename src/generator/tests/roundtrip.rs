@@ -183,11 +183,7 @@ fn call_with_ptr_blocks_deferral() {
             }
         "#;
     let out = compact(src);
-    // TODO: upgrade to assert_valid_wgsl once compactor emits `*p` (Load) correctly
-    assert!(
-        naga::front::wgsl::parse_str(&out).is_ok(),
-        "re-parse failed: {out}"
-    );
+    assert_valid_wgsl(&out);
 }
 
 #[test]
@@ -249,8 +245,6 @@ fn atomic_add_roundtrip() {
 
 #[test]
 fn atomic_compare_exchange_roundtrip() {
-    // TODO: upgrade to assert_valid_wgsl once naga stops naming the return
-    // struct `__atomic_compare_exchange_result` (reserved `__` prefix).
     let src = r#"
             @group(0) @binding(0) var<storage, read_write> val: atomic<u32>;
             @compute @workgroup_size(1)
@@ -264,6 +258,7 @@ fn atomic_compare_exchange_roundtrip() {
         out.contains("atomicCompareExchangeWeak(&"),
         "atomicCompareExchangeWeak with & pointer should be present: {out}"
     );
+    assert_valid_wgsl(&out);
 }
 
 // MARK: workgroupUniformLoad

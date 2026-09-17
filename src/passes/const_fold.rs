@@ -60,14 +60,14 @@ impl Pass for ConstFoldPass {
             constant_literals(module)
         };
 
-        crate::ir::visit::for_each_function_taken(module, &mut |function, module| {
+        crate::ir::visit::for_each_function_taken(module, &mut |body, function, module| {
             // The identity gate keys on the pre-fold graph, not on mid-loop
             // partial rewrites; a fold replaces an expression with one of the
             // same type, so the index bounds sized here hold through the run.
             let census = reference_census(function);
             let emit_ranges = build_emit_range_map(&function.body, function.expressions.len());
             let zero_locals = zero_init_locals(function, &census);
-            let access_lens = super::expr_util::access_static_lengths(function, module);
+            let access_lens = ctx.access_lens(body, function, module);
             let (folded, simplified) = fold_local_expressions(
                 &mut function.expressions,
                 &census.counts,

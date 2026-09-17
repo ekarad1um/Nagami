@@ -14,6 +14,7 @@ mod names_and_output;
 mod pipeline;
 mod precedence;
 mod price;
+mod reuse;
 mod roundtrip;
 mod statements;
 mod textures;

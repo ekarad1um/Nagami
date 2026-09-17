@@ -12,7 +12,7 @@ use crate::io;
 mod context;
 mod report;
 
-pub use context::{PassContext, TailRender};
+pub use context::{AnalysisCache, ModuleInfoCell, PassContext, Rendered, TailRender};
 pub use report::{PassReport, Report};
 
 /// Hard cap on sweeps; real pipelines converge well under it.
@@ -68,10 +68,29 @@ enum Sweeps {
     Once,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Validation {
+    /// After every declared change, before the next pass runs; a failure
+    /// rolls that pass back on the spot.  Trace and CI runs, whose
+    /// per-pass text needs the info, and the re-run that locates the
+    /// failure a lazy run met.
+    PerPass,
+    /// When a pass reads the info and once at the end: most passes never
+    /// read it.  A failure cannot say which pass is at fault, so the
+    /// pipeline is re-run per pass from a backup.
+    Lazy,
+}
+
+#[derive(Clone, Copy)]
+struct Shared<'a> {
+    cell: &'a ModuleInfoCell,
+    name_log: &'a std::cell::RefCell<crate::name_map::NameLog>,
+    tail: &'a TailRender,
+    analyses: &'a AnalysisCache,
+}
+
 /// Run the IR pipeline: [`crate::passes::build_ir_passes`] to a fixed
-/// point, then [`crate::passes::build_tail_passes`] once.  Every declared
-/// change is validated; a failure rolls back, or escalates under
-/// [`crate::config::TraceConfig::validate_each_pass`].  `info` must
+/// point, then [`crate::passes::build_tail_passes`] once.  `info` must
 /// describe `module` as passed in; the returned info describes it as
 /// returned, so a caller never validates the same state twice.
 pub fn run_ir_passes(
@@ -81,50 +100,147 @@ pub fn run_ir_passes(
     report: &mut Report,
     preamble_names: std::collections::HashSet<String>,
 ) -> Result<Converged, Error> {
-    let name_log = std::cell::RefCell::new(crate::name_map::NameLog::default());
     let tail = TailRender {
         preamble_names,
-        type_uses: std::cell::RefCell::new(None),
+        ..TailRender::default()
     };
-    let passes = crate::passes::build_ir_passes(config);
-    let mut info = run_ir_passes_with(
+    let mut passes = crate::passes::build_ir_passes(config);
+    let mut tail_passes = crate::passes::build_tail_passes(config);
+    run_lists(
         module,
         info,
         config,
         report,
-        passes,
-        (&name_log, &tail),
-        Sweeps::ToFixedPoint,
-    )?;
-    let tail_passes = crate::passes::build_tail_passes(config);
-    if !tail_passes.is_empty() {
-        info = run_ir_passes_with(
+        &tail,
+        &mut passes,
+        &mut tail_passes,
+    )
+}
+
+/// [`run_ir_passes`] over explicit pass lists.  Every declared change is
+/// validated: per pass where a mode needs the per-pass info, lazily
+/// otherwise.  A lazy run that meets an invalid module is discarded and
+/// redone per pass from a backup, which reports and rolls back the pass
+/// at fault as the per-pass run always did, so the lazy run has no
+/// observable outcome of its own.
+fn run_lists(
+    module: &mut naga::Module,
+    info: naga::valid::ModuleInfo,
+    config: &Config,
+    report: &mut Report,
+    tail: &TailRender,
+    passes: &mut [Box<dyn Pass>],
+    tail_passes: &mut [Box<dyn Pass>],
+) -> Result<Converged, Error> {
+    let name_log = std::cell::RefCell::new(crate::name_map::NameLog::default());
+    let analyses = AnalysisCache::default();
+    let per_pass = config.trace.enabled || config.trace.validate_each_pass;
+    let mut cell = ModuleInfoCell::new(info);
+    if !per_pass {
+        let backup = module.clone();
+        let reports = report.pass_reports.len();
+        let converged = report.converged;
+        let shared = Shared {
+            cell: &cell,
+            name_log: &name_log,
+            tail,
+            analyses: &analyses,
+        };
+        match run_both(
             module,
-            info,
             config,
             report,
+            shared,
+            passes,
             tail_passes,
-            (&name_log, &tail),
-            Sweeps::Once,
-        )?;
+            Validation::Lazy,
+        ) {
+            Err(_) if cell.failed() => {}
+            outcome => {
+                let info = outcome?;
+                return Ok(Converged {
+                    name_log: name_log.into_inner(),
+                    info,
+                    render: tail.render.take(),
+                });
+            }
+        }
+        // Back to the pre-run state: the report entries, the renames and
+        // the tail's render were the discarded run's.
+        *module = backup;
+        *name_log.borrow_mut() = crate::name_map::NameLog::default();
+        report.pass_reports.truncate(reports);
+        report.converged = converged;
+        *tail.render.borrow_mut() = None;
+        analyses.clear();
+        cell = ModuleInfoCell::new(io::validate_module(module)?);
     }
+    let shared = Shared {
+        cell: &cell,
+        name_log: &name_log,
+        tail,
+        analyses: &analyses,
+    };
+    let info = run_both(
+        module,
+        config,
+        report,
+        shared,
+        passes,
+        tail_passes,
+        Validation::PerPass,
+    )?;
     Ok(Converged {
         name_log: name_log.into_inner(),
         info,
-        type_uses: tail.type_uses.into_inner(),
+        render: tail.render.take(),
     })
 }
 
+/// The IR list to a fixed point, the tail once, then the info of the
+/// result.
+fn run_both(
+    module: &mut naga::Module,
+    config: &Config,
+    report: &mut Report,
+    shared: Shared<'_>,
+    passes: &mut [Box<dyn Pass>],
+    tail_passes: &mut [Box<dyn Pass>],
+    validation: Validation,
+) -> Result<naga::valid::ModuleInfo, Error> {
+    run_ir_passes_with(
+        module,
+        config,
+        report,
+        passes,
+        shared,
+        Sweeps::ToFixedPoint,
+        validation,
+    )?;
+    if !tail_passes.is_empty() {
+        run_ir_passes_with(
+            module,
+            config,
+            report,
+            tail_passes,
+            shared,
+            Sweeps::Once,
+            validation,
+        )?;
+    }
+    shared.cell.take_or_validate(module)
+}
+
 /// What [`run_ir_passes`] leaves beside the module: the renames it made,
-/// naga's analysis of the result, and the type spellings the tail's
-/// render of it produced (`None` without that render).
+/// naga's analysis of the result, and the tail's render of it (`None`
+/// without that render).
 pub struct Converged {
     /// The module-scope renames, for the name map.
     pub name_log: crate::name_map::NameLog,
     /// Validation info describing the module as returned.
     pub info: naga::valid::ModuleInfo,
-    /// For [`crate::generator::GenerateOptions::type_uses`].
-    pub type_uses: Option<crate::generator::TypeUses>,
+    /// The tail's render, for the emission that ships.
+    pub render: Option<Rendered>,
 }
 
 /// A hash of the module's `Debug` rendering, the whole IR included: the
@@ -141,23 +257,30 @@ fn module_fingerprint(module: &naga::Module) -> u64 {
 /// Driver parameterised on the pass list so tests can inject synthetic passes.
 fn run_ir_passes_with(
     module: &mut naga::Module,
-    info: naga::valid::ModuleInfo,
     config: &Config,
     report: &mut Report,
-    mut passes: Vec<Box<dyn Pass>>,
-    (name_log, tail): (&std::cell::RefCell<crate::name_map::NameLog>, &TailRender),
+    passes: &mut [Box<dyn Pass>],
+    shared: Shared<'_>,
     sweep_policy: Sweeps,
-) -> Result<naga::valid::ModuleInfo, Error> {
+    validation: Validation,
+) -> Result<(), Error> {
+    let Shared {
+        cell,
+        name_log,
+        tail,
+        analyses,
+    } = shared;
     let trace_run_dir = prepare_trace_dir(config)?;
     let mut sweeps = 0usize;
     let trace_enabled = config.trace.enabled;
     let needs_text_validation = config.trace.validate_each_pass;
     // Trace / CI runs report every pass; the plain path skips idle ones.
     let full_fidelity = trace_enabled || needs_text_validation;
-
-    // Always describes the current `module`: replaced on every accepted
-    // change, and a rollback restores the state it was computed for.
-    let mut current_info = info;
+    let lazy = validation == Validation::Lazy;
+    debug_assert!(
+        !(lazy && full_fidelity),
+        "per-pass text needs per-pass info"
+    );
 
     // `version` counts accepted changes; `clean_at[i]` is the version at
     // which pass `i` last contributed none (no change, or rejected).  Passes
@@ -166,13 +289,14 @@ fn run_ir_passes_with(
     let mut version = 0u64;
     let mut clean_at: Vec<Option<u64>> = vec![None; passes.len()];
 
-    // Rollback state: module + name log (a stale log would report renames
-    // the shipped names lack) as of the run start, plus every accepted pass
-    // run since, in order.  A failure restores it and replays exactly those:
-    // determinism rebuilds the pre-pass state, and a rejected pass never
-    // joins the list, so a second failure cannot resurrect the first one's
-    // output.  Cloned once per run, never under `validate_each_pass`, where
-    // every failure is an `Err`.
+    // Per-pass rollback state: module + name log (a stale log would report
+    // renames the shipped names lack) as of the run start, plus every
+    // accepted pass run since, in order.  A failure restores it and replays
+    // exactly those: determinism rebuilds the pre-pass state, and a rejected
+    // pass never joins the list, so a second failure cannot resurrect the
+    // first one's output.  Cloned once per run; not under
+    // `validate_each_pass`, where every failure is an `Err`, nor under lazy
+    // validation, whose failure redoes the pipeline from its own backup.
     let mut backup: Option<(naga::Module, crate::name_map::NameLog)> = None;
     let mut accepted: Vec<usize> = Vec::new();
 
@@ -194,12 +318,12 @@ fn run_ir_passes_with(
             if !full_fidelity && clean_at[i] == Some(version) {
                 continue;
             }
-            if backup.is_none() && !needs_text_validation {
+            if !lazy && backup.is_none() && !needs_text_validation {
                 backup = Some((module.clone(), name_log.borrow().clone()));
             }
 
             let before_text = if trace_enabled {
-                Some(emit_wgsl_with_info(module, &current_info)?)
+                Some(emit_wgsl_with_info(module, &*cell.get(module)?)?)
             } else {
                 None
             };
@@ -220,11 +344,21 @@ fn run_ir_passes_with(
                 module,
                 &PassContext {
                     config,
-                    info: &current_info,
+                    info: cell,
                     name_log: Some(name_log),
                     tail: Some(tail),
+                    analyses,
                 },
             )?;
+            // A pass may swallow the error a failed lazy validation returned
+            // it; the cell remembers, and the run stops here rather than
+            // pile more passes onto an invalid module.
+            if cell.failed() {
+                return Err(Error::Validation(format!(
+                    "pass '{}' read an invalid module",
+                    passes[i].name()
+                )));
+            }
             #[cfg(debug_assertions)]
             debug_assert!(
                 declared_changed || module_fingerprint(module) == fingerprint_before,
@@ -239,14 +373,21 @@ fn run_ir_passes_with(
             let mut rolled_back = false;
             let mut text_validation_ok = None;
 
-            // No declared change -> the module is still the state the last
-            // validation blessed, so only CI mode re-validates; an
-            // under-reporting pass trips the fingerprint debug_assert.
-            if declared_changed || needs_text_validation {
+            if lazy {
+                if declared_changed {
+                    cell.invalidate();
+                    analyses.clear();
+                    version += 1;
+                }
+            } else if declared_changed || needs_text_validation {
+                // No declared change -> the module is still the state the
+                // last validation blessed, so only CI mode re-validates; an
+                // under-reporting pass trips the fingerprint debug_assert.
                 match io::validate_module(module) {
                     Ok(info) => {
-                        current_info = info;
+                        cell.set(info);
                         if declared_changed {
+                            analyses.clear();
                             version += 1;
                             accepted.push(i);
                         }
@@ -278,18 +419,21 @@ fn run_ir_passes_with(
                             .expect("backup is taken whenever validate_each_pass is off");
                         *module = saved_module.clone();
                         *name_log.borrow_mut() = saved_log.clone();
-                        current_info = io::validate_module(module)?;
+                        analyses.clear();
+                        cell.set(io::validate_module(module)?);
                         for &earlier in &accepted {
                             passes[earlier].run(
                                 module,
                                 &PassContext {
                                     config,
-                                    info: &current_info,
+                                    info: cell,
                                     name_log: Some(name_log),
                                     tail: Some(tail),
+                                    analyses,
                                 },
                             )?;
-                            current_info = io::validate_module(module)?;
+                            analyses.clear();
+                            cell.set(io::validate_module(module)?);
                         }
                         validation_ok = false;
                         rolled_back = true;
@@ -308,7 +452,7 @@ fn run_ir_passes_with(
                     None
                 }
             } else if full_fidelity {
-                Some(emit_wgsl_with_info(module, &current_info)?)
+                Some(emit_wgsl_with_info(module, &*cell.get(module)?)?)
             } else {
                 None
             };
@@ -386,10 +530,16 @@ fn run_ir_passes_with(
 
         sweeps += 1;
         if sweep_policy == Sweeps::Once {
-            return Ok(current_info);
+            return Ok(());
         }
         if !any_changed || sweeps >= MAX_PIPELINE_SWEEPS {
             if sweeps >= MAX_PIPELINE_SWEEPS && any_changed {
+                // An invalid module can keep a lazy run's passes busy to
+                // the cap; the per-pass re-run judges that, not this
+                // warning.
+                if lazy {
+                    drop(cell.get(module)?);
+                }
                 report.converged = false;
                 // The report is observable on the `Err` path too, so the
                 // sweep count lands before the CI-mode escalation (a
@@ -408,7 +558,7 @@ fn run_ir_passes_with(
     }
 
     report.sweeps = sweeps;
-    Ok(current_info)
+    Ok(())
 }
 
 // MARK: Trace directory allocation
@@ -598,26 +748,21 @@ mod driver_tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use super::{Pass, PassContext, Sweeps, TailRender, run_ir_passes_with};
+    use super::{
+        AnalysisCache, ModuleInfoCell, Pass, PassContext, Shared, TailRender, Validation, run_both,
+        run_lists,
+    };
 
     fn run_to_fixed_point(
         module: &mut naga::Module,
         info: naga::valid::ModuleInfo,
         config: &Config,
         report: &mut Report,
-        passes: Vec<Box<dyn Pass>>,
+        mut passes: Vec<Box<dyn Pass>>,
     ) -> Result<naga::valid::ModuleInfo, Error> {
-        let name_log = std::cell::RefCell::new(crate::name_map::NameLog::default());
         let tail = TailRender::default();
-        run_ir_passes_with(
-            module,
-            info,
-            config,
-            report,
-            passes,
-            (&name_log, &tail),
-            Sweeps::ToFixedPoint,
-        )
+        run_lists(module, info, config, report, &tail, &mut passes, &mut [])
+            .map(|converged| converged.info)
     }
     use crate::config::Config;
     use crate::error::Error;
@@ -701,6 +846,39 @@ mod driver_tests {
                 naga::Span::UNDEFINED,
             );
             Ok(true)
+        }
+    }
+
+    /// Reads the module's info, counting the reads that succeed; never
+    /// changes anything.
+    struct ReadInfoPass(Rc<Cell<usize>>);
+
+    impl Pass for ReadInfoPass {
+        fn name(&self) -> &'static str {
+            "synthetic_read_info"
+        }
+        fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
+            ctx.info(module)?;
+            self.0.set(self.0.get() + 1);
+            Ok(false)
+        }
+    }
+
+    /// Reads the shared analysis of the first body and keeps every answer,
+    /// so a recomputed one cannot land at a freed address; never changes
+    /// anything.
+    struct ReadLensPass(Rc<std::cell::RefCell<Vec<super::context::AccessLens>>>);
+
+    impl Pass for ReadLensPass {
+        fn name(&self) -> &'static str {
+            "synthetic_read_lens"
+        }
+        fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
+            // The tiny module's one body, the entry point, is body 0.
+            let function = &module.entry_points[0].function;
+            let lens = ctx.access_lens(0, function, module);
+            self.0.borrow_mut().push(lens);
+            Ok(false)
         }
     }
 
@@ -905,5 +1083,193 @@ mod driver_tests {
                 "limit={limit}"
             );
         }
+    }
+
+    /// The report as the tests compare it: every field but the timing.
+    fn report_key(report: &Report) -> impl PartialEq + std::fmt::Debug {
+        (
+            report.converged,
+            report.sweeps,
+            report
+                .pass_reports
+                .iter()
+                .map(|p| {
+                    (
+                        p.pass_name.clone(),
+                        p.before_bytes,
+                        p.after_bytes,
+                        p.changed,
+                        p.validation_ok,
+                        p.text_validation_ok,
+                        p.rolled_back,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// The lazy driver is an optimisation of the per-pass one: module and
+    /// report agree whether the run is clean, meets an invalid module a
+    /// pass reads, or one nobody reads.
+    #[test]
+    fn lazy_and_per_pass_validation_agree() {
+        type Passes = Vec<Box<dyn Pass>>;
+        let lists: Vec<fn() -> Passes> = vec![
+            || vec![Box::new(AddLocalPass(0)), Box::new(AddLocalPass(1))],
+            || {
+                vec![
+                    Box::new(CorruptingPass),
+                    Box::new(ReadInfoPass(Rc::new(Cell::new(0)))),
+                ]
+            },
+            || vec![Box::new(AddLocalPass(0)), Box::new(CorruptingPass)],
+            || {
+                vec![
+                    Box::new(AddLocalPass(1)),
+                    Box::new(AddLocalPass(0)),
+                    Box::new(CorruptingPass),
+                    Box::new(ReadInfoPass(Rc::new(Cell::new(0)))),
+                ]
+            },
+        ];
+        let cfg = baseline_config(/*validate_each_pass=*/ false);
+        for (i, list) in lists.iter().enumerate() {
+            let mut lazy_module = parsed_module();
+            let mut lazy_report = Report::new(0);
+            let info = io::validate_module(&lazy_module).expect("valid input");
+            run_to_fixed_point(&mut lazy_module, info, &cfg, &mut lazy_report, list())
+                .expect("lazy run converges");
+
+            let mut module = parsed_module();
+            let mut report = Report::new(0);
+            let name_log = std::cell::RefCell::new(crate::name_map::NameLog::default());
+            let tail = TailRender::default();
+            let cell = ModuleInfoCell::new(io::validate_module(&module).expect("valid input"));
+            let analyses = AnalysisCache::default();
+            let shared = Shared {
+                cell: &cell,
+                name_log: &name_log,
+                tail: &tail,
+                analyses: &analyses,
+            };
+            run_both(
+                &mut module,
+                &cfg,
+                &mut report,
+                shared,
+                &mut list(),
+                &mut [],
+                Validation::PerPass,
+            )
+            .expect("per-pass run converges");
+
+            assert_eq!(report_key(&lazy_report), report_key(&report), "list {i}");
+            assert_eq!(
+                format!("{lazy_module:?}"),
+                format!("{module:?}"),
+                "list {i}"
+            );
+        }
+    }
+
+    /// Lazy validation pays once per read of a changed module, plus the
+    /// final one; per-pass validation pays once per change.
+    #[test]
+    fn lazy_validation_pays_per_read_not_per_change() {
+        let cfg = baseline_config(/*validate_each_pass=*/ false);
+        for (reads, expected) in [(false, 1), (true, 2)] {
+            let mut module = parsed_module();
+            let mut report = Report::new(0);
+            let name_log = std::cell::RefCell::new(crate::name_map::NameLog::default());
+            let tail = TailRender::default();
+            let cell = ModuleInfoCell::new(io::validate_module(&module).expect("valid input"));
+            let analyses = AnalysisCache::default();
+            let shared = Shared {
+                cell: &cell,
+                name_log: &name_log,
+                tail: &tail,
+                analyses: &analyses,
+            };
+            let mut passes: Vec<Box<dyn Pass>> = vec![Box::new(AddLocalPass(0))];
+            if reads {
+                passes.push(Box::new(ReadInfoPass(Rc::new(Cell::new(0)))));
+            }
+            passes.push(Box::new(AddLocalPass(1)));
+            if reads {
+                passes.push(Box::new(ReadInfoPass(Rc::new(Cell::new(0)))));
+            }
+            run_both(
+                &mut module,
+                &cfg,
+                &mut report,
+                shared,
+                &mut passes,
+                &mut [],
+                Validation::Lazy,
+            )
+            .expect("converges");
+            assert_eq!(cell.validations.get(), expected, "reads={reads}");
+        }
+    }
+
+    /// Passes that leave the module unchanged share an analysis; an
+    /// accepted change drops it.
+    #[test]
+    fn shared_analyses_survive_idle_passes_and_not_a_change() {
+        let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut module = parsed_module();
+        let cfg = baseline_config(/*validate_each_pass=*/ false);
+        let mut report = Report::new(0);
+        let passes: Vec<Box<dyn Pass>> = vec![
+            Box::new(ReadLensPass(Rc::clone(&seen))),
+            Box::new(ReadLensPass(Rc::clone(&seen))),
+            Box::new(AddLocalPass(0)),
+            Box::new(ReadLensPass(Rc::clone(&seen))),
+        ];
+        let info = io::validate_module(&module).expect("valid input");
+        run_to_fixed_point(&mut module, info, &cfg, &mut report, passes).expect("converges");
+        let seen = seen.borrow();
+        assert!(seen.len() >= 3, "{}", seen.len());
+        assert!(
+            Rc::ptr_eq(&seen[0], &seen[1]),
+            "idle passes share the entry"
+        );
+        assert!(!Rc::ptr_eq(&seen[1], &seen[2]), "a change drops it");
+    }
+
+    /// A pass reading an invalid module fails its read; the re-run per
+    /// pass names and rolls back the pass at fault, and the reader then
+    /// reads the restored module.
+    #[test]
+    fn a_read_of_an_invalid_module_names_the_pass_at_fault() {
+        let reads = Rc::new(Cell::new(0usize));
+        let mut module = parsed_module();
+        let cfg = baseline_config(/*validate_each_pass=*/ false);
+        let mut report = Report::new(0);
+        let passes: Vec<Box<dyn Pass>> = vec![
+            Box::new(CorruptingPass),
+            Box::new(ReadInfoPass(Rc::clone(&reads))),
+        ];
+        let info = io::validate_module(&module).expect("valid input");
+        run_to_fixed_point(&mut module, info, &cfg, &mut report, passes)
+            .expect("the rollback keeps the pipeline on the happy path");
+        io::validate_module(&module).expect("the corruption is rolled back");
+        assert_eq!(
+            reads.get(),
+            1,
+            "the reader succeeds once, after the rollback"
+        );
+        let names: Vec<_> = report
+            .pass_reports
+            .iter()
+            .map(|p| (p.pass_name.as_str(), p.rolled_back, p.validation_ok))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("synthetic_corrupt", true, false),
+                ("synthetic_read_info", false, true)
+            ]
+        );
     }
 }

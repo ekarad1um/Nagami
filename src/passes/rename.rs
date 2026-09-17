@@ -68,6 +68,7 @@ impl Pass for RenamePass {
             // boundary; a module the emitter declines keeps them.  The
             // preamble's declarations are left out as the shipped render
             // leaves them out, so the type spellings counted are its.
+            let info = ctx.info(module)?;
             let options = crate::generator::GenerateOptions {
                 preamble_names: ctx
                     .tail
@@ -75,14 +76,24 @@ impl Pass for RenamePass {
                     .unwrap_or_default(),
                 ..crate::generator::GenerateOptions::from_config(ctx.config)
             };
-            if let Ok(emission) =
-                crate::generator::generate(&plan.applied(module), ctx.info, options)
+            if let Ok(mut emission) =
+                crate::generator::generate(&plan.applied(module), &info, options)
             {
-                plan =
-                    plan_names_weighed(module, &self.preserve, self.mangle, emission.name_weights);
+                let weighed = plan_names_weighed(
+                    module,
+                    &self.preserve,
+                    self.mangle,
+                    std::mem::take(&mut emission.name_weights),
+                );
                 if let Some(tail) = ctx.tail {
-                    *tail.type_uses.borrow_mut() = Some(emission.type_uses);
+                    // Weighing that moved no name leaves this text the
+                    // shipped one, but for what its own spellings decide.
+                    *tail.render.borrow_mut() = Some(crate::pipeline::Rendered {
+                        names_kept: weighed.spells_like(&plan),
+                        emission,
+                    });
                 }
+                plan = weighed;
             }
         }
         Ok(plan.apply(module, ctx.name_log))
@@ -242,6 +253,21 @@ impl NamePlan {
             .enumerate()
             .map(|(i, t)| t.1 * (self.draw_len(rank + i + 1) - self.draw_len(rank + i)))
             .sum()
+    }
+
+    /// Whether `other` gives every target the name this plan gives it,
+    /// whatever their ranks: applying either yields the same module.
+    pub(crate) fn spells_like(&self, other: &NamePlan) -> bool {
+        // The declaration sequence numbers the targets of one module the
+        // same in every plan, so it aligns two rankings without a map.
+        fn by_sequence(plan: &NamePlan) -> Vec<&str> {
+            let mut names = vec![""; plan.targets.len()];
+            for ((_, _, seq), name) in plan.targets.iter().zip(&plan.names) {
+                names[*seq] = name;
+            }
+            names
+        }
+        self.targets.len() == other.targets.len() && by_sequence(self) == by_sequence(other)
     }
 
     /// A copy of `module` carrying the planned names.
@@ -578,7 +604,7 @@ fn compute_weights(module: &naga::Module) -> Weights {
     for (body, function) in all_functions(module).enumerate() {
         let (counts, _live) = live_expression_ref_counts(function);
         for (h, expr) in function.expressions.iter() {
-            w.reference(body, expr, counts[h.index()]);
+            w.reference(body, expr, counts[h.index()] as usize);
         }
     }
     w
@@ -1328,6 +1354,26 @@ fn f(x: f32) -> f32 {
             1,
             "exactly one local keeps the preserved name: {:?}",
             collect_declaration_names(&module)
+        );
+    }
+
+    #[test]
+    fn a_plan_spells_like_one_that_ranks_its_targets_differently() {
+        let module = naga::front::wgsl::parse_str(
+            "fn f(a: f32, b: f32) -> f32 { let c = a + b; return c * a; }",
+        )
+        .expect("source should parse");
+        let plan = plan_names(&module, &HashSet::new(), true);
+        assert!(plan.targets.len() >= 2);
+        let mut ranked = plan.clone();
+        ranked.targets.swap(0, 1);
+        ranked.names.swap(0, 1);
+        assert!(plan.spells_like(&ranked));
+        let mut moved = plan.clone();
+        moved.names.swap(0, 1);
+        assert!(
+            !moved.spells_like(&plan),
+            "a name on another target is another module"
         );
     }
 }

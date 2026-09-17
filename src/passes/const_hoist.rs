@@ -278,9 +278,10 @@ impl Pass for ConstHoistPass {
         // candidates `collect` left contiguous.
         let mut preserve = std::collections::HashSet::new();
         preserve.extend(ctx.config.preserve_symbols.iter().cloned());
+        let info = ctx.info(module)?;
         let plan = super::rename::plan_names(module, &preserve, ctx.config.mangle());
         let renamed = plan.applied(module);
-        let mut pricer = Pricer::new(&renamed, ctx.info, ctx.config, &plan);
+        let mut pricer = Pricer::new(&renamed, &info, ctx.config, &plan);
         let mut prices: Vec<Option<SitePrice>> = (0..candidates.len()).map(|_| None).collect();
         let mut start = 0;
         while start < candidates.len() {

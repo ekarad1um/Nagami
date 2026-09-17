@@ -733,8 +733,7 @@ impl<'a> Generator<'a> {
             Some(condition) => {
                 self.push_indent();
                 self.out.push_str("break if ");
-                let text = self.emit_expr(condition, ctx)?;
-                self.out.push_str(&text);
+                self.push_expr(condition, ctx)?;
                 self.out.push(';');
                 self.push_newline();
                 Ok(())
@@ -913,14 +912,13 @@ impl<'a> Generator<'a> {
             } => {
                 if accept.is_empty() && !reject.is_empty() {
                     self.out.push_str("if ");
-                    self.out
-                        .push_str(&self.emit_negated_condition(*condition, ctx)?);
+                    self.push_negated_condition(*condition, ctx)?;
                     self.open_brace();
                     self.generate_block(reject, ctx)?;
                     self.close_brace();
                 } else {
                     self.out.push_str("if ");
-                    self.out.push_str(&self.emit_expr(*condition, ctx)?);
+                    self.push_expr(*condition, ctx)?;
                     self.open_brace();
                     self.generate_block(accept, ctx)?;
                     self.close_brace();
@@ -957,7 +955,7 @@ impl<'a> Generator<'a> {
                 self.out.push_str("return");
                 if let Some(v) = value {
                     self.out.push(' ');
-                    self.out.push_str(&self.emit_expr(*v, ctx)?);
+                    self.push_expr(*v, ctx)?;
                 }
                 self.out.push(';');
             }
@@ -1020,8 +1018,7 @@ impl<'a> Generator<'a> {
                 self.out.push_str(&name);
                 self.push_assign();
                 self.out.push_str("workgroupUniformLoad(");
-                self.out
-                    .push_str(&self.emit_pointer_operand(*pointer, ctx)?);
+                self.push_pointer_operand(*pointer, ctx)?;
                 self.out.push_str(");");
                 ctx.expr_names.insert(*result, name);
             }
@@ -1032,7 +1029,7 @@ impl<'a> Generator<'a> {
                 self.push_assign();
                 self.out.push_str("subgroupBallot(");
                 if let Some(pred) = predicate {
-                    self.out.push_str(&self.emit_expr(*pred, ctx)?);
+                    self.push_expr(*pred, ctx)?;
                 }
                 self.out.push_str(");");
                 ctx.expr_names.insert(*result, name);
@@ -1051,8 +1048,7 @@ impl<'a> Generator<'a> {
                 self.out.push_str(fn_name);
                 self.out.push('(');
                 let arg_hint = self.expr_scalar_hint(*result, ctx);
-                self.out
-                    .push_str(&self.emit_expr_with_scalar_hint(*argument, arg_hint, ctx)?);
+                self.push_expr_with_scalar_hint(*argument, arg_hint, ctx)?;
                 self.out.push_str(");");
                 ctx.expr_names.insert(*result, name);
             }
@@ -1070,16 +1066,14 @@ impl<'a> Generator<'a> {
                 self.out.push_str(fn_name);
                 self.out.push('(');
                 let arg_hint = self.expr_scalar_hint(*result, ctx);
-                self.out
-                    .push_str(&self.emit_expr_with_scalar_hint(*argument, arg_hint, ctx)?);
+                self.push_expr_with_scalar_hint(*argument, arg_hint, ctx)?;
                 if let Some(idx) = index {
                     self.out.push_str(sep);
                     let u32_hint = Some(naga::Scalar {
                         kind: naga::ScalarKind::Uint,
                         width: 4,
                     });
-                    self.out
-                        .push_str(&self.emit_expr_with_scalar_hint(idx, u32_hint, ctx)?);
+                    self.push_expr_with_scalar_hint(idx, u32_hint, ctx)?;
                 }
                 self.out.push_str(");");
                 ctx.expr_names.insert(*result, name);
@@ -1092,13 +1086,11 @@ impl<'a> Generator<'a> {
                 } => {
                     let sep = self.comma_sep();
                     self.out.push_str("traceRay(");
-                    self.out
-                        .push_str(&self.emit_expr(*acceleration_structure, ctx)?);
+                    self.push_expr(*acceleration_structure, ctx)?;
                     self.out.push_str(sep);
-                    self.out.push_str(&self.emit_expr(*descriptor, ctx)?);
+                    self.push_expr(*descriptor, ctx)?;
                     self.out.push_str(sep);
-                    self.out
-                        .push_str(&self.emit_pointer_operand(*payload, ctx)?);
+                    self.push_pointer_operand(*payload, ctx)?;
                     self.out.push_str(");");
                 }
             },
@@ -1188,7 +1180,7 @@ impl<'a> Generator<'a> {
                 &self.options.float_precision,
             ));
         } else {
-            self.out.push_str(&self.emit_expr(*selector, ctx)?);
+            self.push_expr(*selector, ctx)?;
         }
         self.open_brace();
         let mut new_case = true;
@@ -1297,10 +1289,10 @@ impl<'a> Generator<'a> {
                             &self.options.float_precision,
                         ));
                     } else {
-                        self.out.push_str(&self.emit_expr(*value, ctx)?);
+                        self.push_expr(*value, ctx)?;
                     }
                 } else {
-                    self.out.push_str(&self.emit_expr(*value, ctx)?);
+                    self.push_expr(*value, ctx)?;
                 }
             }
             self.out.push(';');
@@ -1322,7 +1314,7 @@ impl<'a> Generator<'a> {
         // Decide the form before rendering the lvalue: the decision reads the
         // binding map, which rendering may extend.
         let compound = self.try_compound_assign(pointer, value, ctx);
-        self.out.push_str(&self.emit_lvalue(pointer, ctx)?);
+        self.push_lvalue(pointer, ctx)?;
         if let Some((cop, other)) = compound {
             if let Some(inc) = self.try_increment(cop, other, value, ctx) {
                 self.out.push_str(inc);
@@ -1331,12 +1323,11 @@ impl<'a> Generator<'a> {
                 self.out.push_str(sp);
                 self.out.push_str(cop);
                 self.out.push_str(sp);
-                self.out
-                    .push_str(&self.emit_compound_assign_rhs(cop, other, ctx)?);
+                self.push_compound_assign_rhs(cop, other, ctx)?;
             }
         } else {
             self.push_assign();
-            self.out.push_str(&self.emit_expr(value, ctx)?);
+            self.push_expr(value, ctx)?;
         }
         Ok(())
     }
@@ -1352,15 +1343,15 @@ impl<'a> Generator<'a> {
     ) -> Result<(), Error> {
         let sep = self.comma_sep();
         self.out.push_str("textureStore(");
-        self.out.push_str(&self.emit_expr(image, ctx)?);
+        self.push_expr(image, ctx)?;
         self.out.push_str(sep);
-        self.out.push_str(&self.emit_expr(coordinate, ctx)?);
+        self.push_expr(coordinate, ctx)?;
         if let Some(index) = array_index {
             self.out.push_str(sep);
-            self.out.push_str(&self.emit_expr(index, ctx)?);
+            self.push_expr(index, ctx)?;
         }
         self.out.push_str(sep);
-        self.out.push_str(&self.emit_expr(value, ctx)?);
+        self.push_expr(value, ctx)?;
         self.out.push(')');
         Ok(())
     }
@@ -1388,18 +1379,18 @@ impl<'a> Generator<'a> {
                 compare: Some(compare),
             } => {
                 let mut call = String::from("atomicCompareExchangeWeak(&");
-                call.push_str(&self.emit_expr(*pointer, ctx)?);
+                self.emit_expr_into(*pointer, ctx, &mut call)?;
                 call.push_str(sep);
                 if let Some(scalar) = atomic_scalar {
-                    call.push_str(&self.emit_expr_for_atomic(compare, scalar, ctx)?);
+                    self.emit_expr_for_atomic_into(compare, scalar, ctx, &mut call)?;
                 } else {
-                    call.push_str(&self.emit_expr(compare, ctx)?);
+                    self.emit_expr_into(compare, ctx, &mut call)?;
                 }
                 call.push_str(sep);
                 if let Some(scalar) = atomic_scalar {
-                    call.push_str(&self.emit_expr_for_atomic(*value, scalar, ctx)?);
+                    self.emit_expr_for_atomic_into(*value, scalar, ctx, &mut call)?;
                 } else {
-                    call.push_str(&self.emit_expr(*value, ctx)?);
+                    self.emit_expr_into(*value, ctx, &mut call)?;
                 }
                 call.push(')');
                 self.emit_call_result(&call, *result, ctx);
@@ -1408,12 +1399,12 @@ impl<'a> Generator<'a> {
         };
         let mut call = String::from(fn_name);
         call.push('(');
-        call.push_str(&self.emit_pointer_operand(*pointer, ctx)?);
+        self.emit_pointer_operand_into(*pointer, ctx, &mut call)?;
         call.push_str(sep);
         if let Some(scalar) = atomic_scalar {
-            call.push_str(&self.emit_expr_for_atomic(*value, scalar, ctx)?);
+            self.emit_expr_for_atomic_into(*value, scalar, ctx, &mut call)?;
         } else {
-            call.push_str(&self.emit_expr(*value, ctx)?);
+            self.emit_expr_into(*value, ctx, &mut call)?;
         }
         call.push(')');
         self.emit_call_result(&call, *result, ctx);
@@ -1444,24 +1435,24 @@ impl<'a> Generator<'a> {
             } => {
                 let sep = self.comma_sep();
                 let mut call = String::from("textureAtomicCompareExchangeWeak(");
-                call.push_str(&self.emit_expr(*image, ctx)?);
+                self.emit_expr_into(*image, ctx, &mut call)?;
                 call.push_str(sep);
-                call.push_str(&self.emit_expr(*coordinate, ctx)?);
+                self.emit_expr_into(*coordinate, ctx, &mut call)?;
                 if let Some(index) = array_index {
                     call.push_str(sep);
-                    call.push_str(&self.emit_expr(*index, ctx)?);
+                    self.emit_expr_into(*index, ctx, &mut call)?;
                 }
                 call.push_str(sep);
                 if let Some(scalar) = image_atomic_scalar {
-                    call.push_str(&self.emit_expr_for_atomic(compare, scalar, ctx)?);
+                    self.emit_expr_for_atomic_into(compare, scalar, ctx, &mut call)?;
                 } else {
-                    call.push_str(&self.emit_expr(compare, ctx)?);
+                    self.emit_expr_into(compare, ctx, &mut call)?;
                 }
                 call.push_str(sep);
                 if let Some(scalar) = image_atomic_scalar {
-                    call.push_str(&self.emit_expr_for_atomic(*value, scalar, ctx)?);
+                    self.emit_expr_for_atomic_into(*value, scalar, ctx, &mut call)?;
                 } else {
-                    call.push_str(&self.emit_expr(*value, ctx)?);
+                    self.emit_expr_into(*value, ctx, &mut call)?;
                 }
                 call.push(')');
                 self.out.push_str(&call);
@@ -1472,19 +1463,18 @@ impl<'a> Generator<'a> {
         let sep = self.comma_sep();
         self.out.push_str(fn_name);
         self.out.push('(');
-        self.out.push_str(&self.emit_expr(*image, ctx)?);
+        self.push_expr(*image, ctx)?;
         self.out.push_str(sep);
-        self.out.push_str(&self.emit_expr(*coordinate, ctx)?);
+        self.push_expr(*coordinate, ctx)?;
         if let Some(index) = array_index {
             self.out.push_str(sep);
-            self.out.push_str(&self.emit_expr(*index, ctx)?);
+            self.push_expr(*index, ctx)?;
         }
         self.out.push_str(sep);
         if let Some(scalar) = image_atomic_scalar {
-            self.out
-                .push_str(&self.emit_expr_for_atomic(*value, scalar, ctx)?);
+            self.push_expr_for_atomic(*value, scalar, ctx)?;
         } else {
-            self.out.push_str(&self.emit_expr(*value, ctx)?);
+            self.push_expr(*value, ctx)?;
         }
         self.out.push_str(");");
         Ok(())
@@ -1518,10 +1508,9 @@ impl<'a> Generator<'a> {
                 self.out.push_str("rayQueryInitialize(&");
                 self.out.push_str(&query_text);
                 self.out.push_str(sep);
-                self.out
-                    .push_str(&self.emit_expr(*acceleration_structure, ctx)?);
+                self.push_expr(*acceleration_structure, ctx)?;
                 self.out.push_str(sep);
-                self.out.push_str(&self.emit_expr(*descriptor, ctx)?);
+                self.push_expr(*descriptor, ctx)?;
                 self.out.push_str(");");
             }
             naga::RayQueryFunction::Proceed { result } => {
@@ -1542,11 +1531,7 @@ impl<'a> Generator<'a> {
                 // naga's lowerer propagates no expected type into this argument,
                 // so a bare literal would concretize to i32 ("Hit distance must
                 // be an f32").
-                self.out.push_str(&self.emit_expr_with_scalar_hint(
-                    *hit_t,
-                    Some(naga::Scalar::F32),
-                    ctx,
-                )?);
+                self.push_expr_with_scalar_hint(*hit_t, Some(naga::Scalar::F32), ctx)?;
                 self.out.push_str(");");
             }
             naga::RayQueryFunction::ConfirmIntersection => {
@@ -1669,7 +1654,7 @@ impl<'a> Generator<'a> {
                 usize::try_from(parens[h.index()]).unwrap_or(0),
             ),
             None => (
-                ctx.ref_counts[h.index()],
+                ctx.ref_counts[h.index()] as usize,
                 usize::from(ctx.paren_uses[h.index()]),
             ),
         };
@@ -1800,7 +1785,7 @@ impl<'a> Generator<'a> {
                 &self.options.float_precision,
             ));
         } else {
-            self.out.push_str(&self.emit_expr(value, ctx)?);
+            self.push_expr(value, ctx)?;
         }
         Ok(())
     }
@@ -1909,9 +1894,9 @@ impl<'a> Generator<'a> {
                 self.emit_for_init_var(lh, value, ctx)?;
                 deferred_for_init_local = Some(lh);
             } else {
-                self.out.push_str(&self.emit_lvalue(pointer, ctx)?);
+                self.push_lvalue(pointer, ctx)?;
                 self.push_assign();
-                self.out.push_str(&self.emit_expr(value, ctx)?);
+                self.push_expr(value, ctx)?;
             }
         } else if let Some(lh) = absorbed {
             match ctx.func.local_variables[lh].init {
@@ -1937,17 +1922,16 @@ impl<'a> Generator<'a> {
             Vec::new();
         for (pointer, result) in &guard_preloads {
             let mut preload = String::from("workgroupUniformLoad(");
-            preload.push_str(&self.emit_pointer_operand(*pointer, ctx)?);
+            self.emit_pointer_operand_into(*pointer, ctx, &mut preload)?;
             preload.push(')');
             let old = ctx.expr_names.insert(*result, preload);
             preload_old_bindings.push((*result, old));
         }
 
         if needs_negation {
-            self.out
-                .push_str(&self.emit_negated_condition(condition, ctx)?);
+            self.push_negated_condition(condition, ctx)?;
         } else {
-            self.out.push_str(&self.emit_expr(condition, ctx)?);
+            self.push_expr(condition, ctx)?;
         }
 
         for (result, old) in preload_old_bindings {
@@ -1966,7 +1950,7 @@ impl<'a> Generator<'a> {
                 Vec::new();
             for (pointer, result) in &update_preloads {
                 let mut preload = String::from("workgroupUniformLoad(");
-                preload.push_str(&self.emit_pointer_operand(*pointer, ctx)?);
+                self.emit_pointer_operand_into(*pointer, ctx, &mut preload)?;
                 preload.push(')');
                 let old = ctx.expr_names.insert(*result, preload);
                 update_old_bindings.push((*result, old));
@@ -2076,10 +2060,9 @@ impl<'a> Generator<'a> {
     ) -> Result<(), Error> {
         let sep = self.comma_sep();
         self.out.push_str("atomicStore(");
-        self.out.push_str(&self.emit_pointer_operand(pointer, ctx)?);
+        self.push_pointer_operand(pointer, ctx)?;
         self.out.push_str(sep);
-        self.out
-            .push_str(&self.emit_expr_for_atomic(value, atomic_scalar, ctx)?);
+        self.push_expr_for_atomic(value, atomic_scalar, ctx)?;
         self.out.push(')');
         Ok(())
     }
@@ -2087,16 +2070,93 @@ impl<'a> Generator<'a> {
     /// Pointer operand of the atomic builtins, `workgroupUniformLoad`,
     /// `arrayLength` and `traceRay`: a `var`-rooted place needs `&`, a pointer
     /// parameter is one already and `&p` on it is a type error.
-    pub(super) fn emit_pointer_operand(
+    pub(super) fn emit_pointer_operand_into(
         &self,
         pointer: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
-    ) -> Result<String, Error> {
+        out: &mut String,
+    ) -> Result<(), Error> {
         if self.pointer_is_ptr_value(pointer, ctx) {
-            self.emit_expr(pointer, ctx)
+            self.emit_expr_into(pointer, ctx, out)
         } else {
-            Ok(format!("&{}", self.emit_lvalue(pointer, ctx)?))
+            out.push('&');
+            self.emit_lvalue_into(pointer, ctx, out)
         }
+    }
+
+    // MARK: Rendering into the output
+
+    /// [`Self::emit_expr_into`] the output, as every `push_` form below
+    /// does its emitter: expression emission takes `&self` and never reads
+    /// the output, so the output is lent to it and the text lands in place;
+    /// on an error the bytes rendered before it stay, discarded with the
+    /// whole text.
+    pub(super) fn push_expr(
+        &mut self,
+        expr: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        let mut out = std::mem::take(&mut self.out);
+        let result = self.emit_expr_into(expr, ctx, &mut out);
+        self.out = out;
+        result
+    }
+
+    fn push_lvalue(
+        &mut self,
+        expr: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        let mut out = std::mem::take(&mut self.out);
+        let result = self.emit_lvalue_into(expr, ctx, &mut out);
+        self.out = out;
+        result
+    }
+
+    fn push_pointer_operand(
+        &mut self,
+        pointer: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        let mut out = std::mem::take(&mut self.out);
+        let result = self.emit_pointer_operand_into(pointer, ctx, &mut out);
+        self.out = out;
+        result
+    }
+
+    fn push_negated_condition(
+        &mut self,
+        cond: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        let mut out = std::mem::take(&mut self.out);
+        let result = self.emit_negated_condition_into(cond, ctx, &mut out);
+        self.out = out;
+        result
+    }
+
+    fn push_expr_with_scalar_hint(
+        &mut self,
+        expr: naga::Handle<naga::Expression>,
+        hint: Option<naga::Scalar>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        let mut out = std::mem::take(&mut self.out);
+        let result = self.emit_expr_with_scalar_hint_into(expr, hint, ctx, &mut out);
+        self.out = out;
+        result
+    }
+
+    fn push_expr_for_atomic(
+        &mut self,
+        expr: naga::Handle<naga::Expression>,
+        target: naga::Scalar,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        let mut out = std::mem::take(&mut self.out);
+        let result = self.emit_expr_for_atomic_into(expr, target, ctx, &mut out);
+        self.out = out;
+        result
     }
 
     /// `true` when `pointer` is already a `ptr<>` value (a `ptr<...>` parameter).
@@ -2258,18 +2318,21 @@ impl<'a> Generator<'a> {
 
     /// Compound-assignment right-hand side, with splat elision for a Splat /
     /// splat-Compose operand under an arithmetic operator.
-    fn emit_compound_assign_rhs(
-        &self,
+    fn push_compound_assign_rhs(
+        &mut self,
         cop: &str,
         other: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
-    ) -> Result<String, Error> {
+    ) -> Result<(), Error> {
         if matches!(cop, "+=" | "-=" | "*=" | "/=" | "%=")
             && let Some(scalar) = self.try_splat_scalar(other, ctx)
         {
-            return self.emit_constructor_arg(scalar, ctx);
+            let mut out = std::mem::take(&mut self.out);
+            let result = self.emit_constructor_arg_into(scalar, ctx, &mut out);
+            self.out = out;
+            return result;
         }
-        self.emit_expr(other, ctx)
+        self.push_expr(other, ctx)
     }
 
     /// Emit a call statement, binding its result only when something reads it:
@@ -2339,12 +2402,13 @@ impl<'a> Generator<'a> {
         }
     }
 
-    fn emit_expr_for_atomic(
+    fn emit_expr_for_atomic_into(
         &self,
         expr: naga::Handle<naga::Expression>,
         target: naga::Scalar,
         ctx: &mut FunctionCtx<'a, '_>,
-    ) -> Result<String, Error> {
+        out: &mut String,
+    ) -> Result<(), Error> {
         use naga::Expression as E;
         use naga::Literal as L;
 
@@ -2378,11 +2442,12 @@ impl<'a> Generator<'a> {
                 _ => None,
             };
             if let Some(v) = forced {
-                return Ok(v);
+                out.push_str(&v);
+                return Ok(());
             }
         }
 
-        self.emit_expr(expr, ctx)
+        self.emit_expr_into(expr, ctx, out)
     }
 
     fn image_atomic_scalar_for_expr(

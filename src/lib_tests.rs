@@ -187,11 +187,40 @@ fn generator_emit_report_consistency() {
         assert!(gen_report.validation_ok);
         assert_eq!(gen_report.text_validation_ok, Some(true));
     }
-    assert!(gen_report.before_bytes.is_some());
+    assert!(
+        gen_report.before_bytes.is_none(),
+        "the plain path renders no naga baseline"
+    );
     assert!(gen_report.after_bytes.is_some());
-    if gen_report.rolled_back {
-        assert!(!gen_report.changed);
-    }
+    assert_eq!(
+        gen_report.changed,
+        output.source != TRIVIAL_SHADER,
+        "changed says whether the output differs from the input"
+    );
+}
+
+/// A full-fidelity run renders naga's baseline and reports the emit
+/// against it; `changed` means the output differs from the input.
+#[test]
+fn generator_emit_reports_before_bytes_only_under_full_fidelity() {
+    let config = Config {
+        trace: config::TraceConfig {
+            enabled: false,
+            validate_each_pass: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let output = run(TRIVIAL_SHADER, &config).unwrap();
+    let gen_report = output
+        .report
+        .pass_reports
+        .iter()
+        .find(|p| p.pass_name == "generator_emit")
+        .expect("generator_emit pass must exist");
+    assert!(gen_report.before_bytes.is_some_and(|n| n > 0));
+    assert_eq!(gen_report.after_bytes, Some(output.source.len()));
+    assert_eq!(gen_report.changed, output.source != TRIVIAL_SHADER);
 }
 
 // MARK: End-to-end preserve_symbols tests
@@ -2275,12 +2304,25 @@ const MESH_FALLBACK_SRC: &str = "enable wgpu_mesh_shader;\n\
 
 /// The naga-emitter fallback prints the RENAMED module: the name map applies
 /// and the report names the fallback (both were `null`; the web build had no
-/// signal).
+/// signal), and the `generator_emit` entry reports the fallback as rolled
+/// back and the output as changed, which the renamed text is.
 #[test]
 fn naga_fallback_reports_itself_and_keeps_the_name_map() {
     let src = MESH_FALLBACK_SRC;
     let out = run(src, &Config::default()).expect("the module minifies via the fallback");
     assert!(out.report.fallback.is_some(), "the fallback is reported");
+    let gen_report = out
+        .report
+        .pass_reports
+        .iter()
+        .find(|p| p.pass_name == "generator_emit")
+        .expect("generator_emit pass must exist");
+    assert!(gen_report.rolled_back, "the fallback shipped");
+    assert_ne!(out.source, src, "the fallback text carries the renames");
+    assert!(
+        gen_report.changed,
+        "changed reports the output differing from the input on the fallback arm too"
+    );
     let map = out.name_map.expect("the fallback text carries the renames");
     let renamed = map.globals.get("tint").expect("the resource is mapped");
     assert!(
@@ -2292,6 +2334,32 @@ fn naga_fallback_reports_itself_and_keeps_the_name_map() {
         map.structs.get("V").map(|s| s.name.as_str()),
         Some("V"),
         "the surviving struct has its entry"
+    );
+}
+
+/// naga's writer failing on the fallback rung is the second diagnosis:
+/// the error names the generator's own failure too, which is the one to
+/// act on.
+#[test]
+fn a_failing_writer_on_the_fallback_rung_keeps_the_generators_diagnosis() {
+    let writer_fails = || Err(Error::Emit("writer: no arm for this expression".into()));
+    let not_blocked = || None;
+    let err = resolve_generator_output(
+        Err(Error::Emit("generator: unsupported image class".into())),
+        &writer_fails,
+        None,
+        None,
+        "fn f() {}",
+        false,
+        &not_blocked,
+    )
+    .err()
+    .expect("no rung ships");
+    let text = err.to_string();
+    assert!(
+        text.contains("generator: unsupported image class")
+            && text.contains("writer: no arm for this expression"),
+        "{text}"
     );
 }
 

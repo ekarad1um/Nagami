@@ -25,7 +25,7 @@ mod wasm;
 
 use config::Config;
 use error::Error;
-use generator::{GenerateOptions, generate};
+use generator::{GenerateOptions, generate, generate_after, generate_reusing};
 use pipeline::{PassReport, Report};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -530,9 +530,7 @@ pub(crate) fn interface_names(module: &naga::Module) -> (Vec<String>, Vec<String
 /// it with the never-grow guard.
 struct EmitOutcome {
     source: String,
-    /// Output differs from the naga baseline in text or byte count
-    /// (vacuously true without a baseline); dead on the fallback arms, the
-    /// report masks it with `!rolled_back`.
+    /// Output differs from the input.
     changed: bool,
     /// The naga fallback or the compacted input shipped instead of the
     /// generator's text.  Its negation is the report's validation verdict,
@@ -554,10 +552,10 @@ struct EmitOutcome {
 /// pass-manufactured `5f/0f`, whose value inf is const-eval-rejected).
 /// Ships the input compacted, like the parse/validation bailouts, so a
 /// batch run gets correct output instead of a hard error.
-fn untextable_ir_bailout(source: &str, before_bytes: usize, reason: String) -> EmitOutcome {
+fn untextable_ir_bailout(source: &str, reason: String) -> EmitOutcome {
     let compacted = compact_wgsl_text(source);
     EmitOutcome {
-        changed: compacted.len() != before_bytes,
+        changed: compacted != source,
         source: compacted,
         rolled_back: true,
         duration_us: 0,
@@ -575,7 +573,6 @@ fn untextable_ir_bailout(source: &str, before_bytes: usize, reason: String) -> E
 fn ship_naga_fallback(
     naga_output: String,
     source: &str,
-    before_bytes: usize,
     duration_us: u64,
     context: &str,
 ) -> EmitOutcome {
@@ -584,11 +581,11 @@ fn ship_naga_fallback(
             "warning: {context}; minified IR cannot round-trip WGSL text ({ve}); \
              shipping the input lexically compacted"
         );
-        return untextable_ir_bailout(source, before_bytes, ve.to_string());
+        return untextable_ir_bailout(source, ve.to_string());
     }
     let fallback = finalize_naga_fallback_text(naga_output, source);
     EmitOutcome {
-        changed: fallback.len() != before_bytes,
+        changed: fallback != source,
         source: fallback,
         rolled_back: true,
         duration_us,
@@ -597,18 +594,17 @@ fn ship_naga_fallback(
     }
 }
 
-/// The fallback ladder: naga's output when the generator errs or emits
-/// invalid WGSL, the compacted input when that fails re-validation too.
-/// `fallback_blocked` names why naga's text cannot stand in; then the error
-/// propagates.
+/// The fallback ladder: naga's output (`naga_baseline`, rendered when a
+/// rung needs it) when the generator errs or emits invalid WGSL, the
+/// compacted input when that fails re-validation too.  `fallback_blocked`
+/// names why naga's text cannot stand in; then the error propagates.
 #[allow(clippy::too_many_arguments)]
 fn resolve_generator_output(
     gen_result: Result<generator::Emission, Error>,
-    naga_output: Option<String>,
+    naga_baseline: &dyn Fn() -> Result<Option<String>, Error>,
     normalized_preamble: Option<&str>,
     effective_preamble: Option<&str>,
     source: &str,
-    before_bytes: usize,
     trace_enabled: bool,
     fallback_blocked: &dyn Fn() -> Option<String>,
 ) -> Result<EmitOutcome, Error> {
@@ -664,8 +660,6 @@ fn resolve_generator_output(
                 io::validate_wgsl_text(&emitted.source)
             };
             if validation_result.is_ok() {
-                // Before `emitted.source` may be moved.
-                let differs_from_baseline = naga_output.as_deref() != Some(emitted.source.as_str());
                 let final_source = if has_preamble {
                     // The preamble owns all directives, naga-only ones
                     // included.  A module-level `diagnostic(...)` only the
@@ -694,7 +688,7 @@ fn resolve_generator_output(
                 } else {
                     strip_naga_only_enables(emitted.source, source)
                 };
-                let changed = before_bytes != final_source.len() || differs_from_baseline;
+                let changed = final_source != source;
                 Ok(EmitOutcome {
                     source: final_source,
                     changed,
@@ -712,48 +706,57 @@ fn resolve_generator_output(
                     "generator output failed validation; cannot fall back safely: {why}: \
                      {underlying}",
                 )))
-            } else if let Some(naga_output) = naga_output {
-                // The CLI warns from `Report::fallback`; the diagnostic
-                // itself stays trace-gated.
-                if trace_enabled && let Err(e) = &validation_result {
-                    eprintln!("warning: generator WGSL validation error: {e}");
-                }
-                Ok(ship_naga_fallback(
-                    naga_output,
-                    source,
-                    before_bytes,
-                    emitted.duration_us,
-                    "generator output failed text validation",
-                ))
             } else {
-                // No baseline (naga's writer-abort set) means no fallback emitter.
-                let underlying = match validation_result {
+                let underlying = match &validation_result {
                     Err(e) => e.to_string(),
                     Ok(()) => "(no underlying error)".to_string(),
                 };
-                Err(Error::Emit(format!(
-                    "generator output failed validation and no naga fallback \
+                match naga_baseline() {
+                    Ok(Some(naga_output)) => {
+                        // The CLI warns from `Report::fallback`; the
+                        // diagnostic itself stays trace-gated.
+                        if trace_enabled && validation_result.is_err() {
+                            eprintln!("warning: generator WGSL validation error: {underlying}");
+                        }
+                        Ok(ship_naga_fallback(
+                            naga_output,
+                            source,
+                            emitted.duration_us,
+                            "generator output failed text validation",
+                        ))
+                    }
+                    // No baseline (naga's writer-abort set) means no
+                    // fallback emitter.
+                    Ok(None) => Err(Error::Emit(format!(
+                        "generator output failed validation and no naga fallback \
                          is available (naga's writer would abort on this module): \
                          {underlying}"
-                )))
+                    ))),
+                    Err(writer) => Err(Error::Emit(format!(
+                        "generator output failed validation and naga's writer failed \
+                         too ({writer}): {underlying}"
+                    ))),
+                }
             }
         }
-        Err(e) => match naga_output {
-            Some(naga_output) => {
+        Err(e) => match naga_baseline() {
+            Ok(Some(naga_output)) => {
                 if let Some(why) = fallback_blocked() {
                     return Err(Error::Emit(format!("{e}; cannot fall back safely: {why}")));
                 }
                 Ok(ship_naga_fallback(
                     naga_output,
                     source,
-                    before_bytes,
                     /*duration_us=*/ 0,
                     &format!("generator emit failed ({e})"),
                 ))
             }
             // No fallback (writer-abort set): the generator's error is the
             // only diagnosis.
-            None => Err(e),
+            Ok(None) => Err(e),
+            Err(writer) => Err(Error::Emit(format!(
+                "{e}; naga's writer failed too: {writer}"
+            ))),
         },
     }
 }
@@ -910,7 +913,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     let pipeline::Converged {
         name_log,
         info,
-        type_uses,
+        render,
     } = pipeline::run_ir_passes(
         &mut module,
         info,
@@ -918,26 +921,35 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         &mut report,
         preamble_names.clone(),
     )?;
-    // Without a baseline the byte count falls back to the input length.
-    let naga_output: Option<String> = if module_needs_naga_baseline_skip(&module) {
-        None
-    } else {
-        Some(emit_wgsl_with_naga_safe(&module, &info)?)
+    // naga's rendering of the optimized module, the fallback text and the
+    // full-fidelity report's byte count; on demand, since the plain path
+    // ships the generator's text and the writer costs a share of every run.
+    let naga_baseline = || -> Result<Option<String>, Error> {
+        if module_needs_naga_baseline_skip(&module) {
+            Ok(None)
+        } else {
+            emit_wgsl_with_naga_safe(&module, &info).map(Some)
+        }
     };
-    let before_bytes = naga_output
-        .as_ref()
-        .map_or_else(|| source.len(), String::len);
+    let before_bytes = if config.trace.enabled || config.trace.validate_each_pass {
+        naga_baseline()?.map(|text| text.len())
+    } else {
+        None
+    };
 
-    let gen_result = generate(
-        &module,
-        &info,
-        GenerateOptions {
-            preserve_members: preserve_members.iter().cloned().collect(),
-            preamble_names,
-            type_uses,
-            ..GenerateOptions::from_config(&effective_config)
-        },
-    );
+    let options = GenerateOptions {
+        preserve_members: preserve_members.iter().cloned().collect(),
+        preamble_names,
+        type_uses: render.as_ref().map(|r| r.emission.type_uses.clone()),
+        ..GenerateOptions::from_config(&effective_config)
+    };
+    let gen_result = match render {
+        Some(prior) if prior.names_kept => {
+            generate_reusing(&module, &info, options, prior.emission)
+        }
+        Some(prior) => generate_after(&module, &info, options, prior.emission),
+        None => generate(&module, &info, options),
+    };
 
     let has_preamble = effective_preamble.is_some();
     // naga's text cannot stand in with a preamble (it embeds the preamble's
@@ -970,11 +982,10 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         naga_fallback,
     } = resolve_generator_output(
         gen_result,
-        naga_output,
+        &naga_baseline,
         normalized_preamble.as_deref(),
         effective_preamble,
         source,
-        before_bytes,
         config.trace.enabled,
         &fallback_blocked,
     )?;
@@ -1025,9 +1036,9 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
 
     report.pass_reports.push(PassReport {
         pass_name: "generator_emit".to_string(),
-        before_bytes: Some(before_bytes),
+        before_bytes,
         after_bytes: Some(final_bytes),
-        changed: !rolled_back && changed,
+        changed,
         duration_us,
         validation_ok: !rolled_back,
         text_validation_ok: Some(!rolled_back),

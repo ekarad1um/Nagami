@@ -54,17 +54,17 @@ pub(crate) fn for_each_function_mut(
 /// function - is never the one asked).
 pub(crate) fn for_each_function_taken(
     module: &mut naga::Module,
-    visit: &mut dyn FnMut(&mut naga::Function, &naga::Module),
+    visit: &mut dyn FnMut(usize, &mut naga::Function, &naga::Module),
 ) {
     let handles: Vec<_> = module.functions.iter().map(|(h, _)| h).collect();
-    for h in handles {
+    for (body, h) in handles.into_iter().enumerate() {
         let mut function = std::mem::take(&mut module.functions[h]);
-        visit(&mut function, module);
+        visit(body, &mut function, module);
         module.functions[h] = function;
     }
     for i in 0..module.entry_points.len() {
         let mut function = std::mem::take(&mut module.entry_points[i].function);
-        visit(&mut function, module);
+        visit(module.functions.len() + i, &mut function, module);
         module.entry_points[i].function = function;
     }
 }
@@ -405,7 +405,7 @@ pub fn try_map_expression_handles_in_place(
 
 /// Remap the compare-exchange operand, the only handle an
 /// [`naga::AtomicFunction`] carries.
-pub fn map_atomic_function_handles(
+fn map_atomic_function_handles(
     fun: &mut naga::AtomicFunction,
     remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
 ) {
@@ -447,7 +447,7 @@ pub fn visit_atomic_function_handles(
 }
 
 /// Remap the per-lane operand of a subgroup gather mode.
-pub fn map_gather_mode_handles(
+fn map_gather_mode_handles(
     mode: &mut naga::GatherMode,
     remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
 ) {
@@ -465,7 +465,7 @@ pub fn map_gather_mode_handles(
 }
 
 /// Remap every operand handle of a [`naga::RayQueryFunction`].
-pub fn map_ray_query_function_handles(
+fn map_ray_query_function_handles(
     fun: &mut naga::RayQueryFunction,
     remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
 ) {
@@ -488,7 +488,7 @@ pub fn map_ray_query_function_handles(
 }
 
 /// Remap every operand handle of a [`naga::RayPipelineFunction`].
-pub fn map_ray_pipeline_function_handles(
+fn map_ray_pipeline_function_handles(
     fun: &mut naga::RayPipelineFunction,
     remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
 ) {
@@ -507,7 +507,7 @@ pub fn map_ray_pipeline_function_handles(
 
 /// Remap the `pointer` and `stride` operands of a cooperative-matrix load /
 /// store.
-pub fn map_cooperative_data_handles(
+fn map_cooperative_data_handles(
     data: &mut naga::CooperativeData,
     remap: &mut dyn FnMut(naga::Handle<naga::Expression>) -> naga::Handle<naga::Expression>,
 ) {
@@ -698,7 +698,7 @@ pub(crate) fn walk_block(block: &naga::Block, scope: Scope, visitor: &mut dyn Vi
 /// with its [`Slot`]; nested blocks are the caller's.  THE exhaustive
 /// read-only statement match: kept in lockstep with
 /// [`remap_statement_handles`].  A `dyn` callback, one copy.
-pub(crate) fn walk_statement_fields(
+fn walk_statement_fields(
     statement: &naga::Statement,
     visit: &mut dyn FnMut(naga::Handle<naga::Expression>, Slot),
 ) {

@@ -1876,6 +1876,67 @@ fn ramp(x: f32) -> f32 {
     ));
 }
 
+/// An arm past [`SPECULATED_ARITHMETIC_BOUND`] stays under its guard: the
+/// `select` would run it on every invocation the guard skipped it.
+#[test]
+fn keeps_a_guard_over_a_large_pure_arm() {
+    let src = r#"
+fn poly(x: f32) -> f32 {
+    if (x < 0.0) { return x*x*x*x*x*x*x*x*x*x*x*x*x*x*x*x*x*x*x*x*x; }
+    return x;
+}
+@fragment fn fs_main(@location(0) x: f32) -> @location(0) vec4f { return vec4f(poly(x)); }
+"#;
+    let (_, module) = run_pass(src);
+    let f = function_named(&module, "poly");
+    assert_eq!(count_ifs(&f.body), 1);
+    assert!(matches!(
+        f.body.last(),
+        Some(naga::Statement::Return { value: Some(v) })
+            if matches!(f.expressions[*v], naga::Expression::FunctionArgument(0))
+    ));
+}
+
+/// The tail is bounded like the arm: an early return ahead of a large pure
+/// tail is what a degree or mode check exists for.
+#[test]
+fn keeps_an_early_out_ahead_of_a_large_pure_tail() {
+    let src = r#"
+fn terms(x: f32, degree: u32) -> f32 {
+    if (degree == 0u) { return 1.0; }
+    return x*x*x*x*x*x*x*x*x*x*x*x*x*x*x*x*x*x*x*x*x;
+}
+@fragment fn fs_main(@location(0) x: f32) -> @location(0) vec4f { return vec4f(terms(x, 2u)); }
+"#;
+    let (_, module) = run_pass(src);
+    let f = function_named(&module, "terms");
+    assert_eq!(count_ifs(&f.body), 1);
+}
+
+/// Comparisons and the `select`s of earlier merges are not arithmetic, so a
+/// chain of cheap guarded returns collapses whole, however long.
+#[test]
+fn merges_a_chain_of_cheap_arms_past_the_bound() {
+    let arms: String = (0..20)
+        .map(|k| format!("    if (i == {k}u) {{ return {}.0; }}\n", k + 1))
+        .collect();
+    let src = format!(
+        "fn pick(i: u32) -> f32 {{\n{arms}    return 0.0;\n}}\n\
+         @fragment fn fs_main(@location(0) @interpolate(flat) i: u32) -> @location(0) vec4f {{ return vec4f(pick(i)); }}\n"
+    );
+    let (changed, module) = run_pass(&src);
+    assert!(changed);
+    let f = function_named(&module, "pick");
+    assert_eq!(count_ifs(&f.body), 0);
+    let mut depth = 0;
+    let (_, _, mut reject) = trailing_select(f);
+    while let naga::Expression::Select { reject: inner, .. } = f.expressions[reject] {
+        depth += 1;
+        reject = inner;
+    }
+    assert_eq!(depth, 19, "every guard merged into the one select chain");
+}
+
 /// A guard whose arm does more than return, or that is followed by a
 /// statement before the trailing return, has effects `select` cannot
 /// order, so it stays.

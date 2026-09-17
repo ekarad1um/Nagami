@@ -39,7 +39,7 @@
 use rustc_hash::FxHashMap;
 
 use super::expr_util::{
-    has_negative_zero_leaf, is_bool_false, is_bool_true, is_expensive_expr,
+    RefCount, has_negative_zero_leaf, is_bool_false, is_bool_true, is_expensive_expr,
     is_uniformity_constrained_expr, literal_bit_eq, root_local_var,
 };
 use crate::analysis::ExprClass;
@@ -69,7 +69,7 @@ use crate::pipeline::{Pass, PassContext};
 fn store_with_leading_emits(
     block: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    counts: &[usize],
+    counts: &[RefCount],
 ) -> Option<(
     naga::Handle<naga::Expression>,
     naga::Handle<naga::Expression>,
@@ -110,7 +110,7 @@ fn store_with_leading_emits(
 fn hoisted_fetch_stays_unconditional(
     hoisted: &[naga::Handle<naga::Expression>],
     expressions: &naga::Arena<naga::Expression>,
-    counts: &[usize],
+    counts: &[RefCount],
 ) -> bool {
     let count = |h: naga::Handle<naga::Expression>| counts.get(h.index()).copied().unwrap_or(0);
     let in_range: HandleSet<naga::Expression> = hoisted.iter().copied().collect();
@@ -471,15 +471,15 @@ impl Pass for DeadBranchPass {
         "dead_branch_elimination"
     }
 
-    fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
+    fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
         let mut changed = 0usize;
 
         let const_lits = super::const_fold::constant_literals(module);
         // The forwarder's index bounds and the speculation gate both resolve
         // types against the module, and the bounds are sized only after the
         // re-sugar, whose arena rebuild renumbers every handle.
-        crate::ir::visit::for_each_function_taken(module, &mut |function, module| {
-            changed += run_phases(function, module, &const_lits);
+        crate::ir::visit::for_each_function_taken(module, &mut |body, function, module| {
+            changed += run_phases(body, function, module, &const_lits, ctx);
         });
 
         Ok(changed > 0)
@@ -488,16 +488,24 @@ impl Pass for DeadBranchPass {
 
 /// The five phases over one function, in order; the count of rewrites.
 fn run_phases(
+    body: usize,
     function: &mut naga::Function,
     module: &naga::Module,
     const_lits: &HandleMap<naga::Constant, naga::Literal>,
+    ctx: &PassContext<'_>,
 ) -> usize {
     let mut changed = 0usize;
     if function.result.is_none() {
         changed += strip_tail_void_returns(&mut function.body);
     }
     changed += resugar_short_circuits(function);
-    let access_lens = super::expr_util::access_static_lengths(function, module);
+    // Untouched so far, the function is the one the shared analyses
+    // describe.
+    let access_lens = if changed == 0 {
+        ctx.access_lens(body, function, module)
+    } else {
+        super::expr_util::access_static_lengths(function, module).into()
+    };
     changed += usize::from(forward_single_store_locals(
         function,
         &module.types,
@@ -582,7 +590,7 @@ fn desugar_short_circuit(
     block: &mut naga::Block,
     expressions: &mut naga::Arena<naga::Expression>,
     foldable: &[bool],
-    counts: &[usize],
+    counts: &[RefCount],
 ) -> usize {
     let mut changed = 0usize;
     rewrite_block(
@@ -2042,10 +2050,11 @@ fn strip_tail_void_returns(block: &mut naga::Block) -> usize {
 /// shape the single-call splice takes.  The arm's `Emit`s ran only under
 /// the guard and the tail's only once it fell through; both now run
 /// unconditionally, so their expressions must be safe to speculate
-/// ([`emits_speculatable`]); what any of them reads was emitted at the top
-/// level before the guard, earlier on its own side (still ahead of it), or
-/// needs no `Emit`, so the move keeps naga's block scoping.  `select`
-/// takes scalars and vectors only.
+/// ([`emits_speculatable`]) and cheap enough to run for nothing
+/// ([`SPECULATED_ARITHMETIC_BOUND`]); what any of them reads was emitted at
+/// the top level before the guard, earlier on its own side (still ahead of
+/// it), or needs no `Emit`, so the move keeps naga's block scoping.
+/// `select` takes scalars and vectors only.
 fn merge_trailing_returns(function: &mut naga::Function, module: &naga::Module) -> usize {
     let selectable = function.result.as_ref().is_some_and(|result| {
         matches!(
@@ -2096,6 +2105,10 @@ fn merge_trailing_returns(function: &mut naga::Function, module: &naga::Module) 
                 function,
                 module,
             )
+            || arithmetic_nodes(accept_emits.iter(), &function.expressions)
+                > SPECULATED_ARITHMETIC_BOUND
+            || arithmetic_nodes(body[run..body.len() - 1].iter(), &function.expressions)
+                > SPECULATED_ARITHMETIC_BOUND
         {
             break;
         }
@@ -2154,9 +2167,8 @@ fn merge_trailing_returns(function: &mut naga::Function, module: &naga::Module) 
 /// integer `/` `%` `<<` `>>` by a runtime operand - defined by WGSL, yet a
 /// guarded division by zero is what such a guard exists for, so it keeps
 /// it.  Float `/` `%` are IEEE arithmetic on any operand.  The divisor test
-/// reads the LEAF's const-ness, not the cone's.  No size bound on the rest:
-/// cheap pure arms are what if-conversion is for, and a bound only forfeits
-/// the GVN merge a `select` enables.
+/// reads the LEAF's const-ness, not the cone's.  How much of the rest a
+/// merge may run for nothing is [`SPECULATED_ARITHMETIC_BOUND`]'s question.
 fn emits_speculatable<'a>(
     statements: impl Iterator<Item = &'a naga::Statement>,
     function: &naga::Function,
@@ -2200,6 +2212,32 @@ fn emits_speculatable<'a>(
         naga::Statement::Emit(range) => range.clone().all(&mut speculatable),
         _ => false,
     })
+}
+
+/// Arithmetic a merge may make unconditional on either side: a `select`
+/// runs both arms where a uniform guard ran one, and no backend turns it
+/// back into a branch, so the arm the guard skipped (a colour map's
+/// polynomial, the higher degrees an early return left out) is work every
+/// invocation pays.  Comparisons, the logical operators and earlier merges'
+/// `select`s are the guards' own work in either form and do not count, so
+/// a chain of cheap guarded returns still collapses whole; the bound sits
+/// where such chains pass and polynomial arms stop.
+const SPECULATED_ARITHMETIC_BOUND: usize = 16;
+
+/// The [`ExprClass::ARITHMETIC`] nodes the `Emit`s in `statements`
+/// introduce.
+fn arithmetic_nodes<'a>(
+    statements: impl Iterator<Item = &'a naga::Statement>,
+    arena: &naga::Arena<naga::Expression>,
+) -> usize {
+    statements
+        .filter_map(|statement| match statement {
+            naga::Statement::Emit(range) => Some(range.clone()),
+            _ => None,
+        })
+        .flatten()
+        .filter(|&h| ExprClass::node(&arena[h]).any(ExprClass::ARITHMETIC))
+        .count()
 }
 
 // MARK: Tests

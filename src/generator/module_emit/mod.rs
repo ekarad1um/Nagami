@@ -5,7 +5,7 @@
 
 use crate::error::Error;
 
-use super::core::{ExprTypes, FunctionCtx, Generator};
+use super::core::{ExprTypes, FunctionAnalyses, FunctionCtx, FunctionExprInfo, Generator};
 use super::syntax::{address_space, binding_attrs, storage_access};
 
 mod call_inline;
@@ -17,6 +17,7 @@ mod twins;
 
 pub(super) use defer_vars::find_deferrable_vars;
 pub(super) use local_resolve::local_var_in_stmts;
+pub(super) use twins::Twins;
 
 use crate::analysis::compute_fn_effects;
 use crate::handle_set::HandleSet;
@@ -287,11 +288,15 @@ fn preamble_owns(preamble: &std::collections::HashSet<String>, name: Option<&str
 impl<'a> Generator<'a> {
     /// The module-wide analyses every function's rendering reads: ref
     /// counts, callee purity, and the literal extraction (a literal renders
-    /// as its `const` name from here on).  Once, before any text.
+    /// as its `const` name from here on).  Once, before any text.  The
+    /// census serves the literal count and the bodies' analyses, both of
+    /// which a render of these arenas may have left already.
     pub(super) fn prepare(&mut self) {
-        self.ref_count_cache = crate::ir::visit::all_functions(self.module)
-            .map(compute_expression_ref_counts)
-            .collect();
+        if self.analyses.literal_counts.is_none() {
+            self.ref_count_cache = crate::ir::visit::all_functions(self.module)
+                .map(compute_expression_ref_counts)
+                .collect();
+        }
 
         self.fn_effects = compute_fn_effects(self.module);
         self.name_weights = crate::passes::rename::Weights::declared(self.module);
@@ -890,22 +895,28 @@ impl<'a> Generator<'a> {
         Ok(())
     }
 
-    /// The context one function body renders in: its analyses over the
-    /// prepared caches (taken, so each function is built once) and its
-    /// argument and local names claimed.  `cache_idx` indexes
-    /// `ref_count_cache` / `defer_cache`: `module.functions` order, then
-    /// the entry points.
-    pub(super) fn function_ctx<'m>(
+    /// The analyses `func`'s context is built from: the ones a render of
+    /// these arenas left ([`super::core::Analyses`]), else built over the
+    /// prepared caches (taken, so each function is built once).
+    fn function_analyses(
         &mut self,
-        displayed_name: &str,
         func: &'a naga::Function,
         finfo: &'a naga::valid::FunctionInfo,
-        module_used_names: &'m std::collections::HashSet<String>,
         cache_idx: usize,
-    ) -> FunctionCtx<'a, 'm> {
-        let mut ref_counts = std::mem::take(&mut self.ref_count_cache[cache_idx].ref_counts);
-        let mut paren_uses = std::mem::take(&mut self.ref_count_cache[cache_idx].paren_uses);
-        let (deferred_vars, dead_vars) = std::mem::take(&mut self.defer_cache[cache_idx]);
+    ) -> FunctionAnalyses {
+        if let Some(built) = self.take_function_analyses(cache_idx) {
+            return built;
+        }
+        // A body the prepared census does not cover counts its own.
+        let FunctionExprInfo {
+            mut ref_counts,
+            live,
+            mut paren_uses,
+        } = self
+            .ref_count_cache
+            .get_mut(cache_idx)
+            .map(std::mem::take)
+            .unwrap_or_else(|| compute_expression_ref_counts(func));
         // A value is priced by the uses of all its spellings, so the loop
         // model below sees it bound where the byte rule will bind it.
         let twins = structural_twins(
@@ -921,14 +932,45 @@ impl<'a> Generator<'a> {
             finfo,
             &self.module.types,
             &must_bind,
-            &self.ref_count_cache[cache_idx].live,
+            &live,
             &twins,
             &mut ref_counts,
         );
-        let for_loop_vars = find_for_loop_vars(func, &must_bind, &deferred_vars);
+        let for_loop_vars = find_for_loop_vars(func, &must_bind, &self.analyses.defer[cache_idx].0);
         discount_initializer_refs(func, &for_loop_vars, &mut ref_counts);
         let inlineable_calls =
             find_inlineable_calls(&func.body, &ref_counts, &func.expressions, &self.fn_effects);
+        FunctionAnalyses {
+            ref_counts,
+            paren_uses,
+            twins,
+            must_bind,
+            for_loop_vars,
+            inlineable_calls,
+        }
+    }
+
+    /// The context one function body renders in: its analyses
+    /// ([`Self::function_analyses`]) and its argument and local names
+    /// claimed.  `cache_idx` indexes `ref_count_cache` / `Analyses::defer`:
+    /// `module.functions` order, then the entry points.
+    pub(super) fn function_ctx<'m>(
+        &mut self,
+        displayed_name: &str,
+        func: &'a naga::Function,
+        finfo: &'a naga::valid::FunctionInfo,
+        module_used_names: &'m std::collections::HashSet<String>,
+        cache_idx: usize,
+    ) -> FunctionCtx<'a, 'm> {
+        let FunctionAnalyses {
+            ref_counts,
+            paren_uses,
+            twins,
+            must_bind,
+            for_loop_vars,
+            inlineable_calls,
+        } = self.function_analyses(func, finfo, cache_idx);
+        let (deferred_vars, dead_vars) = self.analyses.defer[cache_idx].clone();
         let typed_pointer_arg_locals =
             typed_pointer_arg_locals(func, &self.module.types, &self.type_names);
         let mut ctx = FunctionCtx {
@@ -948,6 +990,7 @@ impl<'a> Generator<'a> {
             typed_pointer_arg_locals,
             for_loop_vars,
             expr_name_counter: 0,
+            drawn_expr_name: None,
             module_names: module_used_names,
             local_used_names: std::collections::HashSet::new(),
             inlineable_calls,
@@ -994,7 +1037,8 @@ impl<'a> Generator<'a> {
     ) -> Result<(), Error> {
         let mut ctx = self.function_ctx(displayed_name, func, finfo, module_used_names, body);
         let fn_name = entry_name.unwrap_or(displayed_name);
-        self.generate_function_in(fn_name, func, entry_name.is_some(), &mut ctx)?;
+        let built = self.generate_function_in(fn_name, func, entry_name.is_some(), &mut ctx)?;
+        self.keep_function_analyses(body, built);
         for (h, expr) in func.expressions.iter() {
             let count = usize::try_from(ctx.render_counts[h.index()]).unwrap_or(0);
             self.name_weights.reference(body, expr, count);
@@ -1012,16 +1056,20 @@ impl<'a> Generator<'a> {
     /// which the census counted once; a twin's counts are its first
     /// spelling's, `counts_by_value`), either rendering the function again
     /// from the context as built; [`RENDER_ROUNDS`] caps a bistable pair at
-    /// a text that is valid but a byte or two off.
-    pub(super) fn generate_function_in(
+    /// a text that is valid but a byte or two off.  Hands back the context
+    /// as passed, the rendered one in `ctx`.
+    pub(super) fn generate_function_in<'m>(
         &mut self,
         fn_name: &str,
         func: &'a naga::Function,
         is_entry_point: bool,
-        ctx: &mut FunctionCtx<'a, '_>,
-    ) -> Result<(), Error> {
+        ctx: &mut FunctionCtx<'a, 'm>,
+    ) -> Result<FunctionCtx<'a, 'm>, Error> {
         let start = self.out.len();
         let has_loop = must_bind::has_loop(func);
+        // What a further round overwrites in `ctx`, as passed: `must_bind`
+        // and `measured`.
+        let mut passed = None;
         for round in 1.. {
             let mut attempt = ctx.clone();
             self.render_function(fn_name, func, is_entry_point, &mut attempt)?;
@@ -1048,10 +1096,15 @@ impl<'a> Generator<'a> {
                     super::stmt_emit::binding_pays(refs, parens, d.len, d.name, beautify) == d.bound
                 });
             if settled || round == RENDER_ROUNDS {
-                *ctx = attempt;
-                return Ok(());
+                let mut as_passed = std::mem::replace(ctx, attempt);
+                if let Some((must_bind, measured)) = passed {
+                    as_passed.must_bind = must_bind;
+                    as_passed.measured = measured;
+                }
+                return Ok(as_passed);
             }
             self.out.truncate(start);
+            passed.get_or_insert_with(|| (ctx.must_bind.clone(), ctx.measured.take()));
             ctx.must_bind.extend(sunk.iter().copied());
             ctx.measured = Some((render_counts, paren_counts));
         }
@@ -1147,7 +1200,7 @@ impl<'a> Generator<'a> {
                         &self.options.float_precision,
                     ));
                 } else {
-                    self.out.push_str(&self.emit_expr(init, ctx)?);
+                    self.push_expr(init, ctx)?;
                 }
             } else {
                 // Zero-initialised by WGSL: the shorter of `:type` / `=0i`.

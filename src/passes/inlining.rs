@@ -442,7 +442,7 @@ impl Pass for InliningPass {
         // e(); e();` survives every pass, pinned alive by its own call
         // sites.
         let mut changed = delete_calls_to_empty_functions(module, &ctx.config.preserve_symbols);
-        changed |= splice_calls(module, ctx, self.max_node_count, self.max_call_sites) > 0;
+        changed |= splice_calls(module, ctx, self.max_node_count, self.max_call_sites)? > 0;
         Ok(changed)
     }
 }
@@ -504,11 +504,11 @@ fn splice_calls(
     ctx: &PassContext<'_>,
     max_node_count: usize,
     max_call_sites: usize,
-) -> usize {
+) -> Result<usize, Error> {
     // A library module keeps every function: a splice would only add a
     // second copy of the body.
     if is_library_module(module) {
-        return 0;
+        return Ok(0);
     }
     let preserve = &ctx.config.preserve_symbols;
     let call_sites = collect_call_sites(module);
@@ -581,10 +581,10 @@ fn splice_calls(
             &callers,
             &scope_names,
             ctx,
-        ));
+        )?);
     }
     if candidates.is_empty() {
-        return 0;
+        return Ok(0);
     }
 
     // The pre-check judged each multi-site clone on the caller before any
@@ -621,7 +621,7 @@ fn splice_calls(
                     preserve.iter().any(|p| p == name)
                 });
             }
-            return spliced;
+            return Ok(spliced);
         }
         let (functions, entry_points) = snapshot.expect("a multi-site candidate declined");
         module.functions = functions;
@@ -631,7 +631,7 @@ fn splice_calls(
             multi.remove(h);
         }
         if candidates.is_empty() {
-            return 0;
+            return Ok(0);
         }
     }
 }
@@ -1250,13 +1250,15 @@ fn paying_clones(
     callers: &[&naga::Function],
     scope_names: &HashSet<String>,
     ctx: &PassContext<'_>,
-) -> Vec<naga::Handle<naga::Function>> {
+) -> Result<Vec<naga::Handle<naga::Function>>, Error> {
     let preserve: HashSet<String> = ctx.config.preserve_symbols.iter().cloned().collect();
+    // The empty-call deletion before this removed statements only, so the
+    // info of the module as handed in and as it is now agree on every
+    // arena, and either prices it.
+    let info = ctx.info(module)?;
     let plan = super::rename::plan_names(module, &preserve, ctx.config.mangle());
     let renamed = plan.applied(module);
-    // The empty-call deletion before this removed statements only, so the
-    // pass's `info` still describes every arena.
-    let mut pricer = Pricer::new(&renamed, ctx.info, ctx.config, &plan);
+    let mut pricer = Pricer::new(&renamed, &info, ctx.config, &plan);
 
     let callees: Vec<Option<CalleePrice>> = clonable
         .iter()
@@ -1356,10 +1358,10 @@ fn paying_clones(
         })
         .partition(|&(_, pays)| pays);
     if paying.is_empty() && admitted.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Some(base_len) = super::shipped_len(module.clone(), ctx) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     // Whether `module` with `set` cloned renders shorter; a site that
     // declines one of them fails the set.
@@ -1384,7 +1386,7 @@ fn paying_clones(
         paying.into_iter().filter(|&h| pays(&[h])).collect()
     };
     confirmed.extend(admitted.into_iter().map(|(h, _)| h).filter(|&h| pays(&[h])));
-    confirmed
+    Ok(confirmed)
 }
 
 /// One call of a candidate: the caller (its position in [`all_functions`]

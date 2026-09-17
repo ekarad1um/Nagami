@@ -65,14 +65,19 @@ impl ExprClass {
     /// implicit-LOD / bias non-gather sample (the front-end lowers gathers
     /// to `level: Zero`, so the gather clause only guards an upstream change).
     pub const CONVERGENT: Self = Self(1 << 15);
+    /// A math builtin or an arithmetic or bitwise operator: the work a
+    /// guard may exist to skip, which a rewrite that runs both arms bounds
+    /// (`merge_trailing_returns`).  Comparisons and the logical operators
+    /// are a guard's own work.
+    pub const ARITHMETIC: Self = Self(1 << 16);
 
     // Cone bits, set by `Classes::of` only.
     /// The whole cone reads as a WGSL const-expression.
-    pub const CONST_CONE: Self = Self(1 << 16);
+    pub const CONST_CONE: Self = Self(1 << 17);
     /// A `STMT_RESULT` sits in the cone.
-    pub const STMT_RESULT_IN_CONE: Self = Self(1 << 17);
+    pub const STMT_RESULT_IN_CONE: Self = Self(1 << 18);
     /// An `EXPENSIVE` node sits in the cone.
-    pub const EXPENSIVE_IN_CONE: Self = Self(1 << 18);
+    pub const EXPENSIVE_IN_CONE: Self = Self(1 << 19);
 
     // The questions, as masks.
     /// The evaluation a guard exists to save: kept at its count, its
@@ -131,8 +136,8 @@ impl ExprClass {
             | E::Swizzle { .. }
             | E::Select { .. }
             | E::Relational { .. }
-            | E::Math { .. }
             | E::As { .. } => Self::PURE_OP,
+            E::Math { .. } => Self::PURE_OP | Self::ARITHMETIC,
             E::Unary { op, .. } => {
                 if matches!(op, naga::UnaryOperator::Negate) {
                     Self::PURE_OP | Self::SIGN_SENSITIVE_OP
@@ -140,15 +145,28 @@ impl ExprClass {
                     Self::PURE_OP
                 }
             }
-            E::Binary { op, .. } => match op {
-                naga::BinaryOperator::Multiply
-                | naga::BinaryOperator::Divide
-                | naga::BinaryOperator::Modulo => Self::PURE_OP | Self::SIGN_SENSITIVE_OP,
-                naga::BinaryOperator::LogicalAnd | naga::BinaryOperator::LogicalOr => {
-                    Self::PURE_OP | Self::SHORT_CIRCUIT
+            E::Binary { op, .. } => {
+                use naga::BinaryOperator as B;
+                match op {
+                    B::Multiply | B::Divide | B::Modulo => {
+                        Self::PURE_OP | Self::ARITHMETIC | Self::SIGN_SENSITIVE_OP
+                    }
+                    B::Add
+                    | B::Subtract
+                    | B::And
+                    | B::ExclusiveOr
+                    | B::InclusiveOr
+                    | B::ShiftLeft
+                    | B::ShiftRight => Self::PURE_OP | Self::ARITHMETIC,
+                    B::LogicalAnd | B::LogicalOr => Self::PURE_OP | Self::SHORT_CIRCUIT,
+                    B::Equal
+                    | B::NotEqual
+                    | B::Less
+                    | B::LessEqual
+                    | B::Greater
+                    | B::GreaterEqual => Self::PURE_OP,
                 }
-                _ => Self::PURE_OP,
-            },
+            }
             E::Load { .. } => Self::LOAD,
             E::ImageSample { gather, level, .. } => {
                 if gather.is_none()
@@ -519,8 +537,16 @@ mod tests {
             if class.any(ExprClass::OVERRIDE) {
                 assert!(matches!(expr, E::Override(_)));
             }
-            if class.any(ExprClass::SHORT_CIRCUIT | ExprClass::SIGN_SENSITIVE_OP) {
+            if class.any(
+                ExprClass::SHORT_CIRCUIT | ExprClass::SIGN_SENSITIVE_OP | ExprClass::ARITHMETIC,
+            ) {
                 assert!(class.any(ExprClass::PURE_OP), "{expr:?}");
+            }
+            if class.any(ExprClass::SIGN_SENSITIVE_OP) && matches!(expr, E::Binary { .. }) {
+                assert!(class.any(ExprClass::ARITHMETIC), "{expr:?}");
+            }
+            if class.any(ExprClass::SHORT_CIRCUIT) {
+                assert!(!class.any(ExprClass::ARITHMETIC), "{expr:?}");
             }
             if class.any(ExprClass::CONVERGENT) {
                 assert!(
@@ -543,6 +569,13 @@ mod tests {
             .count();
         // dpdx plus the gather-less Auto and Bias samples.
         assert_eq!(convergent, 3);
+        let arithmetic = samples
+            .iter()
+            .filter(|e| ExprClass::node(e).any(ExprClass::ARITHMETIC))
+            .count();
+        // The two math builtins plus the ten arithmetic and bitwise
+        // operators; the six comparisons and two logical operators are not.
+        assert_eq!(arithmetic, 12);
     }
 
     /// The cone bits over a small arena: `a * (b + c)` with `a` a literal

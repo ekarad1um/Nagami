@@ -3,7 +3,7 @@
 use crate::analysis::{ExprClass, FnEffects, PointerRoot, resolve_pointer_root};
 use crate::handle_set::{HandleMap, HandleSet};
 use crate::ir::visit::visit_expression_children;
-use crate::passes::expr_util::{root_local_var, short_circuit_rhs};
+use crate::passes::expr_util::{RefCount, root_local_var, short_circuit_rhs};
 
 /// A single-use `Call` result that may still be inlined into a later use site,
 /// with the function-locals its arguments load so a Store to a local drops
@@ -85,7 +85,7 @@ type CallReads = HandleMap<naga::Expression, HandleSet<naga::LocalVariable>>;
 /// clearing event cannot undo a use already made and program order is kept.
 pub(super) fn find_inlineable_calls(
     block: &naga::Block,
-    ref_counts: &[usize],
+    ref_counts: &[RefCount],
     expressions: &naga::Arena<naga::Expression>,
     fn_effects: &[FnEffects],
 ) -> HandleSet<naga::Expression> {
@@ -97,7 +97,7 @@ pub(super) fn find_inlineable_calls(
 
 fn find_inlineable_calls_in_block(
     block: &naga::Block,
-    ref_counts: &[usize],
+    ref_counts: &[RefCount],
     expressions: &naga::Arena<naga::Expression>,
     fn_effects: &[FnEffects],
     call_reads: &mut CallReads,
@@ -320,7 +320,7 @@ fn expr_is_memory_free(
 /// loses bytes.
 fn shared_pointer_chain(
     h: naga::Handle<naga::Expression>,
-    ref_counts: &[usize],
+    ref_counts: &[RefCount],
     expressions: &naga::Arena<naga::Expression>,
 ) -> bool {
     ref_counts[h.index()] > 1
@@ -338,7 +338,7 @@ fn shared_pointer_chain(
 fn consume_pending_for_statement(
     stmt: &naga::Statement,
     expressions: &naga::Arena<naga::Expression>,
-    ref_counts: &[usize],
+    ref_counts: &[RefCount],
     pending: &mut Vec<PendingCall>,
     result: &mut HandleSet<naga::Expression>,
 ) {

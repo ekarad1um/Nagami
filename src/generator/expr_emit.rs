@@ -1,7 +1,11 @@
-//! Expression emitters.  `emit_expr` short-circuits a let-bound expression to
-//! its name; `emit_expr_uncached` renders every [`naga::Expression`] variant
-//! and hosts the size rewrites (splat elision, swizzle collapse, extracted-
-//! literal substitution, parenthesis minimisation) that beat naga's writer.
+//! Expression emitters.  `emit_expr_into` short-circuits a let-bound
+//! expression to its name; `emit_expr_uncached_into` renders every
+//! [`naga::Expression`] variant and hosts the size rewrites (splat elision,
+//! swizzle collapse, extracted-literal substitution, parenthesis
+//! minimisation) that beat naga's writer.  Every emitter appends to the one
+//! sink it is handed, the operands in turn, so a rendering costs no string
+//! per node; the `String`-returning forms exist for a text that is priced or
+//! kept apart from the output.
 
 use crate::error::Error;
 use crate::passes::expr_util::literal_bit_eq;
@@ -275,24 +279,35 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// `name(args)`, prefixing `&` to an argument bound to a pointer
-    /// parameter: globals, locals and access chains are WGSL references,
-    /// while a forwarded pointer-typed function argument is already a
-    /// pointer value.
     pub(super) fn emit_call(
         &self,
         function: naga::Handle<naga::Function>,
         arguments: &[naga::Handle<naga::Expression>],
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
+        let mut out = String::new();
+        self.emit_call_into(function, arguments, ctx, &mut out)?;
+        Ok(out)
+    }
+
+    /// `name(args)`, prefixing `&` to an argument bound to a pointer
+    /// parameter: globals, locals and access chains are WGSL references,
+    /// while a forwarded pointer-typed function argument is already a
+    /// pointer value.
+    pub(super) fn emit_call_into(
+        &self,
+        function: naga::Handle<naga::Function>,
+        arguments: &[naga::Handle<naga::Expression>],
+        ctx: &mut FunctionCtx<'a, '_>,
+        out: &mut String,
+    ) -> Result<(), Error> {
         let sep = self.comma_sep();
         let callee = &self.module.functions[function];
-        let mut s = String::new();
-        s.push_str(&self.function_names[function.index()]);
-        s.push('(');
+        out.push_str(&self.function_names[function.index()]);
+        out.push('(');
         for (i, arg) in arguments.iter().enumerate() {
             if i > 0 {
-                s.push_str(sep);
+                out.push_str(sep);
             }
             let needs_ref = if let Some(param) = callee.arguments.get(i) {
                 matches!(
@@ -310,19 +325,19 @@ impl<'a> Generator<'a> {
                 false
             };
             if needs_ref {
-                s.push('&');
+                out.push('&');
             }
-            let arg_text = self.emit_expr(*arg, ctx)?;
-            if i + 1 < arguments.len() && self.renders_as_bare_less(*arg, ctx) {
-                s.push('(');
-                s.push_str(&arg_text);
-                s.push(')');
-            } else {
-                s.push_str(&arg_text);
+            let wrap = i + 1 < arguments.len() && self.renders_as_bare_less(*arg, ctx);
+            if wrap {
+                out.push('(');
+            }
+            self.emit_expr_into(*arg, ctx, out)?;
+            if wrap {
+                out.push(')');
             }
         }
-        s.push(')');
-        Ok(s)
+        out.push(')');
+        Ok(())
     }
 
     /// Shortest negation of `cond`: a let-bound condition is `!name`, a
@@ -330,15 +345,18 @@ impl<'a> Generator<'a> {
     /// ordered float comparison, where `!(x<y)` and `x>=y` differ under NaN,
     /// `!!x` collapses to `x`, and anything else is `!expr`, parenthesized
     /// only when `expr` is binary.
-    pub(super) fn emit_negated_condition(
+    pub(super) fn emit_negated_condition_into(
         &self,
         cond: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
-    ) -> Result<String, Error> {
+        out: &mut String,
+    ) -> Result<(), Error> {
         use naga::Expression as E;
 
         if let Some(name) = ctx.expr_names.get(cond) {
-            return Ok(format!("!{name}"));
+            out.push('!');
+            out.push_str(name);
+            return Ok(());
         }
 
         match &ctx.exprs[cond] {
@@ -370,9 +388,17 @@ impl<'a> Generator<'a> {
                             right,
                             child_needs_parens(right, arena, flipped, true, false),
                         );
-                        let ls = self.emit_expr(left, ctx)?;
-                        let rs = self.emit_expr(right, ctx)?;
-                        return Ok(assemble_binary(&ls, &rs, op_str, sp, wrap_l, wrap_r));
+                        return self.push_binary(
+                            out,
+                            ctx,
+                            Operand::Value(left),
+                            Operand::Value(right),
+                            op_str,
+                            sp,
+                            wrap_l,
+                            wrap_r,
+                            false,
+                        );
                     }
                 }
             }
@@ -380,101 +406,119 @@ impl<'a> Generator<'a> {
                 op: naga::UnaryOperator::LogicalNot,
                 expr,
             } => {
-                return self.emit_expr(*expr, ctx);
+                return self.emit_expr_into(*expr, ctx, out);
             }
             _ => {}
         }
 
         // `!` binds tighter than every binary operator, and nothing else a
         // condition can be spells one: a call, an index, a name.
-        let inner = self.emit_expr(cond, ctx)?;
-        Ok(if matches!(ctx.exprs[cond], E::Binary { .. }) {
-            format!("!({inner})")
-        } else {
-            format!("!{inner}")
-        })
+        out.push('!');
+        let wrap = matches!(ctx.exprs[cond], E::Binary { .. });
+        if wrap {
+            out.push('(');
+        }
+        self.emit_expr_into(cond, ctx, out)?;
+        if wrap {
+            out.push(')');
+        }
+        Ok(())
     }
 
     /// The name of the variable `expr` reads, counted as a rendering (a
-    /// place renders outside `emit_expr`).
-    fn variable_name(
+    /// place renders outside `emit_expr_into`).
+    fn push_variable_name(
         &self,
         expr: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
-    ) -> String {
+        out: &mut String,
+    ) {
         ctx.rendered(expr);
         match &ctx.exprs[expr] {
-            naga::Expression::GlobalVariable(h) => self.global_names[h.index()].clone(),
-            naga::Expression::LocalVariable(h) => ctx.local_names[h].clone(),
+            naga::Expression::GlobalVariable(h) => out.push_str(&self.global_names[h.index()]),
+            naga::Expression::LocalVariable(h) => out.push_str(&ctx.local_names[h]),
             _ => unreachable!("a variable"),
         }
     }
 
     /// `expr` as an assignable place; a root that is neither a variable nor
     /// an access chain renders dereferenced (`*expr`).
-    pub(super) fn emit_lvalue(
+    pub(super) fn emit_lvalue_into(
         &self,
         expr: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
-    ) -> Result<String, Error> {
+        out: &mut String,
+    ) -> Result<(), Error> {
         use naga::Expression as E;
-        Ok(match &ctx.exprs[expr] {
-            E::GlobalVariable(_) | E::LocalVariable(_) => self.variable_name(expr, ctx),
+        match &ctx.exprs[expr] {
+            E::GlobalVariable(_) | E::LocalVariable(_) => self.push_variable_name(expr, ctx, out),
             E::Access { base, index } => {
-                let mut s = self.emit_lvalue_or_value(*base, ctx)?;
-                s.push('[');
-                s.push_str(&self.emit_expr(*index, ctx)?);
-                s.push(']');
-                s
+                self.emit_lvalue_or_value_into(*base, ctx, out)?;
+                out.push('[');
+                self.emit_expr_into(*index, ctx, out)?;
+                out.push(']');
             }
             E::AccessIndex { base, index } => {
-                let mut s = self.emit_lvalue_or_value(*base, ctx)?;
-                self.push_access_index(&mut s, *base, *index, ctx);
-                s
+                self.emit_lvalue_or_value_into(*base, ctx, out)?;
+                self.push_access_index(out, *base, *index, ctx);
             }
             _ => {
-                let mut s = String::with_capacity(1 + 16);
-                s.push('*');
-                s.push_str(&self.emit_expr(expr, ctx)?);
-                s
+                out.push('*');
+                self.emit_expr_into(expr, ctx, out)?;
             }
-        })
+        }
+        Ok(())
     }
 
     /// Place form for a variable or access chain, value form otherwise, for
     /// callers that accept either (the base of a store-through access chain).
-    pub(super) fn emit_lvalue_or_value(
+    fn emit_lvalue_or_value_into(
         &self,
         expr: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
-    ) -> Result<String, Error> {
+        out: &mut String,
+    ) -> Result<(), Error> {
         use naga::Expression as E;
-        Ok(match &ctx.exprs[expr] {
-            E::GlobalVariable(_) | E::LocalVariable(_) => self.variable_name(expr, ctx),
-            E::Access { .. } | E::AccessIndex { .. } => self.emit_lvalue(expr, ctx)?,
+        match &ctx.exprs[expr] {
+            E::GlobalVariable(_) | E::LocalVariable(_) => self.push_variable_name(expr, ctx, out),
+            E::Access { .. } | E::AccessIndex { .. } => self.emit_lvalue_into(expr, ctx, out)?,
             // A function-argument `ptr<...>` is a pointer value, not a
             // reference, so as the root of an lvalue chain it needs the
             // explicit `(*p)`.
             _ if self.pointer_is_ptr_value(expr, ctx) => {
-                format!("(*{})", self.emit_expr(expr, ctx)?)
+                out.push_str("(*");
+                self.emit_expr_into(expr, ctx, out)?;
+                out.push(')');
             }
-            _ => self.emit_expr(expr, ctx)?,
-        })
+            _ => self.emit_expr_into(expr, ctx, out)?,
+        }
+        Ok(())
     }
 
-    /// Value text of `expr`; a let/var/argument-bound expression renders as
-    /// its name.
     pub(super) fn emit_expr(
         &self,
         expr: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
+        let mut out = String::new();
+        self.emit_expr_into(expr, ctx, &mut out)?;
+        Ok(out)
+    }
+
+    /// Value text of `expr` appended to `out`; a let/var/argument-bound
+    /// expression renders as its name.
+    pub(super) fn emit_expr_into(
+        &self,
+        expr: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+        out: &mut String,
+    ) -> Result<(), Error> {
         if let Some(name) = ctx.expr_names.get(expr) {
-            let name = name.clone();
+            out.push_str(name);
             ctx.rendered(expr);
-            return Ok(name);
+            return Ok(());
         }
-        self.emit_expr_uncached(expr, ctx)
+        self.emit_expr_uncached_into(expr, ctx, out)
     }
 
     /// A ray-query builtin's `query` operand: naga admits any
@@ -482,34 +526,46 @@ impl<'a> Generator<'a> {
     /// `&`, while the only other legal producer, a pointer-typed function
     /// argument (`ray_query` cannot live in composites, so no access chain
     /// yields one), is already a pointer value.
-    fn emit_ray_query_arg(
+    fn emit_ray_query_arg_into(
         &self,
         query: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
-    ) -> Result<String, Error> {
-        let text = self.emit_expr(query, ctx)?;
-        Ok(match ctx.exprs[query] {
-            naga::Expression::LocalVariable(_) => format!("&{text}"),
-            _ => text,
-        })
+        out: &mut String,
+    ) -> Result<(), Error> {
+        if matches!(ctx.exprs[query], naga::Expression::LocalVariable(_)) {
+            out.push('&');
+        }
+        self.emit_expr_into(query, ctx, out)
     }
 
-    /// A `Compose`/`Splat` component.  An uncached literal renders bare
-    /// because the constructor pins its type; an argument rendering with a
-    /// top-level `<` is parenthesised (template-list guard).
     pub(super) fn emit_constructor_arg(
         &self,
         arg: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
+        let mut out = String::new();
+        self.emit_constructor_arg_into(arg, ctx, &mut out)?;
+        Ok(out)
+    }
+
+    /// A `Compose`/`Splat` component.  An uncached literal renders bare
+    /// because the constructor pins its type; an argument rendering with a
+    /// top-level `<` is parenthesised (template-list guard).
+    pub(super) fn emit_constructor_arg_into(
+        &self,
+        arg: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+        out: &mut String,
+    ) -> Result<(), Error> {
         if !ctx.expr_names.contains_key(arg) {
             if let naga::Expression::Literal(lit) = &ctx.exprs[arg] {
-                let bare = literal_to_wgsl_bare(*lit, &self.options.float_precision);
+                // The key's text is the bare spelling.
                 let key = literal_extract_key(*lit, &self.options.float_precision);
-                if let Some(name) = self.extracted_literals.get(&key) {
-                    return Ok(name.clone());
+                match self.extracted_literals.get(&key) {
+                    Some(name) => out.push_str(name),
+                    None => out.push_str(&key.expr_text),
                 }
-                return Ok(bare);
+                return Ok(());
             }
             // Template-list guard; the `<=` wrap is redundant but harmless.
             if self.renders_as_bare_less(arg, ctx)
@@ -521,9 +577,11 @@ impl<'a> Generator<'a> {
                     }
                 )
             {
-                let s = self.emit_expr_uncached(arg, ctx)?;
+                out.push('(');
+                self.emit_expr_uncached_into(arg, ctx, out)?;
                 ctx.wrapped(arg);
-                return Ok(format!("({s})"));
+                out.push(')');
+                return Ok(());
             }
             // An identity-swizzle `Compose` (`vecN(b.0,..,b.N-1)`) collapses to
             // its bare base.  A constructor argument has nothing appended, so
@@ -533,27 +591,33 @@ impl<'a> Generator<'a> {
                 // A pointer-value base collapses to `(*p)`, not the bare
                 // pointer.
                 if self.pointer_is_ptr_value(base, ctx) {
-                    return Ok(format!("(*{})", self.emit_expr(base, ctx)?));
+                    out.push_str("(*");
+                    self.emit_expr_into(base, ctx, out)?;
+                    out.push(')');
+                    return Ok(());
                 }
-                let s = self.emit_expr(base, ctx)?;
                 // A collapsed `Less`/`LessEqual` base takes the template-list
                 // guard; other operator bases stay bare.
-                if !ctx.expr_names.contains_key(base)
+                let wrap = !ctx.expr_names.contains_key(base)
                     && matches!(
                         ctx.exprs[base],
                         naga::Expression::Binary {
                             op: naga::BinaryOperator::Less | naga::BinaryOperator::LessEqual,
                             ..
                         }
-                    )
-                {
-                    ctx.wrapped(base);
-                    return Ok(format!("({s})"));
+                    );
+                if wrap {
+                    out.push('(');
                 }
-                return Ok(s);
+                self.emit_expr_into(base, ctx, out)?;
+                if wrap {
+                    ctx.wrapped(base);
+                    out.push(')');
+                }
+                return Ok(());
             }
         }
-        self.emit_expr(arg, ctx)
+        self.emit_expr_into(arg, ctx, out)
     }
 
     /// The scalar an uncached `Splat` (or scalar-per-lane splat `Compose`)
@@ -591,18 +655,22 @@ impl<'a> Generator<'a> {
     /// Base of a postfix `.member` / `[index]` / `.xyzw`: postfix binds
     /// tighter than any prefix or infix operator, so a Binary/Unary/Select
     /// base is parenthesised (`(a-b).x`, since `a-b.x` parses as `a-(b.x)`).
-    fn emit_postfix_base(
+    fn emit_postfix_base_into(
         &self,
         base: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
-    ) -> Result<String, Error> {
+        out: &mut String,
+    ) -> Result<(), Error> {
         // A pointer VALUE (function-argument `ptr<...>`) does not auto-deref:
         // naga accepts `p.x` on it but tint/Dawn reject it, so it renders
         // `(*p)`; references (globals, locals, chains rooted in them) do
         // auto-deref.  Checked before the cached path because an argument
         // renders by name yet still needs the deref.
         if self.pointer_is_ptr_value(base, ctx) {
-            return Ok(format!("(*{})", self.emit_expr(base, ctx)?));
+            out.push_str("(*");
+            self.emit_expr_into(base, ctx, out)?;
+            out.push(')');
+            return Ok(());
         }
         let needs_parens = matches!(
             ctx.exprs[base],
@@ -614,85 +682,81 @@ impl<'a> Generator<'a> {
             ctx.wrapped(base);
         }
         if ctx.expr_names.contains_key(base) {
-            return self.emit_expr(base, ctx);
+            return self.emit_expr_into(base, ctx, out);
         }
-        let s = self.emit_expr(base, ctx)?;
+        if needs_parens {
+            out.push('(');
+            self.emit_expr_into(base, ctx, out)?;
+            out.push(')');
+            return Ok(());
+        }
+        let start = out.len();
+        self.emit_expr_into(base, ctx, out)?;
         // An inlined whole-pointee `Load` of a pointer value renders `*p`, and
         // a bare `*p.field` parses as `*(p.field)` ("operand of `*` must be a
         // pointer"), so it is wrapped too; a let-bound one already rendered
         // as a name.
-        if needs_parens || s.starts_with('*') {
-            Ok(format!("({s})"))
-        } else {
-            Ok(s)
+        if out.as_bytes().get(start) == Some(&b'*') {
+            out.insert(start, '(');
+            out.push(')');
         }
+        Ok(())
     }
 
     // MARK: Expression dispatch
 
-    /// Every [`naga::Expression`] variant of an expression with no cached
-    /// binding; each shape rewrite lives in its arm.
     pub(super) fn emit_expr_uncached(
         &self,
         expr: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
+        let mut out = String::new();
+        self.emit_expr_uncached_into(expr, ctx, &mut out)?;
+        Ok(out)
+    }
+
+    /// Every [`naga::Expression`] variant of an expression with no cached
+    /// binding, appended to `out`; each shape rewrite lives in its arm.  An
+    /// arm that reads an operand's text (a leading `-` or `*`) inspects
+    /// what it appended and inserts before it; an arm that weighs two
+    /// spellings renders the challenger apart and swaps it in when shorter.
+    pub(super) fn emit_expr_uncached_into(
+        &self,
+        expr: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+        out: &mut String,
+    ) -> Result<(), Error> {
         use naga::Expression as E;
 
         ctx.rendered(expr);
-        Ok(match &ctx.exprs[expr] {
-            E::Literal(lit) => {
-                if let Some(concrete) =
-                    self.concretize_abstract_literal_for_expr(*lit, expr, ctx)?
-                {
-                    concrete
-                } else {
-                    let key = literal_extract_key(*lit, &self.options.float_precision);
-                    if let Some(name) = self.extracted_literals.get(&key) {
-                        name.clone()
-                    } else if literal_needs_typed_form_outside_constructor(*lit) {
-                        literal_to_wgsl(*lit, &self.options.float_precision)
-                    } else {
-                        key.expr_text
-                    }
-                }
-            }
+        match &ctx.exprs[expr] {
+            E::Literal(lit) => self.push_literal(*lit, expr, ctx, out)?,
             E::Constant(h) => {
                 let c = &self.module.constants[*h];
                 if c.name.is_some() {
-                    self.constant_names[h.index()].clone()
+                    out.push_str(&self.constant_names[h.index()]);
+                } else if let naga::Expression::Literal(lit) =
+                    &self.module.global_expressions[c.init]
+                {
+                    // An unnamed literal-init constant renders as its
+                    // literal at every use: same extraction lookup and
+                    // bare-form gate as the Literal arm, one suffix byte
+                    // cheaper than the typed global-expr path.
+                    self.push_literal(*lit, expr, ctx, out)?;
                 } else {
-                    if let naga::Expression::Literal(lit) = &self.module.global_expressions[c.init]
-                    {
-                        if let Some(concrete) =
-                            self.concretize_abstract_literal_for_expr(*lit, expr, ctx)?
-                        {
-                            concrete
-                        } else {
-                            // An unnamed literal-init constant renders as its
-                            // literal at every use: same extraction lookup and
-                            // bare-form gate as the Literal arm, one suffix
-                            // byte cheaper than the typed global-expr path.
-                            let key = literal_extract_key(*lit, &self.options.float_precision);
-                            if let Some(name) = self.extracted_literals.get(&key) {
-                                name.clone()
-                            } else if literal_needs_typed_form_outside_constructor(*lit) {
-                                literal_to_wgsl(*lit, &self.options.float_precision)
-                            } else {
-                                key.expr_text
-                            }
-                        }
-                    } else {
-                        // Rendered under its own context: a constructor it
-                        // spells is not counted for the alias plan, an
-                        // under-count that only ever forgoes a borderline
-                        // alias.
-                        self.emit_global_expr_in(c.init, false, &mut self.module_ctx())?
-                    }
+                    // Rendered under its own context: a constructor it
+                    // spells is not counted for the alias plan, an
+                    // under-count that only ever forgoes a borderline
+                    // alias.
+                    out.push_str(&self.emit_global_expr_in(
+                        c.init,
+                        false,
+                        &mut self.module_ctx(),
+                    )?);
                 }
             }
-            E::Override(h) => self.override_names[h.index()].clone(),
-            E::ZeroValue(ty) => self.zero_value(*ty, ctx)?,
+            E::Override(h) => out.push_str(&self.override_names[h.index()]),
+            E::ZeroValue(ty) => self.zero_value_into(*ty, ctx, out)?,
             E::Compose { ty, components } => 'compose: {
                 // All-zero vector/matrix -> `vec2f()`, but ONLY when inlined
                 // (ref count 1): naga re-parses `vec2f()` as a non-emittable
@@ -709,16 +773,17 @@ impl<'a> Generator<'a> {
                         compose_is_all_zero(c, ctx.exprs, &|c| ctx.expr_names.contains_key(c))
                     })
                 {
-                    break 'compose self.zero_value(*ty, ctx)?;
+                    self.zero_value_into(*ty, ctx, out)?;
+                    break 'compose;
                 }
 
                 if matches!(self.module.types[*ty].inner, naga::TypeInner::Vector { .. })
-                    && let Some(swizzle) = self.try_compose_as_full_swizzle(components, ctx)?
+                    && self.try_compose_as_full_swizzle(components, ctx, out)?
                 {
-                    break 'compose swizzle;
+                    break 'compose;
                 }
 
-                let mut s = String::new();
+                let start = out.len();
                 // The spellings below are tried in turn and the shorter kept;
                 // the counts of a dropped one go with it.
                 let mut kept = (ctx.mark(), 0);
@@ -735,15 +800,15 @@ impl<'a> Generator<'a> {
                 let array_pins =
                     !pinned && ctx.elide_array_ctor && self.array_ctor_pins(*ty, components, ctx);
                 if array_pins && "array".len() < ctor_name.len() {
-                    s.push_str("array");
+                    out.push_str("array");
                 } else {
-                    s.push_str(&ctor_name);
+                    out.push_str(&ctor_name);
                 }
                 if array_pins {
                     unaliased = unaliased.min("array".len());
                 }
                 ctx.note_type(*ty, unaliased);
-                s.push('(');
+                out.push('(');
                 let is_splat = matches!(
                     self.module.types[*ty].inner,
                     naga::TypeInner::Vector { size, .. }
@@ -753,21 +818,21 @@ impl<'a> Generator<'a> {
                     ctx.expr_names.contains_key(c)
                 });
                 if is_splat {
-                    s.push_str(&self.emit_constructor_arg(components[0], ctx)?);
+                    self.emit_constructor_arg_into(components[0], ctx, out)?;
                 } else if matches!(self.module.types[*ty].inner, naga::TypeInner::Vector { .. })
-                    && self.emit_compose_grouped(&mut s, components, ctx)?
+                    && self.emit_compose_grouped(out, components, ctx)?
                 {
-                    // Grouped swizzle runs already written to `s`.
+                    // Grouped swizzle runs already written.
                 } else {
                     let sep = self.comma_sep();
                     for (i, c) in components.iter().enumerate() {
                         if i > 0 {
-                            s.push_str(sep);
+                            out.push_str(sep);
                         }
-                        s.push_str(&self.emit_constructor_arg(*c, ctx)?);
+                        self.emit_constructor_arg_into(*c, ctx, out)?;
                     }
                 }
-                s.push(')');
+                out.push(')');
                 kept.1 = ctx.mark();
                 // A matrix of explicit scalar columns also has the flat form
                 // `mat2x2f(a,b,c,d)`; keep whichever is shorter - the column
@@ -776,7 +841,7 @@ impl<'a> Generator<'a> {
                 if let Some(flat) =
                     matrix_flatten_scalars(*ty, components, &self.module.types, ctx.exprs)
                 {
-                    let start = ctx.mark();
+                    let mark = ctx.mark();
                     let (mut sf, unaliased) = self.vector_ctor_name(*ty, components, ctx)?;
                     ctx.note_type(*ty, unaliased);
                     sf.push('(');
@@ -785,42 +850,41 @@ impl<'a> Generator<'a> {
                         if i > 0 {
                             sf.push_str(sep);
                         }
-                        sf.push_str(&self.emit_constructor_arg(*c, ctx)?);
+                        self.emit_constructor_arg_into(*c, ctx, &mut sf)?;
                     }
                     sf.push(')');
-                    if sf.len() < s.len() {
+                    if sf.len() < out.len() - start {
                         ctx.discard_range(kept.0, kept.1);
-                        s = sf;
-                        kept = (start, ctx.mark());
+                        out.truncate(start);
+                        out.push_str(&sf);
+                        kept = (mark, ctx.mark());
                     } else {
-                        ctx.discard_since(start);
+                        ctx.discard_since(mark);
                     }
                 }
                 // Equal-scalar runs may collapse to sub-vector splats
                 // (`vec4f(0,0,0,2)` -> `vec4f(vec3f(),2)`); kept only when
                 // strictly shorter, since the sub-vector type often lacks a
                 // short alias.
-                let start = ctx.mark();
+                let mark = ctx.mark();
                 match self.try_subsplat_compose(*ty, components, pinned, ctx)? {
-                    Some(sub) if sub.len() < s.len() => {
+                    Some(sub) if sub.len() < out.len() - start => {
                         ctx.discard_range(kept.0, kept.1);
-                        s = sub;
+                        out.truncate(start);
+                        out.push_str(&sub);
                     }
-                    _ => ctx.discard_since(start),
+                    _ => ctx.discard_since(mark),
                 }
-                s
             }
             E::Access { base, index } => {
-                let mut s = self.emit_postfix_base(*base, ctx)?;
-                s.push('[');
-                s.push_str(&self.emit_expr(*index, ctx)?);
-                s.push(']');
-                s
+                self.emit_postfix_base_into(*base, ctx, out)?;
+                out.push('[');
+                self.emit_expr_into(*index, ctx, out)?;
+                out.push(']');
             }
             E::AccessIndex { base, index } => {
-                let mut s = self.emit_postfix_base(*base, ctx)?;
-                self.push_access_index(&mut s, *base, *index, ctx);
-                s
+                self.emit_postfix_base_into(*base, ctx, out)?;
+                self.push_access_index(out, *base, *index, ctx);
             }
             E::Splat { size: _, value } => 'splat: {
                 // All-zero splat -> `vec3f()`, gated on ref count <= 1: a bound
@@ -829,8 +893,9 @@ impl<'a> Generator<'a> {
                 if ctx.ref_counts[expr.index()] <= 1
                     && compose_is_all_zero(*value, ctx.exprs, &|c| ctx.expr_names.contains_key(c))
                 {
-                    let target_ty = self.expr_type_name(expr, ctx)?;
-                    break 'splat format!("{target_ty}()");
+                    out.push_str(&self.expr_type_name(expr, ctx)?);
+                    out.push_str("()");
+                    break 'splat;
                 }
                 // The one lane pins the scalar as a `Compose`'s would, and
                 // the text of `vec4(x)` re-parses as this very `Splat`; a
@@ -841,14 +906,10 @@ impl<'a> Generator<'a> {
                 } else {
                     self.splat_ctor_name(expr, *value, ctx)?
                 };
-                let lane = self.emit_constructor_arg(*value, ctx)?;
-                {
-                    let mut s = target_ty;
-                    s.push('(');
-                    s.push_str(&lane);
-                    s.push(')');
-                    s
-                }
+                out.push_str(&target_ty);
+                out.push('(');
+                self.emit_constructor_arg_into(*value, ctx, out)?;
+                out.push(')');
             }
             E::Swizzle {
                 size,
@@ -883,32 +944,34 @@ impl<'a> Generator<'a> {
                         | naga::Expression::Select { .. }
                 );
                 if is_identity && base_is_full && base_paren_free {
-                    break 'swizzle self.emit_expr(*vector, ctx)?;
+                    self.emit_expr_into(*vector, ctx, out)?;
+                    break 'swizzle;
                 }
 
-                let mut s = self.emit_postfix_base(*vector, ctx)?;
-                s.push('.');
+                self.emit_postfix_base_into(*vector, ctx, out)?;
+                out.push('.');
                 for c in &pattern[..n] {
-                    s.push(match c {
+                    out.push(match c {
                         naga::SwizzleComponent::X => 'x',
                         naga::SwizzleComponent::Y => 'y',
                         naga::SwizzleComponent::Z => 'z',
                         naga::SwizzleComponent::W => 'w',
                     });
                 }
-                s
             }
-            E::FunctionArgument(i) => ctx.argument_names[*i as usize].clone(),
-            E::GlobalVariable(h) => self.global_names[h.index()].clone(),
-            E::LocalVariable(h) => ctx.local_names[h].clone(),
+            E::FunctionArgument(i) => out.push_str(&ctx.argument_names[*i as usize]),
+            E::GlobalVariable(h) => out.push_str(&self.global_names[h.index()]),
+            E::LocalVariable(h) => out.push_str(&ctx.local_names[h]),
             E::Load { pointer } => {
                 // naga lowers `atomicLoad(&p)` and a direct read to the same
                 // `Load`, but the spec and tint/Dawn reject reading `atomic<T>`
                 // directly.
                 if self.atomic_scalar_for_expr(*pointer, ctx).is_some() {
-                    format!("atomicLoad({})", self.emit_pointer_operand(*pointer, ctx)?)
+                    out.push_str("atomicLoad(");
+                    self.emit_pointer_operand_into(*pointer, ctx, out)?;
+                    out.push(')');
                 } else {
-                    self.emit_lvalue(*pointer, ctx)?
+                    self.emit_lvalue_into(*pointer, ctx, out)?;
                 }
             }
             E::ImageSample {
@@ -923,13 +986,12 @@ impl<'a> Generator<'a> {
                 clamp_to_edge,
             } => {
                 let sep = self.comma_sep();
-                let mut s = String::new();
 
                 if let Some(component) = gather {
                     let suffix = if depth_ref.is_some() { "Compare" } else { "" };
-                    s.push_str("textureGather");
-                    s.push_str(suffix);
-                    s.push('(');
+                    out.push_str("textureGather");
+                    out.push_str(suffix);
+                    out.push('(');
                     // Only a non-depth gather takes the leading component index.
                     if depth_ref.is_none() {
                         let is_depth = matches!(
@@ -940,28 +1002,28 @@ impl<'a> Generator<'a> {
                             }
                         );
                         if !is_depth {
-                            s.push_str(&(*component as u8).to_string());
-                            s.push_str(sep);
+                            out.push_str(&(*component as u8).to_string());
+                            out.push_str(sep);
                         }
                     }
-                    s.push_str(&self.emit_expr(*image, ctx)?);
-                    s.push_str(sep);
-                    s.push_str(&self.emit_expr(*sampler, ctx)?);
-                    s.push_str(sep);
-                    s.push_str(&self.emit_expr(*coordinate, ctx)?);
+                    self.emit_expr_into(*image, ctx, out)?;
+                    out.push_str(sep);
+                    self.emit_expr_into(*sampler, ctx, out)?;
+                    out.push_str(sep);
+                    self.emit_expr_into(*coordinate, ctx, out)?;
                     if let Some(ai) = array_index {
-                        s.push_str(sep);
-                        s.push_str(&self.emit_expr(*ai, ctx)?);
+                        out.push_str(sep);
+                        self.emit_expr_into(*ai, ctx, out)?;
                     }
                     if let Some(dr) = depth_ref {
-                        s.push_str(sep);
-                        s.push_str(&self.emit_expr(*dr, ctx)?);
+                        out.push_str(sep);
+                        self.emit_expr_into(*dr, ctx, out)?;
                     }
                     if let Some(off) = offset {
-                        s.push_str(sep);
-                        s.push_str(&self.emit_expr(*off, ctx)?);
+                        out.push_str(sep);
+                        self.emit_expr_into(*off, ctx, out)?;
                     }
-                    s.push(')');
+                    out.push(')');
                 } else {
                     let fn_name = match (depth_ref.is_some(), level, clamp_to_edge) {
                         (false, naga::SampleLevel::Zero, true) => "textureSampleBaseClampToEdge",
@@ -981,34 +1043,34 @@ impl<'a> Generator<'a> {
                             )));
                         }
                     };
-                    s.push_str(fn_name);
-                    s.push('(');
-                    s.push_str(&self.emit_expr(*image, ctx)?);
-                    s.push_str(sep);
-                    s.push_str(&self.emit_expr(*sampler, ctx)?);
-                    s.push_str(sep);
-                    s.push_str(&self.emit_expr(*coordinate, ctx)?);
+                    out.push_str(fn_name);
+                    out.push('(');
+                    self.emit_expr_into(*image, ctx, out)?;
+                    out.push_str(sep);
+                    self.emit_expr_into(*sampler, ctx, out)?;
+                    out.push_str(sep);
+                    self.emit_expr_into(*coordinate, ctx, out)?;
                     if let Some(ai) = array_index {
-                        s.push_str(sep);
-                        s.push_str(&self.emit_expr(*ai, ctx)?);
+                        out.push_str(sep);
+                        self.emit_expr_into(*ai, ctx, out)?;
                     }
                     if let Some(dr) = depth_ref {
-                        s.push_str(sep);
-                        s.push_str(&self.emit_expr(*dr, ctx)?);
+                        out.push_str(sep);
+                        self.emit_expr_into(*dr, ctx, out)?;
                     }
                     match level {
                         naga::SampleLevel::Auto => {}
                         naga::SampleLevel::Zero => {
                             // Only `textureSampleLevel` takes the explicit `0`.
                             if !clamp_to_edge && depth_ref.is_none() {
-                                s.push_str(sep);
-                                s.push('0');
+                                out.push_str(sep);
+                                out.push('0');
                             }
                         }
                         naga::SampleLevel::Exact(h) => {
                             if depth_ref.is_none() {
-                                s.push_str(sep);
-                                s.push_str(&self.emit_expr(*h, ctx)?);
+                                out.push_str(sep);
+                                self.emit_expr_into(*h, ctx, out)?;
                             } else {
                                 // `textureSampleCompareLevel` has no level
                                 // slot (always level 0); naga's frontend
@@ -1025,23 +1087,22 @@ impl<'a> Generator<'a> {
                             }
                         }
                         naga::SampleLevel::Bias(h) => {
-                            s.push_str(sep);
-                            s.push_str(&self.emit_expr(*h, ctx)?);
+                            out.push_str(sep);
+                            self.emit_expr_into(*h, ctx, out)?;
                         }
                         naga::SampleLevel::Gradient { x, y } => {
-                            s.push_str(sep);
-                            s.push_str(&self.emit_expr(*x, ctx)?);
-                            s.push_str(sep);
-                            s.push_str(&self.emit_expr(*y, ctx)?);
+                            out.push_str(sep);
+                            self.emit_expr_into(*x, ctx, out)?;
+                            out.push_str(sep);
+                            self.emit_expr_into(*y, ctx, out)?;
                         }
                     }
                     if let Some(off) = offset {
-                        s.push_str(sep);
-                        s.push_str(&self.emit_expr(*off, ctx)?);
+                        out.push_str(sep);
+                        self.emit_expr_into(*off, ctx, out)?;
                     }
-                    s.push(')');
+                    out.push(')');
                 }
-                s
             }
             E::ImageLoad {
                 image,
@@ -1051,54 +1112,48 @@ impl<'a> Generator<'a> {
                 level,
             } => {
                 let sep = self.comma_sep();
-                let mut s = String::from("textureLoad(");
-                s.push_str(&self.emit_expr(*image, ctx)?);
-                s.push_str(sep);
-                s.push_str(&self.emit_expr(*coordinate, ctx)?);
+                out.push_str("textureLoad(");
+                self.emit_expr_into(*image, ctx, out)?;
+                out.push_str(sep);
+                self.emit_expr_into(*coordinate, ctx, out)?;
                 if let Some(ai) = array_index {
-                    s.push_str(sep);
-                    s.push_str(&self.emit_expr(*ai, ctx)?);
+                    out.push_str(sep);
+                    self.emit_expr_into(*ai, ctx, out)?;
                 }
                 if let Some(sample) = sample {
-                    s.push_str(sep);
-                    s.push_str(&self.emit_expr(*sample, ctx)?);
+                    out.push_str(sep);
+                    self.emit_expr_into(*sample, ctx, out)?;
                 } else if let Some(level) = level {
-                    s.push_str(sep);
-                    s.push_str(&self.emit_expr(*level, ctx)?);
+                    out.push_str(sep);
+                    self.emit_expr_into(*level, ctx, out)?;
                 }
-                s.push(')');
-                s
+                out.push(')');
             }
             E::ImageQuery { image, query } => {
                 let sep = self.comma_sep();
-                let mut s = String::new();
                 match query {
                     naga::ImageQuery::Size { level } => {
-                        s.push_str("textureDimensions(");
-                        s.push_str(&self.emit_expr(*image, ctx)?);
+                        out.push_str("textureDimensions(");
+                        self.emit_expr_into(*image, ctx, out)?;
                         if let Some(level) = level {
-                            s.push_str(sep);
-                            s.push_str(&self.emit_expr(*level, ctx)?);
+                            out.push_str(sep);
+                            self.emit_expr_into(*level, ctx, out)?;
                         }
-                        s.push(')');
                     }
                     naga::ImageQuery::NumLevels => {
-                        s.push_str("textureNumLevels(");
-                        s.push_str(&self.emit_expr(*image, ctx)?);
-                        s.push(')');
+                        out.push_str("textureNumLevels(");
+                        self.emit_expr_into(*image, ctx, out)?;
                     }
                     naga::ImageQuery::NumLayers => {
-                        s.push_str("textureNumLayers(");
-                        s.push_str(&self.emit_expr(*image, ctx)?);
-                        s.push(')');
+                        out.push_str("textureNumLayers(");
+                        self.emit_expr_into(*image, ctx, out)?;
                     }
                     naga::ImageQuery::NumSamples => {
-                        s.push_str("textureNumSamples(");
-                        s.push_str(&self.emit_expr(*image, ctx)?);
-                        s.push(')');
+                        out.push_str("textureNumSamples(");
+                        self.emit_expr_into(*image, ctx, out)?;
                     }
                 }
-                s
+                out.push(')');
             }
             E::Unary { op, expr } => {
                 // Deliberately no comparison flip in value position (unlike
@@ -1117,33 +1172,36 @@ impl<'a> Generator<'a> {
                 if unary_child_needs_parens(*expr, ctx.exprs, false) {
                     ctx.wrapped(*expr);
                 }
-                let mut s = self.emit_expr(*expr, ctx)?;
+                out.push_str(op_str);
+                if wrap {
+                    out.push('(');
+                }
+                let start = out.len();
+                self.emit_expr_into(*expr, ctx, out)?;
                 // A float zero renders bare as `0` where a sibling pins the
                 // type, and `-0` re-parses as the ABSTRACT INTEGER zero, which
                 // has no sign bit (`1.0 / -0` is `+inf`).  Abstract floats
                 // count: this emitter also renders module-scope
                 // const-expressions, which naga has not concretised.
                 if matches!(op, naga::UnaryOperator::Negate)
-                    && s == "0"
+                    && &out[start..] == "0"
                     && matches!(
                         ctx.ty(*expr).inner_with(&self.module.types).scalar_kind(),
                         Some(naga::ScalarKind::Float | naga::ScalarKind::AbstractFloat)
                     )
                 {
-                    s.push('.');
+                    out.push('.');
                 }
                 if wrap {
-                    s.insert(0, '(');
-                    s.push(')');
+                    out.push(')');
+                } else if matches!(op, naga::UnaryOperator::Negate)
+                    && out.as_bytes().get(start) == Some(&b'-')
+                {
+                    // WGSL reserves `--`: a `Negate` over a child rendering
+                    // with a leading `-` takes a space, one byte cheaper than
+                    // parens (`!`/`~` form no reserved adjacency).
+                    out.insert(start, ' ');
                 }
-                // WGSL reserves `--`: a `Negate` over a child rendering with a
-                // leading `-` takes a space, one byte cheaper than parens
-                // (`!`/`~` form no reserved adjacency).
-                if matches!(op, naga::UnaryOperator::Negate) && !wrap && s.starts_with('-') {
-                    s.insert(0, ' ');
-                }
-                s.insert_str(0, op_str);
-                s
             }
             E::Binary { op, left, right } => {
                 let op_str = binary_op_str(*op);
@@ -1197,7 +1255,7 @@ impl<'a> Generator<'a> {
                 };
 
                 let wrap_l = child_needs_parens(eff_l, arena, *op, false, eff_lc);
-                let mut wrap_r = child_needs_parens(eff_r, arena, *op, true, eff_rc);
+                let wrap_r = child_needs_parens(eff_r, arena, *op, true, eff_rc);
                 ctx.wrapped_operands(
                     eff_l,
                     child_needs_parens(eff_l, arena, *op, false, false),
@@ -1225,8 +1283,8 @@ impl<'a> Generator<'a> {
                         .then_some(l)
                     })
                     .flatten();
-                let ls = if let Some(lit) = widening_left {
-                    literal_to_wgsl(lit, &self.options.float_precision)
+                let left = if let Some(lit) = widening_left {
+                    Operand::Typed(lit)
                 } else if !elide_l
                     && matches!(
                         op,
@@ -1235,27 +1293,26 @@ impl<'a> Generator<'a> {
                     && let Some(lit) = self.inline_scalar_literal(*left, ctx)
                     && literal_bare_form_changes_type(lit)
                 {
-                    literal_to_wgsl(lit, &self.options.float_precision)
-                } else if elide_l {
-                    self.emit_expr(left_scalar.unwrap(), ctx)?
+                    Operand::Typed(lit)
                 } else {
-                    self.emit_expr(*left, ctx)?
+                    Operand::Value(eff_l)
                 };
-                let rs = if elide_r {
-                    let s = self.emit_expr(right_scalar.unwrap(), ctx)?;
-                    // `a--b` would lex as a decrement in no-space mode.
-                    if !wrap_r
-                        && sp.is_empty()
-                        && matches!(op, naga::BinaryOperator::Subtract)
-                        && s.starts_with('-')
-                    {
-                        wrap_r = true;
-                    }
-                    s
-                } else {
-                    self.emit_expr(*right, ctx)?
-                };
-                assemble_binary(&ls, &rs, op_str, sp, wrap_l, wrap_r)
+                // `a--b` would lex as a decrement in no-space mode.
+                let guard_minus = elide_r
+                    && !wrap_r
+                    && sp.is_empty()
+                    && matches!(op, naga::BinaryOperator::Subtract);
+                self.push_binary(
+                    out,
+                    ctx,
+                    left,
+                    Operand::Value(eff_r),
+                    op_str,
+                    sp,
+                    wrap_l,
+                    wrap_r,
+                    guard_minus,
+                )?;
             }
             E::Select {
                 condition,
@@ -1263,49 +1320,15 @@ impl<'a> Generator<'a> {
                 reject,
             } => {
                 let sep = self.comma_sep();
-                let mut s = String::from("select(");
-
-                // `select`'s value operands must share one concrete type, so
-                // an uncached literal takes its typed form (a bound one's
-                // `let` carries the type, and its name keeps the runtime
-                // evaluation a hazard binding exists for).
-                let reject_str = if let naga::Expression::Literal(lit) = &ctx.exprs[*reject]
-                    && !ctx.expr_names.contains_key(reject)
-                {
-                    literal_to_wgsl(*lit, &self.options.float_precision)
-                } else {
-                    self.emit_expr(*reject, ctx)?
-                };
+                out.push_str("select(");
                 // Template-list guard on the two non-final arguments; the
                 // closing `)` covers the condition.
-                if self.renders_as_bare_less(*reject, ctx) {
-                    s.push('(');
-                    s.push_str(&reject_str);
-                    s.push(')');
-                } else {
-                    s.push_str(&reject_str);
-                }
-                s.push_str(sep);
-
-                let accept_str = if let naga::Expression::Literal(lit) = &ctx.exprs[*accept]
-                    && !ctx.expr_names.contains_key(accept)
-                {
-                    literal_to_wgsl(*lit, &self.options.float_precision)
-                } else {
-                    self.emit_expr(*accept, ctx)?
-                };
-                if self.renders_as_bare_less(*accept, ctx) {
-                    s.push('(');
-                    s.push_str(&accept_str);
-                    s.push(')');
-                } else {
-                    s.push_str(&accept_str);
-                }
-                s.push_str(sep);
-
-                s.push_str(&self.emit_expr(*condition, ctx)?);
-                s.push(')');
-                s
+                self.push_select_arm(*reject, ctx, out)?;
+                out.push_str(sep);
+                self.push_select_arm(*accept, ctx, out)?;
+                out.push_str(sep);
+                self.emit_expr_into(*condition, ctx, out)?;
+                out.push(')');
             }
             E::Derivative { axis, ctrl, expr } => {
                 let name = match (axis, ctrl) {
@@ -1321,22 +1344,17 @@ impl<'a> Generator<'a> {
                     }
                     (naga::DerivativeAxis::Width, naga::DerivativeControl::Fine) => "fwidthFine",
                 };
+                out.push_str(name);
+                out.push('(');
+                // Derivatives take floats only; a bare `1` would infer i32.
+                if !ctx.expr_names.contains_key(expr)
+                    && let naga::Expression::Literal(lit) = ctx.exprs[*expr]
                 {
-                    let mut s = String::from(name);
-                    s.push('(');
-                    // Derivatives take floats only; a bare `1` would infer i32.
-                    if !ctx.expr_names.contains_key(expr) {
-                        if let naga::Expression::Literal(lit) = ctx.exprs[*expr] {
-                            s.push_str(&literal_to_wgsl(lit, &self.options.float_precision));
-                        } else {
-                            s.push_str(&self.emit_expr(*expr, ctx)?);
-                        }
-                    } else {
-                        s.push_str(&self.emit_expr(*expr, ctx)?);
-                    }
-                    s.push(')');
-                    s
+                    out.push_str(&literal_to_wgsl(lit, &self.options.float_precision));
+                } else {
+                    self.emit_expr_into(*expr, ctx, out)?;
                 }
+                out.push(')');
             }
             E::Relational { fun, argument } => {
                 let name = match fun {
@@ -1351,11 +1369,10 @@ impl<'a> Generator<'a> {
                         )));
                     }
                 };
-                let mut s = String::from(name);
-                s.push('(');
-                s.push_str(&self.emit_expr(*argument, ctx)?);
-                s.push(')');
-                s
+                out.push_str(name);
+                out.push('(');
+                self.emit_expr_into(*argument, ctx, out)?;
+                out.push(')');
             }
             E::Math {
                 fun,
@@ -1365,9 +1382,8 @@ impl<'a> Generator<'a> {
                 arg3,
             } => {
                 let sep = self.comma_sep();
-                let mut s = String::new();
-                s.push_str(math_name(*fun));
-                s.push('(');
+                out.push_str(math_name(*fun));
+                out.push('(');
                 // `extractBits` / `insertBits` type as their value
                 // operand(s) alone, so `offset` / `count` pin nothing;
                 // every other builtin shares one type across its arguments
@@ -1405,42 +1421,28 @@ impl<'a> Generator<'a> {
                             })
                         })
                 };
-                let typed_if_literal = |g: &Self,
-                                        h: naga::Handle<naga::Expression>,
-                                        ctx: &mut FunctionCtx<'a, '_>|
-                 -> Result<String, Error> {
-                    if pins_alone
-                        && let Some(lit) = g.inline_scalar_literal(h, ctx)
-                        && literal_bare_form_changes_type(lit)
-                    {
-                        Ok(literal_to_wgsl(lit, &g.options.float_precision))
-                    } else {
-                        g.emit_expr(h, ctx)
-                    }
-                };
                 if float_needs_pin && let Some(lit) = self.inline_scalar_literal(*arg, ctx) {
-                    s.push_str(&literal_to_wgsl(lit, &self.options.float_precision));
+                    out.push_str(&literal_to_wgsl(lit, &self.options.float_precision));
                 } else {
-                    s.push_str(&typed_if_literal(self, *arg, ctx)?);
+                    self.push_math_arg(*arg, pins_alone, ctx, out)?;
                 }
                 if let Some(v) = arg1 {
-                    s.push_str(sep);
+                    out.push_str(sep);
                     if *fun == naga::MathFunction::InsertBits {
-                        s.push_str(&typed_if_literal(self, *v, ctx)?);
+                        self.push_math_arg(*v, pins_alone, ctx, out)?;
                     } else {
-                        s.push_str(&self.emit_expr(*v, ctx)?);
+                        self.emit_expr_into(*v, ctx, out)?;
                     }
                 }
                 if let Some(v) = arg2 {
-                    s.push_str(sep);
-                    s.push_str(&self.emit_expr(*v, ctx)?);
+                    out.push_str(sep);
+                    self.emit_expr_into(*v, ctx, out)?;
                 }
                 if let Some(v) = arg3 {
-                    s.push_str(sep);
-                    s.push_str(&self.emit_expr(*v, ctx)?);
+                    out.push_str(sep);
+                    self.emit_expr_into(*v, ctx, out)?;
                 }
-                s.push(')');
-                s
+                out.push(')');
             }
             E::As {
                 expr,
@@ -1475,13 +1477,11 @@ impl<'a> Generator<'a> {
                             width: target_width,
                         },
                     };
-                    let target = self.type_name_for_inner(&target_inner, ctx)?;
-                    let source = self.emit_expr(*expr, ctx)?;
-                    let mut s = target;
-                    s.push('(');
-                    s.push_str(&source);
-                    s.push(')');
-                    return Ok(s);
+                    out.push_str(&self.type_name_for_inner(&target_inner, ctx)?);
+                    out.push('(');
+                    self.emit_expr_into(*expr, ctx, out)?;
+                    out.push(')');
+                    return Ok(());
                 }
                 let (vec_size, src_width) = match src_inner {
                     naga::TypeInner::Scalar(s) => (None, s.width),
@@ -1557,52 +1557,45 @@ impl<'a> Generator<'a> {
                         ctx,
                     )?
                 {
-                    return Ok(folded);
+                    out.push_str(&folded);
+                    return Ok(());
                 }
                 let target = self.type_name_for_inner(&target_inner, ctx)?;
-                let source = if let Some(lit) = self.inline_scalar_literal(*expr, ctx)
+                if convert.is_some() {
+                    out.push_str(&target);
+                } else {
+                    out.push_str("bitcast<");
+                    out.push_str(&target);
+                    out.push('>');
+                }
+                out.push('(');
+                if let Some(lit) = self.inline_scalar_literal(*expr, ctx)
                     && as_operand_keeps_suffix(lit, *kind, *convert)
                 {
-                    literal_to_wgsl(lit, &self.options.float_precision)
+                    out.push_str(&literal_to_wgsl(lit, &self.options.float_precision));
                 } else if !ctx.expr_names.contains_key(expr)
                     && matches!(ctx.exprs[*expr], E::Compose { .. } | E::Splat { .. })
                     && compose_lane_keeps_suffix(ctx.exprs, *expr, *kind, *convert)
                 {
                     // The constructor's own type keeps every lane typed.
                     let outer = ctx.pinned_root.replace(*expr);
-                    let text = self.emit_expr(*expr, ctx);
+                    let text = self.emit_expr_into(*expr, ctx, out);
                     ctx.pinned_root = outer;
-                    text?
+                    text?;
                 } else {
-                    self.emit_expr(*expr, ctx)?
-                };
-                let mut s = if convert.is_some() {
-                    target
-                } else {
-                    let mut s = String::from("bitcast<");
-                    s.push_str(&target);
-                    s.push('>');
-                    s
-                };
-                s.push('(');
-                s.push_str(&source);
-                s.push(')');
-                s
+                    self.emit_expr_into(*expr, ctx, out)?;
+                }
+                out.push(')');
             }
-            E::CallResult(_) => ctx
-                .expr_names
-                .get(expr)
-                .cloned()
-                .unwrap_or_else(|| format!("_e{}", expr.index())),
-            E::AtomicResult { .. }
+            E::CallResult(_)
+            | E::AtomicResult { .. }
             | E::WorkGroupUniformLoadResult { .. }
             | E::SubgroupBallotResult
             | E::SubgroupOperationResult { .. }
-            | E::RayQueryProceedResult => ctx
-                .expr_names
-                .get(expr)
-                .cloned()
-                .unwrap_or_else(|| format!("_e{}", expr.index())),
+            | E::RayQueryProceedResult => match ctx.expr_names.get(expr) {
+                Some(name) => out.push_str(name),
+                None => out.push_str(&format!("_e{}", expr.index())),
+            },
             // Free-standing builtin calls with no binding statement (unlike
             // `RayQueryProceedResult`, bound by its `RayQuery` statement) that
             // read the query's CURRENT traversal state, so
@@ -1610,26 +1603,28 @@ impl<'a> Generator<'a> {
             // a read that would otherwise re-evaluate past a query-mutating
             // statement.
             E::RayQueryGetIntersection { query, committed } => {
-                let mut s = String::from(if *committed {
+                out.push_str(if *committed {
                     "rayQueryGetCommittedIntersection("
                 } else {
                     "rayQueryGetCandidateIntersection("
                 });
-                s.push_str(&self.emit_ray_query_arg(*query, ctx)?);
-                s.push(')');
-                s
+                self.emit_ray_query_arg_into(*query, ctx, out)?;
+                out.push(')');
             }
             E::RayQueryVertexPositions { query, committed } => {
-                let mut s = String::from(if *committed {
+                out.push_str(if *committed {
                     "getCommittedHitVertexPositions("
                 } else {
                     "getCandidateHitVertexPositions("
                 });
-                s.push_str(&self.emit_ray_query_arg(*query, ctx)?);
-                s.push(')');
-                s
+                self.emit_ray_query_arg_into(*query, ctx, out)?;
+                out.push(')');
             }
-            E::ArrayLength(e) => format!("arrayLength({})", self.emit_pointer_operand(*e, ctx)?),
+            E::ArrayLength(e) => {
+                out.push_str("arrayLength(");
+                self.emit_pointer_operand_into(*e, ctx, out)?;
+                out.push(')');
+            }
             _ => {
                 return Err(Error::Emit(format!(
                     "unsupported expression in function '{}' (expr {}): {}",
@@ -1638,7 +1633,153 @@ impl<'a> Generator<'a> {
                     expression_kind(&ctx.exprs[expr]),
                 )));
             }
-        })
+        }
+        Ok(())
+    }
+
+    /// A literal at `expr`, its own or an unnamed constant's: concretised
+    /// through the site's type, else its extracted name, else typed where
+    /// the bare form would retype it.
+    fn push_literal(
+        &self,
+        lit: naga::Literal,
+        expr: naga::Handle<naga::Expression>,
+        ctx: &FunctionCtx<'a, '_>,
+        out: &mut String,
+    ) -> Result<(), Error> {
+        if self.push_concretized_abstract_literal(lit, expr, ctx, out)? {
+            return Ok(());
+        }
+        let key = literal_extract_key(lit, &self.options.float_precision);
+        if let Some(name) = self.extracted_literals.get(&key) {
+            out.push_str(name);
+        } else if literal_needs_typed_form_outside_constructor(lit) {
+            out.push_str(&literal_to_wgsl(lit, &self.options.float_precision));
+        } else {
+            out.push_str(&key.expr_text);
+        }
+        Ok(())
+    }
+
+    /// A value operand of `select`, which must share one concrete type with
+    /// the other: an uncached literal takes its typed form (a bound one's
+    /// `let` carries the type, and its name keeps the runtime evaluation a
+    /// hazard binding exists for), under the template-list guard.
+    fn push_select_arm(
+        &self,
+        arm: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+        out: &mut String,
+    ) -> Result<(), Error> {
+        let wrap = self.renders_as_bare_less(arm, ctx);
+        if wrap {
+            out.push('(');
+        }
+        if let naga::Expression::Literal(lit) = &ctx.exprs[arm]
+            && !ctx.expr_names.contains_key(arm)
+        {
+            out.push_str(&literal_to_wgsl(*lit, &self.options.float_precision));
+        } else {
+            self.emit_expr_into(arm, ctx, out)?;
+        }
+        if wrap {
+            out.push(')');
+        }
+        Ok(())
+    }
+
+    /// A builtin's value operand: typed where the call types by it alone
+    /// (`pins_alone`) and its bare form would retype the call.
+    fn push_math_arg(
+        &self,
+        h: naga::Handle<naga::Expression>,
+        pins_alone: bool,
+        ctx: &mut FunctionCtx<'a, '_>,
+        out: &mut String,
+    ) -> Result<(), Error> {
+        if pins_alone
+            && let Some(lit) = self.inline_scalar_literal(h, ctx)
+            && literal_bare_form_changes_type(lit)
+        {
+            out.push_str(&literal_to_wgsl(lit, &self.options.float_precision));
+            Ok(())
+        } else {
+            self.emit_expr_into(h, ctx, out)
+        }
+    }
+
+    /// `left op right` appended to `out` with the requested wraps and
+    /// beautify spacing; every binary emission funnels through here.  The
+    /// right operand's first byte decides the no-space guards, so it is
+    /// read once appended and the guard's byte inserted before it.
+    /// `guard_minus` wraps a bare right operand opening with `-` under a
+    /// no-space `-` (an elided splat scalar) where the plain guard would
+    /// space it.
+    #[allow(clippy::too_many_arguments)]
+    fn push_binary(
+        &self,
+        out: &mut String,
+        ctx: &mut FunctionCtx<'a, '_>,
+        left: Operand,
+        right: Operand,
+        op_str: &str,
+        sp: &str,
+        wrap_l: bool,
+        wrap_r: bool,
+        guard_minus: bool,
+    ) -> Result<(), Error> {
+        if wrap_l {
+            out.push('(');
+        }
+        self.push_operand(left, ctx, out)?;
+        if wrap_l {
+            out.push(')');
+        }
+        out.push_str(sp);
+        out.push_str(op_str);
+        if !sp.is_empty() {
+            out.push_str(sp);
+        }
+        let start = out.len();
+        if wrap_r {
+            out.push('(');
+        }
+        self.push_operand(right, ctx, out)?;
+        if wrap_r {
+            out.push(')');
+            return Ok(());
+        }
+        let first = out.as_bytes().get(start).copied();
+        if guard_minus && first == Some(b'-') {
+            out.insert(start, '(');
+            out.push(')');
+        } else if sp.is_empty()
+            && let (Some(&oc), Some(rc)) = (op_str.as_bytes().last(), first)
+            && ((oc == rc && (oc == b'-' || oc == b'/')) || (oc == b'/' && rc == b'*'))
+        {
+            // No-space mode: keep the lexer from fusing `-` and `-b` into the
+            // reserved decrement, `/` and `/` into a line comment (impossible
+            // from valid IR, guarded for symmetry) or `/` and `*p` (a pointer
+            // deref) into a block-comment opener.
+            out.insert(start, ' ');
+        }
+        Ok(())
+    }
+
+    fn push_operand(
+        &self,
+        operand: Operand,
+        ctx: &mut FunctionCtx<'a, '_>,
+        out: &mut String,
+    ) -> Result<(), Error> {
+        match operand {
+            Operand::Value(h) => self.emit_expr_into(h, ctx, out),
+            Operand::Typed(lit) => {
+                out.push_str(&literal_to_wgsl(lit, &self.options.float_precision));
+                Ok(())
+            }
+            Operand::Hinted(h, hint) => self.emit_expr_with_scalar_hint_into(h, hint, ctx, out),
+        }
     }
 
     /// The concrete scalar literal `h` inlines as (a `Literal` or an
@@ -1710,14 +1851,17 @@ impl<'a> Generator<'a> {
         Ok((annotation, self.emit_expr(operand, ctx)?))
     }
 
-    fn concretize_abstract_literal_for_expr(
+    /// `lit` concretised through `expr`'s type and appended; `false`, with
+    /// nothing appended, for a concrete literal or a type pinning no scalar.
+    fn push_concretized_abstract_literal(
         &self,
         lit: naga::Literal,
         expr: naga::Handle<naga::Expression>,
         ctx: &FunctionCtx<'a, '_>,
-    ) -> Result<Option<String>, Error> {
+        out: &mut String,
+    ) -> Result<bool, Error> {
         let inner = ctx.ty(expr).inner_with(&self.module.types);
-        Ok(match concretize_abstract_literal_via_inner(lit, inner) {
+        match concretize_abstract_literal_via_inner(lit, inner) {
             // Scan (`count_literals`) and emission both key on the CONCRETE
             // form, so a hot concretized literal substitutes its extracted
             // name; otherwise the typed form keeps the type pinned where
@@ -1725,16 +1869,17 @@ impl<'a> Generator<'a> {
             Some(ConcretizedAbstract::Lit(concrete)) => {
                 let key = literal_extract_key(concrete, &self.options.float_precision);
                 if let Some(name) = self.extracted_literals.get(&key) {
-                    Some(name.clone())
+                    out.push_str(name);
                 } else {
-                    Some(literal_to_wgsl(concrete, &self.options.float_precision))
+                    out.push_str(&literal_to_wgsl(concrete, &self.options.float_precision));
                 }
             }
             // Wrapper text (`f16(0.5f)`, `i32(<huge>)`) cannot be
             // substituted; the scan side skips counting it too.
-            Some(ConcretizedAbstract::Text(text)) => Some(text),
-            None => None,
-        })
+            Some(ConcretizedAbstract::Text(text)) => out.push_str(&text),
+            None => return Ok(false),
+        }
+        Ok(true)
     }
 
     // MARK: Global expression emission
@@ -1881,6 +2026,16 @@ impl<'a> Generator<'a> {
         self.type_ref(ty)
     }
 
+    pub(super) fn spell_type_into(
+        &self,
+        ty: naga::Handle<naga::Type>,
+        ctx: &mut FunctionCtx<'a, '_>,
+        out: &mut String,
+    ) -> Result<(), Error> {
+        ctx.note_type(ty, self.type_spelled_len(ty));
+        self.push_type_ref(ty, out)
+    }
+
     /// [`Self::type_ref`] in a declaration, noted likewise.
     pub(super) fn declare_type(&mut self, ty: naga::Handle<naga::Type>) -> Result<String, Error> {
         self.type_uses.note(ty, self.type_spelled_len[ty.index()]);
@@ -1901,16 +2056,50 @@ impl<'a> Generator<'a> {
         )
     }
 
-    /// Shortest zero of `ty`: a scalar literal (`0i`, `false`) or `T()`.
+    pub(super) fn push_type_ref(
+        &self,
+        ty: naga::Handle<naga::Type>,
+        out: &mut String,
+    ) -> Result<(), Error> {
+        if let Some(name) = self.type_names.get(ty) {
+            out.push_str(name);
+            return Ok(());
+        }
+        out.push_str(&type_inner_name(
+            &self.module.types[ty].inner,
+            self.module,
+            &self.type_names,
+            &self.override_names,
+            &self.shadowed_type_aliases,
+        )?);
+        Ok(())
+    }
+
     pub(super) fn zero_value(
         &self,
         ty: naga::Handle<naga::Type>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
-        Ok(match &self.module.types[ty].inner {
-            naga::TypeInner::Scalar(s) => scalar_zero(s.kind, s.width).to_string(),
-            _ => format!("{}()", self.spell_type(ty, ctx)?),
-        })
+        let mut out = String::new();
+        self.zero_value_into(ty, ctx, &mut out)?;
+        Ok(out)
+    }
+
+    /// Shortest zero of `ty`: a scalar literal (`0i`, `false`) or `T()`.
+    pub(super) fn zero_value_into(
+        &self,
+        ty: naga::Handle<naga::Type>,
+        ctx: &mut FunctionCtx<'a, '_>,
+        out: &mut String,
+    ) -> Result<(), Error> {
+        match &self.module.types[ty].inner {
+            naga::TypeInner::Scalar(s) => out.push_str(scalar_zero(s.kind, s.width)),
+            _ => {
+                self.spell_type_into(ty, ctx, out)?;
+                out.push_str("()");
+            }
+        }
+        Ok(())
     }
 
     /// Append `:<type>` (WGSL zero-initialises an uninitialised local) or
@@ -2285,7 +2474,7 @@ impl<'a> Generator<'a> {
         let types = &self.module.types;
         let (base, idx) =
             swizzle_component(handle, ctx.exprs, types, &|b| ctx.ty(b).inner_with(types))?;
-        Some((ctx.twins.get(base).copied().unwrap_or(base), idx))
+        Some((ctx.twins.first_of(base).unwrap_or(base), idx))
     }
 
     /// The base an uncached identity-swizzle `Compose` (`vecN(b.0,..,b.N-1)`)
@@ -2331,14 +2520,16 @@ impl<'a> Generator<'a> {
     }
 
     /// A vector `Compose` as a bare swizzle: `vec3f(v.x,v.y,v.z)` -> `v.xyz`,
-    /// and the identity over a same-size vector -> `v`.
+    /// and the identity over a same-size vector -> `v`; `false`, with
+    /// nothing appended, for any other shape.
     fn try_compose_as_full_swizzle(
         &self,
         components: &[naga::Handle<naga::Expression>],
         ctx: &mut FunctionCtx<'a, '_>,
-    ) -> Result<Option<String>, Error> {
+        out: &mut String,
+    ) -> Result<bool, Error> {
         if components.len() < 2 || components.len() > 4 {
-            return Ok(None);
+            return Ok(false);
         }
 
         let mut common_base: Option<naga::Handle<naga::Expression>> = None;
@@ -2349,11 +2540,11 @@ impl<'a> Generator<'a> {
                 match common_base {
                     None => common_base = Some(base),
                     Some(b) if b == base => {}
-                    _ => return Ok(None),
+                    _ => return Ok(false),
                 }
                 pattern.push(idx);
             } else {
-                return Ok(None);
+                return Ok(false);
             }
         }
 
@@ -2367,15 +2558,16 @@ impl<'a> Generator<'a> {
             // The substituted text replaces the whole Compose, so the parent
             // cannot see an operator expression; an uncached
             // Binary/Unary/Select base keeps its parens.
-            return Ok(Some(self.emit_postfix_base(base, ctx)?));
+            self.emit_postfix_base_into(base, ctx, out)?;
+            return Ok(true);
         }
 
-        let mut s = self.emit_postfix_base(base, ctx)?;
-        s.push('.');
+        self.emit_postfix_base_into(base, ctx, out)?;
+        out.push('.');
         for &idx in &pattern {
-            s.push(Self::SWIZZLE_LETTERS[idx as usize]);
+            out.push(Self::SWIZZLE_LETTERS[idx as usize]);
         }
-        Ok(Some(s))
+        Ok(true)
     }
 
     /// Write the components to `s`, collapsing consecutive same-base swizzle
@@ -2429,14 +2621,14 @@ impl<'a> Generator<'a> {
             first = false;
             match group {
                 ComposeGroup::Swizzle { base, indices } => {
-                    s.push_str(&self.emit_postfix_base(*base, ctx)?);
+                    self.emit_postfix_base_into(*base, ctx, s)?;
                     s.push('.');
                     for &idx in indices {
                         s.push(Self::SWIZZLE_LETTERS[idx as usize]);
                     }
                 }
                 ComposeGroup::Single(handle) => {
-                    s.push_str(&self.emit_constructor_arg(*handle, ctx)?);
+                    self.emit_constructor_arg_into(*handle, ctx, s)?;
                 }
             }
         }
@@ -2487,12 +2679,13 @@ impl<'a> Generator<'a> {
     /// spelling, for positions naga's lowerer gives no abstract coercion
     /// (the `rayQueryGenerateIntersection` hit_t slot, subgroup-op operands),
     /// where a bare literal would re-concretize to i32.
-    pub(super) fn emit_expr_with_scalar_hint(
+    pub(super) fn emit_expr_with_scalar_hint_into(
         &self,
         expr: naga::Handle<naga::Expression>,
         hint: Option<naga::Scalar>,
         ctx: &mut FunctionCtx<'a, '_>,
-    ) -> Result<String, Error> {
+        out: &mut String,
+    ) -> Result<(), Error> {
         if !ctx.expr_names.contains_key(expr)
             && let Some(scalar) = hint
         {
@@ -2514,16 +2707,25 @@ impl<'a> Generator<'a> {
                         right,
                         child_needs_parens(right, arena, op, true, false),
                     );
-                    let ls = self.emit_expr_with_scalar_hint(left, Some(scalar), ctx)?;
-                    let rs = self.emit_expr_with_scalar_hint(right, Some(scalar), ctx)?;
                     let op_str = binary_op_str(op);
                     let sp = self.bin_op_sep();
-                    return Ok(assemble_binary(&ls, &rs, op_str, sp, wrap_l, wrap_r));
+                    return self.push_binary(
+                        out,
+                        ctx,
+                        Operand::Hinted(left, Some(scalar)),
+                        Operand::Hinted(right, Some(scalar)),
+                        op_str,
+                        sp,
+                        wrap_l,
+                        wrap_r,
+                        false,
+                    );
                 }
                 naga::Expression::Literal(lit) => {
                     if let Some(concrete) = self.concretize_abstract_literal_for_scalar(lit, scalar)
                     {
-                        return Ok(concrete);
+                        out.push_str(&concrete);
+                        return Ok(());
                     }
                 }
                 naga::Expression::Constant(h) => {
@@ -2534,13 +2736,14 @@ impl<'a> Generator<'a> {
                         && let Some(concrete) =
                             self.concretize_abstract_literal_for_scalar(lit, scalar)
                     {
-                        return Ok(concrete);
+                        out.push_str(&concrete);
+                        return Ok(());
                     }
                 }
                 _ => {}
             }
         }
-        self.emit_expr(expr, ctx)
+        self.emit_expr_into(expr, ctx, out)
     }
 
     fn concretize_abstract_literal_for_scalar(
@@ -2800,47 +3003,13 @@ pub(super) fn unary_child_needs_parens(
     !is_cached && matches!(arena[child], naga::Expression::Binary { .. })
 }
 
-/// `left op right` with the requested wraps and beautify spacing; every
-/// binary emission funnels through here.
-fn assemble_binary(
-    ls: &str,
-    rs: &str,
-    op_str: &str,
-    sp: &str,
-    wrap_l: bool,
-    wrap_r: bool,
-) -> String {
-    let mut s = String::new();
-    if wrap_l {
-        s.push('(');
-    }
-    s.push_str(ls);
-    if wrap_l {
-        s.push(')');
-    }
-    s.push_str(sp);
-    s.push_str(op_str);
-    if !sp.is_empty() {
-        s.push_str(sp);
-    } else if !wrap_r {
-        // No-space mode: keep the lexer from fusing `-` and `-b` into the
-        // reserved decrement, `/` and `/` into a line comment (impossible
-        // from valid IR, guarded for symmetry) or `/` and `*p` (a pointer
-        // deref) into a block-comment opener.
-        if let (Some(&oc), Some(&rc)) = (op_str.as_bytes().last(), rs.as_bytes().first())
-            && ((oc == rc && (oc == b'-' || oc == b'/')) || (oc == b'/' && rc == b'*'))
-        {
-            s.push(' ');
-        }
-    }
-    if wrap_r {
-        s.push('(');
-    }
-    s.push_str(rs);
-    if wrap_r {
-        s.push(')');
-    }
-    s
+/// An operand of [`Generator::push_binary`], rendered where it stands.
+enum Operand {
+    Value(naga::Handle<naga::Expression>),
+    /// A literal spelled typed whatever the site would elide.
+    Typed(naga::Literal),
+    /// The value with every bare literal in it spelled to the hint.
+    Hinted(naga::Handle<naga::Expression>, Option<naga::Scalar>),
 }
 
 // MARK: Abstract literal concretisation

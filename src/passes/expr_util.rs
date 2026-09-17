@@ -448,6 +448,10 @@ pub fn literal_bit_eq(a: &naga::Literal, b: &naga::Literal) -> bool {
     lit_key(*a) == lit_key(*b)
 }
 
+/// Live consumers of an expression: `u32`, since no shader refers to one
+/// value four billion times and the vectors are half the size.
+pub(crate) type RefCount = u32;
+
 /// Per-handle reference counts plus the liveness bitmap, in one walk.  Live
 /// is "materialised by an `Emit` range", so dead code's children score zero
 /// and never claim a short name.  A statement RESULT is not a use - it stays
@@ -458,7 +462,7 @@ pub fn literal_bit_eq(a: &naga::Literal, b: &naga::Literal) -> bool {
 /// The generator prices its output by these counts and `rename` spends short
 /// names by them; the two MUST agree, or a name the generator inlines away
 /// takes the shortest identifier with it.
-pub fn live_expression_ref_counts(function: &naga::Function) -> (Vec<usize>, Vec<bool>) {
+pub fn live_expression_ref_counts(function: &naga::Function) -> (Vec<RefCount>, Vec<bool>) {
     let len = function.expressions.len();
 
     let mut live = vec![false; len];
@@ -470,7 +474,7 @@ pub fn live_expression_ref_counts(function: &naga::Function) -> (Vec<usize>, Vec
         }
     });
 
-    let mut counts = vec![0usize; len];
+    let mut counts = vec![0 as RefCount; len];
     for (h, expr) in function.expressions.iter() {
         if live[h.index()] {
             visit_expression_children(expr, |child| counts[child.index()] += 1);
@@ -632,7 +636,7 @@ pub(crate) fn static_index_bound(
 }
 
 /// [`static_index_bound`]'s answer.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct IndexBound {
     /// As [`index_is_static_error`] judges it.
     pub(crate) len: u32,

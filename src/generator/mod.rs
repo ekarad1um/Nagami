@@ -44,6 +44,36 @@ pub struct Emission {
     /// The type spellings the text holds, for the alias plan of the
     /// render that ships (`GenerateOptions::type_uses`).
     pub(crate) type_uses: TypeUses,
+    /// The options the text was rendered under and what the spellings
+    /// decided, for a render that may ship this text again.
+    pub(crate) options: GenerateOptions,
+    pub(crate) type_plan: core::TypePlan,
+    /// What the render computed from the arenas, for a render of the
+    /// same arenas (`generate_after`).
+    pub(crate) analyses: core::Analyses,
+}
+
+/// Wall clock of one emission; zero on wasm (no high-resolution clock).
+struct Timer(#[cfg(not(target_arch = "wasm32"))] Instant);
+
+impl Timer {
+    fn start() -> Self {
+        Self(
+            #[cfg(not(target_arch = "wasm32"))]
+            Instant::now(),
+        )
+    }
+
+    fn elapsed_us(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.0.elapsed().as_micros() as u64
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0
+        }
+    }
 }
 
 /// Emitted struct / member names keyed by originals; unnamed types are
@@ -101,10 +131,77 @@ pub fn generate(
     info: &naga::valid::ModuleInfo,
     options: GenerateOptions,
 ) -> Result<Emission, Error> {
-    #[cfg(not(target_arch = "wasm32"))]
-    let start = Instant::now();
-    let mut generator = Generator::new(module, info, options);
+    let timer = Timer::start();
+    finish(Generator::new(module, info, options), timer)
+}
+
+/// [`generate`], given `prior`: an emission of a module with these arenas
+/// (the names may differ) under these options but for `type_uses`.  What
+/// a render computes from the arenas alone is the same, so this render
+/// takes it over instead of computing it again.
+pub fn generate_after(
+    module: &naga::Module,
+    info: &naga::valid::ModuleInfo,
+    options: GenerateOptions,
+    prior: Emission,
+) -> Result<Emission, Error> {
+    let timer = Timer::start();
+    let (generator, _) = generator_after(module, info, options, prior);
+    finish(generator, timer)
+}
+
+/// [`generate_after`] when `prior` is an emission of this module, names
+/// included, whose spellings `options` now carries.  A render is a
+/// function of the module, the info and the options, and the spellings
+/// decide the type plan alone, so `prior` is the text this render would
+/// produce whenever the plans agree, and ships again.
+pub fn generate_reusing(
+    module: &naga::Module,
+    info: &naga::valid::ModuleInfo,
+    options: GenerateOptions,
+    prior: Emission,
+) -> Result<Emission, Error> {
+    let timer = Timer::start();
+    let (generator, prior) = generator_after(module, info, options, prior);
+    if let Some(prior) = prior
+        && generator.plans_types_as(&prior.type_plan)
+    {
+        return Ok(Emission {
+            duration_us: timer.elapsed_us(),
+            ..prior
+        });
+    }
+    finish(generator, timer)
+}
+
+/// The generator of a render after `prior`: over `prior`'s analyses when
+/// the options agree but for `type_uses`, fresh otherwise; and `prior`
+/// itself when its text may still ship.
+fn generator_after<'a>(
+    module: &'a naga::Module,
+    info: &'a naga::valid::ModuleInfo,
+    options: GenerateOptions,
+    mut prior: Emission,
+) -> (Generator<'a>, Option<Emission>) {
+    let same_options = prior.options
+        == GenerateOptions {
+            type_uses: None,
+            ..options.clone()
+        };
+    if !same_options {
+        return (Generator::new(module, info, options), None);
+    }
+    let analyses = std::mem::take(&mut prior.analyses);
+    (
+        Generator::with_analyses(module, info, options, Some(analyses)),
+        Some(prior),
+    )
+}
+
+/// Render the module `generator` was built for.
+fn finish(mut generator: Generator<'_>, timer: Timer) -> Result<Emission, Error> {
     generator.generate_module()?;
+    let module = generator.module;
     let structs = struct_name_table(module, &generator);
     let live_const_names = module
         .constants
@@ -112,16 +209,15 @@ pub fn generate(
         .filter(|(h, c)| c.name.is_some() && generator.live_constants.contains(h))
         .filter_map(|(_, c)| c.name.clone())
         .collect();
-    #[cfg(not(target_arch = "wasm32"))]
-    let duration_us = start.elapsed().as_micros() as u64;
-    #[cfg(target_arch = "wasm32")]
-    let duration_us = 0u64;
     Ok(Emission {
-        duration_us,
+        duration_us: timer.elapsed_us(),
         structs,
         live_const_names,
         name_weights: std::mem::take(&mut generator.name_weights),
         type_uses: std::mem::take(&mut generator.type_uses),
+        options: std::mem::take(&mut generator.options),
+        type_plan: generator.take_type_plan(),
+        analyses: generator.take_analyses(),
         source: generator.into_output(),
     })
 }

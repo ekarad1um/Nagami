@@ -47,13 +47,13 @@ impl Pass for LoadDedupPass {
         "load_dedup"
     }
 
-    fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
+    fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
         let mut changed = false;
         let const_literals = super::const_fold::constant_literals(module);
-        crate::ir::visit::for_each_function_taken(module, &mut |f, module| {
+        crate::ir::visit::for_each_function_taken(module, &mut |body, f, module| {
             // Sized before the rewrites, which keep every `Access` and its
             // base's type.
-            let access_lens = super::expr_util::access_static_lengths(f, module);
+            let access_lens = ctx.access_lens(body, f, module);
             changed |= remove_dead_stores_in_function(f);
             changed |= dedup_loads_in_function(f, &module.types, &const_literals, &access_lens);
             changed |= eliminate_write_only_locals(f);

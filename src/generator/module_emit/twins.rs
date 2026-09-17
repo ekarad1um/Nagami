@@ -22,9 +22,52 @@ use rustc_hash::{FxHashMap, FxHasher};
 use crate::analysis::{Classes, ExprClass};
 use crate::generator::expr_emit::{compose_is_splat, matrix_flatten_scalars};
 use crate::handle_set::HandleMap;
-use crate::passes::expr_util::{KeyToken, lit_key};
+use crate::passes::expr_util::{KeyToken, RefCount, lit_key};
 
 type Handle = naga::Handle<naga::Expression>;
+
+/// Every later twin to the first spelling of its value, by twin.  A few
+/// pairs of a body's expressions, so a list rather than a map over the
+/// arena: the context clones it per render round and the emission
+/// carries it.
+#[derive(Clone, Default)]
+pub(in crate::generator) struct Twins(Vec<(Handle, Handle)>);
+
+impl Twins {
+    /// The census's map, in arena order: sorted by twin without a sort.
+    fn of(
+        map: &HandleMap<naga::Expression, Handle>,
+        exprs: &naga::Arena<naga::Expression>,
+    ) -> Self {
+        Self(
+            exprs
+                .iter()
+                .filter_map(|(h, _)| map.get(h).map(|&first| (h, first)))
+                .collect(),
+        )
+    }
+
+    /// The first spelling `twin` renders as, if it is a twin.
+    pub(in crate::generator) fn first_of(&self, twin: Handle) -> Option<Handle> {
+        self.0
+            .binary_search_by_key(&twin, |&(twin, _)| twin)
+            .ok()
+            .map(|i| self.0[i].1)
+    }
+
+    pub(in crate::generator) fn is_twin(&self, h: Handle) -> bool {
+        self.first_of(h).is_some()
+    }
+
+    pub(in crate::generator) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// `(twin, first)` pairs.
+    pub(in crate::generator) fn iter(&self) -> impl Iterator<Item = (Handle, Handle)> + '_ {
+        self.0.iter().copied()
+    }
+}
 
 /// The value of `expr` as tokens: a pre-emit leaf by what it names, a
 /// pure operation by its kind and fields, then its operands by class.
@@ -202,9 +245,9 @@ pub(super) fn structural_twins(
     func: &naga::Function,
     types: &naga::UniqueArena<naga::Type>,
     finfo: &naga::valid::FunctionInfo,
-    counts: &mut [usize],
+    counts: &mut [RefCount],
     parens: &mut [u16],
-) -> HandleMap<naga::Expression, Handle> {
+) -> Twins {
     use naga::Expression as E;
     let exprs = &func.expressions;
     let classes = Classes::of(exprs);
@@ -266,5 +309,5 @@ pub(super) fn structural_twins(
             }
         });
     });
-    twins
+    Twins::of(&twins, exprs)
 }

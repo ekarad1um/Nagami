@@ -11,16 +11,17 @@ use std::collections::HashSet;
 use crate::config::FloatPrecision;
 
 use super::expr_emit::subsplat_runs;
+use super::module_emit::Twins;
 use super::syntax::LiteralExtractKey;
 use crate::handle_set::{HandleMap, HandleSet};
 use crate::ir::visit::{all_functions, visit_expression_children};
-use crate::passes::expr_util::is_library_module;
+use crate::passes::expr_util::{RefCount, is_library_module};
 
 // MARK: Options
 
 /// Caller-facing generator knobs, each resolved from a [`crate::config::Config`]
 /// entry by [`crate::run`]; changing a default is a public-surface change.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GenerateOptions {
     /// Emit human-readable output with indentation and newlines.
     pub beautify: bool,
@@ -78,7 +79,7 @@ impl Default for GenerateOptions {
 /// collapse into one declaration when the outer type takes an alias, so
 /// counting them would credit `T` for sites that may not survive; the
 /// under-count only forgoes an alias, never mints a losing one.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TypeUses {
     sites: Vec<u32>,
     bytes: Vec<u32>,
@@ -138,18 +139,158 @@ impl GenerateOptions {
     }
 }
 
+/// What the type spellings decide in [`Generator::new`]: the alias
+/// declarations, the type names ranked by use and the member names minted
+/// after them.  Nothing else there reads the spellings, so two generators
+/// of one module under one set of options that agree here render the same
+/// text (`super::generate_reusing`).
+#[derive(Debug, Default)]
+pub(crate) struct TypePlan {
+    type_names: HandleMap<naga::Type, String>,
+    member_names: HandleMap<naga::Type, Vec<String>>,
+    type_alias_decls: Vec<(String, String)>,
+}
+
+impl Generator<'_> {
+    pub(super) fn take_type_plan(&mut self) -> TypePlan {
+        TypePlan {
+            type_names: std::mem::take(&mut self.type_names),
+            member_names: std::mem::take(&mut self.member_names),
+            type_alias_decls: std::mem::take(&mut self.type_alias_decls),
+        }
+    }
+
+    /// Whether this generator decided `plan`.
+    pub(super) fn plans_types_as(&self, plan: &TypePlan) -> bool {
+        fn same<T, V: PartialEq>(a: &HandleMap<T, V>, b: &HandleMap<T, V>) -> bool {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|((ha, va), (hb, vb))| ha == hb && va == vb)
+        }
+        same(&self.type_names, &plan.type_names)
+            && same(&self.member_names, &plan.member_names)
+            && self.type_alias_decls == plan.type_alias_decls
+    }
+}
+
+/// What a render computes from the arenas alone: per body, its local
+/// bitmaps, the type groups it may spell and the analyses its context is
+/// built from ([`FunctionAnalyses`], kept once the body rendered), and the
+/// literal census.  The rename sets names and nothing else, so the render
+/// that ships takes the tail's rename render's instead of computing them
+/// again (`super::generate_after`).
+#[derive(Default)]
+pub(crate) struct Analyses {
+    /// Per-function `(deferrable, dead)` local bitmaps, indexed like
+    /// `ref_count_cache`; computed once so the live-type census, alias cost
+    /// model, literal extraction and emission cannot disagree.
+    pub(super) defer: Vec<(Vec<bool>, Vec<bool>)>,
+    /// Per function, the type groups its body may spell
+    /// (`spelled_type_groups`).
+    spelled_groups: Vec<HandleSet<naga::Type>>,
+    /// How often the text spells each literal, and whether ever bare
+    /// (`Generator::literal_census`); `None` until counted.
+    pub(super) literal_counts: Option<FxHashMap<LiteralExtractKey, (usize, bool)>>,
+    /// Indexed like `ref_count_cache`; `None` until the body rendered.
+    functions: Vec<Option<FunctionAnalyses>>,
+}
+
+impl Analyses {
+    /// What a render computes before the census, for one computing its
+    /// own.
+    fn fresh(
+        module: &naga::Module,
+        info: &naga::valid::ModuleInfo,
+        canonical: &HandleMap<naga::Type, naga::Handle<naga::Type>>,
+        inner_to_first: &FxHashMap<&naga::TypeInner, naga::Handle<naga::Type>>,
+    ) -> Self {
+        let bodies = module.functions.len() + module.entry_points.len();
+        Self {
+            defer: all_functions(module)
+                .map(super::module_emit::find_deferrable_vars)
+                .collect(),
+            spelled_groups: spelled_type_groups(module, info, canonical, inner_to_first),
+            literal_counts: None,
+            functions: (0..bodies).map(|_| None).collect(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bodies_built(&self) -> usize {
+        self.functions.iter().flatten().count()
+    }
+}
+
+/// Handles and counts, nothing a report reads: the size stands in.
+impl std::fmt::Debug for Analyses {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Analyses")
+            .field("functions", &self.functions.len())
+            .finish()
+    }
+}
+
+impl Generator<'_> {
+    pub(super) fn take_analyses(&mut self) -> Analyses {
+        std::mem::take(&mut self.analyses)
+    }
+
+    /// The analyses `body`'s context is built from, if a render of these
+    /// arenas left them; taken, so each body is built once.
+    pub(super) fn take_function_analyses(&mut self, body: usize) -> Option<FunctionAnalyses> {
+        self.analyses.functions.get_mut(body).and_then(Option::take)
+    }
+
+    /// Keeps what `ctx` was built from, for a later render of these
+    /// arenas.
+    pub(super) fn keep_function_analyses(&mut self, body: usize, ctx: FunctionCtx<'_, '_>) {
+        if let Some(slot) = self.analyses.functions.get_mut(body) {
+            *slot = Some(FunctionAnalyses::of(ctx));
+        }
+    }
+}
+
 // MARK: Cached analyses
 
 /// Per-function expression analysis, computed once and in lock-step by
-/// `compute_expression_ref_counts`.  `ref_counts` and `paren_uses` are
-/// `mem::take`n by `generate_function`, so they are not readable once that
-/// function has been emitted; `live` is only ever borrowed.
+/// `compute_expression_ref_counts`: the census the literal extraction and
+/// [`FunctionAnalyses`] are built from, taken by the latter.
+#[derive(Default)]
 pub(super) struct FunctionExprInfo {
-    pub(super) ref_counts: Vec<usize>,
+    pub(super) ref_counts: Vec<RefCount>,
     pub(super) live: Vec<bool>,
     /// How many live consumers would wrap the expression's own text in
     /// parentheses (`paren_uses_in`).
     pub(super) paren_uses: Vec<u16>,
+}
+
+/// The analyses one body's context is built from before any text
+/// (`Generator::function_analyses`): the [`FunctionCtx`] fields of these
+/// names, as built.  A function of the arenas, the types and the callees'
+/// effects, so a render of the same arenas under other names is built
+/// from the same.
+pub(super) struct FunctionAnalyses {
+    pub(super) ref_counts: Vec<RefCount>,
+    pub(super) paren_uses: Vec<u16>,
+    pub(super) twins: Twins,
+    pub(super) must_bind: HandleSet<naga::Expression>,
+    pub(super) for_loop_vars: Vec<Option<naga::Handle<naga::Expression>>>,
+    pub(super) inlineable_calls: HandleSet<naga::Expression>,
+}
+
+impl FunctionAnalyses {
+    /// `ctx` as built, before any text; the render hands it back as passed.
+    fn of(ctx: FunctionCtx<'_, '_>) -> Self {
+        Self {
+            ref_counts: ctx.ref_counts,
+            paren_uses: ctx.paren_uses,
+            twins: ctx.twins,
+            must_bind: ctx.must_bind,
+            for_loop_vars: ctx.for_loop_vars,
+            inlineable_calls: ctx.inlineable_calls,
+        }
+    }
 }
 
 // MARK: Generator state
@@ -194,10 +335,9 @@ pub(super) struct Generator<'a> {
     /// Per-function analyses indexed `[0..N)` for functions and `[N..N+E)` for
     /// entry points.
     pub(super) ref_count_cache: Vec<FunctionExprInfo>,
-    /// Per-function `(deferrable, dead)` local bitmaps, indexed like
-    /// `ref_count_cache`; computed once so the live-type census, alias cost
-    /// model, literal extraction and emission cannot disagree.
-    pub(super) defer_cache: Vec<(Vec<bool>, Vec<bool>)>,
+    /// What this render computed from the arenas, or took over from a
+    /// render of the same arenas.
+    pub(super) analyses: Analyses,
     /// Per-`module.functions` effect summary: keeps impure single-use calls
     /// bound rather than inlined past a read of what they write, and tells
     /// the forced-binding analysis which loads a call stales.
@@ -314,8 +454,8 @@ pub(super) struct FunctionCtx<'a, 'm> {
     /// Each later spelling of a value in scope, to its first
     /// (`structural_twins`): it renders as the first's name once that has
     /// one, and `ref_counts` / `paren_uses` of the first hold its uses.
-    pub(super) twins: HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
-    pub(super) ref_counts: Vec<usize>,
+    pub(super) twins: Twins,
+    pub(super) ref_counts: Vec<RefCount>,
     /// Of `ref_counts`, the uses that parenthesise an inlined text
     /// (`FunctionExprInfo::paren_uses`).
     pub(super) paren_uses: Vec<u16>,
@@ -332,6 +472,10 @@ pub(super) struct FunctionCtx<'a, 'm> {
     /// declares it (`find_for_loop_vars`); cleared once rendered.
     pub(super) for_loop_vars: Vec<Option<naga::Handle<naga::Expression>>>,
     pub(super) expr_name_counter: usize,
+    /// The name the next `let` takes and the counter past it, drawn once
+    /// per state of the names in use: a decision prices it before the
+    /// binding claims it, and a declined one prices the same name again.
+    pub(super) drawn_expr_name: Option<(String, usize)>,
     /// Module-scope names shared across functions; not cloned per call.
     pub(super) module_names: &'m std::collections::HashSet<String>,
     /// Names claimed in this function: arguments, locals, expression bindings.
@@ -420,18 +564,25 @@ impl<'a, 'm> FunctionCtx<'a, 'm> {
     }
 
     /// The next free `let` name and the counter past it; nothing claimed.
-    fn draw_expr_name(&self) -> (String, usize) {
-        let mut counter = self.expr_name_counter;
-        loop {
-            let name = crate::name_gen::next_name(&mut counter);
-            if !self.module_names.contains(&name) && !self.local_used_names.contains(&name) {
-                return (name, counter);
-            }
+    /// Valid until [`Self::next_expr_name`] claims it: the names in use
+    /// change nowhere else once the context is built.
+    fn draw_expr_name(&mut self) -> &(String, usize) {
+        if self.drawn_expr_name.is_none() {
+            let mut counter = self.expr_name_counter;
+            let drawn = loop {
+                let name = crate::name_gen::next_name(&mut counter);
+                if !self.module_names.contains(&name) && !self.local_used_names.contains(&name) {
+                    break (name, counter);
+                }
+            };
+            self.drawn_expr_name = Some(drawn);
         }
+        self.drawn_expr_name.as_ref().expect("drawn above")
     }
 
     pub(super) fn next_expr_name(&mut self) -> String {
-        let (name, counter) = self.draw_expr_name();
+        self.draw_expr_name();
+        let (name, counter) = self.drawn_expr_name.take().expect("drawn above");
         self.expr_name_counter = counter;
         self.local_used_names.insert(name.clone());
         name
@@ -439,7 +590,7 @@ impl<'a, 'm> FunctionCtx<'a, 'm> {
 
     /// Length of the name [`Self::next_expr_name`] would return, for
     /// pricing a `let` before deciding on it.
-    pub(super) fn peek_expr_name_len(&self) -> usize {
+    pub(super) fn peek_expr_name_len(&mut self) -> usize {
         self.draw_expr_name().0.len()
     }
 
@@ -454,8 +605,8 @@ impl<'a, 'm> FunctionCtx<'a, 'm> {
         let twins: Vec<_> = self
             .twins
             .iter()
-            .filter(|&(_, &first)| first == h)
-            .map(|(&twin, _)| twin)
+            .filter(|&(_, first)| first == h)
+            .map(|(twin, _)| twin)
             .collect();
         for twin in twins {
             self.expr_names.insert(twin, name.clone());
@@ -467,7 +618,7 @@ impl<'a, 'm> FunctionCtx<'a, 'm> {
     pub(super) fn counts_by_value(&self) -> (Vec<i32>, Vec<i32>) {
         let mut renders = self.render_counts.clone();
         let mut parens = self.paren_counts.clone();
-        for (&twin, &first) in self.twins.iter() {
+        for (twin, first) in self.twins.iter() {
             renders[first.index()] += renders[twin.index()];
             parens[first.index()] += parens[twin.index()];
         }
@@ -639,7 +790,7 @@ impl<'a> Generator<'a> {
                 .iter()
                 .map(|(h, c)| (*h, self.constant_names[c.index()].clone()))
                 .collect(),
-            twins: HandleMap::default(),
+            twins: Twins::default(),
             ref_counts: vec![0; n],
             paren_uses: Vec::new(),
             deferred_vars: Vec::new(),
@@ -647,6 +798,7 @@ impl<'a> Generator<'a> {
             dead_vars: Vec::new(),
             for_loop_vars: Vec::new(),
             expr_name_counter: 0,
+            drawn_expr_name: None,
             module_names: &NO_NAMES,
             local_used_names: HashSet::new(),
             inlineable_calls: HandleSet::default(),
@@ -1253,26 +1405,21 @@ fn spelled_type_groups(
 }
 
 /// Per function (functions, then entry points), the type groups its body
-/// may spell and its argument and local names: a minted type name must
-/// dodge the locals of every function that spells it (a same-named local
-/// there would shadow it) and only those - reserving every local
-/// module-wide would push a frequent type's alias past the single
-/// characters, one byte at every use (the alias cliff), and make a
+/// may spell ([`spelled_type_groups`]) and its argument and local names: a
+/// minted type name must dodge the locals of every function that spells it
+/// (a same-named local there would shadow it) and only those - reserving
+/// every local module-wide would push a frequent type's alias past the
+/// single characters, one byte at every use (the alias cliff), and make a
 /// re-minify derive them against a different taken set.
 struct SpellingScopes<'m> {
-    groups: Vec<HandleSet<naga::Type>>,
+    groups: &'m [HandleSet<naga::Type>],
     locals: Vec<crate::name_gen::LocalNames<'m>>,
 }
 
 impl<'m> SpellingScopes<'m> {
-    fn new(
-        module: &'m naga::Module,
-        info: &naga::valid::ModuleInfo,
-        canonical: &HandleMap<naga::Type, naga::Handle<naga::Type>>,
-        inner_to_first: &FxHashMap<&naga::TypeInner, naga::Handle<naga::Type>>,
-    ) -> Self {
+    fn new(module: &'m naga::Module, groups: &'m [HandleSet<naga::Type>]) -> Self {
         Self {
-            groups: spelled_type_groups(module, info, canonical, inner_to_first),
+            groups,
             locals: all_functions(module)
                 .map(crate::name_gen::LocalNames::of)
                 .collect(),
@@ -1472,10 +1619,22 @@ impl<'a> Generator<'a> {
         info: &'a naga::valid::ModuleInfo,
         options: GenerateOptions,
     ) -> Self {
-        let mangle = options.mangle;
+        Self::with_analyses(module, info, options, None)
+    }
 
+    /// [`Self::new`] over `prior`, the [`Analyses`] of a render of these
+    /// arenas under these options, whatever its names.
+    pub(super) fn with_analyses(
+        module: &'a naga::Module,
+        info: &'a naga::valid::ModuleInfo,
+        options: GenerateOptions,
+        prior: Option<Analyses>,
+    ) -> Self {
+        let mangle = options.mangle;
         let (canonical, inner_to_first) = type_groups(module);
-        let spelling = SpellingScopes::new(module, info, &canonical, &inner_to_first);
+        let analyses =
+            prior.unwrap_or_else(|| Analyses::fresh(module, info, &canonical, &inner_to_first));
+        let spelling = SpellingScopes::new(module, &analyses.spelled_groups);
         let StructNames {
             mut type_names,
             mut member_names,
@@ -1552,11 +1711,8 @@ impl<'a> Generator<'a> {
         // bail.
         let layouter_complete = layouter.update(module.to_ctx()).is_ok();
 
-        let defer_cache: Vec<(Vec<bool>, Vec<bool>)> = all_functions(module)
-            .map(super::module_emit::find_deferrable_vars)
-            .collect();
         let live_constants = compute_live_constants(module, &options.preserve_symbols);
-        let live_types = compute_live_types(module, &live_constants, &defer_cache);
+        let live_types = compute_live_types(module, &live_constants, &analyses.defer);
 
         let in_scope = || {
             emitted_names(
@@ -1589,7 +1745,7 @@ impl<'a> Generator<'a> {
                 (sites, Some(bytes))
             }
             None => (
-                count_type_handle_refs(module, &live_constants, &live_types, &defer_cache),
+                count_type_handle_refs(module, &live_constants, &live_types, &analyses.defer),
                 None,
             ),
         };
@@ -1689,7 +1845,7 @@ impl<'a> Generator<'a> {
             layouter,
             layouter_complete,
             ref_count_cache: Vec::new(),
-            defer_cache,
+            analyses,
             fn_effects: Vec::new(),
             name_weights: Default::default(),
             type_uses: TypeUses::sized(module.types.len()),

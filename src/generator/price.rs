@@ -186,7 +186,7 @@ impl FunctionPricer<'_, '_> {
     }
 
     /// Length of the name the function's next `let` takes.
-    pub(crate) fn let_name_len(&self) -> usize {
+    pub(crate) fn let_name_len(&mut self) -> usize {
         self.ctx.peek_expr_name_len()
     }
 
@@ -204,6 +204,6 @@ impl FunctionPricer<'_, '_> {
 
     /// How many times the emitter renders `h` (or its `let` name).
     pub(crate) fn uses(&self, h: naga::Handle<naga::Expression>) -> usize {
-        self.ctx.ref_counts[h.index()]
+        self.ctx.ref_counts[h.index()] as usize
     }
 }

@@ -5,7 +5,7 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::passes::expr_util::{KeyToken, lit_key};
+use crate::passes::expr_util::{KeyToken, RefCount, lit_key};
 
 use super::core::Generator;
 use super::expr_emit::{
@@ -17,9 +17,10 @@ use super::syntax::{LiteralExtractKey, literal_extract_key};
 use crate::handle_set::HandleSet;
 
 impl<'a> Generator<'a> {
-    /// Bind module-wide repeated literals to shared `const`s where the
-    /// emission count beats the break-even threshold.
-    pub(super) fn scan_and_extract_literals(&mut self) {
+    /// How often the text spells each literal over every body, and whether
+    /// ever bare (`Analyses::literal_counts`): a function of the arenas and
+    /// the float precision, counted over the prepared census.
+    fn literal_census(&self) -> FxHashMap<LiteralExtractKey, (usize, bool)> {
         let precision = &self.options.float_precision;
         let module = &self.module;
 
@@ -32,7 +33,7 @@ impl<'a> Generator<'a> {
         let count_literals =
             |func: &naga::Function,
              func_info: &naga::valid::FunctionInfo,
-             ref_counts: &[usize],
+             ref_counts: &[RefCount],
              live: &[bool],
              deferrable: &[bool],
              rendered: &mut FxHashMap<KeyToken, LiteralExtractKey>,
@@ -62,7 +63,7 @@ impl<'a> Generator<'a> {
                 // store, a switch selector).  Select / Derivative force only a
                 // direct `Literal`; an unnamed `Constant` there takes the normal,
                 // extraction-aware path and needs no adjustment.
-                let mut adjust: Vec<usize> = vec![0; func.expressions.len()];
+                let mut adjust: Vec<RefCount> = vec![0; func.expressions.len()];
 
                 // `bare_handle[h]`: `h` is emitted somewhere in a bare
                 // constructor slot (`Compose` component or `Splat` value).  A
@@ -382,6 +383,7 @@ impl<'a> Generator<'a> {
                         .entry(lit_key(key_lit))
                         .or_insert_with(|| literal_extract_key(key_lit, precision));
                     let bare = bare_handle[h.index()];
+                    let emissions = emissions as usize;
                     if let Some(entry) = literal_counts.get_mut(emitted) {
                         entry.0 += emissions;
                         entry.1 |= bare;
@@ -416,11 +418,25 @@ impl<'a> Generator<'a> {
                 fn_info,
                 &self.ref_count_cache[cache_idx].ref_counts,
                 &self.ref_count_cache[cache_idx].live,
-                &self.defer_cache[cache_idx].0,
+                &self.analyses.defer[cache_idx].0,
                 &mut rendered,
                 &mut literal_counts,
             );
         }
+        literal_counts
+    }
+
+    /// Bind module-wide repeated literals to shared `const`s where the
+    /// emission count beats the break-even threshold.
+    pub(super) fn scan_and_extract_literals(&mut self) {
+        if self.analyses.literal_counts.is_none() {
+            self.analyses.literal_counts = Some(self.literal_census());
+        }
+        let literal_counts = self
+            .analyses
+            .literal_counts
+            .as_ref()
+            .expect("counted above");
 
         // Names the extracted `const` must avoid: every module-scope name
         // (the preserve list among them: a pruned preamble binding is in no
@@ -443,8 +459,8 @@ impl<'a> Generator<'a> {
         // estimate conservative; for every other kind the two texts are equal.
         let boilerplate = super::syntax::decl_boilerplate(self.options.beautify) as isize;
         let mut candidates: Vec<(isize, LiteralExtractKey, usize, bool)> = literal_counts
-            .into_iter()
-            .filter_map(|(key, (count, has_bare))| {
+            .iter()
+            .filter_map(|(key, &(count, has_bare))| {
                 let expr_len = key.expr_text.len() as isize;
                 let decl_len = key.decl_text.len() as isize;
                 let typed_only = !has_bare && key.decl_text != key.expr_text;
@@ -452,7 +468,7 @@ impl<'a> Generator<'a> {
                 let k = count as isize;
                 let est = k * (use_len - 1) - (boilerplate + 1 + decl_len);
                 if est > 0 {
-                    Some((est, key, count, has_bare))
+                    Some((est, key.clone(), count, has_bare))
                 } else {
                     None
                 }

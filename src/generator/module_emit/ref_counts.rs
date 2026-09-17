@@ -7,7 +7,9 @@
 //! discount here or the pricing binds a `let` the text then uses once - a
 //! second pass, whose input already carries the collapsed spelling, drops it.
 
-use crate::handle_set::{HandleMap, HandleSet};
+use super::twins::Twins;
+use crate::handle_set::HandleSet;
+use crate::passes::expr_util::RefCount;
 
 use crate::generator::core::FunctionExprInfo;
 use crate::generator::expr_emit::{
@@ -87,7 +89,7 @@ fn paren_uses_in(expressions: &naga::Arena<naga::Expression>, live: &[bool]) -> 
 pub(super) fn discount_initializer_refs(
     func: &naga::Function,
     for_loop_vars: &[Option<naga::Handle<naga::Expression>>],
-    counts: &mut [usize],
+    counts: &mut [RefCount],
 ) {
     let mut visited = vec![false; func.expressions.len()];
     let mut stack: Vec<_> = func
@@ -115,12 +117,12 @@ fn swizzle_component_base<'t>(
     expressions: &naga::Arena<naga::Expression>,
     finfo: &'t naga::valid::FunctionInfo,
     types: &'t naga::UniqueArena<naga::Type>,
-    twins: &HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
+    twins: &Twins,
 ) -> Option<naga::Handle<naga::Expression>> {
     swizzle_component(handle, expressions, types, &|b| {
         finfo[b].ty.inner_with(types)
     })
-    .map(|(base, _)| twins.get(base).copied().unwrap_or(base))
+    .map(|(base, _)| twins.first_of(base).unwrap_or(base))
 }
 
 /// Whether `h`'s operand cone holds a statement result or an expensive
@@ -171,8 +173,8 @@ pub(super) fn discount_compose_folds(
     types: &naga::UniqueArena<naga::Type>,
     must_bind: &HandleSet<naga::Expression>,
     live: &[bool],
-    twins: &HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
-    counts: &mut [usize],
+    twins: &Twins,
+    counts: &mut [RefCount],
 ) {
     let expressions = &func.expressions;
     // Only a live `Compose` (`live`: in an `Emit` range, the census's own
@@ -198,9 +200,9 @@ pub(super) fn discount_compose_folds(
 
     // Decisions read the counts as the census left them and land together, so
     // one run's discount cannot change whether a later run forms.
-    let mut deltas = vec![0usize; expressions.len()];
+    let mut deltas = vec![0 as RefCount; expressions.len()];
     let mut cone_memo = None;
-    let inlined = |c: naga::Handle<naga::Expression>, counts: &[usize]| {
+    let inlined = |c: naga::Handle<naga::Expression>, counts: &[RefCount]| {
         counts[c.index()] == 1 && !must_bind.contains(c)
     };
 
@@ -263,7 +265,7 @@ pub(super) fn discount_compose_folds(
                 j += 1;
             }
             if j - i >= 2 && !cone_has_call_or_image(base, expressions, &mut cone_memo) {
-                deltas[base.index()] += j - i - 1;
+                deltas[base.index()] += (j - i - 1) as RefCount;
             }
             i = j;
         }
