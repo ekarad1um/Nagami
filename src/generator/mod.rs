@@ -5,23 +5,24 @@
 //! so the custom path only optimises the happy case.  `syntax` holds grammar
 //! constants, `core` the `Generator` state and options, `literal_extract` the
 //! repeated-literal `const` extraction, `const_hazard` the tint
-//! const-expression guard, and `expr_emit` / `stmt_emit` / `module_emit` one
-//! emitter per IR scope.
+//! const-expression guard, `expr_emit` / `stmt_emit` / `module_emit` one
+//! emitter per IR scope, and `price` the same emitter as a pass's cost model.
 
 mod const_hazard;
 mod core;
 mod expr_emit;
 mod literal_extract;
 mod module_emit;
+pub(crate) mod price;
 mod stmt_emit;
-mod syntax;
+pub(crate) mod syntax;
 
 use crate::error::Error;
 use core::Generator;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
-pub use core::GenerateOptions;
+pub use core::{GenerateOptions, TypeUses};
 
 /// Emitter output: the WGSL source plus what the name map needs.
 #[derive(Debug)]
@@ -37,6 +38,12 @@ pub struct Emission {
     /// Constants this emission declared; a constant can survive the IR with
     /// every use folded away, so the name map filters through this.
     pub live_const_names: std::collections::HashSet<String>,
+    /// How often the text spells each renameable name, for the rename
+    /// that ranks by the text.
+    pub(crate) name_weights: crate::passes::rename::Weights,
+    /// The type spellings the text holds, for the alias plan of the
+    /// render that ships (`GenerateOptions::type_uses`).
+    pub(crate) type_uses: TypeUses,
 }
 
 /// Emitted struct / member names keyed by originals; unnamed types are
@@ -63,7 +70,8 @@ fn struct_name_table(
             if let Some(member_original) = &member.name {
                 let member_emitted = generator
                     .member_names
-                    .get(&(ty_h, idx as u32))
+                    .get(ty_h)
+                    .and_then(|names| names.get(idx))
                     .cloned()
                     .unwrap_or_else(|| member_original.clone());
                 member_map.insert(member_original.clone(), member_emitted);
@@ -78,31 +86,6 @@ fn struct_name_table(
         );
     }
     structs
-}
-
-/// (source, struct table, kept-constant names); see [`Emission`].
-type GeneratedWgsl = (
-    String,
-    std::collections::BTreeMap<String, crate::name_map::StructRename>,
-    std::collections::HashSet<String>,
-);
-
-/// Entry point shared by [`generate`] and the test harness.
-fn generate_wgsl(
-    module: &naga::Module,
-    info: &naga::valid::ModuleInfo,
-    options: GenerateOptions,
-) -> Result<GeneratedWgsl, Error> {
-    let mut generator = Generator::new(module, info, options);
-    generator.generate_module()?;
-    let structs = struct_name_table(module, &generator);
-    let live_const_names = module
-        .constants
-        .iter()
-        .filter(|(h, c)| c.name.is_some() && generator.live_constants.contains(h))
-        .filter_map(|(_, c)| c.name.clone())
-        .collect();
-    Ok((generator.into_output(), structs, live_const_names))
 }
 
 /// Emit minified WGSL for `module` with the custom generator.  On error the
@@ -120,16 +103,26 @@ pub fn generate(
 ) -> Result<Emission, Error> {
     #[cfg(not(target_arch = "wasm32"))]
     let start = Instant::now();
-    let (source, structs, live_const_names) = generate_wgsl(module, info, options)?;
+    let mut generator = Generator::new(module, info, options);
+    generator.generate_module()?;
+    let structs = struct_name_table(module, &generator);
+    let live_const_names = module
+        .constants
+        .iter()
+        .filter(|(h, c)| c.name.is_some() && generator.live_constants.contains(h))
+        .filter_map(|(_, c)| c.name.clone())
+        .collect();
     #[cfg(not(target_arch = "wasm32"))]
     let duration_us = start.elapsed().as_micros() as u64;
     #[cfg(target_arch = "wasm32")]
     let duration_us = 0u64;
     Ok(Emission {
-        source,
         duration_us,
         structs,
         live_const_names,
+        name_weights: std::mem::take(&mut generator.name_weights),
+        type_uses: std::mem::take(&mut generator.type_uses),
+        source: generator.into_output(),
     })
 }
 

@@ -233,6 +233,9 @@ fn parse_config(config: JsValue) -> Result<Config, JsError> {
     if let Some(symbols) = get_string_array(&config, "preserveSymbols")? {
         cfg.preserve_symbols = symbols;
     }
+    if let Some(keep) = get_bool(&config, "preserveInterface")? {
+        cfg.preserve_interface = keep;
+    }
     if let Some(mangle) = get_bool(&config, "mangle")? {
         cfg.mangle = Some(mangle);
     }
@@ -255,20 +258,39 @@ fn parse_config(config: JsValue) -> Result<Config, JsError> {
     if let Some(validate) = get_bool(&config, "validateEachPass")? {
         cfg.trace.validate_each_pass = validate;
     }
+    if let Some(v) = get_f64(&config, "optBisectLimit")? {
+        cfg.trace.opt_bisect_limit = Some(require_usize(v, "optBisectLimit")? as u64);
+    }
 
     Ok(cfg)
 }
 
 // MARK: Public entry points
 
+/// The thrown `Error` (TS `NagamiError`): `code` is
+/// [`crate::error::Error::kind`], `line` / `column` the
+/// [`crate::error::ParseDiagnostic::location`] when there is one.
+fn js_error(err: &crate::error::Error) -> JsValue {
+    let js = js_sys::Error::new(&err.to_string());
+    let set = |key: &str, value: JsValue| {
+        let _ = js_sys::Reflect::set(&js, &JsValue::from_str(key), &value);
+    };
+    set("code", JsValue::from_str(err.kind()));
+    if let Some(loc) = err.location() {
+        set("line", JsValue::from_f64(f64::from(loc.line_number)));
+        set("column", JsValue::from_f64(f64::from(loc.line_position)));
+    }
+    js.into()
+}
+
 /// Minify `source` into the parsed [`crate::json`] document (TS `Output`).
-/// Errors are thrown JS `Error`s; a `JSON.parse` rejection (unreachable, the
-/// renderer emits valid JSON) propagates as its own `SyntaxError`, which keeps
-/// `JsValue`'s `Debug` glue out of the bundle.
+/// Errors are thrown JS `Error`s ([`js_error`]); a `JSON.parse` rejection
+/// (unreachable, the renderer emits valid JSON) propagates as its own
+/// `SyntaxError`, which keeps `JsValue`'s `Debug` glue out of the bundle.
 #[wasm_bindgen(skip_typescript)]
 pub fn run(source: &str, config: JsValue) -> Result<JsValue, JsValue> {
     let config = parse_config(config)?;
-    let output = crate::run(source, &config).map_err(|e| JsError::new(&e.to_string()))?;
+    let output = crate::run(source, &config).map_err(|e| js_error(&e))?;
 
     // Shared with the CLI's `--format json`, so the TS interfaces cannot drift.
     js_sys::JSON::parse(&crate::json::render_output(&output))
@@ -301,6 +323,8 @@ export type FloatPrecision =
 export interface Config {
     profile?: "baseline" | "aggressive" | "max";
     preserveSymbols?: string[];
+    /** Keep bound globals, overrides and the struct types / members they reach: for hosts that address the shipped text by name. */
+    preserveInterface?: boolean;
     mangle?: boolean;
     beautify?: boolean;
     indent?: number;
@@ -309,6 +333,15 @@ export interface Config {
     maxInlineCallSites?: number;
     preamble?: string;
     validateEachPass?: boolean;
+    optBisectLimit?: number;
+}
+
+/** Thrown by `run`. */
+export interface NagamiError extends Error {
+    code: "parse" | "validation" | "emit" | "io";
+    /** 1-based, in the text passed to `run`; for a `<preamble>` error, in the preamble as nagami preprocessed it, an injected `enable` line included.  Only a labelled parse error has them. */
+    line?: number;
+    column?: number;
 }
 
 export interface PassReport {

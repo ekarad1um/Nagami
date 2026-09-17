@@ -21,9 +21,9 @@
 //! argument - stays a pointer parameter and validates through
 //! [`validation_stand_in`] instead.
 
-use super::expr_util::for_each_function_mut;
+use super::expr_util::is_library_module;
 use crate::handle_set::{HandleMap, HandleSet};
-use rustc_hash::FxHashMap;
+use crate::ir::visit::for_each_function_mut;
 
 /// Parameter positions naga's validator rejects; mirrors `valid::function`
 /// so trigger and rejection cannot drift.
@@ -117,7 +117,7 @@ fn collect_keys_in_block(
     out: &mut Vec<SpecKey>,
     declined: &mut HandleSet<naga::Function>,
 ) {
-    super::expr_util::for_each_statement(block, &mut |stmt| {
+    crate::ir::visit::for_each_statement(block, &mut |stmt| {
         if let naga::Statement::Call {
             function,
             arguments,
@@ -142,18 +142,18 @@ fn rewrite_calls_in_block(
     block: &mut naga::Block,
     caller_exprs: &naga::Arena<naga::Expression>,
     banned: &HandleMap<naga::Function, Vec<u32>>,
-    clones: &FxHashMap<SpecKey, naga::Handle<naga::Function>>,
+    clones: &[(SpecKey, naga::Handle<naga::Function>)],
     result_retargets: &mut Vec<(naga::Handle<naga::Expression>, naga::Handle<naga::Function>)>,
 ) -> bool {
     let mut changed = false;
-    for stmt in block.iter_mut() {
+    crate::ir::visit::for_each_statement_mut(block, &mut |stmt| {
         if let naga::Statement::Call {
             function,
             arguments,
             result,
         } = stmt
             && let Some(key) = call_spec_key(*function, arguments, caller_exprs, banned)
-            && let Some(&clone) = clones.get(&key)
+            && let Some(clone) = clone_for(clones, &key)
         {
             *function = clone;
             for &(p, _) in key.1.iter().rev() {
@@ -164,12 +164,17 @@ fn rewrite_calls_in_block(
             }
             changed = true;
         }
-        for nested in super::expr_util::nested_blocks_mut(stmt) {
-            changed |=
-                rewrite_calls_in_block(nested, caller_exprs, banned, clones, result_retargets);
-        }
-    }
+    });
     changed
+}
+
+/// The clones are few (one per banned callee and argument pattern), so a
+/// list beats a hashed `Vec` key.
+fn clone_for(
+    clones: &[(SpecKey, naga::Handle<naga::Function>)],
+    key: &SpecKey,
+) -> Option<naga::Handle<naga::Function>> {
+    clones.iter().find(|(k, _)| k == key).map(|&(_, h)| h)
 }
 
 /// Create or reuse the clone for `key`, building the clones IT needs first
@@ -181,11 +186,11 @@ fn ensure_clone(
     key: &SpecKey,
     banned: &HandleMap<naga::Function, Vec<u32>>,
     declined: &HandleSet<naga::Function>,
-    clones: &mut FxHashMap<SpecKey, naga::Handle<naga::Function>>,
+    clones: &mut Vec<(SpecKey, naga::Handle<naga::Function>)>,
     used_names: &mut std::collections::HashSet<String>,
     depth: usize,
 ) -> Option<naga::Handle<naga::Function>> {
-    if let Some(&h) = clones.get(key) {
+    if let Some(h) = clone_for(clones, key) {
         return Some(h);
     }
     if depth > 64 {
@@ -205,7 +210,7 @@ fn ensure_clone(
     // collision.
     let base = source.name.as_deref().unwrap_or("");
     let first_of_callee =
-        !base.is_empty() && !declined.contains(key.0) && !clones.keys().any(|k| k.0 == key.0);
+        !base.is_empty() && !declined.contains(key.0) && !clones.iter().any(|(k, _)| k.0 == key.0);
     let name = if first_of_callee {
         base.to_string()
     } else {
@@ -250,7 +255,7 @@ fn ensure_clone(
     }
 
     let handle = module.functions.append(clone, naga::Span::UNDEFINED);
-    clones.insert(key.clone(), handle);
+    clones.push((key.clone(), handle));
     Some(handle)
 }
 
@@ -261,7 +266,7 @@ fn ensure_clone(
 /// numbered before any call is remapped.
 fn restore_call_order(module: &mut naga::Module) {
     fn callees_of(func: &naga::Function, out: &mut Vec<naga::Handle<naga::Function>>) {
-        crate::passes::expr_util::for_each_statement(&func.body, &mut |stmt| {
+        crate::ir::visit::for_each_statement(&func.body, &mut |stmt| {
             if let naga::Statement::Call { function, .. } = stmt {
                 out.push(*function);
             }
@@ -292,20 +297,11 @@ fn restore_call_order(module: &mut naga::Module) {
         func: &mut naga::Function,
         map: &HandleMap<naga::Function, naga::Handle<naga::Function>>,
     ) {
-        fn walk(
-            block: &mut naga::Block,
-            map: &HandleMap<naga::Function, naga::Handle<naga::Function>>,
-        ) {
-            for stmt in block.iter_mut() {
-                if let naga::Statement::Call { function, .. } = stmt {
-                    *function = map[*function];
-                }
-                for nested in crate::passes::expr_util::nested_blocks_mut(stmt) {
-                    walk(nested, map);
-                }
+        crate::ir::visit::for_each_statement_mut(&mut func.body, &mut |stmt| {
+            if let naga::Statement::Call { function, .. } = stmt {
+                *function = map[*function];
             }
-        }
-        walk(&mut func.body, map);
+        });
         for (_, expr) in func.expressions.iter_mut() {
             if let naga::Expression::CallResult(f) = expr {
                 *f = map[*f];
@@ -335,7 +331,7 @@ pub fn specialize_ptr_params(
     module: &mut naga::Module,
     frozen_fn_names: &std::collections::HashSet<String>,
 ) -> bool {
-    if module.entry_points.is_empty() {
+    if is_library_module(module) {
         return false;
     }
     let banned = banned_functions(module);
@@ -382,7 +378,7 @@ pub fn specialize_ptr_params(
             .chain(crate::name_gen::type_names(module))
             .map(str::to_owned)
             .collect();
-    let mut clones: FxHashMap<SpecKey, naga::Handle<naga::Function>> = Default::default();
+    let mut clones: Vec<(SpecKey, naga::Handle<naga::Function>)> = Vec::new();
     for key in &needed {
         ensure_clone(
             module,
@@ -468,7 +464,7 @@ fn drop_pointer_arguments(
     types: &naga::UniqueArena<naga::Type>,
     banned: &HandleMap<naga::Function, Vec<u32>>,
 ) {
-    for stmt in block.iter_mut() {
+    crate::ir::visit::for_each_statement_mut(block, &mut |stmt| {
         if let naga::Statement::Call {
             function,
             arguments,
@@ -485,10 +481,7 @@ fn drop_pointer_arguments(
                 }
             }
         }
-        for nested in super::expr_util::nested_blocks_mut(stmt) {
-            drop_pointer_arguments(nested, expressions, own_arguments, types, banned);
-        }
-    }
+    });
 }
 
 /// `Some(clone)` when a function keeps a parameter [`specialize_ptr_params`]
@@ -898,7 +891,7 @@ mod tests {
         crate::io::validate_module(&module).expect("member, element and forwarded roots");
         let stand_in = validation_stand_in(&module).unwrap();
         let mut arities = Vec::new();
-        crate::passes::expr_util::for_each_statement(
+        crate::ir::visit::for_each_statement(
             &stand_in.entry_points[0].function.body,
             &mut |stmt| {
                 if let naga::Statement::Call { arguments, .. } = stmt {

@@ -722,11 +722,19 @@ fn ray_hit_stages_emit_incoming_payload_attr() {
     "#;
 
     let out = compact(src);
-    assert!(
-        out.contains("@incoming_payload("),
-        "ray hit/miss stages should emit @incoming_payload: {out}"
-    );
+    for attr in [
+        "@miss@incoming_payload(incoming_p)fn miss_main(",
+        "@any_hit@incoming_payload(incoming_p)fn any_hit_main(",
+        "@closest_hit@incoming_payload(incoming_p)fn closest_hit_main(",
+    ] {
+        assert!(out.contains(attr), "expected `{attr}` in: {out}");
+    }
     assert_valid_wgsl(&out);
+    let pretty = compact_beautified(src);
+    assert!(
+        pretty.contains("@any_hit @incoming_payload(incoming_p) fn any_hit_main("),
+        "beautified stage attributes are space-separated: {pretty}"
+    );
 }
 
 #[test]

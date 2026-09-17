@@ -8,46 +8,29 @@
 //! depends on the order, only on its determinism.
 
 use std::borrow::Borrow;
-use std::marker::PhantomData;
 
 use naga::Handle;
 
 const PRESENT: u8 = 1;
 const LISTED: u8 = 2;
 
-pub struct HandleSet<T> {
+/// Membership by index, the flag logic every arena type's set and map
+/// share: non-generic, so each `T` adds a thin wrapper rather than a copy.
+/// A slot is PRESENT while a member and LISTED once it has ever been, which
+/// is how first-insertion order survives a remove.
+#[derive(Default, Clone)]
+struct Slots {
     flags: Vec<u8>,
-    order: Vec<Handle<T>>,
     len: usize,
-    marker: PhantomData<T>,
 }
 
-impl<T> Default for HandleSet<T> {
-    fn default() -> Self {
-        Self {
-            flags: Vec::new(),
-            order: Vec::new(),
-            len: 0,
-            marker: PhantomData,
-        }
+impl Slots {
+    fn listed(&self, i: usize) -> bool {
+        self.flags.get(i).is_some_and(|f| f & LISTED != 0)
     }
-}
 
-impl<T> Clone for HandleSet<T> {
-    fn clone(&self) -> Self {
-        Self {
-            flags: self.flags.clone(),
-            order: self.order.clone(),
-            len: self.len,
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<T> HandleSet<T> {
-    /// `true` when `handle` was not a member.
-    pub fn insert(&mut self, handle: Handle<T>) -> bool {
-        let i = handle.index();
+    /// `true` when `i` was not present.
+    fn insert(&mut self, i: usize) -> bool {
         if i >= self.flags.len() {
             self.flags.resize(i + 1, 0);
         }
@@ -55,23 +38,18 @@ impl<T> HandleSet<T> {
         if *flags & PRESENT != 0 {
             return false;
         }
-        if *flags & LISTED == 0 {
-            self.order.push(handle);
-        }
         *flags = PRESENT | LISTED;
         self.len += 1;
         true
     }
 
-    pub fn contains(&self, handle: impl Borrow<Handle<T>>) -> bool {
-        self.flags
-            .get(handle.borrow().index())
-            .is_some_and(|f| f & PRESENT != 0)
+    fn contains(&self, i: usize) -> bool {
+        self.flags.get(i).is_some_and(|f| f & PRESENT != 0)
     }
 
-    /// `true` when `handle` was a member.
-    pub fn remove(&mut self, handle: impl Borrow<Handle<T>>) -> bool {
-        match self.flags.get_mut(handle.borrow().index()) {
+    /// `true` when `i` was present.
+    fn remove(&mut self, i: usize) -> bool {
+        match self.flags.get_mut(i) {
             Some(f) if *f & PRESENT != 0 => {
                 *f &= !PRESENT;
                 self.len -= 1;
@@ -80,20 +58,67 @@ impl<T> HandleSet<T> {
             _ => false,
         }
     }
+}
+
+pub struct HandleSet<T> {
+    slots: Slots,
+    order: Vec<Handle<T>>,
+}
+
+impl<T> Default for HandleSet<T> {
+    fn default() -> Self {
+        Self {
+            slots: Slots::default(),
+            order: Vec::new(),
+        }
+    }
+}
+
+impl<T> Clone for HandleSet<T> {
+    fn clone(&self) -> Self {
+        Self {
+            slots: self.slots.clone(),
+            order: self.order.clone(),
+        }
+    }
+}
+
+impl<T> HandleSet<T> {
+    /// `true` when `handle` was not a member.
+    pub fn insert(&mut self, handle: Handle<T>) -> bool {
+        let i = handle.index();
+        let listed = self.slots.listed(i);
+        if !self.slots.insert(i) {
+            return false;
+        }
+        if !listed {
+            self.order.push(handle);
+        }
+        true
+    }
+
+    pub fn contains(&self, handle: impl Borrow<Handle<T>>) -> bool {
+        self.slots.contains(handle.borrow().index())
+    }
+
+    /// `true` when `handle` was a member.
+    pub fn remove(&mut self, handle: impl Borrow<Handle<T>>) -> bool {
+        self.slots.remove(handle.borrow().index())
+    }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.slots.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.slots.len == 0
     }
 
     /// Members in first-insertion order.
     pub fn iter(&self) -> SetIter<'_, T> {
         SetIter {
             order: self.order.iter(),
-            flags: &self.flags,
+            flags: &self.slots.flags,
         }
     }
 
@@ -112,9 +137,9 @@ impl<T> HandleSet<T> {
     /// across a walk then pays no per-clear memset.
     pub fn clear(&mut self) {
         for h in self.order.drain(..) {
-            self.flags[h.index()] = 0;
+            self.slots.flags[h.index()] = 0;
         }
-        self.len = 0;
+        self.slots.len = 0;
     }
 }
 
@@ -168,20 +193,18 @@ impl<T> FromIterator<Handle<T>> for HandleSet<T> {
     }
 }
 
+/// The key set carries membership and order, so a map instantiation adds
+/// only what touches `V`.
 pub struct HandleMap<T, V> {
     slots: Vec<Option<V>>,
-    listed: Vec<bool>,
-    order: Vec<Handle<T>>,
-    len: usize,
+    keys: HandleSet<T>,
 }
 
 impl<T, V> Default for HandleMap<T, V> {
     fn default() -> Self {
         Self {
             slots: Vec::new(),
-            listed: Vec::new(),
-            order: Vec::new(),
-            len: 0,
+            keys: HandleSet::default(),
         }
     }
 }
@@ -190,9 +213,7 @@ impl<T, V: Clone> Clone for HandleMap<T, V> {
     fn clone(&self) -> Self {
         Self {
             slots: self.slots.clone(),
-            listed: self.listed.clone(),
-            order: self.order.clone(),
-            len: self.len,
+            keys: self.keys.clone(),
         }
     }
 }
@@ -244,17 +265,9 @@ impl<T, V> HandleMap<T, V> {
         let i = handle.index();
         if i >= self.slots.len() {
             self.slots.resize_with(i + 1, || None);
-            self.listed.resize(i + 1, false);
         }
-        if !self.listed[i] {
-            self.listed[i] = true;
-            self.order.push(handle);
-        }
-        let prev = self.slots[i].replace(value);
-        if prev.is_none() {
-            self.len += 1;
-        }
-        prev
+        self.keys.insert(handle);
+        self.slots[i].replace(value)
     }
 
     pub fn get(&self, handle: impl Borrow<Handle<T>>) -> Option<&V> {
@@ -270,13 +283,14 @@ impl<T, V> HandleMap<T, V> {
     }
 
     pub fn contains_key(&self, handle: impl Borrow<Handle<T>>) -> bool {
-        self.get(handle).is_some()
+        self.keys.contains(handle)
     }
 
     pub fn remove(&mut self, handle: impl Borrow<Handle<T>>) -> Option<V> {
-        let prev = self.slots.get_mut(handle.borrow().index())?.take();
+        let handle = handle.borrow();
+        let prev = self.slots.get_mut(handle.index())?.take();
         if prev.is_some() {
-            self.len -= 1;
+            self.keys.remove(handle);
         }
         prev
     }
@@ -289,23 +303,23 @@ impl<T, V> HandleMap<T, V> {
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.keys.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.keys.is_empty()
     }
 
     /// Entries in first-insertion order.
     pub fn iter(&self) -> MapIter<'_, T, V> {
         MapIter {
-            order: self.order.iter(),
+            keys: self.keys.iter(),
             slots: &self.slots,
         }
     }
 
-    pub fn keys(&self) -> impl Iterator<Item = &Handle<T>> + '_ {
-        self.iter().map(|(h, _)| h)
+    pub fn keys(&self) -> SetIter<'_, T> {
+        self.keys.iter()
     }
 
     pub fn values(&self) -> impl Iterator<Item = &V> + '_ {
@@ -313,8 +327,8 @@ impl<T, V> HandleMap<T, V> {
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(&Handle<T>, &mut V) -> bool) {
-        for i in 0..self.order.len() {
-            let h = self.order[i];
+        for i in 0..self.keys.order.len() {
+            let h = self.keys.order[i];
             if let Some(v) = self.slots[h.index()].as_mut()
                 && !keep(&h, v)
             {
@@ -325,30 +339,32 @@ impl<T, V> HandleMap<T, V> {
 
     /// Empties the map while keeping the slot arrays; see [`HandleSet::clear`].
     pub fn clear(&mut self) {
-        for h in self.order.drain(..) {
+        for h in self.keys.iter() {
             self.slots[h.index()] = None;
-            self.listed[h.index()] = false;
         }
-        self.len = 0;
+        self.keys.clear();
     }
 
-    /// Every entry, in first-insertion order, leaving the map empty.  The slots move
-    /// into the iterator rather than staying behind half-emptied, so dropping
-    /// it early is as consistent as running it out.
-    pub fn drain(&mut self) -> impl Iterator<Item = (Handle<T>, V)> {
-        let order = std::mem::take(&mut self.order);
-        let mut slots = std::mem::take(&mut self.slots);
-        self.listed.clear();
-        self.len = 0;
-        order
-            .into_iter()
-            .filter_map(move |h| slots[h.index()].take().map(|v| (h, v)))
+    /// Every entry, in first-insertion order, leaving the map empty.
+    pub fn drain(&mut self) -> std::vec::IntoIter<(Handle<T>, V)> {
+        let live: Vec<_> = self
+            .keys
+            .iter()
+            .map(|&h| {
+                (
+                    h,
+                    self.slots[h.index()].take().expect("a member has a value"),
+                )
+            })
+            .collect();
+        self.keys.clear();
+        live.into_iter()
     }
 }
 
 /// [`HandleMap::iter`]; named for the same reason as [`SetIter`].
 pub struct MapIter<'a, T, V> {
-    order: std::slice::Iter<'a, Handle<T>>,
+    keys: SetIter<'a, T>,
     slots: &'a [Option<V>],
 }
 
@@ -356,7 +372,7 @@ impl<'a, T, V> Iterator for MapIter<'a, T, V> {
     type Item = (&'a Handle<T>, &'a V);
     fn next(&mut self) -> Option<Self::Item> {
         let slots = self.slots;
-        self.order
+        self.keys
             .find_map(|h| slots.get(h.index())?.as_ref().map(|v| (h, v)))
     }
 }
@@ -387,12 +403,7 @@ impl<T, V> IntoIterator for HandleMap<T, V> {
     type Item = (Handle<T>, V);
     type IntoIter = std::vec::IntoIter<(Handle<T>, V)>;
     fn into_iter(mut self) -> Self::IntoIter {
-        let order = std::mem::take(&mut self.order);
-        let live: Vec<_> = order
-            .into_iter()
-            .filter_map(|h| self.slots[h.index()].take().map(|v| (h, v)))
-            .collect();
-        live.into_iter()
+        self.drain()
     }
 }
 

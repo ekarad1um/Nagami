@@ -3,8 +3,9 @@
 //! binding in the WGSL writer, blocking single-use inlining at the use
 //! site; one `Emit` over the union range restores it.
 
-use super::expr_util::{for_each_function_mut, nested_blocks_mut};
 use crate::error::Error;
+use crate::ir::rewrite::rewrite_statements;
+use crate::ir::visit::{for_each_function_mut, nested_blocks_mut};
 use crate::pipeline::{Pass, PassContext};
 
 /// Merges adjacent contiguous `Emit` statements, recursing into every
@@ -64,8 +65,6 @@ fn merge_emits_in_block(block: &mut naga::Block) -> bool {
     }
 
     let mut changed = nested_changed;
-    let original = std::mem::take(block);
-    let mut rebuilt = naga::Block::with_capacity(original.len());
 
     // `(first, last, span, emit_count)`; `changed` is reported only when two
     // or more emits merged.
@@ -75,8 +74,20 @@ fn merge_emits_in_block(block: &mut naga::Block) -> bool {
         naga::Span,
         usize,
     )> = None;
+    let flush =
+        |pending: &mut Option<(_, _, _, usize)>, out: &mut naga::Block, changed: &mut bool| {
+            if let Some((pf, pl, ps, pc)) = pending.take() {
+                if pc > 1 {
+                    *changed = true;
+                }
+                out.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(pf, pl)),
+                    ps,
+                );
+            }
+        };
 
-    for (statement, span) in original.span_into_iter() {
+    rewrite_statements(block, &mut |statement, span, out| {
         if let naga::Statement::Emit(ref range) = statement {
             let mut iter = range.clone();
             let Some(first) = iter.next() else {
@@ -84,53 +95,25 @@ fn merge_emits_in_block(block: &mut naga::Block) -> bool {
                 // shrinks while reporting `false`, defeating the convergence
                 // signal.
                 changed = true;
-                continue;
+                return;
             };
             let last = iter.last().unwrap_or(first);
 
-            if let Some((pf, pl, ps, pc)) = pending {
-                if first.index() == pl.index() + 1 {
-                    pending = Some((pf, last, ps, pc + 1));
-                } else {
-                    if pc > 1 {
-                        changed = true;
-                    }
-                    rebuilt.push(
-                        naga::Statement::Emit(naga::Range::new_from_bounds(pf, pl)),
-                        ps,
-                    );
-                    pending = Some((first, last, span, 1));
-                }
+            if let Some((pf, pl, ps, pc)) = pending
+                && first.index() == pl.index() + 1
+            {
+                pending = Some((pf, last, ps, pc + 1));
             } else {
+                flush(&mut pending, out, &mut changed);
                 pending = Some((first, last, span, 1));
             }
-            continue;
+            return;
         }
 
-        if let Some((pf, pl, ps, pc)) = pending.take() {
-            if pc > 1 {
-                changed = true;
-            }
-            rebuilt.push(
-                naga::Statement::Emit(naga::Range::new_from_bounds(pf, pl)),
-                ps,
-            );
-        }
-
-        rebuilt.push(statement, span);
-    }
-
-    if let Some((pf, pl, ps, pc)) = pending {
-        if pc > 1 {
-            changed = true;
-        }
-        rebuilt.push(
-            naga::Statement::Emit(naga::Range::new_from_bounds(pf, pl)),
-            ps,
-        );
-    }
-
-    *block = rebuilt;
+        flush(&mut pending, out, &mut changed);
+        out.push(statement, span);
+    });
+    flush(&mut pending, block, &mut changed);
     changed
 }
 
@@ -158,12 +141,8 @@ mod tests {
     fn merges_consecutive_emits() {
         let mut module = make_test_module();
         let config = crate::config::Config::default();
-        let ctx = PassContext {
-            config: &config,
-            name_log: None,
-        };
         let mut pass = EmitMergePass;
-        let changed = pass.run(&mut module, &ctx).unwrap();
+        let changed = PassContext::run_pass(&mut pass, &mut module, &config).unwrap();
         assert!(changed, "should merge consecutive emits");
 
         let info = naga::valid::Validator::new(
@@ -180,12 +159,8 @@ mod tests {
         let src = "fn f(a: f32) -> f32 { return a; }";
         let mut module = naga::front::wgsl::parse_str(src).expect("parse failed");
         let config = crate::config::Config::default();
-        let ctx = PassContext {
-            config: &config,
-            name_log: None,
-        };
         let mut pass = EmitMergePass;
-        let changed = pass.run(&mut module, &ctx).unwrap();
+        let changed = PassContext::run_pass(&mut pass, &mut module, &config).unwrap();
         assert!(!changed, "should report no change");
     }
 
@@ -203,12 +178,8 @@ mod tests {
         "#;
         let mut module = naga::front::wgsl::parse_str(src).expect("parse failed");
         let config = crate::config::Config::default();
-        let ctx = PassContext {
-            config: &config,
-            name_log: None,
-        };
         let mut pass = EmitMergePass;
-        let _ = pass.run(&mut module, &ctx).unwrap();
+        let _ = PassContext::run_pass(&mut pass, &mut module, &config).unwrap();
 
         let info = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -238,14 +209,10 @@ mod tests {
         "#;
         let mut module = naga::front::wgsl::parse_str(src).expect("parses");
         let config = crate::config::Config::default();
-        let ctx = PassContext {
-            config: &config,
-            name_log: None,
-        };
         let mut pass = EmitMergePass;
 
-        let _ = pass.run(&mut module, &ctx).unwrap();
-        let changed2 = pass.run(&mut module, &ctx).unwrap();
+        let _ = PassContext::run_pass(&mut pass, &mut module, &config).unwrap();
+        let changed2 = PassContext::run_pass(&mut pass, &mut module, &config).unwrap();
         assert!(
             !changed2,
             "second run must report no-change (fast-path bypasses rebuild on converged IR)"
@@ -272,12 +239,8 @@ mod tests {
         let _ = module.functions.append(function, Span::UNDEFINED);
 
         let config = crate::config::Config::default();
-        let ctx = PassContext {
-            config: &config,
-            name_log: None,
-        };
         let mut pass = EmitMergePass;
-        let changed = pass.run(&mut module, &ctx).unwrap();
+        let changed = PassContext::run_pass(&mut pass, &mut module, &config).unwrap();
         assert!(
             changed,
             "dropping empty Emit ranges must report `changed = true`"

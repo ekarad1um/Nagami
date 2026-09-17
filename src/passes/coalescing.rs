@@ -29,9 +29,9 @@
 //! intersection; `Switch` and `Loop` never propagate writes, since case
 //! fall-through and early-`break` paths would otherwise be mis-classified.
 
-use super::expr_util::for_each_function_mut;
 use crate::error::Error;
 use crate::handle_set::{HandleMap, HandleSet};
+use crate::ir::visit::for_each_function_mut;
 use crate::pipeline::{Pass, PassContext};
 
 /// Coalesce disjoint same-typed locals onto shared backing slots.
@@ -842,13 +842,8 @@ mod tests {
         let mut module = naga::front::wgsl::parse_str(source).expect("source should parse");
         let mut pass = CoalescingPass;
         let config = Config::default();
-        let ctx = PassContext {
-            config: &config,
-            name_log: None,
-        };
 
-        let changed = pass
-            .run(&mut module, &ctx)
+        let changed = PassContext::run_pass(&mut pass, &mut module, &config)
             .expect("coalescing pass should run");
         let _ = crate::io::validate_module(&module).expect("module should remain valid");
         (changed, module)

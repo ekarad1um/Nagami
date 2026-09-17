@@ -10,9 +10,11 @@ use std::collections::HashSet;
 
 use crate::config::FloatPrecision;
 
+use super::expr_emit::subsplat_runs;
 use super::syntax::LiteralExtractKey;
 use crate::handle_set::{HandleMap, HandleSet};
-use crate::passes::expr_util::all_functions;
+use crate::ir::visit::{all_functions, visit_expression_children};
+use crate::passes::expr_util::is_library_module;
 
 // MARK: Options
 
@@ -41,6 +43,13 @@ pub struct GenerateOptions {
     pub preamble_names: HashSet<String>,
     /// Emit `alias` declarations for repeated types when that shortens output.
     pub type_alias: bool,
+    /// The type spellings a render of this module produced, which the
+    /// alias planner prices instead of its IR census: the census counts
+    /// constructors the text elides or spells bare (`vec3(`) and preamble-
+    /// owned declarations, and misses conversions (`vec3f(v)`), so it mints
+    /// aliases that lose and skips ones that pay.  The tail's rename renders
+    /// the module once already; its emission carries these.
+    pub type_uses: Option<TypeUses>,
 }
 
 impl Default for GenerateOptions {
@@ -55,6 +64,76 @@ impl Default for GenerateOptions {
             preserve_members: HashSet::new(),
             preamble_names: HashSet::new(),
             type_alias: false,
+            type_uses: None,
+        }
+    }
+}
+
+/// The type spellings a render produced, per type handle: how many, and
+/// the bytes they take without an alias of their own (a constructor that
+/// may drop its suffix - `vec3(`, `array(` - counts as the shorter form,
+/// a scalar `var x=0i` tail as its literal), so an alias of `n` bytes
+/// saves `bytes - sites * n` at them.  A type spelled inside another's
+/// (`array<T,N>`, `ptr<_,T>`) is not a site of `T`: those spellings
+/// collapse into one declaration when the outer type takes an alias, so
+/// counting them would credit `T` for sites that may not survive; the
+/// under-count only forgoes an alias, never mints a losing one.
+#[derive(Debug, Clone, Default)]
+pub struct TypeUses {
+    sites: Vec<u32>,
+    bytes: Vec<u32>,
+}
+
+impl TypeUses {
+    pub(super) fn sized(types: usize) -> Self {
+        Self {
+            sites: vec![0; types],
+            bytes: vec![0; types],
+        }
+    }
+
+    pub(super) fn note(&mut self, ty: naga::Handle<naga::Type>, len: u32) {
+        self.sites[ty.index()] += 1;
+        self.bytes[ty.index()] += len;
+    }
+
+    fn unnote(&mut self, index: usize, len: u32) {
+        self.sites[index] -= 1;
+        self.bytes[index] -= len;
+    }
+
+    /// A function's counts, once its render settled.
+    pub(super) fn absorb(&mut self, other: &TypeUses) {
+        for (mine, theirs) in self.sites.iter_mut().zip(&other.sites) {
+            *mine += theirs;
+        }
+        for (mine, theirs) in self.bytes.iter_mut().zip(&other.bytes) {
+            *mine += theirs;
+        }
+    }
+
+    /// `(sites, bytes)` of `ty`; none for a type the counted render never
+    /// had (the counts are sized by the module they came from).
+    fn at(&self, ty: naga::Handle<naga::Type>) -> (usize, usize) {
+        let at = |v: &[u32]| v.get(ty.index()).copied().unwrap_or(0) as usize;
+        (at(&self.sites), at(&self.bytes))
+    }
+}
+
+impl GenerateOptions {
+    /// The options every emission of a compacted module shares; the
+    /// preamble-derived sets are the caller's.  One resolution of the
+    /// config, so the pricer's generator renders the text the shipped one
+    /// will.
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            beautify: config.beautify,
+            indent: config.indent,
+            mangle: config.mangle(),
+            float_precision: config.float_precision,
+            preserve_symbols: config.preserve_symbols.iter().cloned().collect(),
+            type_alias: true,
+            ..Default::default()
         }
     }
 }
@@ -62,17 +141,20 @@ impl Default for GenerateOptions {
 // MARK: Cached analyses
 
 /// Per-function expression analysis, computed once and in lock-step by
-/// `compute_expression_ref_counts`.  `live` is `mem::take`n by literal
-/// extraction and `ref_counts` by `generate_function`, so neither is readable
-/// after its consumer has run.
+/// `compute_expression_ref_counts`.  `ref_counts` and `paren_uses` are
+/// `mem::take`n by `generate_function`, so they are not readable once that
+/// function has been emitted; `live` is only ever borrowed.
 pub(super) struct FunctionExprInfo {
     pub(super) ref_counts: Vec<usize>,
     pub(super) live: Vec<bool>,
+    /// How many live consumers would wrap the expression's own text in
+    /// parentheses (`paren_uses_in`).
+    pub(super) paren_uses: Vec<u16>,
 }
 
 // MARK: Generator state
 
-/// Emission state for one module; created per [`super::generate_wgsl`] call and
+/// Emission state for one module; created per [`super::generate`] call and
 /// never reused.
 pub(super) struct Generator<'a> {
     pub(super) module: &'a naga::Module,
@@ -81,7 +163,9 @@ pub(super) struct Generator<'a> {
     pub(super) out: String,
     pub(super) indent_depth: u32,
     pub(super) type_names: HandleMap<naga::Type, String>,
-    pub(super) member_names: FxHashMap<(naga::Handle<naga::Type>, u32), String>,
+    /// Per struct type, a name per member; absent for a struct spelled as
+    /// the source has it.
+    pub(super) member_names: HandleMap<naga::Type, Vec<String>>,
     pub(super) constant_names: Vec<String>,
     pub(super) override_names: Vec<String>,
     pub(super) global_names: Vec<String>,
@@ -114,10 +198,24 @@ pub(super) struct Generator<'a> {
     /// `ref_count_cache`; computed once so the live-type census, alias cost
     /// model, literal extraction and emission cannot disagree.
     pub(super) defer_cache: Vec<(Vec<bool>, Vec<bool>)>,
-    /// Per-`module.functions` purity bitmap (`true` = no side effect beyond the
-    /// return value); keeps impure single-use calls bound rather than inlined
-    /// past a read of what they write.
-    pub(super) pure_functions: Vec<bool>,
+    /// Per-`module.functions` effect summary: keeps impure single-use calls
+    /// bound rather than inlined past a read of what they write, and tells
+    /// the forced-binding analysis which loads a call stales.
+    pub(super) fn_effects: Vec<crate::analysis::FnEffects>,
+    /// How often the text spells each renameable name, gathered as the
+    /// bodies render (`FunctionCtx::render_counts`), for the rename that
+    /// ranks by it.
+    pub(super) name_weights: crate::passes::rename::Weights,
+    /// The type spellings this render produced (`FunctionCtx::type_uses`
+    /// absorbed as each body settles, the declarations counted here), for
+    /// the alias plan of the render that ships.
+    pub(super) type_uses: TypeUses,
+    /// Bytes of each type's spelling without an alias of its own (nested
+    /// aliases as planned), what a site would cost were its alias dropped.
+    pub(super) type_spelled_len: Vec<u32>,
+    /// The arena-first handle of each `TypeInner`, for a spelling that has
+    /// the inner alone (a conversion's target, a splat's vector).
+    pub(super) inner_to_first: FxHashMap<&'a naga::TypeInner, naga::Handle<naga::Type>>,
     /// Format tokens fixed at construction from `options.beautify`, so the
     /// hot path never branches per character.
     tok: &'static Tokens,
@@ -178,8 +276,20 @@ static PRETTY_TOKENS: Tokens = Tokens {
 
 // MARK: Function context
 
+/// One `let`-or-inline decision the byte rule made: the value, its text as
+/// priced, the name length priced against, and the verdict.
+#[derive(Clone, Copy)]
+pub(super) struct ByteDecision {
+    pub(super) handle: naga::Handle<naga::Expression>,
+    pub(super) len: usize,
+    pub(super) name: usize,
+    pub(super) bound: bool,
+}
+
 /// Per-function emission context, threaded through every statement and
-/// expression emitter.
+/// expression emitter.  `Clone` so a pricer can render from a copy and keep
+/// its own state pristine.
+#[derive(Clone)]
 pub(super) struct FunctionCtx<'a, 'm> {
     /// The enclosing function, or an empty one at module scope.
     pub(super) func: &'a naga::Function,
@@ -191,14 +301,24 @@ pub(super) struct FunctionCtx<'a, 'm> {
     /// front-end rejects the elided form against a module-scope declaration
     /// whose type resolves through an alias.
     pub(super) elide_array_ctor: bool,
-    /// Root of a declaration that prints no `: T`, so its own text must spell
-    /// the concrete type: an elided `vec2(42,43)` would leave the constant
-    /// abstract, a different type that naga drops from the arena entirely.
+    /// A root whose own text must spell its concrete type: the initializer
+    /// of a declaration that prints no `: T` (an elided `vec2(42,43)` would
+    /// leave the constant abstract, a different type that naga drops from
+    /// the arena entirely), or the all-literal `Compose` operand of a
+    /// conversion that would convert its lanes differently as abstract
+    /// values (`compose_lane_keeps_suffix`).
     pub(super) pinned_root: Option<naga::Handle<naga::Expression>>,
     pub(super) argument_names: Vec<String>,
     pub(super) local_names: HandleMap<naga::LocalVariable, String>,
     pub(super) expr_names: HandleMap<naga::Expression, String>,
+    /// Each later spelling of a value in scope, to its first
+    /// (`structural_twins`): it renders as the first's name once that has
+    /// one, and `ref_counts` / `paren_uses` of the first hold its uses.
+    pub(super) twins: HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
     pub(super) ref_counts: Vec<usize>,
+    /// Of `ref_counts`, the uses that parenthesise an inlined text
+    /// (`FunctionExprInfo::paren_uses`).
+    pub(super) paren_uses: Vec<u16>,
     pub(super) deferred_vars: Vec<bool>,
     pub(super) dead_vars: Vec<bool>,
     /// Matrix / array locals passed by address to a call while their type
@@ -208,9 +328,9 @@ pub(super) struct FunctionCtx<'a, 'm> {
     /// canonicalise, structs are always named), so `f(&b)` against
     /// `ptr<function, ALIAS>` fails the re-parse.
     pub(super) typed_pointer_arg_locals: Vec<bool>,
-    /// Locals whose references stay inside one `Loop`, absorbable into a
-    /// `for (var x = init; ...)` header.
-    pub(super) for_loop_vars: Vec<bool>,
+    /// Per local, the guard of the `Loop` whose `for(var x=init;...)` header
+    /// declares it (`find_for_loop_vars`); cleared once rendered.
+    pub(super) for_loop_vars: Vec<Option<naga::Handle<naga::Expression>>>,
     pub(super) expr_name_counter: usize,
     /// Module-scope names shared across functions; not cloned per call.
     pub(super) module_names: &'m std::collections::HashSet<String>,
@@ -219,10 +339,8 @@ pub(super) struct FunctionCtx<'a, 'm> {
     /// Call results inlinable at their use site: `ref_count == 1` and no
     /// side-effecting statement between the `Call` and the use.
     pub(super) inlineable_calls: HandleSet<naga::Expression>,
-    /// `Load`s that must be `let`-bound: their place is written between the
-    /// `Load`'s `Emit` and a use, so inlining would relocate the read past the
-    /// write and yield the post-write value (the classic swap `let t=x;x=y;y=t`).
-    pub(super) must_bind_loads: HandleSet<naga::Expression>,
+    /// Expressions `let`-bound whatever the byte cost (`compute_must_bind`).
+    pub(super) must_bind: HandleSet<naga::Expression>,
     /// Memo for the rendered-depth cap (`0` = not computed).  Depths are
     /// queried child-first in arena order, so a child bound after its entry was
     /// taken can only make an ancestor's stored depth an overestimate, the safe
@@ -233,16 +351,37 @@ pub(super) struct FunctionCtx<'a, 'm> {
     /// off the `Call` statement), so without it a chain of stashed calls prices
     /// as nested leaves and escapes the depth cap.
     pub(super) stashed_call_depth: HandleMap<naga::Expression, u16>,
-    /// Operands `let`-bound by the `const_hazard` guard, in emission order:
-    /// pre-emitted expressions usable from any block, so each name must leave
+    /// How many times each expression has rendered at a use so far (its
+    /// text or its name) and how many of those a consumer would wrap in
+    /// parentheses: exactly what the text holds, since a rendering the text
+    /// drops (a pricing render of a value that inlines, the longer of two
+    /// constructor spellings) is undone through `count_journal` and a
+    /// `let`'s own rendering is never counted.
+    pub(super) render_counts: Vec<i32>,
+    pub(super) paren_counts: Vec<i32>,
+    /// Every count taken, in order, so a range of them can be undone;
+    /// a type spelling (`note_type`) is a negative entry.
+    pub(super) count_journal: Vec<i32>,
+    /// The type spellings this render produced, journaled like the counts.
+    pub(super) type_uses: TypeUses,
+    /// The counts a previous render of this function measured, which the
+    /// byte rule prices by instead of the census; `None` on the first.
+    pub(super) measured: Option<(Vec<i32>, Vec<i32>)>,
+    /// Every byte decision this render made, for the check against the
+    /// counts it produced.
+    pub(super) decisions: Vec<ByteDecision>,
+    /// Operands the `const_hazard` guard named, in emission order: a `let` it
+    /// emitted, or an `override` read routed through an open binding's name.
+    /// Pre-emitted, so usable from any block, and each name must leave
     /// `expr_names` when its block closes.
     pub(super) const_hazard_bindings: Vec<naga::Handle<naga::Expression>>,
-    /// Function name for diagnostics.
+    /// The name the declaration prints, and the diagnostics' name.
     pub(super) display_name: String,
 }
 
 /// Where an expression's resolved type comes from: naga keeps function
 /// expressions in `FunctionInfo` and module-scope ones in `ModuleInfo`.
+#[derive(Clone, Copy)]
 pub(super) enum ExprTypes<'a> {
     Function(&'a naga::valid::FunctionInfo),
     Module(&'a naga::valid::ModuleInfo),
@@ -280,13 +419,139 @@ impl<'a, 'm> FunctionCtx<'a, 'm> {
         }
     }
 
-    pub(super) fn next_expr_name(&mut self) -> String {
+    /// The next free `let` name and the counter past it; nothing claimed.
+    fn draw_expr_name(&self) -> (String, usize) {
+        let mut counter = self.expr_name_counter;
         loop {
-            let name = crate::name_gen::next_name(&mut self.expr_name_counter);
+            let name = crate::name_gen::next_name(&mut counter);
             if !self.module_names.contains(&name) && !self.local_used_names.contains(&name) {
-                self.local_used_names.insert(name.clone());
-                return name;
+                return (name, counter);
             }
+        }
+    }
+
+    pub(super) fn next_expr_name(&mut self) -> String {
+        let (name, counter) = self.draw_expr_name();
+        self.expr_name_counter = counter;
+        self.local_used_names.insert(name.clone());
+        name
+    }
+
+    /// Length of the name [`Self::next_expr_name`] would return, for
+    /// pricing a `let` before deciding on it.
+    pub(super) fn peek_expr_name_len(&self) -> usize {
+        self.draw_expr_name().0.len()
+    }
+
+    /// The twins of `h` take the name it was just given.
+    pub(super) fn name_twins(&mut self, h: naga::Handle<naga::Expression>) {
+        if self.twins.is_empty() {
+            return;
+        }
+        let Some(name) = self.expr_names.get(h).cloned() else {
+            return;
+        };
+        let twins: Vec<_> = self
+            .twins
+            .iter()
+            .filter(|&(_, &first)| first == h)
+            .map(|(&twin, _)| twin)
+            .collect();
+        for twin in twins {
+            self.expr_names.insert(twin, name.clone());
+        }
+    }
+
+    /// The counts with each twin's folded into its first spelling's: what
+    /// the byte rule of that value is judged by.
+    pub(super) fn counts_by_value(&self) -> (Vec<i32>, Vec<i32>) {
+        let mut renders = self.render_counts.clone();
+        let mut parens = self.paren_counts.clone();
+        for (&twin, &first) in self.twins.iter() {
+            renders[first.index()] += renders[twin.index()];
+            parens[first.index()] += parens[twin.index()];
+        }
+        (renders, parens)
+    }
+
+    /// `h` rendered once more, its text or its name.
+    pub(super) fn rendered(&mut self, h: naga::Handle<naga::Expression>) {
+        self.render_counts[h.index()] += 1;
+        self.count_journal.push(Self::journal_entry(h, false));
+    }
+
+    /// A consumer rendering `h` would wrap its text in parentheses (it may
+    /// be rendering the name instead).
+    pub(super) fn wrapped(&mut self, h: naga::Handle<naga::Expression>) {
+        self.paren_counts[h.index()] += 1;
+        self.count_journal.push(Self::journal_entry(h, true));
+    }
+
+    /// The text spelled `ty`, `len` bytes without an alias of its own.
+    pub(super) fn note_type(&mut self, ty: naga::Handle<naga::Type>, len: usize) {
+        let len = u32::try_from(len).map_or(TYPE_LEN_CAP, |l| l.min(TYPE_LEN_CAP));
+        self.type_uses.note(ty, len);
+        let entry =
+            i32::try_from(ty.index() as u32 * (TYPE_LEN_CAP + 1) + len).expect("a type index");
+        self.count_journal.push(-1 - entry);
+    }
+
+    /// The journal's spelling of one count: the handle and which count,
+    /// never zero (a zero is an entry already undone) and never negative
+    /// (a type spelling).
+    fn journal_entry(h: naga::Handle<naga::Expression>, paren: bool) -> i32 {
+        let idx = i32::try_from(h.index()).expect("an arena index");
+        idx * 2 + i32::from(paren) + 1
+    }
+
+    /// Where the journal stands, for a rendering that may be dropped.
+    pub(super) fn mark(&self) -> usize {
+        self.count_journal.len()
+    }
+
+    /// Undo the counts taken since `mark`: the rendering they came from is
+    /// not in the text.
+    pub(super) fn discard_since(&mut self, mark: usize) {
+        self.discard_range(mark, self.count_journal.len());
+        self.count_journal.truncate(mark);
+    }
+
+    /// [`Self::discard_since`] for the counts in `start..end`, later ones
+    /// kept (an earlier spelling lost to a later one).
+    pub(super) fn discard_range(&mut self, start: usize, end: usize) {
+        for i in start..end {
+            let entry = std::mem::replace(&mut self.count_journal[i], 0);
+            if entry == 0 {
+                continue;
+            }
+            if entry < 0 {
+                let packed = (-1 - entry) as u32;
+                let (idx, len) = (packed / (TYPE_LEN_CAP + 1), packed % (TYPE_LEN_CAP + 1));
+                self.type_uses.unnote(idx as usize, len);
+                continue;
+            }
+            let idx = ((entry - 1) / 2) as usize;
+            if (entry - 1) % 2 == 0 {
+                self.render_counts[idx] -= 1;
+            } else {
+                self.paren_counts[idx] -= 1;
+            }
+        }
+    }
+
+    /// [`Self::wrapped`] for the two operands of a binary rendering.
+    pub(super) fn wrapped_operands(
+        &mut self,
+        left: naga::Handle<naga::Expression>,
+        wrap_l: bool,
+        right: naga::Handle<naga::Expression>,
+        wrap_r: bool,
+    ) {
+        if wrap_l {
+            self.wrapped(left);
+        }
+        if wrap_r {
+            self.wrapped(right);
         }
     }
 }
@@ -357,9 +622,8 @@ impl<'a> Generator<'a> {
 }
 
 impl<'a> Generator<'a> {
-    /// Context for module-scope expressions: no locals, and every earlier named
-    /// constant's initializer bound to that constant's name, so a shared
-    /// initializer re-emits as the name.
+    /// Context for module-scope expressions: no locals, and
+    /// [`Generator::expr_to_const`]'s constants pre-bound to their names.
     pub(super) fn module_ctx(&self) -> FunctionCtx<'a, 'static> {
         let n = self.module.global_expressions.len();
         FunctionCtx {
@@ -375,7 +639,9 @@ impl<'a> Generator<'a> {
                 .iter()
                 .map(|(h, c)| (*h, self.constant_names[c.index()].clone()))
                 .collect(),
+            twins: HandleMap::default(),
             ref_counts: vec![0; n],
+            paren_uses: Vec::new(),
             deferred_vars: Vec::new(),
             typed_pointer_arg_locals: Vec::new(),
             dead_vars: Vec::new(),
@@ -384,9 +650,15 @@ impl<'a> Generator<'a> {
             module_names: &NO_NAMES,
             local_used_names: HashSet::new(),
             inlineable_calls: HandleSet::default(),
-            must_bind_loads: HandleSet::default(),
+            must_bind: HandleSet::default(),
             render_depth_memo: vec![0; n],
             stashed_call_depth: HandleMap::default(),
+            render_counts: vec![0; n],
+            paren_counts: vec![0; n],
+            count_journal: Vec::new(),
+            type_uses: TypeUses::sized(self.module.types.len()),
+            measured: None,
+            decisions: Vec::new(),
             const_hazard_bindings: Vec::new(),
             display_name: String::from("<module>"),
         }
@@ -425,7 +697,7 @@ fn count_type_handle_refs(
     // Compose / ZeroValue walk) and can introduce a net-larger alias.  Two safe
     // imprecisions only ever forgo a borderline alias: a `Splat`-init const
     // under-counts (the global-expr walk skips `Splat`), and an unnamed
-    // constant that `generate_constants` skips is still counted.
+    // constant that `emit_constant_decls` skips is still counted.
     for (h, c) in module.constants.iter() {
         if !live_constants.contains(h) {
             continue;
@@ -453,11 +725,11 @@ fn count_type_handle_refs(
 
     // A dead local is never printed, so counting its type would credit an
     // `alias X=T;` used nowhere.  Argument / result types always print;
-    // `Compose` / `ZeroValue` entries are counted wholesale because
-    // `collect_emitted_handles` under-marks some expressions the emitter does
-    // print, which makes a live-only gate unsound here.  The alias planner is
-    // greedy, so any count perturbation can flip a marginal choice; all outputs
-    // stay valid.
+    // `Compose` / `ZeroValue` entries are counted whether or not their
+    // expression prints, since no per-expression liveness is known here and
+    // an under-count forgoes a paying alias.  The alias planner is greedy,
+    // so any count perturbation can flip a marginal choice; all outputs stay
+    // valid.
     for (func, (_, dead_locals)) in all_functions(module).zip(defer_cache) {
         for arg in &func.arguments {
             inc(arg.ty);
@@ -482,19 +754,554 @@ fn count_type_handle_refs(
     counts
 }
 
+struct StructNames {
+    type_names: HandleMap<naga::Type, String>,
+    member_names: HandleMap<naga::Type, Vec<String>>,
+    /// Struct names assigned under mangling, preserved ones included and
+    /// predeclared ones excluded; [`crate::name_gen::module_scope_names`]
+    /// lists no type, so the anonymous override's minted name dodges these
+    /// explicitly.
+    minted: HashSet<String>,
+    /// Names the source or the language fixes (preserved, predeclared), which
+    /// [`reassign_type_names_by_use`] must not hand to anything else.
+    fixed: HashSet<String>,
+}
+
+/// Name every struct type; without mangling the source names are kept
+/// verbatim.  A minted struct name lives at module scope and dodges what an
+/// alias dodges ([`plan_type_aliases`]) plus the other minted type names.
+/// Members are named by [`mint_member_names`] once every type name is
+/// final; only the predeclared structs get theirs here, because those are
+/// canonical.
+fn mint_struct_names(
+    module: &naga::Module,
+    options: &GenerateOptions,
+    canonical: &HandleMap<naga::Type, naga::Handle<naga::Type>>,
+    spelling: &SpellingScopes<'_>,
+) -> StructNames {
+    let mangle = options.mangle;
+    let preserve = &options.preserve_symbols;
+    let mut type_names = HandleMap::default();
+    let mut member_names = HandleMap::default();
+    let mut minted: HashSet<String> = HashSet::new();
+    let mut fixed: HashSet<String> = HashSet::new();
+
+    // naga predeclared / special struct types are never renamed: their members
+    // are accessed through canonical names (`.old_value`, `.fract`, `.kind`,
+    // ...) and no declaration is emitted for them, so a mangled accessor would
+    // be invalid WGSL.
+    let predeclared_type_handles = super::module_emit::special_struct_handles(module);
+
+    let mut module_used = crate::name_gen::NameScope::default();
+    if mangle {
+        module_used.extend(crate::name_gen::module_scope_names(module).map(str::to_owned));
+        module_used.extend(preserve.iter().cloned());
+        module_used.extend(options.preserve_members.iter().cloned());
+    }
+
+    for (h, ty) in module.types.iter() {
+        let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+            continue;
+        };
+        if !mangle {
+            type_names.insert(
+                h,
+                ty.name.clone().unwrap_or_else(|| format!("T{}", h.index())),
+            );
+            continue;
+        }
+        // Name-based fallback for IRs where `special_types.ray_desc` is not
+        // populated.
+        let is_ray_descriptor = ty.name.as_deref() == Some("RayDesc");
+        if predeclared_type_handles.contains(h) || is_ray_descriptor {
+            let name = ty.name.clone().unwrap_or_else(|| format!("T{}", h.index()));
+            fixed.insert(name.clone());
+            type_names.insert(h, name);
+            member_names.insert(
+                h,
+                members
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, member)| member.name.clone().unwrap_or_else(|| format!("m{}", idx)))
+                    .collect(),
+            );
+            continue;
+        }
+
+        let name = match ty.name.as_deref().filter(|n| preserve.contains(*n)) {
+            Some(kept) => {
+                fixed.insert(kept.to_string());
+                kept.to_string()
+            }
+            None => spelling.shortest_free_name(&module_used, canonical[&h]),
+        };
+        minted.insert(name.clone());
+        module_used.insert(name.clone());
+        type_names.insert(h, name);
+    }
+
+    StructNames {
+        type_names,
+        member_names,
+        minted,
+        fixed,
+    }
+}
+
+/// Name the members of every mangled struct.  A member lives in its
+/// struct's own namespace, so it dodges only that struct's kept members
+/// and every struct counts from the first letter - except for the names of
+/// the types the struct body spells.  WGSL keeps members and types apart;
+/// the C++ that naga's MSL writer emits does not, and there a member named
+/// like a type hides that type for the members declared after it, so the
+/// shader compiles under Dawn (which renames every symbol first) and fails
+/// under wgpu on Metal.  Direct member types are the whole
+/// list: naga spells an array through a module-scope wrapper, so an element
+/// type's name never appears in the containing body, and pointers cannot be
+/// members.  Runs after the type names are final, and the predeclared
+/// structs keep the canonical names [`mint_struct_names`] gave them.
+fn mint_member_names(
+    module: &naga::Module,
+    options: &GenerateOptions,
+    type_names: &HandleMap<naga::Type, String>,
+    member_names: &mut HandleMap<naga::Type, Vec<String>>,
+) {
+    if !options.mangle {
+        return;
+    }
+    let predeclared = super::module_emit::special_struct_handles(module);
+    for (h, ty) in module.types.iter() {
+        let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+            continue;
+        };
+        if predeclared.contains(h) || ty.name.as_deref() == Some("RayDesc") {
+            continue;
+        }
+        let kept: HashSet<String> = members
+            .iter()
+            .filter_map(|m| m.name.as_deref())
+            .filter(|n| {
+                options.preserve_symbols.contains(*n) || options.preserve_members.contains(*n)
+            })
+            .map(str::to_owned)
+            .collect();
+        let mut forbidden = kept.clone();
+        forbidden.extend(members.iter().filter_map(|m| type_names.get(m.ty).cloned()));
+        let mut counter = 0usize;
+        let names = members
+            .iter()
+            .map(|member| match member.name.as_deref() {
+                Some(name) if kept.contains(name) => name.to_string(),
+                _ => crate::name_gen::next_name_unique(&mut counter, &forbidden),
+            })
+            .collect();
+        member_names.insert(h, names);
+    }
+}
+
+/// The longest type spelling a journal entry records, beyond which the
+/// bytes are capped (an alias for such a type is under-credited, never
+/// over): the entry packs the type index above it.
+const TYPE_LEN_CAP: u32 = 1023;
+
+/// The type-group and shadowing state [`plan_type_aliases`] and
+/// [`rank_type_names_by_use`] share.
+struct AliasScope<'s> {
+    /// Arena-first handle of each type's `TypeInner` group.
+    canonical: &'s HandleMap<naga::Type, naga::Handle<naga::Type>>,
+    /// Summed reference count per group head.
+    group_ref_count: &'s HandleMap<naga::Type, usize>,
+    /// Summed bytes the sites spell without an alias, per group head, from
+    /// a render (`TypeUses`); `None` prices every site at the full spelling.
+    group_bytes: Option<&'s HandleMap<naga::Type, usize>>,
+    /// Per function, the groups it spells and the locals a minted name
+    /// must then dodge.
+    spelling: &'s SpellingScopes<'s>,
+    /// Predeclared aliases a module-scope name already shadows.
+    shadowed_type_aliases: &'s super::syntax::ShadowedAliases,
+}
+
+/// Mint an alias for each non-struct type whose uses pay for the declaration,
+/// naming it in `type_names`; the declarations and the handles they name,
+/// parallel.  An alias dodges every module-scope name and the locals of
+/// the functions that spell its type ([`SpellingScopes`]).
+#[allow(clippy::too_many_arguments)]
+fn plan_type_aliases(
+    module: &naga::Module,
+    options: &GenerateOptions,
+    type_names: &mut HandleMap<naga::Type, String>,
+    scope: &AliasScope<'_>,
+    constant_names: &[String],
+    override_names: &[String],
+    global_names: &[String],
+    function_names: &[String],
+) -> (Vec<(String, String)>, Vec<naga::Handle<naga::Type>>) {
+    let mut module_names: crate::name_gen::NameScope = emitted_module_names(
+        module,
+        options,
+        type_names,
+        constant_names,
+        override_names,
+        global_names,
+        function_names,
+    )
+    .map(str::to_owned)
+    .collect();
+    module_names.extend(options.preserve_members.iter().cloned());
+    let mut minted_aliases = module_names.clone();
+    let mut decls: Vec<(String, String)> = Vec::new();
+    let mut decl_handles: Vec<naga::Handle<naga::Type>> = Vec::new();
+    let fixed_overhead = super::syntax::decl_boilerplate(options.beautify);
+
+    for (h, ty) in module.types.iter() {
+        // Structs are already named by `mint_struct_names`.
+        if type_names.contains_key(h) {
+            continue;
+        }
+
+        let group_head = scope.canonical[&h];
+        if h != group_head
+            && let Some(existing) = type_names.get(group_head).cloned()
+        {
+            type_names.insert(h, existing);
+            continue;
+        }
+
+        let count = scope.group_ref_count.get(group_head).copied().unwrap_or(0);
+        if count == 0 {
+            continue;
+        }
+        // Rendered with the aliases minted so far, so aliases nest.
+        let Ok(type_str) = super::syntax::type_inner_name(
+            &ty.inner,
+            module,
+            type_names,
+            override_names,
+            scope.shadowed_type_aliases,
+        ) else {
+            continue;
+        };
+        // Priced at the shortest name the ranking below can hand it (the
+        // other aliases' letters are reassigned there by use); minted
+        // provisionally past them.
+        let name_len = scope
+            .spelling
+            .shortest_free_name(&module_names, group_head)
+            .len();
+        let alias_name = scope
+            .spelling
+            .shortest_free_name(&minted_aliases, group_head);
+
+        let decl_cost = fixed_overhead + name_len + type_str.len();
+        let spelled = scope.group_bytes.map_or(count * type_str.len(), |bytes| {
+            bytes.get(group_head).copied().unwrap_or(0)
+        });
+        let total_savings = spelled.saturating_sub(count * name_len);
+        if total_savings > decl_cost {
+            minted_aliases.insert(alias_name.clone());
+            decls.push((alias_name.clone(), type_str));
+            decl_handles.push(h);
+            type_names.insert(h, alias_name);
+        }
+    }
+
+    (decls, decl_handles)
+}
+
+/// Re-letter the minted type names by use count
+/// ([`reassign_type_names_by_use`]) and re-render the alias declarations
+/// against the result, last, so a nested alias spells the final name.
+#[allow(clippy::too_many_arguments)]
+fn rank_type_names_by_use(
+    module: &naga::Module,
+    type_names: &mut HandleMap<naga::Type, String>,
+    type_alias_decls: &mut [(String, String)],
+    decl_handles: &[naga::Handle<naga::Type>],
+    scope: &AliasScope<'_>,
+    ref_counts: &HandleMap<naga::Type, usize>,
+    fixed_type_names: &HashSet<String>,
+    // Spelled inside an `array<_, N>` alias, so the re-render needs them.
+    override_names: &[String],
+    options: &GenerateOptions,
+    // Constant, override, global and function names.
+    taken: [&[String]; 4],
+) {
+    // A kept member name is dodged too: the type letter would otherwise be
+    // hidden inside the very struct that spells it (see `mint_member_names`).
+    let mut assigned: crate::name_gen::NameScope = taken
+        .iter()
+        .flat_map(|names| names.iter())
+        .chain(fixed_type_names)
+        .chain(&options.preserve_symbols)
+        .chain(&options.preserve_members)
+        .cloned()
+        .collect();
+    assigned.extend(module.entry_points.iter().map(|entry| entry.name.clone()));
+
+    reassign_type_names_by_use(
+        type_names,
+        assigned,
+        scope.canonical,
+        |h| {
+            if matches!(module.types[h].inner, naga::TypeInner::Struct { .. }) {
+                (ref_counts.get(h).copied().unwrap_or(0), true)
+            } else {
+                (
+                    scope
+                        .group_ref_count
+                        .get(scope.canonical[&h])
+                        .copied()
+                        .unwrap_or(0),
+                    false,
+                )
+            }
+        },
+        scope.spelling,
+    );
+
+    for (decl, &h) in type_alias_decls.iter_mut().zip(decl_handles) {
+        if let (Some(name), Ok(type_str)) = (
+            type_names.get(h).cloned(),
+            super::syntax::type_inner_name(
+                &module.types[h].inner,
+                module,
+                type_names,
+                override_names,
+                scope.shadowed_type_aliases,
+            ),
+        ) {
+            *decl = (name, type_str);
+        }
+    }
+}
+
+/// Letters by use count.  The arena-order minting hands the first free
+/// letter to whichever type comes first, so a struct spelled once can hold
+/// the letter an alias spelled a hundred times wanted, and a re-minify,
+/// registering the types in another order, derives other letters (text
+/// drift on the second pass).  Every minted name in `type_names` - one not
+/// in `assigned`, which holds the module-scope names and the fixed type
+/// names - is reassigned in descending `count`, each dodging `assigned`,
+/// the names given so far and the locals of the functions that spell its
+/// group.  Ties go to aliases before structs, then handle order: a
+/// re-minify registers types in the order the output declares them,
+/// aliases first, so that is the one order both passes agree on.  Only
+/// letters move; no minting decision does.  Plain loops throughout: a sort
+/// or a map instantiation here is kilobytes of binary for a dozen names.
+fn reassign_type_names_by_use(
+    type_names: &mut HandleMap<naga::Type, String>,
+    mut assigned: crate::name_gen::NameScope,
+    canonical: &HandleMap<naga::Type, naga::Handle<naga::Type>>,
+    count: impl Fn(naga::Handle<naga::Type>) -> (usize, bool),
+    spelling: &SpellingScopes<'_>,
+) {
+    // (old name, (count, is struct), group head).
+    let mut entities: Vec<(String, (usize, bool), naga::Handle<naga::Type>)> = Vec::new();
+    for (&h, name) in type_names.iter() {
+        if assigned.contains(name) || entities.iter().any(|(n, _, _)| n == name) {
+            continue;
+        }
+        entities.push((name.clone(), count(h), canonical[&h]));
+    }
+    let rank = |i: usize| {
+        let (_, (n, is_struct), head) = &entities[i];
+        (usize::MAX - *n, *is_struct, head.index())
+    };
+    let mut renamed: Vec<(String, String)> = Vec::with_capacity(entities.len());
+    let mut done = vec![false; entities.len()];
+    for _ in 0..entities.len() {
+        let mut pick = usize::MAX;
+        for (i, &taken) in done.iter().enumerate() {
+            if !taken && (pick == usize::MAX || rank(i) < rank(pick)) {
+                pick = i;
+            }
+        }
+        done[pick] = true;
+        let (old, _, head) = &entities[pick];
+        let new = spelling.shortest_free_name(&assigned, *head);
+        assigned.insert(new.clone());
+        renamed.push((old.clone(), new));
+    }
+    let handles: Vec<_> = type_names.keys().copied().collect();
+    for h in handles {
+        let new = type_names
+            .get(h)
+            .and_then(|old| renamed.iter().find(|(o, _)| o == old))
+            .map(|(_, new)| new.clone());
+        if let Some(new) = new {
+            type_names.insert(h, new);
+        }
+    }
+}
+
+/// `UniqueArena<Type>` deduplicates by the full `Type` (name included), so
+/// one `TypeInner` can sit under several handles when the source mixes bare
+/// types with named aliases.  `canonical[h]` is the arena-first handle of
+/// h's group, `inner_to_first` the group head by inner.
+#[allow(clippy::type_complexity)]
+fn type_groups(
+    module: &naga::Module,
+) -> (
+    HandleMap<naga::Type, naga::Handle<naga::Type>>,
+    FxHashMap<&naga::TypeInner, naga::Handle<naga::Type>>,
+) {
+    let mut canonical: HandleMap<naga::Type, naga::Handle<naga::Type>> = Default::default();
+    let mut inner_to_first: FxHashMap<&naga::TypeInner, naga::Handle<naga::Type>> =
+        Default::default();
+    for (h, ty) in module.types.iter() {
+        let first = *inner_to_first.entry(&ty.inner).or_insert(h);
+        canonical.insert(h, first);
+    }
+    (canonical, inner_to_first)
+}
+
+/// Per function (functions, then entry points), the type groups its body
+/// may spell: argument, result and local types, the resolved type of every
+/// expression (constructors, splats, casts, zero values), and the bases those
+/// nest (`array<T,N>`, `ptr<_,T>` print `T` inline).  Over-approximate on
+/// purpose: a group listed here that never prints only widens a minted type
+/// name's dodge set, a missed one would let a local shadow the name.
+fn spelled_type_groups(
+    module: &naga::Module,
+    info: &naga::valid::ModuleInfo,
+    canonical: &HandleMap<naga::Type, naga::Handle<naga::Type>>,
+    inner_to_first: &FxHashMap<&naga::TypeInner, naga::Handle<naga::Type>>,
+) -> Vec<HandleSet<naga::Type>> {
+    let infos = module
+        .functions
+        .iter()
+        .map(|(h, _)| &info[h])
+        .chain((0..module.entry_points.len()).map(|i| info.get_entry_point(i)));
+    all_functions(module)
+        .zip(infos)
+        .map(|(func, finfo)| {
+            let mut groups: HandleSet<naga::Type> = Default::default();
+            let mut stack: Vec<naga::Handle<naga::Type>> = Vec::new();
+            let mut add = |h: naga::Handle<naga::Type>, groups: &mut HandleSet<naga::Type>| {
+                stack.push(h);
+                while let Some(t) = stack.pop() {
+                    if !groups.insert(canonical[&t]) {
+                        continue;
+                    }
+                    match &module.types[t].inner {
+                        naga::TypeInner::Array { base, .. }
+                        | naga::TypeInner::BindingArray { base, .. }
+                        | naga::TypeInner::Pointer { base, .. } => stack.push(*base),
+                        _ => {}
+                    }
+                }
+            };
+            for arg in &func.arguments {
+                add(arg.ty, &mut groups);
+            }
+            if let Some(result) = &func.result {
+                add(result.ty, &mut groups);
+            }
+            for (_, local) in func.local_variables.iter() {
+                add(local.ty, &mut groups);
+            }
+            for (h, expr) in func.expressions.iter() {
+                match &finfo[h].ty {
+                    naga::proc::TypeResolution::Handle(t) => add(*t, &mut groups),
+                    naga::proc::TypeResolution::Value(inner) => {
+                        if let Some(&t) = inner_to_first.get(inner) {
+                            add(t, &mut groups);
+                        }
+                        if let naga::TypeInner::Pointer { base, .. } = inner {
+                            add(*base, &mut groups);
+                        }
+                    }
+                }
+                // A vector `Compose` with a run of equal lanes may print it
+                // as a SUB-vector splat (`vec4f(vec3f(2),x)`), a type no
+                // expression of the function resolves to.  Only such a
+                // constructor counts: listing the sub-vectors of every
+                // compose widened the dodge set of their aliases module-wide
+                // (a two-letter alias name).
+                if let naga::Expression::Compose { ty, components } = expr
+                    && let naga::TypeInner::Vector { size, scalar } = module.types[*ty].inner
+                    && let Some(runs) = subsplat_runs(
+                        components,
+                        &func.expressions,
+                        size as usize,
+                        |c| {
+                            matches!(
+                                finfo[c].ty.inner_with(&module.types),
+                                naga::TypeInner::Scalar(_)
+                            )
+                        },
+                        &|_| false,
+                    )
+                {
+                    for (_, k) in runs {
+                        let sub = match k {
+                            2 => naga::VectorSize::Bi,
+                            3 => naga::VectorSize::Tri,
+                            _ => continue,
+                        };
+                        if let Some(&t) =
+                            inner_to_first.get(&naga::TypeInner::Vector { size: sub, scalar })
+                        {
+                            add(t, &mut groups);
+                        }
+                    }
+                }
+            }
+            groups
+        })
+        .collect()
+}
+
+/// Per function (functions, then entry points), the type groups its body
+/// may spell and its argument and local names: a minted type name must
+/// dodge the locals of every function that spells it (a same-named local
+/// there would shadow it) and only those - reserving every local
+/// module-wide would push a frequent type's alias past the single
+/// characters, one byte at every use (the alias cliff), and make a
+/// re-minify derive them against a different taken set.
+struct SpellingScopes<'m> {
+    groups: Vec<HandleSet<naga::Type>>,
+    locals: Vec<crate::name_gen::LocalNames<'m>>,
+}
+
+impl<'m> SpellingScopes<'m> {
+    fn new(
+        module: &'m naga::Module,
+        info: &naga::valid::ModuleInfo,
+        canonical: &HandleMap<naga::Type, naga::Handle<naga::Type>>,
+        inner_to_first: &FxHashMap<&naga::TypeInner, naga::Handle<naga::Type>>,
+    ) -> Self {
+        Self {
+            groups: spelled_type_groups(module, info, canonical, inner_to_first),
+            locals: all_functions(module)
+                .map(crate::name_gen::LocalNames::of)
+                .collect(),
+        }
+    }
+
+    /// The shortest name free at module scope and in every function that
+    /// spells the group `head` leads.
+    fn shortest_free_name(
+        &self,
+        scope: &crate::name_gen::NameScope,
+        head: naga::Handle<naga::Type>,
+    ) -> String {
+        crate::name_gen::shortest_free_name(scope, &self.locals, &|i| self.groups[i].contains(head))
+    }
+}
+
 // MARK: Liveness analyses
 
 /// Constants transitively reachable from function / entry-point expressions,
-/// global-variable and override initialisers, and preserved names.  A library
-/// module (no entry points) keeps every constant, matching the `Compact`
-/// pass's `KeepUnused::Yes`.
+/// global-variable and override initialisers, and preserved names; a library
+/// module ([`is_library_module`]) keeps every constant.
 fn compute_live_constants(
     module: &naga::Module,
     preserve_names: &HashSet<String>,
 ) -> HandleSet<naga::Constant> {
     let mut live: HandleSet<naga::Constant> = Default::default();
 
-    if module.entry_points.is_empty() {
+    if is_library_module(module) {
         return module.constants.iter().map(|(h, _)| h).collect();
     }
 
@@ -503,7 +1310,7 @@ fn compute_live_constants(
             if let Some(name) = c.name.as_deref()
                 && preserve_names.contains(name)
             {
-                live.insert(h);
+                mark_const_live(h, module, &mut live);
             }
         }
     }
@@ -511,104 +1318,45 @@ fn compute_live_constants(
     for func in all_functions(module) {
         for (_, expr) in func.expressions.iter() {
             if let naga::Expression::Constant(h) = expr {
-                live.insert(*h);
+                mark_const_live(*h, module, &mut live);
             }
         }
     }
 
-    for (_, g) in module.global_variables.iter() {
-        if let Some(init) = g.init {
-            collect_const_refs_in_global_expr(init, module, &mut live);
-        }
-    }
-
-    for (_, ov) in module.overrides.iter() {
-        if let Some(init) = ov.init {
-            collect_const_refs_in_global_expr(init, module, &mut live);
-        }
-    }
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let snapshot: Vec<_> = live.iter().copied().collect();
-        for ch in snapshot {
-            let before = live.len();
-            collect_const_refs_in_global_expr(module.constants[ch].init, module, &mut live);
-            if live.len() > before {
-                changed = true;
-            }
-        }
+    for init in module
+        .global_variables
+        .iter()
+        .filter_map(|(_, g)| g.init)
+        .chain(module.overrides.iter().filter_map(|(_, o)| o.init))
+    {
+        collect_const_refs_in_global_expr(init, module, &mut live);
     }
 
     live
 }
 
-/// Collect `Constant` references in a global-expression tree, following into
-/// each constant's own init.
+/// Marks `h` live and, the first time, the constants its init reads: every
+/// insertion walks, so the set needs no fixpoint loop over itself.
+fn mark_const_live(
+    h: naga::Handle<naga::Constant>,
+    module: &naga::Module,
+    live: &mut HandleSet<naga::Constant>,
+) {
+    if live.insert(h) {
+        collect_const_refs_in_global_expr(module.constants[h].init, module, live);
+    }
+}
+
 fn collect_const_refs_in_global_expr(
     expr_h: naga::Handle<naga::Expression>,
     module: &naga::Module,
     live: &mut HandleSet<naga::Constant>,
 ) {
-    use naga::Expression as E;
-    match &module.global_expressions[expr_h] {
-        E::Constant(h) if live.insert(*h) => {
-            collect_const_refs_in_global_expr(module.constants[*h].init, module, live);
-        }
-        E::Compose { components, .. } => {
-            for c in components {
-                collect_const_refs_in_global_expr(*c, module, live);
-            }
-        }
-        E::Binary { left, right, .. } => {
-            collect_const_refs_in_global_expr(*left, module, live);
-            collect_const_refs_in_global_expr(*right, module, live);
-        }
-        E::Unary { expr, .. } | E::As { expr, .. } => {
-            collect_const_refs_in_global_expr(*expr, module, live);
-        }
-        E::Splat { value, .. } => {
-            collect_const_refs_in_global_expr(*value, module, live);
-        }
-        E::Select {
-            condition,
-            accept,
-            reject,
-        } => {
-            collect_const_refs_in_global_expr(*condition, module, live);
-            collect_const_refs_in_global_expr(*accept, module, live);
-            collect_const_refs_in_global_expr(*reject, module, live);
-        }
-        E::Math {
-            arg,
-            arg1,
-            arg2,
-            arg3,
-            ..
-        } => {
-            collect_const_refs_in_global_expr(*arg, module, live);
-            if let Some(a) = arg1 {
-                collect_const_refs_in_global_expr(*a, module, live);
-            }
-            if let Some(a) = arg2 {
-                collect_const_refs_in_global_expr(*a, module, live);
-            }
-            if let Some(a) = arg3 {
-                collect_const_refs_in_global_expr(*a, module, live);
-            }
-        }
-        E::Access { base, index } => {
-            collect_const_refs_in_global_expr(*base, module, live);
-            collect_const_refs_in_global_expr(*index, module, live);
-        }
-        E::AccessIndex { base, .. }
-        | E::Swizzle { vector: base, .. }
-        | E::Relational { argument: base, .. } => {
-            collect_const_refs_in_global_expr(*base, module, live);
-        }
-        _ => {}
+    let expr = &module.global_expressions[expr_h];
+    if let naga::Expression::Constant(h) = expr {
+        mark_const_live(*h, module, live);
     }
+    visit_expression_children(expr, |c| collect_const_refs_in_global_expr(c, module, live));
 }
 
 /// Types transitively reachable from live code, so dead struct declarations
@@ -620,7 +1368,7 @@ fn compute_live_types(
 ) -> HandleSet<naga::Type> {
     let mut live: HandleSet<naga::Type> = Default::default();
 
-    if module.entry_points.is_empty() {
+    if is_library_module(module) {
         return module.types.iter().map(|(h, _)| h).collect();
     }
 
@@ -676,111 +1424,42 @@ fn compute_live_types(
         }
     }
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let snapshot: Vec<_> = live.iter().copied().collect();
-        for th in snapshot {
-            let before = live.len();
-            collect_inner_types(th, module, &mut live);
-            if live.len() > before {
-                changed = true;
+    // A live composite carries its members, element and pointee along.
+    let mut work: Vec<_> = live.iter().copied().collect();
+    while let Some(th) = work.pop() {
+        let mut nest = |t: naga::Handle<naga::Type>| {
+            if live.insert(t) {
+                work.push(t);
             }
+        };
+        match &module.types[th].inner {
+            naga::TypeInner::Struct { members, .. } => members.iter().for_each(|m| nest(m.ty)),
+            naga::TypeInner::Array { base, .. }
+            | naga::TypeInner::BindingArray { base, .. }
+            | naga::TypeInner::Pointer { base, .. } => nest(*base),
+            _ => {}
         }
     }
 
     live
 }
 
-/// Insert the types nested directly in `ty_h` (struct members, array element,
-/// pointer base) so liveness propagates through composites.
-fn collect_inner_types(
-    ty_h: naga::Handle<naga::Type>,
-    module: &naga::Module,
-    live: &mut HandleSet<naga::Type>,
-) {
-    match &module.types[ty_h].inner {
-        naga::TypeInner::Struct { members, .. } => {
-            for m in members {
-                live.insert(m.ty);
-            }
-        }
-        naga::TypeInner::Array { base, .. } | naga::TypeInner::BindingArray { base, .. } => {
-            live.insert(*base);
-        }
-        naga::TypeInner::Pointer { base, .. } => {
-            live.insert(*base);
-        }
-        _ => {}
-    }
-}
-
-/// Insert every `Compose` / `ZeroValue` type in a global-expression tree,
-/// following into constants' inits.
 fn collect_types_in_global_expr(
     expr_h: naga::Handle<naga::Expression>,
     module: &naga::Module,
     live: &mut HandleSet<naga::Type>,
 ) {
-    use naga::Expression as E;
-    match &module.global_expressions[expr_h] {
-        E::Compose { ty, components } => {
-            live.insert(*ty);
-            for c in components {
-                collect_types_in_global_expr(*c, module, live);
-            }
-        }
-        E::ZeroValue(ty) => {
+    let expr = &module.global_expressions[expr_h];
+    match expr {
+        naga::Expression::Compose { ty, .. } | naga::Expression::ZeroValue(ty) => {
             live.insert(*ty);
         }
-        E::Constant(h) => {
+        naga::Expression::Constant(h) => {
             collect_types_in_global_expr(module.constants[*h].init, module, live);
-        }
-        E::Binary { left, right, .. }
-        | E::Access {
-            base: left,
-            index: right,
-        } => {
-            collect_types_in_global_expr(*left, module, live);
-            collect_types_in_global_expr(*right, module, live);
-        }
-        E::Unary { expr, .. }
-        | E::As { expr, .. }
-        | E::Splat { value: expr, .. }
-        | E::AccessIndex { base: expr, .. }
-        | E::Swizzle { vector: expr, .. }
-        | E::Relational { argument: expr, .. } => {
-            collect_types_in_global_expr(*expr, module, live);
-        }
-        E::Select {
-            condition,
-            accept,
-            reject,
-        } => {
-            collect_types_in_global_expr(*condition, module, live);
-            collect_types_in_global_expr(*accept, module, live);
-            collect_types_in_global_expr(*reject, module, live);
-        }
-        E::Math {
-            arg,
-            arg1,
-            arg2,
-            arg3,
-            ..
-        } => {
-            collect_types_in_global_expr(*arg, module, live);
-            if let Some(a) = arg1 {
-                collect_types_in_global_expr(*a, module, live);
-            }
-            if let Some(a) = arg2 {
-                collect_types_in_global_expr(*a, module, live);
-            }
-            if let Some(a) = arg3 {
-                collect_types_in_global_expr(*a, module, live);
-            }
         }
         _ => {}
     }
+    visit_expression_children(expr, |c| collect_types_in_global_expr(c, module, live));
 }
 
 // MARK: Construction and output
@@ -795,97 +1474,27 @@ impl<'a> Generator<'a> {
     ) -> Self {
         let mangle = options.mangle;
 
-        // Minted names (mangled struct / member names, the anonymous
-        // override's) must dodge every name in scope where they are
-        // referenced: all module-scope names, every argument and local
-        // (function scope shadows type names) and the preserve list.  Built
-        // only when something draws on it.
+        let (canonical, inner_to_first) = type_groups(module);
+        let spelling = SpellingScopes::new(module, info, &canonical, &inner_to_first);
+        let StructNames {
+            mut type_names,
+            mut member_names,
+            minted: minted_types,
+            fixed: fixed_type_names,
+        } = mint_struct_names(module, &options, &canonical, &spelling);
+
+        // The anonymous override's minted name is referenced from module
+        // scope and function bodies alike, so it dodges every name in scope
+        // plus `StructNames::minted`.
         let mut used_names = HashSet::new();
-        if mangle || module.overrides.iter().any(|(_, o)| o.name.is_none()) {
+        if module.overrides.iter().any(|(_, o)| o.name.is_none()) {
             used_names.extend(
                 crate::name_gen::module_scope_names(module)
                     .chain(all_functions(module).flat_map(crate::name_gen::function_local_names))
                     .map(str::to_owned),
             );
             used_names.extend(options.preserve_symbols.iter().cloned());
-        }
-        let mut mangle_counter = 0usize;
-
-        let preserve = &options.preserve_symbols;
-        let mut type_names = HandleMap::default();
-        let mut member_names = FxHashMap::default();
-
-        // naga predeclared / special struct types are never renamed: their
-        // members are accessed through canonical names (`.old_value`,
-        // `.fract`, `.kind`, ...) and no declaration is emitted for them, so a
-        // mangled accessor would be invalid WGSL.
-        let predeclared_type_handles = super::module_emit::special_struct_handles(module);
-
-        for (h, ty) in module.types.iter() {
-            if let naga::TypeInner::Struct { members, .. } = &ty.inner {
-                // Name-based fallback for IRs where `special_types.ray_desc` is
-                // not populated.
-                let is_ray_descriptor = ty.name.as_deref() == Some("RayDesc");
-
-                let is_predeclared = predeclared_type_handles.contains(h);
-
-                if mangle {
-                    if is_predeclared || is_ray_descriptor {
-                        type_names.insert(
-                            h,
-                            ty.name.clone().unwrap_or_else(|| format!("T{}", h.index())),
-                        );
-                        for (idx, member) in members.iter().enumerate() {
-                            member_names.insert(
-                                (h, idx as u32),
-                                member.name.clone().unwrap_or_else(|| format!("m{}", idx)),
-                            );
-                        }
-                        continue;
-                    }
-
-                    if let Some(name) = ty.name.as_deref() {
-                        if preserve.contains(name) {
-                            type_names.insert(h, name.to_string());
-                        } else {
-                            type_names.insert(
-                                h,
-                                crate::name_gen::next_name_unique(&mut mangle_counter, &used_names),
-                            );
-                        }
-                    } else {
-                        type_names.insert(
-                            h,
-                            crate::name_gen::next_name_unique(&mut mangle_counter, &used_names),
-                        );
-                    }
-                    for (idx, member) in members.iter().enumerate() {
-                        if let Some(name) = member.name.as_deref() {
-                            if preserve.contains(name) || options.preserve_members.contains(name) {
-                                member_names.insert((h, idx as u32), name.to_string());
-                            } else {
-                                member_names.insert(
-                                    (h, idx as u32),
-                                    crate::name_gen::next_name_unique(
-                                        &mut mangle_counter,
-                                        &used_names,
-                                    ),
-                                );
-                            }
-                        } else {
-                            member_names.insert(
-                                (h, idx as u32),
-                                crate::name_gen::next_name_unique(&mut mangle_counter, &used_names),
-                            );
-                        }
-                    }
-                } else {
-                    type_names.insert(
-                        h,
-                        ty.name.clone().unwrap_or_else(|| format!("T{}", h.index())),
-                    );
-                }
-            }
+            used_names.extend(minted_types.iter().cloned());
         }
 
         let mut constant_names = Vec::with_capacity(module.constants.len());
@@ -966,83 +1575,96 @@ impl<'a> Generator<'a> {
             .map(str::to_owned)
             .collect();
 
-        let type_alias_decls = if options.type_alias {
-            let ref_counts =
-                count_type_handle_refs(module, &live_constants, &live_types, &defer_cache);
-
-            let mut alias_used: HashSet<String> = in_scope().map(str::to_owned).collect();
-
-            let mut alias_counter = 0usize;
-            let mut decls: Vec<(String, String)> = Vec::new();
-
-            let fixed_overhead = super::syntax::decl_boilerplate(options.beautify);
-
-            // `UniqueArena<Type>` deduplicates by the full `Type` (name
-            // included), so one `TypeInner` can sit under several handles when
-            // the source mixes bare types with named aliases.  Group by inner
-            // once: `canonical[h]` is the arena-first handle of h's group and
-            // `group_ref_count[head]` the group's summed `ref_counts`.
-            let mut canonical: HandleMap<naga::Type, naga::Handle<naga::Type>> = Default::default();
-            let mut inner_to_first: FxHashMap<&naga::TypeInner, naga::Handle<naga::Type>> =
-                Default::default();
-            for (h, ty) in module.types.iter() {
-                let first = *inner_to_first.entry(&ty.inner).or_insert(h);
-                canonical.insert(h, first);
+        let (ref_counts, ref_bytes) = match &options.type_uses {
+            Some(uses) => {
+                let mut sites = HandleMap::default();
+                let mut bytes = HandleMap::default();
+                for (h, _) in module.types.iter() {
+                    let (n, b) = uses.at(h);
+                    if n > 0 {
+                        sites.insert(h, n);
+                        bytes.insert(h, b);
+                    }
+                }
+                (sites, Some(bytes))
             }
-            let mut group_ref_count: HandleMap<naga::Type, usize> = Default::default();
-            for (h, _) in module.types.iter() {
-                let first = canonical[&h];
-                *group_ref_count.entry(first).or_insert(0) +=
-                    ref_counts.get(h).copied().unwrap_or(0);
-            }
-
-            for (h, ty) in module.types.iter() {
-                // Structs already have short names.
-                if type_names.contains_key(h) {
-                    continue;
-                }
-
-                let group_head = canonical[&h];
-                if h != group_head
-                    && let Some(existing) = type_names.get(group_head).cloned()
-                {
-                    type_names.insert(h, existing);
-                    continue;
-                }
-
-                let count = group_ref_count.get(group_head).copied().unwrap_or(0);
-                if count == 0 {
-                    continue;
-                }
-                // Rendered with the aliases minted so far, so aliases nest.
-                let type_str = match super::syntax::type_inner_name(
-                    &ty.inner,
-                    module,
-                    &type_names,
-                    &override_names,
-                    &shadowed_type_aliases,
-                ) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let alias_name = crate::name_gen::next_name_unique(&mut alias_counter, &alias_used);
-                let alias_len = alias_name.len();
-                let type_len = type_str.len();
-
-                let decl_cost = fixed_overhead + alias_len + type_len;
-                let savings_per_use = type_len.saturating_sub(alias_len);
-                let total_savings = count * savings_per_use;
-
-                if total_savings > decl_cost {
-                    alias_used.insert(alias_name.clone());
-                    decls.push((alias_name.clone(), type_str));
-                    type_names.insert(h, alias_name);
-                }
-            }
-            decls
-        } else {
-            Vec::new()
+            None => (
+                count_type_handle_refs(module, &live_constants, &live_types, &defer_cache),
+                None,
+            ),
         };
+        let mut group_ref_count: HandleMap<naga::Type, usize> = Default::default();
+        let mut group_bytes: HandleMap<naga::Type, usize> = Default::default();
+        for (h, _) in module.types.iter() {
+            let first = canonical[&h];
+            *group_ref_count.entry(first).or_insert(0) += ref_counts.get(h).copied().unwrap_or(0);
+            if let Some(bytes) = &ref_bytes {
+                *group_bytes.entry(first).or_insert(0) += bytes.get(h).copied().unwrap_or(0);
+            }
+        }
+        let alias_scope = AliasScope {
+            canonical: &canonical,
+            group_ref_count: &group_ref_count,
+            group_bytes: ref_bytes.is_some().then_some(&group_bytes),
+            spelling: &spelling,
+            shadowed_type_aliases: &shadowed_type_aliases,
+        };
+        let (type_alias_decls, decl_handles) = if options.type_alias {
+            plan_type_aliases(
+                module,
+                &options,
+                &mut type_names,
+                &alias_scope,
+                &constant_names,
+                &override_names,
+                &global_names,
+                &function_names,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        let mut type_alias_decls = type_alias_decls;
+        if mangle {
+            rank_type_names_by_use(
+                module,
+                &mut type_names,
+                &mut type_alias_decls,
+                &decl_handles,
+                &alias_scope,
+                &ref_counts,
+                &fixed_type_names,
+                &override_names,
+                &options,
+                [
+                    constant_names.as_slice(),
+                    override_names.as_slice(),
+                    global_names.as_slice(),
+                    function_names.as_slice(),
+                ],
+            );
+        }
+        mint_member_names(module, &options, &type_names, &mut member_names);
+        // A struct spells its name; anything else its structure, through
+        // the aliases nested types got.
+        let type_spelled_len = module
+            .types
+            .iter()
+            .map(|(h, ty)| {
+                let spelled = match &ty.inner {
+                    naga::TypeInner::Struct { .. } => type_names.get(h).map_or(0, String::len),
+                    inner => super::syntax::type_inner_name(
+                        inner,
+                        module,
+                        &type_names,
+                        &override_names,
+                        &shadowed_type_aliases,
+                    )
+                    .map_or(0, |s| s.len()),
+                };
+                u32::try_from(spelled).unwrap_or(u32::MAX)
+            })
+            .collect();
 
         let initial_capacity = options.initial_capacity;
         Self {
@@ -1068,7 +1690,11 @@ impl<'a> Generator<'a> {
             layouter_complete,
             ref_count_cache: Vec::new(),
             defer_cache,
-            pure_functions: Vec::new(),
+            fn_effects: Vec::new(),
+            name_weights: Default::default(),
+            type_uses: TypeUses::sized(module.types.len()),
+            type_spelled_len,
+            inner_to_first,
             tok,
             indent_unit,
         }

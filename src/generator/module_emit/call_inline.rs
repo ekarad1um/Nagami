@@ -1,8 +1,9 @@
 //! Call purity and single-use call-inlining analysis.
 
+use crate::analysis::{ExprClass, FnEffects, PointerRoot, resolve_pointer_root};
 use crate::handle_set::{HandleMap, HandleSet};
-use crate::passes::expr_util::{root_local_var, short_circuit_rhs, visit_expression_children};
-use rustc_hash::FxHashSet;
+use crate::ir::visit::visit_expression_children;
+use crate::passes::expr_util::{root_local_var, short_circuit_rhs};
 
 /// A single-use `Call` result that may still be inlined into a later use site,
 /// with the function-locals its arguments load so a Store to a local drops
@@ -70,177 +71,6 @@ fn collect_loaded_locals(
 /// retains a pending call longer, the safe direction.
 type CallReads = HandleMap<naga::Expression, HandleSet<naga::LocalVariable>>;
 
-/// The root a pointer expression resolves to, for the write-effect analysis.
-enum PointerRoot {
-    /// A write here is contained in the function.
-    Local,
-    /// A write here escapes to every caller.
-    Global,
-    /// The function's own pointer parameter: a write through it lands in
-    /// whatever the caller passed.
-    Param(u32),
-    /// An exotic pointer expression, treated as escaping.
-    Other,
-}
-
-fn resolve_pointer_root(
-    ptr: naga::Handle<naga::Expression>,
-    expressions: &naga::Arena<naga::Expression>,
-) -> PointerRoot {
-    match &expressions[ptr] {
-        naga::Expression::LocalVariable(_) => PointerRoot::Local,
-        naga::Expression::GlobalVariable(_) => PointerRoot::Global,
-        naga::Expression::FunctionArgument(i) => PointerRoot::Param(*i),
-        naga::Expression::Access { base, .. } | naga::Expression::AccessIndex { base, .. } => {
-            resolve_pointer_root(*base, expressions)
-        }
-        _ => PointerRoot::Other,
-    }
-}
-
-/// A function's memory effects observable OUTSIDE a call to it.  Writes to its
-/// own locals never escape; the two escape routes are tracked separately so a
-/// caller that passes its OWN local to a param-writing helper stays pure:
-/// `escapes` (a global write, an atomic / image store / barrier / ray /
-/// subgroup / cooperative op / `discard`, or any of these via a callee) is
-/// always observable; `written_params` (writes through the function's own
-/// pointer parameters, directly or via a callee) escape depending on what each
-/// caller passes.
-#[derive(Clone)]
-struct FnEffects {
-    escapes: bool,
-    written_params: FxHashSet<u32>,
-}
-
-fn accumulate_statement_effects(
-    stmt: &naga::Statement,
-    expressions: &naga::Arena<naga::Expression>,
-    module: &naga::Module,
-    memo: &mut [Option<FnEffects>],
-    eff: &mut FnEffects,
-) {
-    use naga::Statement as S;
-    match stmt {
-        S::Store { pointer, .. } | S::Atomic { pointer, .. } => {
-            match resolve_pointer_root(*pointer, expressions) {
-                PointerRoot::Local => {}
-                PointerRoot::Param(i) => {
-                    eff.written_params.insert(i);
-                }
-                PointerRoot::Global | PointerRoot::Other => eff.escapes = true,
-            }
-        }
-        S::ImageStore { .. } | S::ImageAtomic { .. } | S::CooperativeStore { .. } => {
-            eff.escapes = true
-        }
-        S::ControlBarrier(_) | S::MemoryBarrier(_) | S::WorkGroupUniformLoad { .. } => {
-            eff.escapes = true
-        }
-        S::RayQuery { .. } | S::RayPipelineFunction(_) => eff.escapes = true,
-        S::SubgroupBallot { .. }
-        | S::SubgroupGather { .. }
-        | S::SubgroupCollectiveOperation { .. } => eff.escapes = true,
-        S::Kill => eff.escapes = true,
-        S::Call {
-            function,
-            arguments,
-            ..
-        } => {
-            let callee = function_effects(*function, module, memo);
-            if callee.escapes {
-                eff.escapes = true;
-            }
-            // A callee write through a pointer parameter lands in what WE passed:
-            // our local stays contained, our param forwards the escape, a global
-            // or exotic pointer escapes here.
-            for &p in &callee.written_params {
-                match arguments.get(p as usize) {
-                    Some(&arg) => match resolve_pointer_root(arg, expressions) {
-                        PointerRoot::Local => {}
-                        PointerRoot::Param(i) => {
-                            eff.written_params.insert(i);
-                        }
-                        PointerRoot::Global | PointerRoot::Other => eff.escapes = true,
-                    },
-                    None => eff.escapes = true, // arity mismatch - stay conservative
-                }
-            }
-        }
-        S::Block(inner) => accumulate_block_effects(inner, expressions, module, memo, eff),
-        S::If { accept, reject, .. } => {
-            accumulate_block_effects(accept, expressions, module, memo, eff);
-            accumulate_block_effects(reject, expressions, module, memo, eff);
-        }
-        S::Switch { cases, .. } => {
-            for case in cases {
-                accumulate_block_effects(&case.body, expressions, module, memo, eff);
-            }
-        }
-        S::Loop {
-            body, continuing, ..
-        } => {
-            accumulate_block_effects(body, expressions, module, memo, eff);
-            accumulate_block_effects(continuing, expressions, module, memo, eff);
-        }
-        S::Emit(_) | S::Return { .. } | S::Break | S::Continue => {}
-    }
-}
-
-fn accumulate_block_effects(
-    block: &naga::Block,
-    expressions: &naga::Arena<naga::Expression>,
-    module: &naga::Module,
-    memo: &mut [Option<FnEffects>],
-    eff: &mut FnEffects,
-) {
-    for stmt in block.iter() {
-        accumulate_statement_effects(stmt, expressions, module, memo, eff);
-    }
-}
-
-/// Memoised [`FnEffects`] of `module.functions[h]`.  naga forbids recursion,
-/// and the in-progress marker (`escapes = true`) makes any unexpected cycle
-/// resolve to "escapes everything", so the recursion always terminates.
-fn function_effects(
-    h: naga::Handle<naga::Function>,
-    module: &naga::Module,
-    memo: &mut [Option<FnEffects>],
-) -> FnEffects {
-    if let Some(known) = &memo[h.index()] {
-        return known.clone();
-    }
-    memo[h.index()] = Some(FnEffects {
-        escapes: true,
-        written_params: Default::default(),
-    });
-    let func = &module.functions[h];
-    let mut eff = FnEffects {
-        escapes: false,
-        written_params: Default::default(),
-    };
-    accumulate_block_effects(&func.body, &func.expressions, module, memo, &mut eff);
-    memo[h.index()] = Some(eff.clone());
-    eff
-}
-
-/// Per-`module.functions` inline-purity bitmap: a single-use `Call` is relocated
-/// to an arbitrary use site only when the callee's sole caller-observable effect
-/// is its return value, i.e. `!escapes && written_params.is_empty()`.  A
-/// function writing through its OWN param is not inline-pure; one that merely
-/// calls such a helper with its OWN local is.
-pub(super) fn compute_pure_functions(module: &naga::Module) -> Vec<bool> {
-    let mut memo: Vec<Option<FnEffects>> = vec![None; module.functions.len()];
-    for (h, _) in module.functions.iter() {
-        function_effects(h, module, &mut memo);
-    }
-    memo.into_iter()
-        .map(|e| match e {
-            Some(eff) => !eff.escapes && eff.written_params.is_empty(),
-            None => false,
-        })
-        .collect()
-}
-
 /// `Call` results that can be inlined at their single use site instead of
 /// being `let`-bound: `ref_count == 1`; the callee is pure, or the call is
 /// impure and its consuming statement evaluates no other memory access (an
@@ -257,25 +87,19 @@ pub(super) fn find_inlineable_calls(
     block: &naga::Block,
     ref_counts: &[usize],
     expressions: &naga::Arena<naga::Expression>,
-    pure_functions: &[bool],
+    fn_effects: &[FnEffects],
 ) -> HandleSet<naga::Expression> {
     // Function-wide: an inner call's stashed text is re-evaluated wherever the
     // OUTER pending call that consumed it ends up.
     let mut call_reads = CallReads::default();
-    find_inlineable_calls_in_block(
-        block,
-        ref_counts,
-        expressions,
-        pure_functions,
-        &mut call_reads,
-    )
+    find_inlineable_calls_in_block(block, ref_counts, expressions, fn_effects, &mut call_reads)
 }
 
 fn find_inlineable_calls_in_block(
     block: &naga::Block,
     ref_counts: &[usize],
     expressions: &naga::Arena<naga::Expression>,
-    pure_functions: &[bool],
+    fn_effects: &[FnEffects],
     call_reads: &mut CallReads,
 ) -> HandleSet<naga::Expression> {
     let mut result = HandleSet::default();
@@ -293,12 +117,14 @@ fn find_inlineable_calls_in_block(
                 // consumer and reads no memory: a materialised `Load` (e.g.
                 // `let x = W;` binding a global the call writes) would be
                 // hoisted above the call's write.  The call result itself counts
-                // as memory-free.
-                let mut found = false;
+                // as memory-free.  A wrapper the emitter renders at every use
+                // ([`shared_pointer_chain`]) would run the call once per use.
                 let mut memo = Default::default();
-                range
-                    .clone()
-                    .all(|root| expr_is_memory_free(root, h, expressions, &mut found, &mut memo))
+                range.clone().all(|root| {
+                    let mut found = false;
+                    expr_is_memory_free(root, h, expressions, &mut found, &mut memo)
+                        && !(found && shared_pointer_chain(root, ref_counts, expressions))
+                })
             } else {
                 false
             };
@@ -319,7 +145,7 @@ fn find_inlineable_calls_in_block(
         // Consumption BEFORE the clearing rules, so a control-flow statement
         // cannot retroactively drop a result whose use already happened.
         if !pending.is_empty() {
-            consume_pending_for_statement(stmt, expressions, &mut pending, &mut result);
+            consume_pending_for_statement(stmt, expressions, ref_counts, &mut pending, &mut result);
         }
 
         match stmt {
@@ -329,7 +155,7 @@ fn find_inlineable_calls_in_block(
                 arguments,
                 ..
             } if ref_counts[h.index()] == 1 => {
-                if pure_functions[function.index()] {
+                if fn_effects[function.index()].inline_pure() {
                     // A pure callee is not a reordering barrier: prior pending
                     // pure calls survive it (those its arguments consumed were
                     // already moved to `result`), so adjacent pure-call `let`s
@@ -377,12 +203,12 @@ fn find_inlineable_calls_in_block(
             // and analyse nested blocks with their own empty one.
             _ => {
                 pending.clear();
-                for nested in crate::passes::expr_util::nested_blocks(stmt) {
+                for nested in crate::ir::visit::nested_blocks(stmt) {
                     result.extend(find_inlineable_calls_in_block(
                         nested,
                         ref_counts,
                         expressions,
-                        pure_functions,
+                        fn_effects,
                         call_reads,
                     ));
                 }
@@ -434,9 +260,9 @@ fn impure_call_inlines_safely(
 
 /// `true` when evaluating the tree at `root` reads no memory and observes no
 /// side effect, with `call_result` (the one call being inlined) a transparent
-/// hole that sets `*found`.  A `Load`, every effect-result expression and any
-/// future variant default to not memory-free, so the predicate is conservative
-/// by construction.
+/// hole that sets `*found`.  A node outside [`ExprClass::MEMORY_FREE_NODE`]
+/// (a `Load`, every effect result) is not memory-free, so the predicate is
+/// conservative by construction.
 ///
 /// Memory-freedom answers "is a reorder observable"; the call ALSO needs its
 /// new position evaluated unconditionally, or its write is skipped on the
@@ -460,49 +286,49 @@ fn expr_is_memory_free(
         *found |= holds_call;
         return memory_free;
     }
-    use naga::Expression as E;
     let mut holds_call = false;
-    let memory_free = match &expressions[root] {
-        E::Literal(_)
-        | E::Constant(_)
-        | E::Override(_)
-        | E::ZeroValue(_)
-        | E::FunctionArgument(_)
-        | E::GlobalVariable(_)
-        | E::LocalVariable(_) => true,
-        E::Access { .. }
-        | E::AccessIndex { .. }
-        | E::Splat { .. }
-        | E::Swizzle { .. }
-        | E::Unary { .. }
-        | E::Binary { .. }
-        | E::Select { .. }
-        | E::Relational { .. }
-        | E::Math { .. }
-        | E::As { .. }
-        | E::Compose { .. }
-        | E::Derivative { .. } => {
-            let conditional = short_circuit_rhs(&expressions[root]);
-            let mut ok = true;
-            visit_expression_children(&expressions[root], |child| {
-                let mut under_child = false;
-                if !expr_is_memory_free(child, call_result, expressions, &mut under_child, memo) {
+    // A leaf has no children, so the walk below is its `true`.
+    let memory_free = ExprClass::node(&expressions[root]).any(ExprClass::MEMORY_FREE_NODE) && {
+        let conditional = short_circuit_rhs(&expressions[root]);
+        let mut ok = true;
+        visit_expression_children(&expressions[root], |child| {
+            let mut under_child = false;
+            if !expr_is_memory_free(child, call_result, expressions, &mut under_child, memo) {
+                ok = false;
+            }
+            if under_child {
+                holds_call = true;
+                if Some(child) == conditional {
                     ok = false;
                 }
-                if under_child {
-                    holds_call = true;
-                    if Some(child) == conditional {
-                        ok = false;
-                    }
-                }
-            });
-            ok
-        }
-        _ => false,
+            }
+        });
+        ok
     };
     *found |= holds_call;
     memo.insert(root, (memory_free, holds_call));
     memory_free
+}
+
+/// An `Access` / `AccessIndex` chain rooted at a variable or parameter with
+/// more than one consumer: the emitter never `let`-binds a pointer-typed
+/// expression, so such a chain is spelled at every use - `let p = &a[f()];
+/// *p = 1; x = *p;` renders `a[f()]` twice - and a call carried inside it
+/// must stay bound at its own statement.  A by-value parameter's chain is
+/// judged the same way (its type is out of reach here): bound in a `let` by
+/// the emitter, the stash would have cost nothing, so the decline only
+/// loses bytes.
+fn shared_pointer_chain(
+    h: naga::Handle<naga::Expression>,
+    ref_counts: &[usize],
+    expressions: &naga::Arena<naga::Expression>,
+) -> bool {
+    ref_counts[h.index()] > 1
+        && matches!(
+            expressions[h],
+            naga::Expression::Access { .. } | naga::Expression::AccessIndex { .. }
+        )
+        && !matches!(resolve_pointer_root(h, expressions), PointerRoot::Other)
 }
 
 /// Consume the pending calls against `stmt`: a non-`Emit` statement is a real
@@ -512,6 +338,7 @@ fn expr_is_memory_free(
 fn consume_pending_for_statement(
     stmt: &naga::Statement,
     expressions: &naga::Arena<naga::Expression>,
+    ref_counts: &[usize],
     pending: &mut Vec<PendingCall>,
     result: &mut HandleSet<naga::Expression>,
 ) {
@@ -539,10 +366,16 @@ fn consume_pending_for_statement(
                 if let Some(rhs) = short_circuit_rhs(&expressions[h]) {
                     pending.retain(|p| p.carrier != rhs);
                 }
+                // Spelled at every use: the call it carries stays bound.
+                let shared = shared_pointer_chain(h, ref_counts, expressions);
                 visit_expression_children(&expressions[h], |child| {
-                    for p in pending.iter_mut() {
-                        if p.carrier == child {
-                            p.carrier = h;
+                    if shared {
+                        pending.retain(|p| p.carrier != child);
+                    } else {
+                        for p in pending.iter_mut() {
+                            if p.carrier == child {
+                                p.carrier = h;
+                            }
                         }
                     }
                 });
@@ -555,7 +388,7 @@ fn consume_pending_for_statement(
         // and emits as a pre-loop `let`; calls inside the loop still inline via
         // the recursion's fresh pending set.
         naga::Statement::Loop { .. } => {}
-        other => crate::passes::expr_util::visit_statement_operands(other, false, &mut |h| {
+        other => crate::ir::visit::visit_statement_operands(other, false, &mut |h| {
             check(h, pending, result)
         }),
     }

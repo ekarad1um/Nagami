@@ -175,17 +175,22 @@ fn naga_spelling(module: &naga::Module) -> naga::FastHashMap<NameKey, String> {
 }
 
 /// The first host-addressed name (entry point, named override, preserved
-/// global / function / constant / struct / member) naga's emitter would print
-/// differently from the IR, as `(ir, printed)`: such a fallback breaks the
-/// host's contract and never ships.  Under an identity log the spelled map's
-/// keys are the IR names (nagami never renames these kinds).
+/// global / function / constant / struct / member - a member also through
+/// `preserve_members`, the interface structs' own under
+/// `--preserve-interface`) naga's emitter would print differently from the
+/// IR, as `(ir, printed)`: such a fallback breaks the host's contract and
+/// never ships.  Under an identity log the spelled map's keys are the IR
+/// names (nagami never renames these kinds).
 pub(crate) fn naga_respelled_interface_name(
     module: &naga::Module,
     preserve: &[String],
+    preserve_members: &[String],
 ) -> Option<(String, String)> {
     let map = NameMap::assemble_naga_spelled(module, &NameLog::default());
     let differs = |(k, v): (&String, &String)| (k != v).then(|| (k.clone(), v.clone()));
     let preserved = |(k, _): &(&String, &String)| preserve.contains(k);
+    let preserved_member =
+        |(k, _): &(&String, &String)| preserve.contains(k) || preserve_members.contains(k);
     map.entry_points
         .iter()
         .chain(map.overrides.iter())
@@ -202,7 +207,7 @@ pub(crate) fn naga_respelled_interface_name(
             map.structs.iter().find_map(|(k, s)| {
                 (preserve.contains(k) && &s.name != k)
                     .then(|| (k.clone(), s.name.clone()))
-                    .or_else(|| s.members.iter().filter(preserved).find_map(differs))
+                    .or_else(|| s.members.iter().filter(preserved_member).find_map(differs))
             })
         })
 }
@@ -258,10 +263,10 @@ mod tests {
             assert!(text.contains(printed), "{printed} in {text}");
         }
         assert_eq!(
-            naga_respelled_interface_name(&module, &["A1".to_owned()]),
+            naga_respelled_interface_name(&module, &["A1".to_owned()], &[]),
             Some(("A1".to_owned(), "A1_".to_owned()))
         );
-        assert_eq!(naga_respelled_interface_name(&module, &[]), None);
+        assert_eq!(naga_respelled_interface_name(&module, &[], &[]), None);
     }
 
     #[test]

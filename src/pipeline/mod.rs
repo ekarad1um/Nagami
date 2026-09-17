@@ -12,7 +12,7 @@ use crate::io;
 mod context;
 mod report;
 
-pub use context::PassContext;
+pub use context::{PassContext, TailRender};
 pub use report::{PassReport, Report};
 
 /// Hard cap on sweeps; real pipelines converge well under it.
@@ -57,10 +57,20 @@ fn emit_wgsl_with_info(
 
 // MARK: Driver
 
-/// Run the IR pipeline to a fixed point: [`crate::passes::build_ir_passes`]
-/// in order, repeated until no pass reports a change, capped at
-/// `MAX_PIPELINE_SWEEPS`.  Every declared change is validated; a failure
-/// rolls back, or escalates under
+/// How many sweeps a pass list gets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sweeps {
+    /// Until no pass reports a change, capped at `MAX_PIPELINE_SWEEPS`; a
+    /// cap hit is reported as non-convergence.
+    ToFixedPoint,
+    /// Exactly one, for a list whose passes reach their fixed point in one
+    /// application and price against the converged module.
+    Once,
+}
+
+/// Run the IR pipeline: [`crate::passes::build_ir_passes`] to a fixed
+/// point, then [`crate::passes::build_tail_passes`] once.  Every declared
+/// change is validated; a failure rolls back, or escalates under
 /// [`crate::config::TraceConfig::validate_each_pass`].  `info` must
 /// describe `module` as passed in; the returned info describes it as
 /// returned, so a caller never validates the same state twice.
@@ -69,9 +79,63 @@ pub fn run_ir_passes(
     info: naga::valid::ModuleInfo,
     config: &Config,
     report: &mut Report,
-) -> Result<(crate::name_map::NameLog, naga::valid::ModuleInfo), Error> {
+    preamble_names: std::collections::HashSet<String>,
+) -> Result<Converged, Error> {
+    let name_log = std::cell::RefCell::new(crate::name_map::NameLog::default());
+    let tail = TailRender {
+        preamble_names,
+        type_uses: std::cell::RefCell::new(None),
+    };
     let passes = crate::passes::build_ir_passes(config);
-    run_ir_passes_with(module, info, config, report, passes)
+    let mut info = run_ir_passes_with(
+        module,
+        info,
+        config,
+        report,
+        passes,
+        (&name_log, &tail),
+        Sweeps::ToFixedPoint,
+    )?;
+    let tail_passes = crate::passes::build_tail_passes(config);
+    if !tail_passes.is_empty() {
+        info = run_ir_passes_with(
+            module,
+            info,
+            config,
+            report,
+            tail_passes,
+            (&name_log, &tail),
+            Sweeps::Once,
+        )?;
+    }
+    Ok(Converged {
+        name_log: name_log.into_inner(),
+        info,
+        type_uses: tail.type_uses.into_inner(),
+    })
+}
+
+/// What [`run_ir_passes`] leaves beside the module: the renames it made,
+/// naga's analysis of the result, and the type spellings the tail's
+/// render of it produced (`None` without that render).
+pub struct Converged {
+    /// The module-scope renames, for the name map.
+    pub name_log: crate::name_map::NameLog,
+    /// Validation info describing the module as returned.
+    pub info: naga::valid::ModuleInfo,
+    /// For [`crate::generator::GenerateOptions::type_uses`].
+    pub type_uses: Option<crate::generator::TypeUses>,
+}
+
+/// A hash of the module's `Debug` rendering, the whole IR included: the
+/// under-reporting check's oracle.  Debug builds only; the rendering links
+/// every naga `Debug` impl, which the release binary must not carry.
+#[cfg(debug_assertions)]
+fn module_fingerprint(module: &naga::Module) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{module:?}").hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Driver parameterised on the pass list so tests can inject synthetic passes.
@@ -81,10 +145,11 @@ fn run_ir_passes_with(
     config: &Config,
     report: &mut Report,
     mut passes: Vec<Box<dyn Pass>>,
-) -> Result<(crate::name_map::NameLog, naga::valid::ModuleInfo), Error> {
+    (name_log, tail): (&std::cell::RefCell<crate::name_map::NameLog>, &TailRender),
+    sweep_policy: Sweeps,
+) -> Result<naga::valid::ModuleInfo, Error> {
     let trace_run_dir = prepare_trace_dir(config)?;
     let mut sweeps = 0usize;
-    let name_log = std::cell::RefCell::new(crate::name_map::NameLog::default());
     let trace_enabled = config.trace.enabled;
     let needs_text_validation = config.trace.validate_each_pass;
     // Trace / CI runs report every pass; the plain path skips idle ones.
@@ -111,10 +176,21 @@ fn run_ir_passes_with(
     let mut backup: Option<(naga::Module, crate::name_map::NameLog)> = None;
     let mut accepted: Vec<usize> = Vec::new();
 
-    loop {
+    'sweeps: loop {
         let mut any_changed = false;
 
         for i in 0..passes.len() {
+            // `opt_bisect_limit` reached: the sweep it cuts short still
+            // counts in the report, and the cut is not a fixed point.
+            if config
+                .trace
+                .opt_bisect_limit
+                .is_some_and(|limit| version >= limit)
+            {
+                sweeps += 1;
+                report.converged = false;
+                break 'sweeps;
+            }
             if !full_fidelity && clean_at[i] == Some(version) {
                 continue;
             }
@@ -131,12 +207,30 @@ fn run_ir_passes_with(
 
             #[cfg(not(target_arch = "wasm32"))]
             let start = Instant::now();
-            let ctx = PassContext {
-                config,
-                name_log: Some(&name_log),
-            };
 
-            let declared_changed = passes[i].run(module, &ctx)?;
+            // The rollback replay and the `clean_at` skip both rest on "no
+            // declared change, no change": a pass that rewrites the arena
+            // behind a `false` leaves the replayed state short of the
+            // timeline's, which `compact` then reports every sweep.
+            // `changed_by_text` cannot see an orphaned expression, so debug
+            // builds hash the IR itself.
+            #[cfg(debug_assertions)]
+            let fingerprint_before = module_fingerprint(module);
+            let declared_changed = passes[i].run(
+                module,
+                &PassContext {
+                    config,
+                    info: &current_info,
+                    name_log: Some(name_log),
+                    tail: Some(tail),
+                },
+            )?;
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                declared_changed || module_fingerprint(module) == fingerprint_before,
+                "pass '{}' under-reports: the IR changed but it returned Ok(false)",
+                passes[i].name()
+            );
             #[cfg(not(target_arch = "wasm32"))]
             let duration_us = start.elapsed().as_micros() as u64;
             #[cfg(target_arch = "wasm32")]
@@ -147,7 +241,7 @@ fn run_ir_passes_with(
 
             // No declared change -> the module is still the state the last
             // validation blessed, so only CI mode re-validates; an
-            // under-reporting pass trips the traced debug_assert.
+            // under-reporting pass trips the fingerprint debug_assert.
             if declared_changed || needs_text_validation {
                 match io::validate_module(module) {
                     Ok(info) => {
@@ -171,21 +265,32 @@ fn run_ir_passes_with(
                             passes[i].name(),
                             e
                         );
-                        // Pre-pass state again.  Replay is deterministic by
-                        // the `Pass` contract, so `current_info` should still
-                        // describe it; re-deriving it costs one validation on
-                        // a path few shaders take and turns a contract
-                        // violation into an error instead of a stale `info`
-                        // the backend indexes out of bounds.
+                        // Pre-pass state again.  Each replayed pass reads
+                        // the info of the state it first ran on, so the
+                        // replay re-validates as the timeline did, on a
+                        // path few shaders take; replay is deterministic
+                        // by the `Pass` contract, and re-deriving the final
+                        // info turns a contract violation into an error
+                        // instead of a stale `info` the backend indexes
+                        // out of bounds.
                         let (saved_module, saved_log) = backup
                             .as_ref()
                             .expect("backup is taken whenever validate_each_pass is off");
                         *module = saved_module.clone();
                         *name_log.borrow_mut() = saved_log.clone();
-                        for &earlier in &accepted {
-                            passes[earlier].run(module, &ctx)?;
-                        }
                         current_info = io::validate_module(module)?;
+                        for &earlier in &accepted {
+                            passes[earlier].run(
+                                module,
+                                &PassContext {
+                                    config,
+                                    info: &current_info,
+                                    name_log: Some(name_log),
+                                    tail: Some(tail),
+                                },
+                            )?;
+                            current_info = io::validate_module(module)?;
+                        }
                         validation_ok = false;
                         rolled_back = true;
                     }
@@ -280,6 +385,9 @@ fn run_ir_passes_with(
         }
 
         sweeps += 1;
+        if sweep_policy == Sweeps::Once {
+            return Ok(current_info);
+        }
         if !any_changed || sweeps >= MAX_PIPELINE_SWEEPS {
             if sweeps >= MAX_PIPELINE_SWEEPS && any_changed {
                 report.converged = false;
@@ -300,7 +408,7 @@ fn run_ir_passes_with(
     }
 
     report.sweeps = sweeps;
-    Ok((name_log.into_inner(), current_info))
+    Ok(current_info)
 }
 
 // MARK: Trace directory allocation
@@ -490,7 +598,27 @@ mod driver_tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use super::{Pass, PassContext, run_ir_passes_with};
+    use super::{Pass, PassContext, Sweeps, TailRender, run_ir_passes_with};
+
+    fn run_to_fixed_point(
+        module: &mut naga::Module,
+        info: naga::valid::ModuleInfo,
+        config: &Config,
+        report: &mut Report,
+        passes: Vec<Box<dyn Pass>>,
+    ) -> Result<naga::valid::ModuleInfo, Error> {
+        let name_log = std::cell::RefCell::new(crate::name_map::NameLog::default());
+        let tail = TailRender::default();
+        run_ir_passes_with(
+            module,
+            info,
+            config,
+            report,
+            passes,
+            (&name_log, &tail),
+            Sweeps::ToFixedPoint,
+        )
+    }
     use crate::config::Config;
     use crate::error::Error;
     use crate::io;
@@ -608,7 +736,7 @@ mod driver_tests {
         let mut report = Report::new(0);
         let passes: Vec<Box<dyn Pass>> = vec![Box::new(CorruptingPass)];
         let info = io::validate_module(&module).expect("valid input");
-        let result = run_ir_passes_with(&mut module, info, &cfg, &mut report, passes);
+        let result = run_to_fixed_point(&mut module, info, &cfg, &mut report, passes);
         match result {
             Err(Error::Validation(msg)) => {
                 assert!(
@@ -631,7 +759,7 @@ mod driver_tests {
         let mut report = Report::new(0);
         let passes: Vec<Box<dyn Pass>> = vec![Box::new(CorruptingPass)];
         let info = io::validate_module(&module).expect("valid input");
-        let result = run_ir_passes_with(&mut module, info, &cfg, &mut report, passes);
+        let result = run_to_fixed_point(&mut module, info, &cfg, &mut report, passes);
         assert!(
             result.is_ok(),
             "without the flag, rollback must keep the pipeline on the happy path; got {result:?}"
@@ -664,7 +792,7 @@ mod driver_tests {
             Box::new(CorruptingPass),
         ];
         let info = io::validate_module(&module).expect("valid input");
-        run_ir_passes_with(&mut module, info, &cfg, &mut report, passes)
+        run_to_fixed_point(&mut module, info, &cfg, &mut report, passes)
             .expect("rollbacks keep the pipeline on the happy path");
         io::validate_module(&module).expect("both corruptions must be rolled back");
         let function = first_function(&mut module);
@@ -712,7 +840,7 @@ mod driver_tests {
             Box::new(CorruptingPass),
         ];
         let info = io::validate_module(&module).expect("valid input");
-        run_ir_passes_with(&mut module, info, &cfg, &mut report, passes).expect("converges");
+        run_to_fixed_point(&mut module, info, &cfg, &mut report, passes).expect("converges");
         io::validate_module(&module).expect("both corruptions must be rolled back");
         assert_eq!(first_function(&mut module).local_variables.len(), 2);
         let adds = report
@@ -737,7 +865,7 @@ mod driver_tests {
                 Box::new(CountingPass(Rc::clone(&runs))),
             ];
             let info = io::validate_module(&module).expect("valid input");
-            run_ir_passes_with(&mut module, info, &cfg, &mut report, passes).expect("converges");
+            run_to_fixed_point(&mut module, info, &cfg, &mut report, passes).expect("converges");
             // Sweep 2 re-runs only the pass that changed (now idle) and
             // skips the one already clean at that version.
             assert_eq!(report.sweeps, 2, "validate_each_pass={validate_each_pass}");
@@ -750,6 +878,31 @@ mod driver_tests {
                 report.pass_reports.len(),
                 expected_reports,
                 "validate_each_pass={validate_each_pass}"
+            );
+        }
+    }
+
+    /// `opt_bisect_limit = N` ships exactly the first N accepted changes.
+    #[test]
+    fn opt_bisect_limit_keeps_exactly_n_accepted_changes() {
+        for (limit, expected_locals) in [(0u64, 0usize), (1, 1), (2, 2), (5, 2)] {
+            let mut module = parsed_module();
+            let mut cfg = baseline_config(/*validate_each_pass=*/ false);
+            cfg.trace.opt_bisect_limit = Some(limit);
+            let mut report = Report::new(0);
+            let passes: Vec<Box<dyn Pass>> =
+                vec![Box::new(AddLocalPass(0)), Box::new(AddLocalPass(1))];
+            let info = io::validate_module(&module).expect("valid input");
+            run_to_fixed_point(&mut module, info, &cfg, &mut report, passes).expect("runs");
+            assert_eq!(
+                first_function(&mut module).local_variables.len(),
+                expected_locals,
+                "limit={limit}"
+            );
+            assert_eq!(
+                report.pass_reports.iter().filter(|p| p.changed).count(),
+                expected_locals,
+                "limit={limit}"
             );
         }
     }

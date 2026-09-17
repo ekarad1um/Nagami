@@ -1,4 +1,4 @@
-//! Dead-branch elimination.  Four phases run per function on every sweep,
+//! Dead-branch elimination.  Five phases run per function on every sweep,
 //! in this order:
 //!
 //! 1. Short-circuit re-sugaring folds the `if/else store` shapes naga's
@@ -19,6 +19,15 @@
 //!    true; }` when no bare break / continue would mis-target, `break if
 //!    false` when the body proves another exit, and single-default-case
 //!    Switch splicing.
+//! 5. Trailing return merging (`merge_trailing_returns`): a top-level
+//!    `if c { return a; } return b;` whose arms are pure becomes
+//!    `return select(b, a, c);`, chain by chain.
+//!
+//! A void function's tail is normalised before phase 1
+//! (`strip_tail_void_returns`): phase 4's else-elision would otherwise
+//! splice `if c { A; return; } else { B; return; }` into
+//! `if c { A; return; } B; return;`, a guard the strip has to fold back
+//! to `if c { A } else { B }`.
 //!
 //! Every fold that could delete - or, by splicing a never-falls-through
 //! arm, make unreachable - what tint credits as a loop's only exit is
@@ -30,10 +39,13 @@
 use rustc_hash::FxHashMap;
 
 use super::expr_util::{
-    has_negative_zero_leaf, is_bool_false, is_bool_true, literal_bit_eq, nested_blocks,
-    nested_blocks_mut, root_local_var,
+    has_negative_zero_leaf, is_bool_false, is_bool_true, is_expensive_expr,
+    is_uniformity_constrained_expr, literal_bit_eq, root_local_var,
 };
+use crate::analysis::ExprClass;
 use crate::error::Error;
+use crate::ir::rewrite::{Rewrite, rewrite_block};
+use crate::ir::visit::{Scope, contains_return, nested_blocks};
 use crate::pipeline::{Pass, PassContext};
 
 /// Match `[Emit..] Store` - a re-sugar accept arm that computes an
@@ -41,26 +53,36 @@ use crate::pipeline::{Pass, PassContext};
 /// return the store's `(pointer, value)`.
 ///
 /// The leading `Emit`s get hoisted into the parent block, so after the fold
-/// they evaluate UNCONDITIONALLY.  Sound because `Emit` expressions are
-/// side-effect-free (every effectful or control-flow construct is a distinct
-/// `Statement` kind, rejected here), WGSL bounds-checks out-of-range
-/// indexing rather than trapping, the `&&` / `||` discards the hoisted value
-/// whenever the guard fails, and lifting a computation OUT of a conditional
-/// can only reduce non-uniformity (it never pushes a derivative /
-/// implicit-LOD sample into non-uniform control flow).
+/// they evaluate UNCONDITIONALLY in the IR.  Sound because `Emit`
+/// expressions are side-effect-free (every effectful or control-flow
+/// construct is a distinct `Statement` kind, rejected here), WGSL
+/// bounds-checks out-of-range indexing rather than trapping, the `&&` /
+/// `||` discards the hoisted value whenever the guard fails, and lifting a
+/// computation OUT of a conditional can only reduce non-uniformity.
+///
+/// Whether the GPU also evaluates it unconditionally is the emitter's call:
+/// a single-reference expression is forwarded into the operator's right
+/// operand, where the short-circuit guards it again, so cheap work and a
+/// single-use fetch cost nothing, while a `let` ahead of the operator runs
+/// where the guard stopped it: the fold declines where that `let`
+/// would hold an [`is_expensive_expr`] ([`hoisted_fetch_stays_unconditional`]).
 fn store_with_leading_emits(
     block: &naga::Block,
+    expressions: &naga::Arena<naga::Expression>,
+    counts: &[usize],
 ) -> Option<(
     naga::Handle<naga::Expression>,
     naga::Handle<naga::Expression>,
 )> {
     let mut store = None;
+    let mut hoisted = Vec::new();
     for stmt in block.iter() {
         match stmt {
-            naga::Statement::Emit(_) => {
+            naga::Statement::Emit(range) => {
                 if store.is_some() {
                     return None;
                 }
+                hoisted.extend(range.clone());
             }
             naga::Statement::Store { pointer, value } => {
                 if store.is_some() {
@@ -71,7 +93,47 @@ fn store_with_leading_emits(
             _ => return None,
         }
     }
+    if hoisted_fetch_stays_unconditional(&hoisted, expressions, counts) {
+        return None;
+    }
     store
+}
+
+/// Whether the emitter would run a fetch among `hoisted` ahead of the
+/// operator: an [`is_uniformity_constrained_expr`] binds at its `Emit`
+/// whatever its count, and an expression with a second reference
+/// (`counts`) binds - by the byte rule or because its cone repeats work -
+/// with every single-reference operand of the range spelled inline in its
+/// `let`.  The walk is the emitter's (`cone_repeats_work`): through the
+/// single-reference operands only, a multi-reference one being a binding
+/// of its own, judged as itself.
+fn hoisted_fetch_stays_unconditional(
+    hoisted: &[naga::Handle<naga::Expression>],
+    expressions: &naga::Arena<naga::Expression>,
+    counts: &[usize],
+) -> bool {
+    let count = |h: naga::Handle<naga::Expression>| counts.get(h.index()).copied().unwrap_or(0);
+    let in_range: HandleSet<naga::Expression> = hoisted.iter().copied().collect();
+    hoisted.iter().any(|&h| {
+        if is_uniformity_constrained_expr(&expressions[h]) {
+            return true;
+        }
+        if count(h) < 2 {
+            return false;
+        }
+        let mut stack = vec![h];
+        while let Some(e) = stack.pop() {
+            if is_expensive_expr(&expressions[e]) {
+                return true;
+            }
+            crate::ir::visit::visit_expression_children(&expressions[e], |c| {
+                if in_range.contains(c) && count(c) == 1 {
+                    stack.push(c);
+                }
+            });
+        }
+        false
+    })
 }
 
 /// The re-sugar skips constant-`bool` guards: `const_fold` runs earlier, so
@@ -113,8 +175,12 @@ fn hoist_leading_emits(rebuilt: &mut naga::Block, accept: naga::Block) {
 /// the materialising `Emit` of every load are top-level statements of the
 /// SAME block, store first, so no load observes a pre-store value.  `E`'s
 /// evaluation position is unchanged (its `Emit` stays put), and the
-/// generator's `must_bind_loads` still guards load-versus-write hazards when
-/// it later inlines `E`.
+/// generator's `must_bind` still guards load-versus-write hazards when
+/// it later inlines `E`.  A forward that would make a static-error or
+/// sign-sensitive slot const answers to the gates `load_dedup`'s own
+/// forwarding does ([`super::load_dedup::decline_static_error_forwards`],
+/// [`super::load_dedup::decline_sign_sensitive_forwards`]), a declined
+/// load keeping its store.
 ///
 /// The dead `var t` and orphaned `Load(t)` are left for the downstream
 /// dead-local / dead-expression cleanup later in the fixpoint; without it a
@@ -122,6 +188,8 @@ fn hoist_leading_emits(rebuilt: &mut naga::Block, accept: naga::Block) {
 fn forward_single_store_locals(
     function: &mut naga::Function,
     types: &naga::UniqueArena<naga::Type>,
+    const_literals: &HandleMap<naga::Constant, naga::Literal>,
+    access_lens: &[Option<super::expr_util::IndexBound>],
 ) -> bool {
     let nlocals = function.local_variables.len();
     if nlocals == 0 {
@@ -151,7 +219,7 @@ fn forward_single_store_locals(
             {
                 load_count[t] += 1;
             }
-            super::expr_util::visit_expression_children(expr, |child| {
+            crate::ir::visit::visit_expression_children(expr, |child| {
                 if let Some(t) = local_index(child) {
                     total_refs[t] += 1;
                 }
@@ -159,7 +227,7 @@ fn forward_single_store_locals(
                 *slot = (*slot).min(hc.index() as u32);
             });
         }
-        super::expr_util::visit_block_expression_handles(&function.body, false, &mut |h| {
+        crate::ir::visit::visit_block_expression_handles(&function.body, false, &mut |h| {
             if let Some(t) = local_index(h) {
                 total_refs[t] += 1;
             }
@@ -194,23 +262,34 @@ fn forward_single_store_locals(
         store_value: &store_value,
         min_consumer: &min_consumer,
     };
+    let mut scan = ForwardScan {
+        store_idx: vec![None; nlocals],
+        found: vec![Vec::new(); nlocals],
+        counted: HandleSet::default(),
+    };
     collect_forwards(
         &function.body,
         &function.expressions,
         &census,
+        &mut scan,
         &mut redirects,
         &mut remove_store,
-        &mut HandleSet::default(),
     );
-    // Substituting a const store value for a runtime local read crosses a
-    // float `-x` / `x * y` / `x / y` slot exactly as `load_dedup`'s own
-    // forwarding does, so it answers to the same test.  A declined load still
-    // reads the local, so its store has to stay.
-    for handle in super::load_dedup::decline_sign_sensitive_forwards(
+    let declined = super::load_dedup::decline_static_error_forwards(
         &function.expressions,
         types,
+        const_literals,
+        access_lens,
         &mut redirects,
-    ) {
+    )
+    .into_iter()
+    .chain(super::load_dedup::decline_sign_sensitive_forwards(
+        &function.expressions,
+        types,
+        const_literals,
+        &mut redirects,
+    ));
+    for handle in declined {
         if let naga::Expression::Load { pointer } = function.expressions[handle]
             && let naga::Expression::LocalVariable(l) = function.expressions[pointer]
         {
@@ -221,12 +300,14 @@ fn forward_single_store_locals(
         return false;
     }
 
-    for (_, expr) in function.expressions.iter_mut() {
-        let _ = super::expr_util::try_map_expression_handles_in_place(expr, &mut |h| {
-            Some(*redirects.get(h).unwrap_or(&h))
-        });
+    // The orphaned loads keep their `Emit` slots for the dead-expression
+    // cleanup later in the fixpoint.
+    Rewrite {
+        map: &redirects,
+        backward_only: false,
+        retire_replaced: false,
     }
-    remap_block_handles(&mut function.body, &redirects);
+    .apply(function);
     remove_forwarded_stores(&mut function.body, &function.expressions, &remove_store);
     true
 }
@@ -237,7 +318,7 @@ fn count_whole_stores(
     whole_stores: &mut [u32],
     store_value: &mut [Option<naga::Handle<naga::Expression>>],
 ) {
-    super::expr_util::for_each_statement(block, &mut |stmt| {
+    crate::ir::visit::for_each_statement(block, &mut |stmt| {
         if let naga::Statement::Store { pointer, value } = stmt
             && let naga::Expression::LocalVariable(l) = exprs[*pointer]
         {
@@ -274,6 +355,16 @@ fn is_candidate_copy(
     )
 }
 
+/// [`collect_forwards`]' per-local scratch, sized once per function and
+/// wiped per block over the locals the block stored, so no block pays an
+/// allocation: a candidate's store position in the block being scanned,
+/// the loads found after it, and every load already claimed by a block.
+struct ForwardScan {
+    store_idx: Vec<Option<usize>>,
+    found: Vec<Vec<naga::Handle<naga::Expression>>>,
+    counted: HandleSet<naga::Expression>,
+}
+
 /// Per block, redirect a candidate's loads to its stored value when the store
 /// and the materialising `Emit` of every load are top-level statements of
 /// THIS block, store first.
@@ -281,17 +372,20 @@ fn collect_forwards(
     block: &naga::Block,
     exprs: &naga::Arena<naga::Expression>,
     census: &ForwardCensus<'_>,
+    scan: &mut ForwardScan,
     redirects: &mut HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
     remove_store: &mut [bool],
-    counted: &mut HandleSet<naga::Expression>,
 ) {
-    let mut store_idx: FxHashMap<usize, usize> = Default::default();
+    let mut stored: Vec<usize> = Vec::new();
     for (i, stmt) in block.iter().enumerate() {
         if let naga::Statement::Store { pointer, .. } = stmt
             && let naga::Expression::LocalVariable(l) = exprs[*pointer]
             && census.candidate[l.index()]
         {
-            store_idx.insert(l.index(), i);
+            if scan.store_idx[l.index()].is_none() {
+                stored.push(l.index());
+            }
+            scan.store_idx[l.index()] = Some(i);
         }
     }
     // Key on the load's MATERIALISATION (its `Emit` index), never on a
@@ -305,7 +399,6 @@ fn collect_forwards(
     // One list per local rather than a set: an expression is emitted once, so
     // `counted` (shared with the nested walks, since no handle can be emitted
     // in two blocks) rejects a repeat and the count below stays exact.
-    let mut found: FxHashMap<usize, Vec<naga::Handle<naga::Expression>>> = Default::default();
     for (i, stmt) in block.iter().enumerate() {
         let naga::Statement::Emit(range) = stmt else {
             continue;
@@ -313,18 +406,16 @@ fn collect_forwards(
         for h in range.clone() {
             if let naga::Expression::Load { pointer } = exprs[h]
                 && let naga::Expression::LocalVariable(l) = exprs[pointer]
-                && let Some(&si) = store_idx.get(&l.index())
+                && let Some(si) = scan.store_idx[l.index()]
                 && i > si
-                && counted.insert(h)
+                && scan.counted.insert(h)
             {
-                found.entry(l.index()).or_default().push(h);
+                scan.found[l.index()].push(h);
             }
         }
     }
-    for &t in store_idx.keys() {
-        let Some(loads_here) = found.get(&t) else {
-            continue;
-        };
+    for &t in &stored {
+        let loads_here = &scan.found[t];
         if loads_here.len() == census.load_count[t]
             && census.load_count[t] > 0
             && let Some(e) = census.store_value[t]
@@ -339,21 +430,13 @@ fn collect_forwards(
             remove_store[t] = true;
         }
     }
+    for &t in &stored {
+        scan.store_idx[t] = None;
+        scan.found[t].clear();
+    }
     for stmt in block.iter() {
         for nested in nested_blocks(stmt) {
-            collect_forwards(nested, exprs, census, redirects, remove_store, counted);
-        }
-    }
-}
-
-fn remap_block_handles(
-    block: &mut naga::Block,
-    redirects: &HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
-) {
-    for stmt in block.iter_mut() {
-        super::expr_util::remap_statement_handles(stmt, &mut |h| *redirects.get(h).unwrap_or(&h));
-        for nested in nested_blocks_mut(stmt) {
-            remap_block_handles(nested, redirects);
+            collect_forwards(nested, exprs, census, scan, redirects, remove_store);
         }
     }
 }
@@ -363,28 +446,22 @@ fn remove_forwarded_stores(
     exprs: &naga::Arena<naga::Expression>,
     remove_store: &[bool],
 ) {
-    let original = std::mem::take(block);
-    let mut rebuilt = naga::Block::with_capacity(original.len());
-    for (mut stmt, span) in original.span_into_iter() {
-        for nested in nested_blocks_mut(&mut stmt) {
-            remove_forwarded_stores(nested, exprs, remove_store);
-        }
+    rewrite_block(block, Scope::default(), &mut |stmt, span, out, _| {
         if let naga::Statement::Store { pointer, .. } = &stmt
             && let naga::Expression::LocalVariable(l) = exprs[*pointer]
             && remove_store[l.index()]
         {
-            continue;
+            return;
         }
-        rebuilt.push(stmt, span);
-    }
-    *block = rebuilt;
+        out.push(stmt, span);
+    });
 }
 
 use super::load_dedup::{collect_modified_locals, is_zero_literal};
 use super::scoped_map::ScopedMap;
 use crate::handle_set::{HandleMap, HandleSet};
 
-/// Dead-branch elimination: the module's four phases, per function, every
+/// Dead-branch elimination: the module's five phases, per function, every
 /// sweep.
 #[derive(Debug, Default)]
 pub struct DeadBranchPass;
@@ -397,41 +474,46 @@ impl Pass for DeadBranchPass {
     fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
         let mut changed = 0usize;
 
-        // Built once: the mutable function walk below cannot re-borrow
-        // `module.constants`.
-        let const_lits = build_const_literal_cache(module);
-        let types = &module.types;
-
-        for (_, function) in module.functions.iter_mut() {
-            // Order is load-bearing: the re-sugar matches the frontend shape
-            // the later phases destroy.
-            changed += resugar_short_circuits(function);
-            changed += usize::from(forward_single_store_locals(function, types));
-            changed += eliminate_redundant_else_stores_in_function(function, &const_lits);
-            changed += eliminate_dead_branches(
-                &mut function.body,
-                &function.expressions,
-                &const_lits,
-                /*in_loop=*/ false,
-                /*break_binds_to_loop=*/ false,
-            );
-        }
-        for entry in module.entry_points.iter_mut() {
-            changed += resugar_short_circuits(&mut entry.function);
-            changed += usize::from(forward_single_store_locals(&mut entry.function, types));
-            changed +=
-                eliminate_redundant_else_stores_in_function(&mut entry.function, &const_lits);
-            changed += eliminate_dead_branches(
-                &mut entry.function.body,
-                &entry.function.expressions,
-                &const_lits,
-                /*in_loop=*/ false,
-                /*break_binds_to_loop=*/ false,
-            );
-        }
+        let const_lits = super::const_fold::constant_literals(module);
+        // The forwarder's index bounds and the speculation gate both resolve
+        // types against the module, and the bounds are sized only after the
+        // re-sugar, whose arena rebuild renumbers every handle.
+        crate::ir::visit::for_each_function_taken(module, &mut |function, module| {
+            changed += run_phases(function, module, &const_lits);
+        });
 
         Ok(changed > 0)
     }
+}
+
+/// The five phases over one function, in order; the count of rewrites.
+fn run_phases(
+    function: &mut naga::Function,
+    module: &naga::Module,
+    const_lits: &HandleMap<naga::Constant, naga::Literal>,
+) -> usize {
+    let mut changed = 0usize;
+    if function.result.is_none() {
+        changed += strip_tail_void_returns(&mut function.body);
+    }
+    changed += resugar_short_circuits(function);
+    let access_lens = super::expr_util::access_static_lengths(function, module);
+    changed += usize::from(forward_single_store_locals(
+        function,
+        &module.types,
+        const_lits,
+        &access_lens,
+    ));
+    changed += eliminate_redundant_else_stores_in_function(function, const_lits);
+    changed += eliminate_dead_branches(
+        &mut function.body,
+        &function.expressions,
+        const_lits,
+        /*in_loop=*/ false,
+        /*break_binds_to_loop=*/ false,
+    );
+    changed += merge_trailing_returns(function, module);
+    changed
 }
 
 // MARK: Short-circuit re-sugaring
@@ -470,9 +552,17 @@ fn compute_resugar_foldable(function: &naga::Function) -> Vec<bool> {
 /// pin the same guard.
 fn resugar_short_circuits(function: &mut naga::Function) -> usize {
     let foldable = compute_resugar_foldable(function);
-    let changed = desugar_short_circuit(&mut function.body, &mut function.expressions, &foldable);
+    // A fold appends only behind every handle it hoists, so the counts of
+    // the hoisted expressions hold across the walk.
+    let (counts, _) = super::expr_util::live_expression_ref_counts(function);
+    let changed = desugar_short_circuit(
+        &mut function.body,
+        &mut function.expressions,
+        &foldable,
+        &counts,
+    );
     if changed > 0 {
-        super::expr_util::rebuild_function_expressions(function);
+        crate::ir::rewrite::rebuild_function_expressions(function);
     }
     changed
 }
@@ -492,152 +582,150 @@ fn desugar_short_circuit(
     block: &mut naga::Block,
     expressions: &mut naga::Arena<naga::Expression>,
     foldable: &[bool],
+    counts: &[usize],
 ) -> usize {
-    let original = std::mem::take(block);
-    let mut rebuilt = naga::Block::with_capacity(original.len());
     let mut changed = 0usize;
+    rewrite_block(
+        block,
+        Scope::default(),
+        &mut |statement, span, rebuilt, _| {
+            match statement {
+                naga::Statement::If {
+                    condition,
+                    accept,
+                    reject,
+                } => {
+                    // `&&`: `if cond { [emits..]; d = val; } else { d = false; }`
+                    // -> hoisted emits; `d = cond && val;`.  Both operands are in
+                    // scope in the parent block: `cond`'s Emit dominates the If,
+                    // and `val`'s producers are the hoisted accept-arm Emits,
+                    // placed ahead of the Binary.
+                    if !is_const_bool(condition, expressions)
+                        && let Some((ptr_r, val_r)) = single_store_info(&reject)
+                        && is_bool_false(expressions, val_r)
+                        && let Some((ptr_a, val_a)) =
+                            store_with_leading_emits(&accept, expressions, counts)
+                        && same_local_pointer(ptr_a, ptr_r, expressions)
+                        && store_target_foldable(ptr_a, expressions, foldable)
+                    {
+                        let binary = expressions.append(
+                            naga::Expression::Binary {
+                                op: naga::BinaryOperator::LogicalAnd,
+                                left: condition,
+                                right: val_a,
+                            },
+                            naga::Span::default(),
+                        );
+                        drop(reject);
+                        hoist_leading_emits(rebuilt, accept);
+                        rebuilt.push(
+                            naga::Statement::Emit(naga::Range::new_from_bounds(binary, binary)),
+                            span,
+                        );
+                        rebuilt.push(
+                            naga::Statement::Store {
+                                pointer: ptr_a,
+                                value: binary,
+                            },
+                            span,
+                        );
+                        changed += 1;
+                        return;
+                    }
 
-    for (mut statement, span) in original.span_into_iter() {
-        for nested in nested_blocks_mut(&mut statement) {
-            changed += desugar_short_circuit(nested, expressions, foldable);
-        }
-
-        match statement {
-            naga::Statement::If {
-                condition,
-                accept,
-                reject,
-            } => {
-                // `&&`: `if cond { [emits..]; d = val; } else { d = false; }`
-                // -> hoisted emits; `d = cond && val;`.  Both operands are in
-                // scope in the parent block: `cond`'s Emit dominates the If,
-                // and `val`'s producers are the hoisted accept-arm Emits,
-                // placed ahead of the Binary.
-                if !is_const_bool(condition, expressions)
-                    && let Some((ptr_r, val_r)) = single_store_info(&reject)
-                    && is_bool_false(expressions, val_r)
-                    && let Some((ptr_a, val_a)) = store_with_leading_emits(&accept)
-                    && same_local_pointer(ptr_a, ptr_r, expressions)
-                    && store_target_foldable(ptr_a, expressions, foldable)
-                {
-                    let binary = expressions.append(
-                        naga::Expression::Binary {
-                            op: naga::BinaryOperator::LogicalAnd,
-                            left: condition,
-                            right: val_a,
-                        },
-                        naga::Span::default(),
-                    );
-                    drop(reject);
-                    hoist_leading_emits(&mut rebuilt, accept);
-                    rebuilt.push(
-                        naga::Statement::Emit(naga::Range::new_from_bounds(binary, binary)),
-                        span,
-                    );
-                    rebuilt.push(
-                        naga::Statement::Store {
-                            pointer: ptr_a,
-                            value: binary,
-                        },
-                        span,
-                    );
-                    changed += 1;
-                    continue;
-                }
-
-                // `||`: `if !cond { [emits..]; d = val; } else { d = true; }`
-                // -> hoisted emits; `d = cond || val;`.  Same scope argument;
-                // `cond` (the `LogicalNot` operand) is in scope transitively.
-                // The negation is recovered two ways: a literal `LogicalNot`
-                // unwraps, and an `==` / `!=` un-flips into a FRESH
-                // expression (const_fold's De Morgan turns the lowering's
-                // `!(x == y)` into `x != y` before this phase, so
-                // equality-left `||` only reaches here flipped).  Un-flipping
-                // the equality pair is NaN-safe in both directions, unlike
-                // the ordered comparisons.  The fresh handle references only
-                // `condition`'s own operands (their Emits dominate the If) and
-                // is covered by starting the Emit range at it.  Structural
-                // guards run FIRST so a failed match appends nothing.
-                if let Some((ptr_r, val_r)) = single_store_info(&reject)
-                    && is_bool_true(expressions, val_r)
-                    && let Some((ptr_a, val_a)) = store_with_leading_emits(&accept)
-                    && same_local_pointer(ptr_a, ptr_r, expressions)
-                    && store_target_foldable(ptr_a, expressions, foldable)
-                    && let Some((inner_cond, synthesized)) =
-                        match unwrap_logical_not(condition, expressions) {
-                            Some(inner) if !is_const_bool(inner, expressions) => {
-                                Some((inner, false))
+                    // `||`: `if !cond { [emits..]; d = val; } else { d = true; }`
+                    // -> hoisted emits; `d = cond || val;`.  Same scope argument;
+                    // `cond` (the `LogicalNot` operand) is in scope transitively.
+                    // The negation is recovered two ways: a literal `LogicalNot`
+                    // unwraps, and an `==` / `!=` un-flips into a FRESH
+                    // expression (const_fold's De Morgan turns the lowering's
+                    // `!(x == y)` into `x != y` before this phase, so
+                    // equality-left `||` only reaches here flipped).  Un-flipping
+                    // the equality pair is NaN-safe in both directions, unlike
+                    // the ordered comparisons.  The fresh handle references only
+                    // `condition`'s own operands (their Emits dominate the If) and
+                    // is covered by starting the Emit range at it.  Structural
+                    // guards run FIRST so a failed match appends nothing.
+                    if let Some((ptr_r, val_r)) = single_store_info(&reject)
+                        && is_bool_true(expressions, val_r)
+                        && let Some((ptr_a, val_a)) =
+                            store_with_leading_emits(&accept, expressions, counts)
+                        && same_local_pointer(ptr_a, ptr_r, expressions)
+                        && store_target_foldable(ptr_a, expressions, foldable)
+                        && let Some((inner_cond, synthesized)) =
+                            match unwrap_logical_not(condition, expressions) {
+                                Some(inner) if !is_const_bool(inner, expressions) => {
+                                    Some((inner, false))
+                                }
+                                Some(_) => None,
+                                None => {
+                                    let unflipped = match &expressions[condition] {
+                                        naga::Expression::Binary {
+                                            op: naga::BinaryOperator::Equal,
+                                            left,
+                                            right,
+                                        } => Some((naga::BinaryOperator::NotEqual, *left, *right)),
+                                        naga::Expression::Binary {
+                                            op: naga::BinaryOperator::NotEqual,
+                                            left,
+                                            right,
+                                        } => Some((naga::BinaryOperator::Equal, *left, *right)),
+                                        _ => None,
+                                    };
+                                    unflipped.map(|(op, left, right)| {
+                                        (
+                                            expressions.append(
+                                                naga::Expression::Binary { op, left, right },
+                                                naga::Span::default(),
+                                            ),
+                                            true,
+                                        )
+                                    })
+                                }
                             }
-                            Some(_) => None,
-                            None => {
-                                let unflipped = match &expressions[condition] {
-                                    naga::Expression::Binary {
-                                        op: naga::BinaryOperator::Equal,
-                                        left,
-                                        right,
-                                    } => Some((naga::BinaryOperator::NotEqual, *left, *right)),
-                                    naga::Expression::Binary {
-                                        op: naga::BinaryOperator::NotEqual,
-                                        left,
-                                        right,
-                                    } => Some((naga::BinaryOperator::Equal, *left, *right)),
-                                    _ => None,
-                                };
-                                unflipped.map(|(op, left, right)| {
-                                    (
-                                        expressions.append(
-                                            naga::Expression::Binary { op, left, right },
-                                            naga::Span::default(),
-                                        ),
-                                        true,
-                                    )
-                                })
-                            }
-                        }
-                {
-                    let binary = expressions.append(
-                        naga::Expression::Binary {
-                            op: naga::BinaryOperator::LogicalOr,
-                            left: inner_cond,
-                            right: val_a,
-                        },
-                        naga::Span::default(),
-                    );
-                    drop(reject);
-                    hoist_leading_emits(&mut rebuilt, accept);
-                    // A synthesized comparison sits directly before `binary`.
-                    let emit_from = if synthesized { inner_cond } else { binary };
+                    {
+                        let binary = expressions.append(
+                            naga::Expression::Binary {
+                                op: naga::BinaryOperator::LogicalOr,
+                                left: inner_cond,
+                                right: val_a,
+                            },
+                            naga::Span::default(),
+                        );
+                        drop(reject);
+                        hoist_leading_emits(rebuilt, accept);
+                        // A synthesized comparison sits directly before `binary`.
+                        let emit_from = if synthesized { inner_cond } else { binary };
+                        rebuilt.push(
+                            naga::Statement::Emit(naga::Range::new_from_bounds(emit_from, binary)),
+                            span,
+                        );
+                        rebuilt.push(
+                            naga::Statement::Store {
+                                pointer: ptr_a,
+                                value: binary,
+                            },
+                            span,
+                        );
+                        changed += 1;
+                        return;
+                    }
+
                     rebuilt.push(
-                        naga::Statement::Emit(naga::Range::new_from_bounds(emit_from, binary)),
-                        span,
-                    );
-                    rebuilt.push(
-                        naga::Statement::Store {
-                            pointer: ptr_a,
-                            value: binary,
+                        naga::Statement::If {
+                            condition,
+                            accept,
+                            reject,
                         },
                         span,
                     );
-                    changed += 1;
-                    continue;
                 }
-
-                rebuilt.push(
-                    naga::Statement::If {
-                        condition,
-                        accept,
-                        reject,
-                    },
-                    span,
-                );
+                other => {
+                    rebuilt.push(other, span);
+                }
             }
-            other => {
-                rebuilt.push(other, span);
-            }
-        }
-    }
-
-    *block = rebuilt;
+        },
+    );
     changed
 }
 
@@ -862,7 +950,7 @@ fn eliminate_dead_branches(
                             span,
                         );
                     } else {
-                        splice_block(&mut rebuilt, if taken { accept } else { reject });
+                        rebuilt.extend_block(if taken { accept } else { reject });
                         changed += 1;
                     }
                 }
@@ -885,7 +973,7 @@ fn eliminate_dead_branches(
                             },
                             span,
                         );
-                        splice_block(&mut rebuilt, hoisted);
+                        rebuilt.extend_block(hoisted);
                         changed += 1;
                     } else {
                         rebuilt.push(
@@ -940,7 +1028,7 @@ fn eliminate_dead_branches(
                                         ))) =>
                             {
                                 let body = collect_case_body(cases, start_idx);
-                                splice_block(&mut rebuilt, body);
+                                rebuilt.extend_block(body);
                                 changed += 1;
                             }
                             None => {
@@ -968,7 +1056,7 @@ fn eliminate_dead_branches(
                     });
                     if degenerate && !contains_bare_break(&cases.last().unwrap().body) {
                         let body = cases.into_iter().next_back().unwrap().body;
-                        splice_block(&mut rebuilt, body);
+                        rebuilt.extend_block(body);
                         changed += 1;
                     } else {
                         rebuilt.push(naga::Statement::Switch { selector, cases }, span);
@@ -988,8 +1076,8 @@ fn eliminate_dead_branches(
                     if !contains_bare_loop_control(&body)
                         && !contains_bare_loop_control(&continuing)
                     {
-                        splice_block(&mut rebuilt, body);
-                        splice_block(&mut rebuilt, continuing);
+                        rebuilt.extend_block(body);
+                        rebuilt.extend_block(continuing);
                         changed += 1;
                     } else {
                         rebuilt.push(
@@ -1069,12 +1157,6 @@ fn eliminate_dead_branches(
 
     *block = rebuilt;
     changed
-}
-
-fn splice_block(target: &mut naga::Block, source: naga::Block) {
-    for (stmt, sp) in source.span_into_iter() {
-        target.push(stmt, sp);
-    }
 }
 
 /// Control never falls off the end of `stmt`.  `bare_break_terminates` is the
@@ -1183,7 +1265,7 @@ fn collect_case_body(cases: Vec<naga::SwitchCase>, start_idx: usize) -> naga::Bl
     let mut combined = naga::Block::new();
     for case in cases.into_iter().skip(start_idx) {
         let done = !case.fall_through;
-        splice_block(&mut combined, case.body);
+        combined.extend_block(case.body);
         if done {
             break;
         }
@@ -1249,23 +1331,6 @@ pub(crate) fn contains_bare_break(block: &naga::Block) -> bool {
     contains_loop_control(
         block, /*want_break=*/ true, /*want_continue=*/ false,
     )
-}
-
-/// A `Return` at ANY depth, nested loops and switches included: it exits
-/// the function, hence every enclosing loop.  Drives the
-/// loop-exit-preservation guards: tint requires every `loop` to exit (a
-/// `break` targeting it, `break if`, or an inner `Return`) and does not
-/// const-evaluate conditions, so an exit inside `if false { .. }` still
-/// counts for tint while naga validates an exit-less `loop {}`; folding
-/// such a block turns tint-valid input into "loop does not exit".
-/// Reachability-blind, over-approximating what tint credits - safe for the
-/// KEEP direction it drives; `tint_block_behavior` is the reachability-aware
-/// complement for the splice direction.  `Kill` does not count: tint
-/// demotes `discard` to a helper-invocation exit, not a loop exit.
-fn contains_return(block: &naga::Block) -> bool {
-    block.iter().any(|stmt| {
-        matches!(stmt, naga::Statement::Return { .. }) || nested_blocks(stmt).any(contains_return)
-    })
 }
 
 /// A construct's behavior set under tint's (WGSL-spec) analysis - which of
@@ -1473,43 +1538,24 @@ enum KnownValue {
 
 // MARK: Redundant else-store elimination
 
-/// Module constants whose init is already a `Literal`; anything else stays
-/// unresolvable.
-fn build_const_literal_cache(module: &naga::Module) -> HandleMap<naga::Constant, naga::Literal> {
-    module
-        .constants
-        .iter()
-        .filter_map(|(ch, c)| {
-            if let naga::Expression::Literal(lit) = module.global_expressions[c.init] {
-                Some((ch, lit))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
 /// WGSL zero-initialises locals without an initialiser; literal inits are
 /// known outright.
-fn init_known_values(
-    locals: &naga::Arena<naga::LocalVariable>,
-    expressions: &naga::Arena<naga::Expression>,
-    const_lits: &HandleMap<naga::Constant, naga::Literal>,
-) -> FxHashMap<naga::Handle<naga::LocalVariable>, KnownValue> {
-    locals
-        .iter()
-        .filter_map(|(lh, lv)| match lv.init {
-            None => Some((lh, KnownValue::Zero)),
-            Some(init_h) => {
-                let lit = resolve_to_literal(expressions, init_h, const_lits)?;
-                if is_zero_literal(&lit) {
-                    Some((lh, KnownValue::Zero))
-                } else {
-                    Some((lh, KnownValue::Literal(lit)))
-                }
+fn init_known_values<'a>(
+    locals: &'a naga::Arena<naga::LocalVariable>,
+    expressions: &'a naga::Arena<naga::Expression>,
+    const_lits: &'a HandleMap<naga::Constant, naga::Literal>,
+) -> impl Iterator<Item = (naga::Handle<naga::LocalVariable>, KnownValue)> + 'a {
+    locals.iter().filter_map(move |(lh, lv)| match lv.init {
+        None => Some((lh, KnownValue::Zero)),
+        Some(init_h) => {
+            let lit = resolve_to_literal(expressions, init_h, const_lits)?;
+            if is_zero_literal(&lit) {
+                Some((lh, KnownValue::Zero))
+            } else {
+                Some((lh, KnownValue::Literal(lit)))
             }
-        })
-        .collect()
+        }
+    })
 }
 
 fn eliminate_redundant_else_stores_in_function(
@@ -1590,7 +1636,7 @@ fn eliminate_redundant_else_stores(
                 // state.  `cond_fresh` is decided once, up front: an
                 // accept-arm store must not perturb the reject decision.
                 // Written out per arm: one shared body needs the narrowing as
-                // a function pointer, which stops it inlining (+1,836 B).
+                // a function pointer, which stops it inlining.
                 let cond_fresh = condition_load_is_fresh(condition, expressions, fresh_loads);
                 let cp_pre_if = known_values.checkpoint();
 
@@ -1764,7 +1810,7 @@ fn eliminate_redundant_else_stores(
             }
 
             // Pointer writes by callees / atomics / ray / cooperative ops.
-            other => super::expr_util::visit_statement_write_pointers(other, &mut |p| {
+            other => crate::ir::visit::visit_statement_write_pointers(other, &mut |p| {
                 if let Some(lh) = root_local_var(p, expressions) {
                     known_values.remove(&lh);
                     fresh_loads.remove(lh);
@@ -1907,6 +1953,253 @@ fn is_zero_value(
         naga::Expression::Constant(c) => const_lits.get(c).is_some_and(is_zero_literal),
         _ => false,
     }
+}
+
+// MARK: Tail void returns
+
+/// Normalise a void function's tail, `block` being in tail position: the
+/// trailing `return;`s go; the first guard `if c { S; return; } T` folds
+/// the rest of the block into its else (`if c { S } else { T }`: exact,
+/// since `T` ran only when the guard did not return, and shorter by the
+/// `return;`); then the last statement's own tails are normalised in turn -
+/// the tails the generator's `elide_tail_void_returns` prints without their
+/// returns, never a loop's, since a return inside one exits it and falling
+/// off the body does not.  naga's front-end re-synthesises the returns on
+/// every parse, so this keeps the shape the passes read equal to the text:
+/// the inliner's single-return splice sees a void helper whose `if` naga
+/// closed with returns.  The count of rewrites.
+fn strip_tail_void_returns(block: &mut naga::Block) -> usize {
+    let mut rewritten = 0;
+    while let Some(naga::Statement::Return { value: None }) = block.last() {
+        block.cull(block.len() - 1..);
+        rewritten += 1;
+    }
+    let guard = block.iter().position(|statement| {
+        matches!(statement, naga::Statement::If { accept, reject, .. }
+            if reject.is_empty()
+                && matches!(accept.last(), Some(naga::Statement::Return { value: None })))
+    });
+    if let Some(at) = guard
+        && at + 1 < block.len()
+    {
+        let mut statements: Vec<_> = std::mem::take(block).span_into_iter().collect();
+        let tail = statements.split_off(at + 1);
+        let mut rebuilt = naga::Block::with_capacity(at + 1);
+        match statements.pop() {
+            Some((
+                naga::Statement::If {
+                    condition,
+                    mut accept,
+                    ..
+                },
+                span,
+            )) => {
+                accept.cull(accept.len() - 1..);
+                let mut reject = naga::Block::with_capacity(tail.len());
+                for (statement, span) in tail {
+                    reject.push(statement, span);
+                }
+                for (statement, span) in statements {
+                    rebuilt.push(statement, span);
+                }
+                rebuilt.push(
+                    naga::Statement::If {
+                        condition,
+                        accept,
+                        reject,
+                    },
+                    span,
+                );
+            }
+            _ => unreachable!("the guard was matched above"),
+        }
+        *block = rebuilt;
+        rewritten += 1;
+    }
+    match block.last_mut() {
+        Some(naga::Statement::If { accept, reject, .. }) => {
+            rewritten += strip_tail_void_returns(accept);
+            rewritten += strip_tail_void_returns(reject);
+        }
+        Some(naga::Statement::Block(inner)) => rewritten += strip_tail_void_returns(inner),
+        Some(naga::Statement::Switch { cases, .. }) => {
+            for case in cases.iter_mut().filter(|case| !case.fall_through) {
+                rewritten += strip_tail_void_returns(&mut case.body);
+            }
+        }
+        _ => {}
+    }
+    rewritten
+}
+
+// MARK: Trailing return merging
+
+/// `[.., If { c, accept: [Emit*, Return a], reject: [] }, Emit*, Return b]`
+/// at a function's top level becomes `[.., Emit*, Emit*, Emit(s), Return s]`
+/// with `s = select(b, a, c)`, repeated inward while the shape holds; the
+/// count merged.  A pure early return spells three characters shorter as
+/// a `select`, and a body whose only `Return` is the trailing one is the
+/// shape the single-call splice takes.  The arm's `Emit`s ran only under
+/// the guard and the tail's only once it fell through; both now run
+/// unconditionally, so their expressions must be safe to speculate
+/// ([`emits_speculatable`]); what any of them reads was emitted at the top
+/// level before the guard, earlier on its own side (still ahead of it), or
+/// needs no `Emit`, so the move keeps naga's block scoping.  `select`
+/// takes scalars and vectors only.
+fn merge_trailing_returns(function: &mut naga::Function, module: &naga::Module) -> usize {
+    let selectable = function.result.as_ref().is_some_and(|result| {
+        matches!(
+            module.types[result.ty].inner,
+            naga::TypeInner::Scalar(_) | naga::TypeInner::Vector { .. }
+        )
+    });
+    if !selectable {
+        return 0;
+    }
+    let mut merged = 0;
+    loop {
+        let body = &function.body;
+        let Some(&naga::Statement::Return {
+            value: Some(reject),
+        }) = body.last()
+        else {
+            break;
+        };
+        let mut run = body.len() - 1;
+        while run > 0 && matches!(body[run - 1], naga::Statement::Emit(_)) {
+            run -= 1;
+        }
+        let Some(guard) = run.checked_sub(1) else {
+            break;
+        };
+        let naga::Statement::If {
+            condition,
+            accept,
+            reject: reject_arm,
+        } = &body[guard]
+        else {
+            break;
+        };
+        let Some(&naga::Statement::Return {
+            value: Some(accept_value),
+        }) = accept.last()
+        else {
+            break;
+        };
+        let accept_emits = &accept[..accept.len() - 1];
+        if !reject_arm.is_empty()
+            || !accept_emits
+                .iter()
+                .all(|s| matches!(s, naga::Statement::Emit(_)))
+            || !emits_speculatable(
+                accept_emits.iter().chain(&body[run..body.len() - 1]),
+                function,
+                module,
+            )
+        {
+            break;
+        }
+        let condition = *condition;
+        let span = naga::Span::UNDEFINED;
+        let select = function.expressions.append(
+            naga::Expression::Select {
+                condition,
+                accept: accept_value,
+                reject,
+            },
+            span,
+        );
+        let mut statements: Vec<_> = std::mem::take(&mut function.body)
+            .span_into_iter()
+            .collect();
+        statements.pop();
+        let tail = statements.split_off(run);
+        let accept = match statements.pop() {
+            Some((naga::Statement::If { accept, .. }, _)) => accept,
+            _ => unreachable!("the guard matched above"),
+        };
+        let mut body = naga::Block::with_capacity(statements.len() + accept.len() + tail.len() + 1);
+        for (statement, span) in statements {
+            body.push(statement, span);
+        }
+        let mut accept = accept;
+        accept.cull(accept.len() - 1..);
+        body.extend_block(accept);
+        for (statement, span) in tail {
+            body.push(statement, span);
+        }
+        body.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(select, select)),
+            span,
+        );
+        body.push(
+            naga::Statement::Return {
+                value: Some(select),
+            },
+            span,
+        );
+        function.body = body;
+        merged += 1;
+    }
+    merged
+}
+
+/// Whether every expression the `Emit`s in `statements` introduce may run
+/// where its guard no longer decides.  naga expressions carry no effects,
+/// so only these answer no: [`ExprClass::NOT_SPECULATABLE`] - the convergent
+/// class or a cooperative-matrix op, tied to the guard's control flow by the
+/// uniformity rules; a ray-query read, tied to its object's state; an
+/// expensive op, whose evaluation is what the guard was saving (a guarded
+/// texture resolve became unconditional loads on the GPU) - and an
+/// integer `/` `%` `<<` `>>` by a runtime operand - defined by WGSL, yet a
+/// guarded division by zero is what such a guard exists for, so it keeps
+/// it.  Float `/` `%` are IEEE arithmetic on any operand.  The divisor test
+/// reads the LEAF's const-ness, not the cone's.  No size bound on the rest:
+/// cheap pure arms are what if-conversion is for, and a bound only forfeits
+/// the GVN merge a `select` enables.
+fn emits_speculatable<'a>(
+    statements: impl Iterator<Item = &'a naga::Statement>,
+    function: &naga::Function,
+    module: &naga::Module,
+) -> bool {
+    let arena = &function.expressions;
+    let mut typifier = naga::front::Typifier::new();
+    let resolve = naga::proc::ResolveContext::with_locals(
+        module,
+        &function.local_variables,
+        &function.arguments,
+    );
+    let is_const =
+        |h: naga::Handle<naga::Expression>| ExprClass::node(&arena[h]).any(ExprClass::CONST_LEAF);
+    let mut is_float = |h: naga::Handle<naga::Expression>| {
+        typifier.grow(h, arena, &resolve).is_ok()
+            && matches!(
+                typifier[h].inner_with(&module.types).scalar(),
+                Some(naga::Scalar {
+                    kind: naga::ScalarKind::Float,
+                    ..
+                })
+            )
+    };
+    let mut speculatable = |h: naga::Handle<naga::Expression>| match arena[h] {
+        ref e if ExprClass::node(e).any(ExprClass::NOT_SPECULATABLE) => false,
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::Divide | naga::BinaryOperator::Modulo,
+            left,
+            right,
+        } => is_const(right) || is_float(left),
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight,
+            right,
+            ..
+        } => is_const(right),
+        _ => true,
+    };
+    let mut statements = statements;
+    statements.all(|statement| match statement {
+        naga::Statement::Emit(range) => range.clone().all(&mut speculatable),
+        _ => false,
+    })
 }
 
 // MARK: Tests

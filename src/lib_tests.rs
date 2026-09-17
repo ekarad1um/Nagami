@@ -602,6 +602,24 @@ fn preamble_declarations_excluded_from_output() {
     io::validate_wgsl_text(&combined).expect("output + preamble must be valid WGSL");
 }
 
+/// A body enabling `f16` behind a preamble that does not: the shipped
+/// [preamble, body] document would lack the directive, and the error says
+/// which one to move rather than quoting the self-check's re-parse.
+#[test]
+fn preamble_missing_the_bodys_enable_names_the_directive() {
+    let config = Config {
+        preamble: Some("const K: u32 = 1u;".to_string()),
+        ..Default::default()
+    };
+    let source = "enable f16;\n@group(0) @binding(0) var<storage, read_write> o: f16;\n\
+                  @compute @workgroup_size(1) fn main() { o = f16(K) + 1h; }";
+    let err = match run(source, &config) {
+        Err(e) => e.to_string(),
+        Ok(out) => panic!("accepted: {}", out.source),
+    };
+    assert!(err.contains("add `enable f16;` to the preamble"), "{err}");
+}
+
 #[test]
 fn preamble_names_preserved_from_renaming() {
     let preamble = "\
@@ -918,8 +936,11 @@ fn ptr_param_clone_keeps_the_original_name() {
                fn touch(p: ptr<workgroup, array<f32, 8>>, i: u32) { (*p)[i] = 1.0; }\n\
                @compute @workgroup_size(8) fn m(@builtin(local_invocation_id) l: vec3u) {\n\
                  touch(&a, l.x);\n\
+                 touch(&a, l.y);\n\
                  touch(&b, l.x);\n\
+                 touch(&b, l.y);\n\
                }";
+    // Each clone is called twice: called once, it would be spliced away.
     let output = run(src, &Config::default()).expect("recovers");
     let functions = output.name_map.expect("recovered run has a map").functions;
     assert!(
@@ -943,15 +964,142 @@ fn ptr_param_clone_keeps_the_original_name() {
     assert_eq!(preserved.name_map.expect("map").functions["touch"], "touch");
 }
 
+/// Minted type names go to the most-used types first: an alias spelled
+/// dozens of times takes the earlier letter over a struct declared first
+/// but spelled once, and the output re-minifies to itself.
+#[test]
+fn type_names_are_assigned_by_use_count() {
+    // Thirty typed globals spell `vec4f` thirty times; the struct is spelled
+    // once, by the uniform.
+    let globals: String = (0..30)
+        .map(|i| format!("var<private> g{i}: vec4f;\n"))
+        .collect();
+    let sum: String = (0..30).map(|i| format!("acc += g{i};\n")).collect();
+    let src = format!(
+        "struct S {{ x: f32 }}\n@group(0) @binding(0) var<uniform> s: S;\n{globals}\
+         @fragment fn m(@location(0) k: f32) -> @location(0) vec4f {{\n\
+         var acc = vec4f(k);\n{sum}return acc + vec4f(s.x);\n}}"
+    );
+    let output = run(&src, &Config::default()).expect("runs");
+    let alias = output
+        .source
+        .split("alias ")
+        .nth(1)
+        .and_then(|rest| rest.split('=').next())
+        .expect("an alias for vec4f is minted");
+    let strukt = output
+        .source
+        .split("struct ")
+        .nth(1)
+        .and_then(|rest| rest.split('{').next())
+        .expect("the struct survives");
+    let position = |name: &str| {
+        let mut counter = 0;
+        std::iter::repeat_with(|| crate::name_gen::next_name(&mut counter))
+            .position(|n| n == name)
+            .expect("a minted name")
+    };
+    assert!(
+        position(alias) < position(strukt),
+        "the alias ({alias}) must take the earlier letter over the struct ({strukt}): {}",
+        output.source
+    );
+    let again = run(&output.source, &Config::default()).expect("re-runs");
+    assert_eq!(
+        again.source, output.source,
+        "the output re-minifies to itself"
+    );
+}
+
+/// A const composite read through a chain of element picks - arrays of
+/// arrays, an array of structs, an array of matrices - folds to its leaf
+/// once the splice puts the composite under the chain, where naga's
+/// front-end no longer sees it; a runtime index keeps its access.
+#[test]
+fn composite_element_chains_fold_after_splicing() {
+    let src = "struct P { a: vec2u, b: u32 }\n\
+               @group(0) @binding(0) var<storage, read_write> o: array<u32>;\n\
+               @group(0) @binding(1) var<storage, read_write> f: array<f32>;\n\
+               fn zeros(a: array<array<u32, 4>, 3>) -> u32 { return a[2][3]; }\n\
+               fn member(a: array<P, 2>) -> u32 { return a[1].a.y; }\n\
+               fn column(a: array<mat2x2f, 2>) -> f32 { return a[1][1].x; }\n\
+               fn dynamic(a: array<u32, 2>, i: u32) -> u32 { return a[i]; }\n\
+               @compute @workgroup_size(1) fn m(@builtin(global_invocation_id) id: vec3u) {\n\
+                 o[0] = zeros(array<array<u32, 4>, 3>());\n\
+                 o[1] = member(array(P(vec2u(1u, 2u), 3u), P(vec2u(4u, 5u), 6u)));\n\
+                 f[0] = column(array(mat2x2f(0.0, 1.0, 2.0, 3.0), mat2x2f(4.0, 5.0, 6.0, 7.0)));\n\
+                 o[2] = dynamic(array(7u, 8u), id.x);\n\
+               }";
+    let output = run(src, &Config::default()).expect("runs");
+    assert!(output.report.bailout.is_none());
+    for expected in ["[0]=0;", "[1]=5;", "[0]=6;"] {
+        assert!(
+            output.source.contains(expected),
+            "{expected}: {}",
+            output.source
+        );
+    }
+    assert!(
+        output.source.contains("array(7,8)[") || output.source.contains("array<u32,2>(7,8)["),
+        "a runtime index keeps its access: {}",
+        output.source
+    );
+}
+
+/// A guard folded into `if !c { .. }` spells the negation without
+/// parentheses around a call, as the same text re-minified would.
+#[test]
+fn negated_guard_condition_spells_a_call_bare() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\n\
+               @compute @workgroup_size(1) fn m(@builtin(global_invocation_id) id: vec3u) {\n\
+                 if (any(id.xy >= vec2u(4u))) { return; }\n\
+                 o[id.x] = 1u;\n\
+               }";
+    let output = run(src, &Config::default()).expect("runs");
+    assert!(
+        output.source.contains("if !any(") && !output.source.contains("!("),
+        "{}",
+        output.source
+    );
+}
+
+/// A void helper whose tail `if` carries the returns naga's front-end
+/// synthesises is spliced once the IR drops them as the text would: one
+/// `fn` survives.
+#[test]
+fn void_helper_with_a_tail_if_is_spliced() {
+    let src = "var<private> acc: u32;\n\
+               fn bump(c: bool) { if (c) { acc = acc + 1u; } }\n\
+               @compute @workgroup_size(1) fn m(@builtin(global_invocation_id) id: vec3u) { bump(id.x > 4u); }";
+    let output = run(src, &Config::default()).expect("runs");
+    assert!(output.report.bailout.is_none());
+    assert_eq!(output.source.matches("fn ").count(), 1, "{}", output.source);
+}
+
+/// A single-call helper whose only early return is a pure guard is merged
+/// into one `select` return and then spliced: no definition survives, and
+/// the guard is spelled as the `select`.
+#[test]
+fn guarded_single_call_helper_is_merged_and_spliced() {
+    let src = "fn safe_sqrt(x: f32) -> f32 { if (x < 0.0) { return 0.0; } return sqrt(x); }\n\
+               @fragment fn m(@location(0) x: f32) -> @location(0) vec4f { return vec4f(safe_sqrt(x)); }";
+    let output = run(src, &Config::default()).expect("runs");
+    assert!(output.report.bailout.is_none());
+    assert_eq!(output.source.matches("fn ").count(), 1, "{}", output.source);
+    assert!(output.source.contains("select("), "{}", output.source);
+}
+
 #[test]
 fn ptr_param_element_chain_root_runs_the_full_pipeline() {
     // An element-rooted pointer (`&a[i]`) carries a call-site-dependent index
     // whole-var specialization cannot express, so the parameter survives and
-    // the stand-in validates it.
+    // the stand-in validates it.  Two call sites: called once, the helper
+    // would be spliced and the parameter dissolved.
     let src = "var<workgroup> a: array<f32, 64>;\n\
                fn setf(p: ptr<workgroup, f32>) { *p = 1.0; }\n\
                @compute @workgroup_size(64) fn m(@builtin(local_invocation_id) lid: vec3u) {\n\
                  setf(&a[lid.x]);\n\
+                 setf(&a[lid.y]);\n\
                }";
     let output = run(src, &Config::default()).expect("runs");
     assert!(
@@ -975,7 +1123,8 @@ fn ptr_param_element_chain_root_runs_the_full_pipeline() {
 #[test]
 fn library_module_pointer_helper_runs_the_full_pipeline() {
     // No entry point, so nothing can be specialized: the stand-in is the only
-    // way in.  Shape of vgpu's fft-core module.
+    // way in.  The shape of an FFT library module: `ptr<workgroup>` stage
+    // helpers behind a `const` size.
     let src = "const N: u32 = 8u;\n\
                fn cmul(a: vec2f, b: vec2f) -> vec2f {\n\
                  return vec2f(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);\n\
@@ -1023,6 +1172,7 @@ fn library_module_pointer_helper_runs_the_full_pipeline() {
 
 #[test]
 fn storage_pointer_parameter_keeps_its_access_mode_and_array_length() {
+    // Two call sites: called once, the helper would be spliced away.
     let src = "struct Buf { data: array<f32> }\n\
                @group(0) @binding(0) var<storage, read_write> buf: Buf;\n\
                fn bump(p: ptr<storage, array<f32>, read_write>, i: u32) {\n\
@@ -1030,6 +1180,7 @@ fn storage_pointer_parameter_keeps_its_access_mode_and_array_length() {
                }\n\
                @compute @workgroup_size(1) fn m(@builtin(global_invocation_id) g: vec3u) {\n\
                  bump(&buf.data, g.x);\n\
+                 bump(&buf.data, g.y);\n\
                }";
     let output = run(src, &Config::default()).expect("runs");
     assert!(
@@ -2111,18 +2262,23 @@ fn preserved_resources_and_named_overrides_survive_dce() {
     );
 }
 
+/// A mesh shader: the generator refuses the stage, so naga's emitter prints
+/// the renamed IR (a known loss) - the fixture for the fallback rung.
+const MESH_FALLBACK_SRC: &str = "enable wgpu_mesh_shader;\n\
+    @group(0) @binding(0) var<uniform> tint: vec4f;\n\
+    struct V { @builtin(position) p: vec4f, @location(0) c: vec3f }\n\
+    struct P { @builtin(point_index) i: u32 }\n\
+    struct M { @builtin(vertices) v: array<V, 1>, @builtin(primitives) q: array<P, 1>, \
+    @builtin(vertex_count) nv: u32, @builtin(primitive_count) np: u32 }\n\
+    var<workgroup> mo: M;\n\
+    @mesh(mo) @workgroup_size(1) fn ms() { mo.v[0] = V(tint, tint.xyz); mo.nv = 1u; mo.np = 1u; }\n";
+
 /// The naga-emitter fallback prints the RENAMED module: the name map applies
 /// and the report names the fallback (both were `null`; the web build had no
 /// signal).
 #[test]
 fn naga_fallback_reports_itself_and_keeps_the_name_map() {
-    // `@interpolate(per_vertex)` ships without its `enable`, so the
-    // generator's text fails the re-parse and naga's emitter prints the
-    // renamed IR (a known loss).
-    let src = "enable wgpu_per_vertex;\n\
-               @group(0) @binding(0) var<uniform> tint: vec4f;\n\
-               struct V { @builtin(position) p: vec4f, @location(0) @interpolate(per_vertex) c: array<vec3f, 3> }\n\
-               @fragment fn fs(v: V) -> @location(0) vec4f { return vec4f(v.c[0], 1.0) * tint; }\n";
+    let src = MESH_FALLBACK_SRC;
     let out = run(src, &Config::default()).expect("the module minifies via the fallback");
     assert!(out.report.fallback.is_some(), "the fallback is reported");
     let map = out.name_map.expect("the fallback text carries the renames");
@@ -2143,21 +2299,41 @@ fn naga_fallback_reports_itself_and_keeps_the_name_map() {
 /// point, a named override or a preserved symbol is refused.
 #[test]
 fn naga_fallback_never_respells_the_interface() {
-    let src = "enable wgpu_per_vertex;\n\
-               @group(0) @binding(0) var<uniform> tint: vec4f;\n\
-               struct V { @builtin(position) p: vec4f, @location(0) @interpolate(per_vertex) c: array<vec3f, 3> }\n\
-               @fragment fn fs1(v: V) -> @location(0) vec4f { return vec4f(v.c[0], 1.0) * tint; }\n";
-    let err = run(src, &Config::default())
+    let src = MESH_FALLBACK_SRC.replace("fn ms()", "fn ms1()");
+    let err = run(&src, &Config::default())
         .err()
         .expect("no rung ships a respelled entry point");
-    assert!(err.to_string().contains("`fs1` as `fs1_`"), "{err}");
-    let with_override = src
-        .replace("* tint;", "* tint * o1;")
+    assert!(err.to_string().contains("`ms1` as `ms1_`"), "{err}");
+    let with_override = MESH_FALLBACK_SRC
+        .replace("V(tint,", "V(tint * o1,")
         .replace("@group(0)", "override o1: f32 = 1.0;\n@group(0)");
-    let err = run(&with_override.replace("fs1", "fs"), &Config::default())
+    let err = run(&with_override, &Config::default())
         .err()
         .expect("no rung ships a respelled override");
     assert!(err.to_string().contains("`o1` as `o1_`"), "{err}");
+}
+
+/// `@interpolate(per_vertex)` needs naga's `wgpu_per_vertex` extension, and
+/// the generator's directive census carries it: the text stands without
+/// the fallback.
+#[test]
+fn per_vertex_interpolation_keeps_its_enable() {
+    let src = "enable wgpu_per_vertex;\n\
+               @group(0) @binding(0) var<uniform> tint: vec4f;\n\
+               struct V { @builtin(position) p: vec4f, @location(0) @interpolate(per_vertex) c: array<vec3f, 3> }\n\
+               @fragment fn fs(v: V) -> @location(0) vec4f { return vec4f(v.c[0], 1.0) * tint; }\n";
+    let out = run(src, &Config::default()).expect("run failed");
+    assert!(
+        out.report.fallback.is_none(),
+        "generator text stands: {}",
+        out.source
+    );
+    assert!(
+        out.source.starts_with("enable wgpu_per_vertex;")
+            && out.source.contains("@interpolate(per_vertex)"),
+        "{}",
+        out.source
+    );
 }
 
 /// Preamble member names are preserved as MEMBER names only: a body function
@@ -2183,5 +2359,349 @@ fn preamble_member_names_do_not_freeze_body_functions() {
         out.source.contains("params.k"),
         "the preamble member keeps its name: {}",
         out.source
+    );
+}
+
+/// A parse label reports the caller's coordinates: the `enable f16;` line
+/// `run` injects and a spliced preamble are subtracted out; the preamble's
+/// own labels stay relative to the preamble text.
+#[test]
+fn parse_error_location_is_in_the_callers_coordinates() {
+    let Err(err) = run("fn bad { }", &Config::default()) else {
+        panic!("syntax error must fail");
+    };
+    let loc = err.location().expect("labelled");
+    assert_eq!((loc.line_number, loc.line_position), (1, 8), "{err}");
+
+    let config = Config {
+        preamble: Some("struct P { t: f32 }\n@group(0) @binding(0) var<uniform> p: P;\n".into()),
+        ..Config::default()
+    };
+    let src = "fn g() -> f16 { return 1h; }\n@compute @workgroup_size(1) fn m() {\n  let x = ;\n}";
+    let Err(err) = run(src, &config) else {
+        panic!("syntax error must fail");
+    };
+    let loc = err.location().expect("labelled");
+    assert_eq!((loc.line_number, loc.line_position), (3, 11), "{err}");
+
+    let config = Config {
+        preamble: Some("struct P { t: f32 \n".into()),
+        ..Config::default()
+    };
+    let Err(err) = run("fn m() {}", &config) else {
+        panic!("preamble syntax error must fail");
+    };
+    assert!(err.to_string().contains("<preamble>"), "{err}");
+    assert!(err.location().is_some(), "{err}");
+}
+
+/// `preserve_interface` keeps what a by-name host reads (bound globals,
+/// overrides, reached struct types and members) and nothing else.
+#[test]
+fn preserve_interface_keeps_host_visible_names_only() {
+    let src = "struct Light { color: vec3f, radius: f32 }\n\
+        struct Camera { view: mat4x4f, lights: array<Light, 2> }\n\
+        struct Local { scratch: f32 }\n\
+        @group(0) @binding(0) var<uniform> camera: Camera;\n\
+        override BIAS: f32 = 1.0;\n\
+        @id(3) override SCALE: f32 = 2.0;\n\
+        var<private> counter: f32;\n\
+        fn helper(p: vec3f) -> f32 { var l: Local; l.scratch = p.x; counter += l.scratch; return counter; }\n\
+        @fragment fn main() -> @location(0) vec4f {\n\
+            let c = camera.lights[1].color * camera.lights[0].radius + BIAS * SCALE;\n\
+            return camera.view * vec4f(c, helper(c));\n\
+        }";
+    let plain = run(src, &Config::default()).expect("minifies").source;
+    // An `@id`-less override is already kept by role (`BIAS`); the rest is
+    // renamed under the default profile.
+    for name in ["camera", "Camera", "lights", "SCALE"] {
+        assert!(
+            !plain.contains(name),
+            "{name} is renamed by default: {plain}"
+        );
+    }
+    assert!(plain.contains("override BIAS"), "{plain}");
+    let config = Config {
+        preserve_interface: true,
+        ..Config::default()
+    };
+    let kept = run(src, &config).expect("minifies").source;
+    for name in [
+        "var<uniform>camera:Camera",
+        "struct Camera{view:",
+        "lights:array<Light,2>",
+        "struct Light{color:",
+        "radius:f32",
+        "override BIAS",
+        "override SCALE",
+    ] {
+        assert!(kept.contains(name), "{name} must be preserved: {kept}");
+    }
+    for name in ["helper", "counter", "Local", "scratch"] {
+        assert!(!kept.contains(name), "{name} is not interface: {kept}");
+    }
+}
+
+// MARK: Pass-order and driver regressions
+
+/// `resugar_short_circuits` rebuilds the arena (renumbering every handle),
+/// so the forwarder's index bounds must be sized after it: a stale table
+/// let a const out-of-bounds forward through and the whole dead_branch run
+/// rolled back, every sweep, until `compact` had culled the dead handle.
+#[test]
+fn dead_branch_sizes_its_index_bounds_after_the_resugar() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\
+        @group(0) @binding(1) var<storage, read> inp: array<u32>;\
+        @compute @workgroup_size(1) fn main() {\
+          var unused: u32 = 5u;\
+          var i: i32; i = 4;\
+          let a = array<u32, 4>(1u, 2u, 3u, 4u);\
+          if (inp[0] > 1u && inp[1] > 2u) { out[0] = a[i + 1]; }\
+        }";
+    let output = run(src, &Config::default()).expect("minifies");
+    assert!(
+        output.report.pass_reports.iter().all(|p| !p.rolled_back),
+        "no pass run may roll back: {}",
+        output.source
+    );
+}
+
+/// An unevaluable index slot is declined only where a zero-init local's
+/// fold could make it const: `a[select(z + 4u, 0u, runtime)]` stays
+/// runtime whatever `z` folds to, so the fold inside it is free (and the
+/// output is what a second pass would have produced anyway).
+#[test]
+fn an_index_slot_with_a_runtime_leaf_folds_its_zero_local() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\
+        @group(0) @binding(1) var<storage, read> inp: array<u32>;\
+        @compute @workgroup_size(1) fn main() {\
+          var z: u32; var y: u32;\
+          let a = array<u32, 4>(1u, 2u, 3u, 4u);\
+          out[0] = a[select(z + 4u, 0u, inp[0] > 3u)];\
+          out[1] = a[(y + 4u) & inp[1]];\
+        }";
+    let first = run(src, &Config::default()).expect("minifies").source;
+    assert!(
+        first.contains("select(4u,0u,") && first.contains("[4&"),
+        "the zero locals fold: {first}"
+    );
+    let second = run(&first, &Config::default()).expect("minifies").source;
+    assert_eq!(first, second, "idempotent");
+}
+
+/// `const_hoist` counts a vector only where it renders: one `const_fold`
+/// materialised at `arr[1]` and then folded away with its `.z` reader is
+/// emitted but consumed by nothing, and hoisting it made a `const` with a
+/// single live use.
+#[test]
+fn const_hoist_ignores_an_unreferenced_materialised_vector() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<f32>;\
+        @group(0) @binding(1) var<storage, read> inp: array<u32>;\
+        @compute @workgroup_size(1) fn main() {\
+          let arr = array<vec4f, 2>(vec4f(1.0), vec4f(5.0, 6.0, 7.0, 8.0));\
+          out[0] = arr[1].z; out[1] = arr[1].w; out[2] = arr[1].x;\
+          out[3] = arr[inp[0]].y;\
+        }";
+    let first = run(src, &Config::default()).expect("minifies").source;
+    assert!(!first.contains("const "), "nothing to hoist: {first}");
+    let second = run(&first, &Config::default()).expect("minifies").source;
+    assert_eq!(first, second, "idempotent");
+}
+
+/// Two sites of one long vector pay for a shared `const` once the render
+/// confirms it, so `const_hoist` no longer waits for a third site.
+#[test]
+fn a_two_site_vector_constant_is_hoisted_when_the_output_shrinks() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<vec4f>;\
+        fn f(v: vec4f) -> vec4f { return v * vec4f(7.25, 2.125, 9.5, 3.75); }\
+        @compute @workgroup_size(1) fn main() {\
+          o[0] = f(o[1]) + vec4f(7.25, 2.125, 9.5, 3.75);\
+        }";
+    let first = run(src, &Config::default()).expect("minifies").source;
+    assert!(
+        first.contains("const ") && first.matches("7.25").count() == 1,
+        "the vector is declared once and referenced twice: {first}"
+    );
+    let second = run(&first, &Config::default()).expect("minifies").source;
+    assert_eq!(first, second, "idempotent");
+}
+
+/// A short vector at two sites costs more as a declaration than it saves;
+/// the per-site model declines it before any render.
+#[test]
+fn a_two_site_hoist_that_cannot_pay_is_declined() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<vec2f>;\
+        fn f(v: vec2f) -> vec2f { return v * vec2f(1.0, 2.0); }\
+        @compute @workgroup_size(1) fn main() { o[0] = f(o[1]) + vec2f(1.0, 2.0); }";
+    let first = run(src, &Config::default()).expect("minifies").source;
+    assert!(!first.contains("const "), "nothing pays: {first}");
+}
+
+/// Four `vec3f(.125)` share a `const` (beside a vector operand such a
+/// value collapses to its scalar, which the render sees and the per-site
+/// model does not - that group is declined by the trial), and a matrix
+/// built from constant columns hoists as ONE constant: its columns render
+/// through it, never on their own.
+#[test]
+fn repeated_splat_values_and_nested_constant_constructors_are_hoisted_whole() {
+    let splat = "@group(0) @binding(0) var<storage, read_write> o: array<vec3f>;\
+        fn f(v: vec3f) -> vec3f { return select(v, vec3f(0.125), v.x > 1.0); }\
+        @compute @workgroup_size(1) fn main() {\
+          o[0] = f(vec3f(0.125)); o[1] = f(vec3f(0.125)); o[2] = vec3f(0.125);\
+        }";
+    let first = run(splat, &Config::default()).expect("minifies").source;
+    assert_eq!(
+        first.matches(".125").count(),
+        1,
+        "one declaration serves the four splats: {first}"
+    );
+    assert_eq!(
+        run(&first, &Config::default()).expect("minifies").source,
+        first
+    );
+
+    let matrix = "@group(0) @binding(0) var<storage, read_write> o: array<vec2f>;\
+        fn f(v: vec2f) -> vec2f { return mat2x2f(vec2f(1.5, 0.25), vec2f(0.75, 1.25)) * v; }\
+        @compute @workgroup_size(1) fn main() {\
+          o[0] = f(o[1]) + mat2x2f(vec2f(1.5, 0.25), vec2f(0.75, 1.25)) * o[2];\
+        }";
+    let first = run(matrix, &Config::default()).expect("minifies").source;
+    assert_eq!(first.matches("const ").count(), 1, "one constant: {first}");
+    assert_eq!(first.matches("1.5").count(), 1, "declared once: {first}");
+    assert_eq!(
+        run(&first, &Config::default()).expect("minifies").source,
+        first
+    );
+}
+
+/// A value the module already declares as a `const` anchors its sites: they
+/// reference it and no twin is minted - the source's own constant here, and
+/// on a re-minification the constant the first pass hoisted, whose value a
+/// fold over it rebuilds.
+#[test]
+fn sites_of_a_declared_constant_reference_it_instead_of_a_twin() {
+    let src = "const K = vec3f(1.5, 2.5, 3.5);\
+        @group(0) @binding(0) var<storage, read_write> o: array<vec3f>;\
+        fn f(v: vec3f) -> vec3f { return v * vec3f(1.5, 2.5, 3.5); }\
+        @compute @workgroup_size(1) fn main() { o[0] = f(o[1]) + K; o[2] = vec3f(1.5, 2.5, 3.5); }";
+    let first = run(src, &Config::default()).expect("minifies").source;
+    assert_eq!(first.matches("const ").count(), 1, "one constant: {first}");
+    assert_eq!(first.matches("1.5").count(), 1, "declared once: {first}");
+    assert_eq!(
+        run(&first, &Config::default()).expect("minifies").source,
+        first
+    );
+}
+
+/// `var v = K;` needs no `: T` when `K` is a named constant of a concrete
+/// type: its declaration fixes the type the way a constructor would.
+#[test]
+fn a_var_initialised_from_a_named_constant_elides_its_type() {
+    let src = "const K = vec3f(1.5, 2.5, 3.5);\
+        @group(0) @binding(0) var<storage, read_write> o: array<vec3f>;\
+        @compute @workgroup_size(1) fn main() { var v = K; v.x += o[1].x; o[0] = v + K; }";
+    let first = run(src, &Config::default()).expect("minifies").source;
+    let var_decl = first
+        .split(';')
+        .find(|stmt| stmt.contains("var ") && !stmt.contains("var<"))
+        .expect("the local survives");
+    assert!(
+        !var_decl.contains(':'),
+        "the constant's type is concrete, so the var infers it: {first}"
+    );
+    assert_eq!(
+        run(&first, &Config::default()).expect("minifies").source,
+        first
+    );
+}
+
+/// A module-level `diagnostic(...)` directive hands every function the
+/// module's filter leaf, which is the caller's too: the splice is still
+/// free.  Only a helper carrying its own `@diagnostic` keeps its call.
+#[test]
+fn a_module_diagnostic_directive_does_not_block_splicing() {
+    let src = "diagnostic(off, derivative_uniformity);\
+        @group(0) @binding(0) var<storage, read_write> out: array<f32>;\
+        fn helper(x: f32) -> f32 { var t = x * 2.0; t += 1.0; return t; }\
+        @compute @workgroup_size(1) fn main() { out[0] = helper(out[1]); }";
+    let output = run(src, &Config::default()).expect("minifies").source;
+    assert!(
+        !output.contains("fn helper") && !output.contains("fn a("),
+        "the helper is spliced: {output}"
+    );
+    assert_eq!(
+        output.matches("fn ").count(),
+        1,
+        "only the entry point remains: {output}"
+    );
+}
+
+/// A parse label at the end of a body a preamble splice terminated with a
+/// newline clamps to the source's end instead of dropping the location, and
+/// a lone-CR source resolves its position on the normalised text (the one
+/// naga counted lines in).
+#[test]
+fn parse_locations_survive_a_trailing_label_and_lone_cr_endings() {
+    let config = Config {
+        preamble: Some("struct P { a: f32 }\n@group(0) @binding(0) var<uniform> u: P;\n".into()),
+        ..Config::default()
+    };
+    let Err(err) = run("fn f() -> f32 { return u.a; ", &config) else {
+        panic!("an unterminated body parses");
+    };
+    let loc = err.location().expect("a location in the user's text");
+    assert_eq!((loc.line_number, loc.line_position), (1, 29));
+    let Err(err) = run(
+        "const x = 1;\rconst y = 2;\rlet z = ;\r",
+        &Config::default(),
+    ) else {
+        panic!("a statement at module scope parses");
+    };
+    let loc = err.location().expect("a location");
+    assert_eq!(loc.line_number, 3);
+}
+
+/// A run cut short by `opt_bisect_limit` is no fixed point.
+#[test]
+fn a_bisect_cut_reports_not_converged() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<f32>;\
+        fn helper(x: f32) -> f32 { var t = x * 2.0; t += 1.0; return t; }\
+        @compute @workgroup_size(1) fn main() { out[0] = helper(out[1]) + 0.0; }";
+    let config = Config {
+        trace: config::TraceConfig {
+            opt_bisect_limit: Some(1),
+            ..Default::default()
+        },
+        ..Config::default()
+    };
+    let output = run(src, &config).expect("minifies");
+    assert!(!output.report.converged, "{:?}", output.report.sweeps);
+}
+
+/// naga is `no_std` and folds `f32` builtins through the `libm` crate; if
+/// any dependency in its closure links `std` (`half` with its default
+/// features would), rustc resolves the same calls to the platform's libm,
+/// whose `coshf(1)` is a last ULP off on macOS - a parse-time fold the
+/// wasm build cannot follow.  `Cargo.toml` keeps `half` at
+/// `default-features = false`; this pins the fold that showed it.
+#[test]
+fn nagas_f32_builtins_fold_through_the_libm_crate() {
+    let module = io::parse_wgsl(
+        "@group(0) @binding(0) var<storage, read_write> o: vec4<f32>;\
+         @compute @workgroup_size(1) fn m() { o = cosh(vec4<f32>(1f, 1f, 1f, 1f)); }",
+    )
+    .unwrap();
+    let folded: Vec<u32> = module.entry_points[0]
+        .function
+        .expressions
+        .iter()
+        .filter_map(|(_, e)| match e {
+            naga::Expression::Literal(naga::Literal::F32(v)) => Some(v.to_bits()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        folded, [0x3fc5_83aa; 4],
+        "cosh(1f) must fold to 1.5430806 (libm), not the platform's 1.5430807"
     );
 }

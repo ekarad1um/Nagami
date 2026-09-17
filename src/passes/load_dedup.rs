@@ -2,7 +2,8 @@
 //! every sweep:
 //!
 //! 1. Dead-store removal: whole-variable `Store`s overwritten before any
-//!    read in the same block, or still pending at a terminator.
+//!    read in the same block, or still pending at a `Return` or where
+//!    control falls off the function's end.
 //! 2. Load deduplication: repeated `Load`s forward to the most recent
 //!    dominating stored (or init) value through a `ScopedMap`; aliasing
 //!    stores and calls invalidate, and a loop starts from an empty
@@ -19,19 +20,23 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::marker::PhantomData;
 
+use crate::analysis::ExprClass;
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
 
-use super::expr_util::for_each_function_mut;
 use super::expr_util::has_negative_zero_leaf;
 use super::expr_util::{
-    LEAF_FLOAT, LEAF_FLOAT_ZERO, flatten_replacement_chains, float_leaf_bits, for_each_statement,
-    is_integer_zero_literal, is_sign_sensitive_op, nested_blocks, nested_blocks_mut,
-    remap_statement_handles, root_local_var, sensitive_leaves, shift_amount_is_static_error,
-    try_map_expression_handles_in_place, visit_expression_children, visit_statement_write_pointers,
+    LEAF_FLOAT, LEAF_FLOAT_ZERO, const_sign_changes, float_leaf_bits, is_integer_zero_literal,
+    is_sign_sensitive_op, root_local_var, shift_amount_is_static_error,
 };
 use super::scoped_map::ScopedMap;
 use crate::handle_set::{HandleMap, HandleSet};
+use crate::ir::rewrite::{Rewrite, flatten_replacement_chains, follow, rewrite_block};
+use crate::ir::visit::{
+    Scope, for_each_statement, nested_blocks, nested_blocks_mut,
+    try_map_expression_handles_in_place, visit_expression_children, visit_statement_write_pointers,
+};
+use crate::ir::visit::{Slot, Visitor, walk_block};
 
 /// Four-phase load / store dataflow cleanup.
 #[derive(Debug, Default)]
@@ -44,10 +49,13 @@ impl Pass for LoadDedupPass {
 
     fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
         let mut changed = false;
-        let types = &module.types;
-        for_each_function_mut(&mut module.functions, &mut module.entry_points, &mut |f| {
+        let const_literals = super::const_fold::constant_literals(module);
+        crate::ir::visit::for_each_function_taken(module, &mut |f, module| {
+            // Sized before the rewrites, which keep every `Access` and its
+            // base's type.
+            let access_lens = super::expr_util::access_static_lengths(f, module);
             changed |= remove_dead_stores_in_function(f);
-            changed |= dedup_loads_in_function(f, types);
+            changed |= dedup_loads_in_function(f, &module.types, &const_literals, &access_lens);
             changed |= eliminate_write_only_locals(f);
             changed |= remove_dead_inits(f);
         });
@@ -129,89 +137,19 @@ struct ExpressionScopeIndex<'body> {
 impl<'body> ExpressionScopeIndex<'body> {
     /// `expressions` only sizes `handle_pos`; the arena is not retained.
     fn build(body: &'body naga::Block, expressions: &naga::Arena<naga::Expression>) -> Self {
-        let mut idx = ExpressionScopeIndex {
-            handle_pos: vec![None; expressions.len()],
-            store_pos: Default::default(),
-            block_interval: Default::default(),
-            _phantom: PhantomData,
+        let mut builder = IndexBuilder {
+            idx: ExpressionScopeIndex {
+                handle_pos: vec![None; expressions.len()],
+                store_pos: Default::default(),
+                block_interval: Default::default(),
+                _phantom: PhantomData,
+            },
+            pos: 0,
+            here: 0,
+            enters: Vec::new(),
         };
-        let mut pos = 0u32;
-        idx.walk(body, &mut pos);
-        idx
-    }
-
-    fn walk(&mut self, block: &'body naga::Block, pos: &mut u32) {
-        let enter = *pos;
-        for stmt in block.iter() {
-            let here = *pos;
-            // Panics in release too: a wrapped position would corrupt
-            // both interval membership and store / load ordering, and
-            // 2^32 statements is a bug, not a workload.
-            *pos = pos
-                .checked_add(1)
-                .expect("ExpressionScopeIndex: more than 2^32 statements in a single function");
-            match stmt {
-                naga::Statement::Emit(range) => {
-                    for h in range.clone() {
-                        self.handle_pos[h.index()] = Some(here);
-                    }
-                }
-                naga::Statement::Store { pointer, value } => {
-                    self.store_pos
-                        .entry((*pointer, *value))
-                        .and_modify(|p| {
-                            if here < *p {
-                                *p = here;
-                            }
-                        })
-                        .or_insert(here);
-                }
-                naga::Statement::Call {
-                    result: Some(r), ..
-                }
-                | naga::Statement::Atomic {
-                    result: Some(r), ..
-                } => {
-                    self.handle_pos[r.index()] = Some(here);
-                }
-                naga::Statement::WorkGroupUniformLoad { result, .. }
-                | naga::Statement::SubgroupBallot { result, .. }
-                | naga::Statement::SubgroupGather { result, .. }
-                | naga::Statement::SubgroupCollectiveOperation { result, .. } => {
-                    self.handle_pos[result.index()] = Some(here);
-                }
-                naga::Statement::RayQuery { fun, .. } => {
-                    if let naga::RayQueryFunction::Proceed { result } = fun {
-                        self.handle_pos[result.index()] = Some(here);
-                    }
-                }
-                // No handles introduced.  Enumerated rather than `_` so a
-                // new naga variant carrying a result handle trips the
-                // build; `nested_blocks` gives the same guarantee for
-                // descent.
-                naga::Statement::Block(_)
-                | naga::Statement::If { .. }
-                | naga::Statement::Switch { .. }
-                | naga::Statement::Loop { .. }
-                | naga::Statement::Call { result: None, .. }
-                | naga::Statement::Atomic { result: None, .. }
-                | naga::Statement::Break
-                | naga::Statement::Continue
-                | naga::Statement::Return { .. }
-                | naga::Statement::Kill
-                | naga::Statement::ControlBarrier(_)
-                | naga::Statement::MemoryBarrier(_)
-                | naga::Statement::ImageStore { .. }
-                | naga::Statement::ImageAtomic { .. }
-                | naga::Statement::RayPipelineFunction(_)
-                | naga::Statement::CooperativeStore { .. } => {}
-            }
-            for nested in nested_blocks(stmt) {
-                self.walk(nested, pos);
-            }
-        }
-        self.block_interval
-            .insert(block as *const naga::Block, (enter, *pos));
+        walk_block(body, Scope::default(), &mut builder);
+        builder.idx
     }
 
     /// `None` for pre-emit handles and for handles no statement reached.
@@ -242,6 +180,57 @@ impl<'body> ExpressionScopeIndex<'body> {
         };
         self.handle_position(h)
             .is_some_and(|p| p >= enter && p < exit)
+    }
+}
+
+/// The walk that numbers statements in pre-order and records where each
+/// handle and block lands.
+struct IndexBuilder<'body> {
+    idx: ExpressionScopeIndex<'body>,
+    /// The next statement's position; the current one's.
+    pos: u32,
+    here: u32,
+    /// Entry positions of the blocks being walked, innermost last.
+    enters: Vec<u32>,
+}
+
+impl Visitor for IndexBuilder<'_> {
+    fn enter_block(&mut self, _: &naga::Block, _: Scope) {
+        self.enters.push(self.pos);
+    }
+    fn exit_block(&mut self, block: &naga::Block, _: Scope) {
+        let enter = self.enters.pop().expect("every exit follows its entry");
+        self.idx
+            .block_interval
+            .insert(block as *const naga::Block, (enter, self.pos));
+    }
+    fn stmt(&mut self, stmt: &naga::Statement, _: Scope) -> bool {
+        self.here = self.pos;
+        // Panics in release too: a wrapped position would corrupt
+        // both interval membership and store / load ordering, and
+        // 2^32 statements is a bug, not a workload.
+        self.pos = self
+            .pos
+            .checked_add(1)
+            .expect("ExpressionScopeIndex: more than 2^32 statements in a single function");
+        if let naga::Statement::Store { pointer, value } = stmt {
+            let here = self.here;
+            self.idx
+                .store_pos
+                .entry((*pointer, *value))
+                .and_modify(|p| {
+                    if here < *p {
+                        *p = here;
+                    }
+                })
+                .or_insert(here);
+        }
+        true
+    }
+    fn handle(&mut self, h: naga::Handle<naga::Expression>, slot: Slot) {
+        if matches!(slot, Slot::Emitted | Slot::Result) {
+            self.idx.handle_pos[h.index()] = Some(self.here);
+        }
     }
 }
 
@@ -409,7 +398,11 @@ fn collect_touched_locals(
 // MARK: Dead-store removal
 
 fn remove_dead_stores_in_function(function: &mut naga::Function) -> bool {
-    remove_dead_stores_in_block(&mut function.body, &function.expressions)
+    remove_dead_stores_in_block(
+        &mut function.body,
+        &function.expressions,
+        /*tail=*/ true,
+    )
 }
 
 /// Drop every store, whole or partial, to a local nothing observes.
@@ -503,34 +496,53 @@ fn remove_stores_to_dead_locals(
     used: &HandleSet<naga::LocalVariable>,
 ) -> bool {
     let mut changed = false;
-    let original = std::mem::replace(block, naga::Block::new());
-    for (mut stmt, span) in original.span_into_iter() {
+    rewrite_block(block, Scope::default(), &mut |stmt, span, out, _| {
         if let naga::Statement::Store { pointer, .. } = &stmt
             && let Some(local) = root_local_var(*pointer, expressions)
             && !used.contains(local)
         {
             changed = true;
-            continue;
+            return;
         }
-        for nested in nested_blocks_mut(&mut stmt) {
-            changed |= remove_stores_to_dead_locals(nested, expressions, used);
-        }
-        block.push(stmt, span);
-    }
+        out.push(stmt, span);
+    });
     changed
 }
 
 /// A whole-variable Store overwritten by another before any Load of the
-/// local, or still pending at a terminator, is dead.
+/// local, or still pending at a terminator, is dead.  `tail` says `block`
+/// ends the function by falling off - the body, or an if-arm, block or
+/// non-fall-through switch case in tail position - where a pending store
+/// is as dead as at a `Return` (a void body carries no trailing one).
 fn remove_dead_stores_in_block(
     block: &mut naga::Block,
     expressions: &naga::Arena<naga::Expression>,
+    tail: bool,
 ) -> bool {
     let mut changed = false;
 
-    for stmt in block.iter_mut() {
-        for nested in nested_blocks_mut(stmt) {
-            changed |= remove_dead_stores_in_block(nested, expressions);
+    let last = block.len().saturating_sub(1);
+    for (idx, stmt) in block.iter_mut().enumerate() {
+        let nested_tail = tail && idx == last;
+        match stmt {
+            naga::Statement::If { accept, reject, .. } => {
+                changed |= remove_dead_stores_in_block(accept, expressions, nested_tail);
+                changed |= remove_dead_stores_in_block(reject, expressions, nested_tail);
+            }
+            naga::Statement::Block(inner) => {
+                changed |= remove_dead_stores_in_block(inner, expressions, nested_tail);
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases.iter_mut() {
+                    let case_tail = nested_tail && !case.fall_through;
+                    changed |= remove_dead_stores_in_block(&mut case.body, expressions, case_tail);
+                }
+            }
+            other => {
+                for nested in nested_blocks_mut(other) {
+                    changed |= remove_dead_stores_in_block(nested, expressions, false);
+                }
+            }
         }
     }
 
@@ -585,6 +597,11 @@ fn remove_dead_stores_in_block(
             }),
         }
     }
+    if tail {
+        for (_, prev_idx) in pending_store.drain() {
+            dead_indices.push(prev_idx);
+        }
+    }
 
     if !dead_indices.is_empty() {
         // Descending so earlier indices stay valid; contiguous runs cull as
@@ -612,25 +629,6 @@ fn remove_dead_stores_in_block(
 
 // MARK: Load deduplication
 
-/// The expression that will stand where `start` does once the rewrite runs.
-/// The budget is a cycle net; chains are acyclic by construction.
-fn forward_target(
-    expressions: &naga::Arena<naga::Expression>,
-    replacements: &HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
-    start: naga::Handle<naga::Expression>,
-) -> naga::Handle<naga::Expression> {
-    let mut handle = start;
-    let mut budget = expressions.len() + 1;
-    while let Some(&next) = replacements.get(handle) {
-        handle = next;
-        budget -= 1;
-        if budget == 0 {
-            break;
-        }
-    }
-    handle
-}
-
 /// Per-handle "reads as a const-expression once the forwards are applied",
 /// the question the whole guard turns on: a runtime slot cannot be a
 /// shader-creation error however its arithmetic falls out.  Children precede
@@ -641,26 +639,17 @@ fn const_after_forwarding(
     expressions: &naga::Arena<naga::Expression>,
     replacements: &HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
 ) -> Vec<bool> {
-    let mut is_const = vec![false; expressions.len()];
-    for (handle, expr) in expressions.iter() {
-        let target = forward_target(expressions, replacements, handle);
-        is_const[handle.index()] = if target.index() > handle.index() {
-            true
+    crate::passes::expr_util::const_cones(expressions, |handle, _, filled| {
+        let target = follow(replacements, handle);
+        if target.index() > handle.index() {
+            Some(true)
         } else if target != handle {
             // A chain end is never itself forwarded, so its entry is final.
-            is_const[target.index()]
+            Some(filled[target.index()])
         } else {
-            match crate::passes::expr_util::const_expression_leaf(expr) {
-                Some(known) => known,
-                None => {
-                    let mut all = true;
-                    visit_expression_children(expr, |child| all &= is_const[child.index()]);
-                    all
-                }
-            }
-        };
-    }
-    is_const
+            None
+        }
+    })
 }
 
 /// Every [`is_sign_sensitive_op`] in the arena.
@@ -693,7 +682,7 @@ fn collect_slot_forwards(
         }
         let target = if replacements.contains_key(handle) {
             out.push(handle);
-            forward_target(expressions, replacements, handle)
+            follow(replacements, handle)
         } else {
             handle
         };
@@ -713,7 +702,7 @@ fn float_leaves_after_forwarding(
 ) -> Vec<u8> {
     let mut leaves = vec![0u8; expressions.len()];
     for (handle, _) in expressions.iter() {
-        let target = forward_target(expressions, replacements, handle);
+        let target = follow(replacements, handle);
         leaves[handle.index()] = if target.index() > handle.index() {
             LEAF_FLOAT_ZERO | LEAF_FLOAT
         } else if target != handle {
@@ -739,12 +728,12 @@ fn float_leaves_after_forwarding(
 ///
 /// Returns the handles it dropped, so a caller that also DELETES the store
 /// behind a forward (register promotion) can keep the ones it must not.  Any
-/// map of load -> value over this arena works, which is why the rule lives
-/// here once rather than in each pass that substitutes a value for a runtime
-/// binding.
+/// map of load -> value over this arena works, so register promotion shares
+/// it rather than carrying a second copy.
 pub(super) fn decline_sign_sensitive_forwards(
     expressions: &naga::Arena<naga::Expression>,
     types: &naga::UniqueArena<naga::Type>,
+    const_literals: &super::const_fold::ConstantLiterals,
     replacements: &mut HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
 ) -> Vec<naga::Handle<naga::Expression>> {
     let roots = sign_sensitive_slots(expressions);
@@ -759,46 +748,119 @@ pub(super) fn decline_sign_sensitive_forwards(
     let mut walk = SlotWalk::default();
     let mut to_decline = Vec::new();
     for root in roots {
-        if !after[root.index()]
-            || before[root.index()]
-            || leaves[root.index()] & sensitive_leaves(&expressions[root]) == 0
-        {
+        if !after[root.index()] || before[root.index()] {
             continue;
         }
-        collect_slot_forwards(expressions, replacements, root, &mut walk, &mut to_decline);
+        // The slot as the rewrite will read it (`var p = 1f; -(p - 1f)`
+        // computes its zero), evaluated only where the leaves do not decide.
+        let changes = const_sign_changes(&expressions[root], leaves[root.index()], || {
+            let mut scratch = naga::Arena::new();
+            let cloned = forwarded_cone(
+                expressions,
+                replacements,
+                root,
+                &mut scratch,
+                &mut HandleMap::default(),
+            );
+            super::const_fold::evaluates_to_negative_zero(types, const_literals, &scratch, cloned)
+        });
+        if changes {
+            collect_slot_forwards(expressions, replacements, root, &mut walk, &mut to_decline);
+        }
     }
-    for &handle in &to_decline {
-        replacements.remove(handle);
-    }
-    to_decline
+    drop_forwards(expressions, replacements, to_decline)
 }
 
-/// Drop forwards that would make the RHS of an integer `/` `%` `<<` `>>` a
-/// const-expression and turn a legal RUNTIME operation into a
-/// shader-creation error (integer divide / modulo by zero, shift `>=` bit
-/// width).  There is no emitter-side net: naga's front-end const-folds a
-/// `let` whose initializer is const, so binding the operand does not clear
-/// the error and the module falls back to LEXICAL COMPACTION - every forward
-/// lost, not just this one.  MUST precede the dead-local scan: a declined
-/// load stays live, so its store must not be classed dead.
-fn decline_static_error_forwards(
+/// Drop the forwards of `declined`, except one to a load that stays a
+/// load: the slot reads the same runtime value through it, so it makes
+/// none of the crossings the two guards decline, and a `var`'s later
+/// loads chain to its first as they do after an init - the guards
+/// collect every forward of a slot, the load-to-load ones with the
+/// const-making one.  Returns what was dropped.
+fn drop_forwards(
     expressions: &naga::Arena<naga::Expression>,
     replacements: &mut HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
-) {
+    declined: Vec<naga::Handle<naga::Expression>>,
+) -> Vec<naga::Handle<naga::Expression>> {
+    let declined_set: HandleSet<naga::Expression> = declined.iter().copied().collect();
+    let mut dropped = Vec::new();
+    for handle in declined {
+        let stays_a_load = replacements.get(handle).is_some_and(|&target| {
+            matches!(expressions[target], naga::Expression::Load { .. })
+                && (!replacements.contains_key(target) || declined_set.contains(target))
+        });
+        if !stays_a_load && replacements.remove(handle).is_some() {
+            dropped.push(handle);
+        }
+    }
+    dropped
+}
+
+/// Drop forwards that would make a static-error slot (the RHS of an
+/// integer `/` `%` `<<` `>>`, the index of an `Access` `access_lens` bounds)
+/// a const-expression and turn a legal RUNTIME operation into a
+/// shader-creation error (integer divide / modulo by zero, shift `>=` bit
+/// width, index outside the base).  No emitter-side `let` hides it (naga's
+/// front-end folds a `let` whose initializer is const) and the driver's
+/// validation ([`super::const_fold::module_static_error_slot`]) rolls the
+/// whole pass back - every forward lost, not just this one.  MUST precede
+/// the dead-local scan: a declined load stays live, so its store must not
+/// be classed dead.  Returns the declined loads, as
+/// [`decline_sign_sensitive_forwards`] does and for the same reason.
+pub(super) fn decline_static_error_forwards(
+    expressions: &naga::Arena<naga::Expression>,
+    types: &naga::UniqueArena<naga::Type>,
+    const_literals: &super::const_fold::ConstantLiterals,
+    access_lens: &[Option<super::expr_util::IndexBound>],
+    replacements: &mut HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
+) -> Vec<naga::Handle<naga::Expression>> {
     let mut to_decline: Vec<naga::Handle<naga::Expression>> = Vec::new();
-    // Most arenas hold no failable operator and the vector is O(arena):
-    // build it on the first one, never again.
+    // Most arenas hold no failable slot and the vector is O(arena): build
+    // it on the first one, never again.
     let mut is_const: Option<Vec<bool>> = None;
     let mut walk = SlotWalk::default();
-    for (_, expr) in expressions.iter() {
-        let naga::Expression::Binary { op, right, .. } = expr else {
-            continue;
-        };
-        let is_dangerous: &dyn Fn(&naga::Literal) -> bool = match op {
-            naga::BinaryOperator::Divide | naga::BinaryOperator::Modulo => &is_integer_zero_literal,
-            naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight => {
-                &shift_amount_is_static_error
-            }
+    for (h, expr) in expressions.iter() {
+        let (operand, is_dangerous): (_, &dyn Fn(&naga::Literal) -> bool) = match expr {
+            naga::Expression::Binary { op, right, .. } => match op {
+                naga::BinaryOperator::Divide | naga::BinaryOperator::Modulo => {
+                    (*right, &is_integer_zero_literal)
+                }
+                naga::BinaryOperator::ShiftLeft | naga::BinaryOperator::ShiftRight => {
+                    (*right, &shift_amount_is_static_error)
+                }
+                _ => continue,
+            },
+            // An index is judged on its forwarded VALUE, not by the interior
+            // rule: `a[i + 1]` with `i` forwarded is the common shape, and
+            // `operand_is_static_error` sizes it exactly.
+            naga::Expression::Access { index, .. } => match access_lens.get(h.index()) {
+                Some(Some(bound)) => {
+                    let is_const = is_const
+                        .get_or_insert_with(|| const_after_forwarding(expressions, replacements));
+                    if !is_const[index.index()] {
+                        continue;
+                    }
+                    let mut scratch = naga::Arena::new();
+                    let root = forwarded_cone(
+                        expressions,
+                        replacements,
+                        *index,
+                        &mut scratch,
+                        &mut HandleMap::default(),
+                    );
+                    if !super::const_fold::operand_is_static_error(
+                        types,
+                        const_literals,
+                        &scratch,
+                        super::const_fold::Role::index(*bound),
+                        root,
+                    ) {
+                        continue;
+                    }
+                    (*index, &|_: &naga::Literal| true)
+                }
+                _ => continue,
+            },
             _ => continue,
         };
         // Stale only in the direction that declines: a decline turns a slot
@@ -809,21 +871,48 @@ fn decline_static_error_forwards(
             expressions,
             replacements,
             is_const,
-            *right,
+            operand,
             is_dangerous,
             &mut walk,
             &mut to_decline,
         );
     }
-    for handle in to_decline {
-        replacements.remove(handle);
+    drop_forwards(expressions, replacements, to_decline)
+}
+
+/// `root`'s cone as it will read once `replacements` are applied, cloned
+/// into `scratch` (memoised in `memo` by source handle, so a shared
+/// sub-DAG stays shared); the clone of `root`.
+fn forwarded_cone(
+    expressions: &naga::Arena<naga::Expression>,
+    replacements: &HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
+    root: naga::Handle<naga::Expression>,
+    scratch: &mut naga::Arena<naga::Expression>,
+    memo: &mut HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
+) -> naga::Handle<naga::Expression> {
+    let source = follow(replacements, root);
+    if let Some(&cloned) = memo.get(source) {
+        return cloned;
     }
+    let mut expression = expressions[source].clone();
+    let _ = try_map_expression_handles_in_place(&mut expression, &mut |child| {
+        Some(forwarded_cone(
+            expressions,
+            replacements,
+            child,
+            scratch,
+            memo,
+        ))
+    });
+    let cloned = scratch.append(expression, naga::Span::UNDEFINED);
+    memo.insert(source, cloned);
+    cloned
 }
 
 /// Scratch reused across one function's slots.  `interior_seen` is shared
-/// because the interior rule is the same for all four operators, and without
-/// it a shared subexpression is re-walked per parent - exponential on the DAG
-/// `cse` deliberately builds.  The value walk needs no such set: it expands
+/// because the interior rule is the same for every slot kind, and without
+/// it a shared subexpression is re-walked per parent - exponential on a
+/// shared-subexpression DAG.  The value walk needs no such set: it expands
 /// only `Splat` / `Compose`, whose nesting the operand's TYPE bounds, not the
 /// shader.
 #[derive(Default)]
@@ -865,7 +954,7 @@ fn decline_slot_forwards(
     walk.lanes.push(root);
     while let Some(handle) = walk.lanes.pop() {
         if replacements.contains_key(handle) {
-            let target = forward_target(expressions, replacements, handle);
+            let target = follow(replacements, handle);
             match &expressions[target] {
                 naga::Expression::Literal(lit) => {
                     if is_dangerous(lit) {
@@ -903,6 +992,8 @@ fn decline_slot_forwards(
 fn dedup_loads_in_function(
     function: &mut naga::Function,
     types: &naga::UniqueArena<naga::Type>,
+    const_literals: &super::const_fold::ConstantLiterals,
+    access_lens: &[Option<super::expr_util::IndexBound>],
 ) -> bool {
     let mut replacements = Default::default();
     let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
@@ -942,8 +1033,19 @@ fn dedup_loads_in_function(
 
     // Ordering: a declined load stays live, so this must precede the
     // dead-local scan.
-    decline_static_error_forwards(&function.expressions, &mut replacements);
-    decline_sign_sensitive_forwards(&function.expressions, types, &mut replacements);
+    decline_static_error_forwards(
+        &function.expressions,
+        types,
+        const_literals,
+        access_lens,
+        &mut replacements,
+    );
+    decline_sign_sensitive_forwards(
+        &function.expressions,
+        types,
+        const_literals,
+        &mut replacements,
+    );
     if replacements.is_empty() {
         return false;
     }
@@ -980,7 +1082,7 @@ fn dedup_loads_in_function(
     // unless they retire something - the whole local (dead), or by
     // last-store inlining the seeding Store, once every load it seeded
     // has an effective replacement even though earlier loads keep the
-    // local.  Simple values (`is_simple_for_forwarding`) never inflate.
+    // local.  Simple values (`ExprClass::SIMPLE_FORWARD`) never inflate.
 
     // Loop-internal Stores are never removal candidates: the back edge
     // reads them.
@@ -1001,7 +1103,11 @@ fn dedup_loads_in_function(
                 if dead_locals.contains(local) {
                     return None;
                 }
-                if is_simple_for_forwarding(&function.expressions[replacement_h]) {
+                // Sign-of-zero is not filtered here: the seeds this chooses
+                // among already passed `has_negative_zero_leaf`.
+                if ExprClass::node(&function.expressions[replacement_h])
+                    .any(ExprClass::SIMPLE_FORWARD)
+                {
                     return None;
                 }
                 Some(load_h)
@@ -1119,33 +1225,29 @@ fn dedup_loads_in_function(
         return false;
     }
 
-    // `r < handle` blocks illegal forward references; `dead_locals`
-    // mirrors the same guard.
-    for (handle, expr) in function.expressions.iter_mut() {
-        let _ = try_map_expression_handles_in_place(expr, &mut |h| match replacements.get(h) {
-            Some(&r) if r < handle => Some(r),
-            _ => Some(h),
-        });
-    }
-
     // A dead local with an init would still be declared.
     for &lh in &dead_locals {
         function.local_variables[lh].init = None;
     }
 
-    apply_to_block(
+    // The retired stores are keyed on their pre-rewrite `(pointer, value)`,
+    // so they go before the rewrite touches either.
+    drop_retired_stores(
         &mut function.body,
-        &replacements,
         &dead_locals,
         &dead_store_ids,
         &function.expressions,
-        false,
     );
 
-    // A name on a replaced handle would become a dangling `let`.
-    function
-        .named_expressions
-        .retain(|h, _| !replacements.contains_key(h));
+    // `backward_only` blocks illegal forward references (`dead_locals`
+    // mirrors the same guard); a replaced load's `Emit` slot and name go
+    // with it, or the binding would dangle.
+    Rewrite {
+        map: &replacements,
+        backward_only: true,
+        retire_replaced: true,
+    }
+    .apply(function);
 
     true
 }
@@ -1199,27 +1301,6 @@ fn build_max_live_load_positions(
         }
     }
     max_pos
-}
-
-/// Cheap to reference from many sites: pre-emit declaratives never get a
-/// `let`, and a `Load` forwarded to N sites is N references to one
-/// already-emitted handle, not N memory reads - unlike `const_fold`'s
-/// `is_pure_to_clone`, which rejects `Load` because it clones expression
-/// CONTENT into a new arena slot and would emit a second read.
-/// Sign-of-zero is not filtered here: the seeds this chooses among already
-/// passed `has_negative_zero_leaf`.
-fn is_simple_for_forwarding(expr: &naga::Expression) -> bool {
-    matches!(
-        expr,
-        naga::Expression::Literal(_)
-            | naga::Expression::Constant(_)
-            | naga::Expression::Override(_)
-            | naga::Expression::ZeroValue(_)
-            | naga::Expression::FunctionArgument(_)
-            | naga::Expression::GlobalVariable(_)
-            | naga::Expression::LocalVariable(_)
-            | naga::Expression::Load { .. }
-    )
 }
 
 /// Ceiling on a store-seeded value's effective (post-forwarding) tree
@@ -1834,92 +1915,35 @@ pub(crate) fn collect_modified_locals(
 
 // MARK: Replacement application
 
-/// Rewrite statement operands, rebuild `Emit` ranges around survivors,
-/// and drop retired Stores, in one walk.
-fn apply_to_block(
+/// Drop the stores the forwarding retired: every store to a dead local, and
+/// the dead `(pointer, value)` stores outside loops.  `dead_store_ids` keys
+/// by `(pointer, value)` alone, and an in-loop Store can share that identity
+/// with the retired out-of-loop one (`x = e` before and inside the loop);
+/// in-loop Stores are never candidates, so a match there is a collision the
+/// back edge still reads.
+fn drop_retired_stores(
     block: &mut naga::Block,
-    replacements: &HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
     dead_locals: &HandleSet<naga::LocalVariable>,
     dead_store_ids: &FxHashSet<StoreId>,
     expressions: &naga::Arena<naga::Expression>,
-    // Set once inside a `Loop`.  `dead_store_ids` keys by `(pointer, value)`
-    // alone, and an in-loop Store can share that identity with the retired
-    // out-of-loop one (`x = e` before and inside the loop); in-loop Stores
-    // are never candidates, so a match there is a collision the back edge
-    // still reads.
-    in_loop: bool,
 ) {
-    let original = std::mem::take(block);
-    let mut rebuilt = naga::Block::with_capacity(original.len());
-
-    for (mut statement, span) in original.span_into_iter() {
-        match &statement {
-            naga::Statement::Emit(range) => {
-                // Every replacement is effective at all uses (the driver
-                // kept only `target < load`), so the binding can go.
-                let surviving: Vec<_> = range
-                    .clone()
-                    .filter(|h| !replacements.contains_key(h))
-                    .collect();
-
-                if surviving.is_empty() {
-                    continue;
-                }
-
-                let mut start = surviving[0];
-                let mut end = surviving[0];
-                for &h in &surviving[1..] {
-                    if h.index() == end.index() + 1 {
-                        end = h;
-                    } else {
-                        rebuilt.push(
-                            naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
-                            span,
-                        );
-                        start = h;
-                        end = h;
-                    }
-                }
-                rebuilt.push(
-                    naga::Statement::Emit(naga::Range::new_from_bounds(start, end)),
-                    span,
-                );
-                continue;
-            }
-            naga::Statement::Store { pointer, value } => {
+    rewrite_block(
+        block,
+        Scope::default(),
+        &mut |statement, span, out, scope| {
+            if let naga::Statement::Store { pointer, value } = &statement {
                 if let Some(lh) = root_local_var(*pointer, expressions)
                     && dead_locals.contains(lh)
                 {
-                    continue;
+                    return;
                 }
-                if !in_loop && dead_store_ids.contains(&(*pointer, *value)) {
-                    continue;
+                if !scope.in_loop() && dead_store_ids.contains(&(*pointer, *value)) {
+                    return;
                 }
             }
-            _ => {}
-        }
-
-        let enter_loop = in_loop || matches!(statement, naga::Statement::Loop { .. });
-        for nested in nested_blocks_mut(&mut statement) {
-            apply_to_block(
-                nested,
-                replacements,
-                dead_locals,
-                dead_store_ids,
-                expressions,
-                enter_loop,
-            );
-        }
-
-        let mut remap = |h: naga::Handle<naga::Expression>| -> naga::Handle<naga::Expression> {
-            replacements.get(h).copied().unwrap_or(h)
-        };
-        remap_statement_handles(&mut statement, &mut remap);
-
-        rebuilt.push(statement, span);
-    }
-
-    *block = rebuilt;
+            out.push(statement, span);
+        },
+    );
 }
 
 // MARK: Tests

@@ -67,7 +67,7 @@ fn float_pair_reinfers_int(
     int_shaped(left) && int_shaped(right)
 }
 
-fn literal_needs_typed_form_outside_constructor(literal: naga::Literal) -> bool {
+pub(super) fn literal_needs_typed_form_outside_constructor(literal: naga::Literal) -> bool {
     matches!(
         literal,
         naga::Literal::F16(_)
@@ -92,17 +92,19 @@ pub(super) fn literal_bare_form_changes_type(literal: naga::Literal) -> bool {
 
 /// A bitcast operand always keeps its suffix (bits); a conversion's only when
 /// the bare token would convert differently: u32 above i32::MAX into i32 or
-/// negative i32 into u32 (range errors where the typed form wraps); a whole
-/// f32 as an integer token when negative into u32 (`u32(-3)` errors,
-/// `u32(-3f)` saturates) or at or above 2^24, where its shortest digits are
-/// exact only as an f32 (`2147483520f` prints `2147483500`); a width with no
-/// abstract spelling; an f16 target (`f16(.1)` double-rounds).
-/// `literal_extract` mirrors this.
+/// negative i32 into u32 (range errors where the typed form wraps); an f32
+/// into an integer when negative into u32 (`u32(-3)` errors, `u32(-3f)`
+/// saturates) or at or above 2^24, where the bare token is an ABSTRACT float
+/// whatever its shape - `i32(3e9)` converts by f64 rules to 2147483647 where
+/// `i32(3e9f)` saturates to 2147483520, and the shortest digits of a larger
+/// f32 are exact only as an f32 (`2147483520f` prints `2147483500`); a width
+/// with no abstract spelling; an f16 target (`f16(.1)` double-rounds).
+/// `literal_extract` mirrors this, and a `Compose` or `Splat` operand pins
+/// its constructor type under the same rule ([`compose_lane_keeps_suffix`]).
 pub(super) fn as_operand_keeps_suffix(
     literal: naga::Literal,
     kind: naga::ScalarKind,
     convert: Option<u8>,
-    precision: &crate::config::FloatPrecision,
 ) -> bool {
     use naga::ScalarKind as K;
     let differs = match literal {
@@ -111,12 +113,46 @@ pub(super) fn as_operand_keeps_suffix(
         naga::Literal::F32(v) => {
             matches!(kind, K::Sint | K::Uint)
                 && ((kind == K::Uint && v < 0.0) || v.abs() >= 16777216.0)
-                && !literal_bare_form_pins_scalar(literal, naga::Scalar::F32, precision)
         }
         naga::Literal::Bool(_) => false,
         _ => true,
     };
     convert.is_none() || differs || convert == Some(2)
+}
+
+/// Whether a `Compose` / `Splat` operand of a conversion must spell its
+/// constructor type: every lane is a literal, so the elided `vecN(..)` is
+/// abstract throughout, and one of them converts differently as such
+/// ([`as_operand_keeps_suffix`]) - `vec2i(vec2(3e9,1))`,
+/// `vec4u(vec4(37,-7,-7,-7))`.  A typed lane pins the constructor's own
+/// element type, which the other lanes then take before the conversion.
+fn compose_lane_keeps_suffix(
+    arena: &naga::Arena<naga::Expression>,
+    h: naga::Handle<naga::Expression>,
+    kind: naga::ScalarKind,
+    convert: Option<u8>,
+) -> bool {
+    match &arena[h] {
+        naga::Expression::Literal(lit) => as_operand_keeps_suffix(*lit, kind, convert),
+        naga::Expression::Splat { value, .. } => {
+            compose_lane_keeps_suffix(arena, *value, kind, convert)
+        }
+        naga::Expression::Compose { components, .. } => {
+            let all_literal = components.iter().all(|&c| {
+                matches!(
+                    arena[c],
+                    naga::Expression::Literal(_)
+                        | naga::Expression::Splat { .. }
+                        | naga::Expression::Compose { .. }
+                )
+            });
+            all_literal
+                && components
+                    .iter()
+                    .any(|&c| compose_lane_keeps_suffix(arena, c, kind, convert))
+        }
+        _ => false,
+    }
 }
 
 /// `true` when `literal`, in the bare form constructor components use,
@@ -292,7 +328,8 @@ impl<'a> Generator<'a> {
     /// Shortest negation of `cond`: a let-bound condition is `!name`, a
     /// comparison flips its operator (`<` -> `>=`, `==` -> `!=`) except an
     /// ordered float comparison, where `!(x<y)` and `x>=y` differ under NaN,
-    /// `!!x` collapses to `x`, and anything else is `!(expr)`.
+    /// `!!x` collapses to `x`, and anything else is `!expr`, parenthesized
+    /// only when `expr` is binary.
     pub(super) fn emit_negated_condition(
         &self,
         cond: naga::Handle<naga::Expression>,
@@ -327,6 +364,12 @@ impl<'a> Generator<'a> {
                         let rc = ctx.expr_names.contains_key(right);
                         let wrap_l = child_needs_parens(left, arena, flipped, false, lc);
                         let wrap_r = child_needs_parens(right, arena, flipped, true, rc);
+                        ctx.wrapped_operands(
+                            left,
+                            child_needs_parens(left, arena, flipped, false, false),
+                            right,
+                            child_needs_parens(right, arena, flipped, true, false),
+                        );
                         let ls = self.emit_expr(left, ctx)?;
                         let rs = self.emit_expr(right, ctx)?;
                         return Ok(assemble_binary(&ls, &rs, op_str, sp, wrap_l, wrap_r));
@@ -342,10 +385,29 @@ impl<'a> Generator<'a> {
             _ => {}
         }
 
-        let mut inner = self.emit_expr(cond, ctx)?;
-        inner.insert_str(0, "!(");
-        inner.push(')');
-        Ok(inner)
+        // `!` binds tighter than every binary operator, and nothing else a
+        // condition can be spells one: a call, an index, a name.
+        let inner = self.emit_expr(cond, ctx)?;
+        Ok(if matches!(ctx.exprs[cond], E::Binary { .. }) {
+            format!("!({inner})")
+        } else {
+            format!("!{inner}")
+        })
+    }
+
+    /// The name of the variable `expr` reads, counted as a rendering (a
+    /// place renders outside `emit_expr`).
+    fn variable_name(
+        &self,
+        expr: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> String {
+        ctx.rendered(expr);
+        match &ctx.exprs[expr] {
+            naga::Expression::GlobalVariable(h) => self.global_names[h.index()].clone(),
+            naga::Expression::LocalVariable(h) => ctx.local_names[h].clone(),
+            _ => unreachable!("a variable"),
+        }
     }
 
     /// `expr` as an assignable place; a root that is neither a variable nor
@@ -357,8 +419,7 @@ impl<'a> Generator<'a> {
     ) -> Result<String, Error> {
         use naga::Expression as E;
         Ok(match &ctx.exprs[expr] {
-            E::GlobalVariable(h) => self.global_names[h.index()].clone(),
-            E::LocalVariable(h) => ctx.local_names[h].clone(),
+            E::GlobalVariable(_) | E::LocalVariable(_) => self.variable_name(expr, ctx),
             E::Access { base, index } => {
                 let mut s = self.emit_lvalue_or_value(*base, ctx)?;
                 s.push('[');
@@ -389,8 +450,7 @@ impl<'a> Generator<'a> {
     ) -> Result<String, Error> {
         use naga::Expression as E;
         Ok(match &ctx.exprs[expr] {
-            E::GlobalVariable(h) => self.global_names[h.index()].clone(),
-            E::LocalVariable(h) => ctx.local_names[h].clone(),
+            E::GlobalVariable(_) | E::LocalVariable(_) => self.variable_name(expr, ctx),
             E::Access { .. } | E::AccessIndex { .. } => self.emit_lvalue(expr, ctx)?,
             // A function-argument `ptr<...>` is a pointer value, not a
             // reference, so as the root of an lvalue chain it needs the
@@ -410,7 +470,9 @@ impl<'a> Generator<'a> {
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
         if let Some(name) = ctx.expr_names.get(expr) {
-            return Ok(name.clone());
+            let name = name.clone();
+            ctx.rendered(expr);
+            return Ok(name);
         }
         self.emit_expr_uncached(expr, ctx)
     }
@@ -460,6 +522,7 @@ impl<'a> Generator<'a> {
                 )
             {
                 let s = self.emit_expr_uncached(arg, ctx)?;
+                ctx.wrapped(arg);
                 return Ok(format!("({s})"));
             }
             // An identity-swizzle `Compose` (`vecN(b.0,..,b.N-1)`) collapses to
@@ -484,6 +547,7 @@ impl<'a> Generator<'a> {
                         }
                     )
                 {
+                    ctx.wrapped(base);
                     return Ok(format!("({s})"));
                 }
                 return Ok(s);
@@ -499,24 +563,25 @@ impl<'a> Generator<'a> {
     pub(super) fn try_splat_scalar(
         &self,
         handle: naga::Handle<naga::Expression>,
-        arena: &naga::Arena<naga::Expression>,
-        cached: bool,
+        ctx: &FunctionCtx<'a, '_>,
     ) -> Option<naga::Handle<naga::Expression>> {
-        if cached {
+        if ctx.expr_names.contains_key(handle) {
             return None;
         }
+        let arena = &ctx.exprs;
         match &arena[handle] {
             naga::Expression::Splat { value, .. } => Some(*value),
             naga::Expression::Compose { ty, components } => {
                 // `vec4(v2, v2)` also satisfies `compose_is_splat`, but its
                 // component is a VECTOR and would emit a type-mismatched
                 // operand (`v2 * v4`); require one scalar per lane.
-                let is_splat = matches!(
-                    self.module.types[*ty].inner,
-                    naga::TypeInner::Vector { size, .. }
-                        if components.len() == size as usize
-                            && components.len() > 1
-                ) && compose_is_splat(components, arena);
+                let is_splat =
+                    matches!(
+                        self.module.types[*ty].inner,
+                        naga::TypeInner::Vector { size, .. }
+                            if components.len() == size as usize
+                                && components.len() > 1
+                    ) && compose_is_splat(components, arena, &|c| ctx.expr_names.contains_key(c));
                 if is_splat { Some(components[0]) } else { None }
             }
             _ => None,
@@ -539,15 +604,18 @@ impl<'a> Generator<'a> {
         if self.pointer_is_ptr_value(base, ctx) {
             return Ok(format!("(*{})", self.emit_expr(base, ctx)?));
         }
-        if ctx.expr_names.contains_key(base) {
-            return self.emit_expr(base, ctx);
-        }
         let needs_parens = matches!(
             ctx.exprs[base],
             naga::Expression::Binary { .. }
                 | naga::Expression::Unary { .. }
                 | naga::Expression::Select { .. }
         );
+        if needs_parens {
+            ctx.wrapped(base);
+        }
+        if ctx.expr_names.contains_key(base) {
+            return self.emit_expr(base, ctx);
+        }
         let s = self.emit_expr(base, ctx)?;
         // An inlined whole-pointee `Load` of a pointer value renders `*p`, and
         // a bare `*p.field` parses as `*(p.field)` ("operand of `*` must be a
@@ -571,6 +639,7 @@ impl<'a> Generator<'a> {
     ) -> Result<String, Error> {
         use naga::Expression as E;
 
+        ctx.rendered(expr);
         Ok(match &ctx.exprs[expr] {
             E::Literal(lit) => {
                 if let Some(concrete) =
@@ -614,12 +683,16 @@ impl<'a> Generator<'a> {
                             }
                         }
                     } else {
-                        self.emit_global_expr(c.init, false)?
+                        // Rendered under its own context: a constructor it
+                        // spells is not counted for the alias plan, an
+                        // under-count that only ever forgoes a borderline
+                        // alias.
+                        self.emit_global_expr_in(c.init, false, &mut self.module_ctx())?
                     }
                 }
             }
             E::Override(h) => self.override_names[h.index()].clone(),
-            E::ZeroValue(ty) => self.zero_value(*ty)?,
+            E::ZeroValue(ty) => self.zero_value(*ty, ctx)?,
             E::Compose { ty, components } => 'compose: {
                 // All-zero vector/matrix -> `vec2f()`, but ONLY when inlined
                 // (ref count 1): naga re-parses `vec2f()` as a non-emittable
@@ -632,11 +705,11 @@ impl<'a> Generator<'a> {
                         self.module.types[*ty].inner,
                         naga::TypeInner::Vector { .. } | naga::TypeInner::Matrix { .. }
                     )
-                    && components
-                        .iter()
-                        .all(|&c| compose_is_all_zero(c, ctx.exprs))
+                    && components.iter().all(|&c| {
+                        compose_is_all_zero(c, ctx.exprs, &|c| ctx.expr_names.contains_key(c))
+                    })
                 {
-                    break 'compose self.zero_value(*ty)?;
+                    break 'compose self.zero_value(*ty, ctx)?;
                 }
 
                 if matches!(self.module.types[*ty].inner, naga::TypeInner::Vector { .. })
@@ -646,27 +719,39 @@ impl<'a> Generator<'a> {
                 }
 
                 let mut s = String::new();
+                // The spellings below are tried in turn and the shorter kept;
+                // the counts of a dropped one go with it.
+                let mut kept = (ctx.mark(), 0);
                 // A pinned root must spell its type; both elisions infer it.
                 let pinned = ctx.pinned_root == Some(expr);
-                let ctor_name = if pinned {
-                    self.type_ref(*ty)?
+                let (ctor_name, mut unaliased) = if pinned {
+                    (self.type_ref(*ty)?, self.type_spelled_len(*ty))
                 } else {
                     self.vector_ctor_name(*ty, components, ctx)?
                 };
-                let bare = (!pinned && ctx.elide_array_ctor)
-                    .then(|| self.array_ctor_name(*ty, components, &ctor_name, ctx.exprs))
-                    .flatten();
-                match bare {
-                    Some(bare) => s.push_str(bare),
-                    None => s.push_str(&ctor_name),
+                // `array(...)` beats the full/aliased `array<T,N>` when
+                // shorter; the alias plan is told what the site spells
+                // without one.
+                let array_pins =
+                    !pinned && ctx.elide_array_ctor && self.array_ctor_pins(*ty, components, ctx);
+                if array_pins && "array".len() < ctor_name.len() {
+                    s.push_str("array");
+                } else {
+                    s.push_str(&ctor_name);
                 }
+                if array_pins {
+                    unaliased = unaliased.min("array".len());
+                }
+                ctx.note_type(*ty, unaliased);
                 s.push('(');
                 let is_splat = matches!(
                     self.module.types[*ty].inner,
                     naga::TypeInner::Vector { size, .. }
                         if components.len() == size as usize
                             && components.len() > 1
-                ) && compose_is_splat(components, ctx.exprs);
+                ) && compose_is_splat(components, ctx.exprs, &|c| {
+                    ctx.expr_names.contains_key(c)
+                });
                 if is_splat {
                     s.push_str(&self.emit_constructor_arg(components[0], ctx)?);
                 } else if matches!(self.module.types[*ty].inner, naga::TypeInner::Vector { .. })
@@ -683,6 +768,7 @@ impl<'a> Generator<'a> {
                     }
                 }
                 s.push(')');
+                kept.1 = ctx.mark();
                 // A matrix of explicit scalar columns also has the flat form
                 // `mat2x2f(a,b,c,d)`; keep whichever is shorter - the column
                 // form wins when a column is let-bound (`mat3x3f(a,a,a)`) or
@@ -690,7 +776,9 @@ impl<'a> Generator<'a> {
                 if let Some(flat) =
                     matrix_flatten_scalars(*ty, components, &self.module.types, ctx.exprs)
                 {
-                    let mut sf = self.vector_ctor_name(*ty, components, ctx)?;
+                    let start = ctx.mark();
+                    let (mut sf, unaliased) = self.vector_ctor_name(*ty, components, ctx)?;
+                    ctx.note_type(*ty, unaliased);
                     sf.push('(');
                     let sep = self.comma_sep();
                     for (i, c) in flat.iter().enumerate() {
@@ -701,17 +789,24 @@ impl<'a> Generator<'a> {
                     }
                     sf.push(')');
                     if sf.len() < s.len() {
+                        ctx.discard_range(kept.0, kept.1);
                         s = sf;
+                        kept = (start, ctx.mark());
+                    } else {
+                        ctx.discard_since(start);
                     }
                 }
                 // Equal-scalar runs may collapse to sub-vector splats
                 // (`vec4f(0,0,0,2)` -> `vec4f(vec3f(),2)`); kept only when
                 // strictly shorter, since the sub-vector type often lacks a
                 // short alias.
-                if let Some(sub) = self.try_subsplat_compose(*ty, components, ctx)?
-                    && sub.len() < s.len()
-                {
-                    s = sub;
+                let start = ctx.mark();
+                match self.try_subsplat_compose(*ty, components, pinned, ctx)? {
+                    Some(sub) if sub.len() < s.len() => {
+                        ctx.discard_range(kept.0, kept.1);
+                        s = sub;
+                    }
+                    _ => ctx.discard_since(start),
                 }
                 s
             }
@@ -728,13 +823,24 @@ impl<'a> Generator<'a> {
                 s
             }
             E::Splat { size: _, value } => 'splat: {
-                let target_ty = self.expr_type_name(expr, ctx)?;
                 // All-zero splat -> `vec3f()`, gated on ref count <= 1: a bound
                 // `vec3f()` re-parses to a non-emittable `ZeroValue` that
                 // re-inlines at every use, a non-idempotent size blow-up.
-                if ctx.ref_counts[expr.index()] <= 1 && compose_is_all_zero(*value, ctx.exprs) {
+                if ctx.ref_counts[expr.index()] <= 1
+                    && compose_is_all_zero(*value, ctx.exprs, &|c| ctx.expr_names.contains_key(c))
+                {
+                    let target_ty = self.expr_type_name(expr, ctx)?;
                     break 'splat format!("{target_ty}()");
                 }
+                // The one lane pins the scalar as a `Compose`'s would, and
+                // the text of `vec4(x)` re-parses as this very `Splat`; a
+                // pinned root (a `const` initializer, a conversion operand)
+                // spells its type as a `Compose` must.
+                let target_ty = if ctx.pinned_root == Some(expr) {
+                    self.expr_type_name(expr, ctx)?
+                } else {
+                    self.splat_ctor_name(expr, *value, ctx)?
+                };
                 let lane = self.emit_constructor_arg(*value, ctx)?;
                 {
                     let mut s = target_ty;
@@ -1008,6 +1114,9 @@ impl<'a> Generator<'a> {
                 };
                 let cached = ctx.expr_names.contains_key(expr);
                 let wrap = unary_child_needs_parens(*expr, ctx.exprs, cached);
+                if unary_child_needs_parens(*expr, ctx.exprs, false) {
+                    ctx.wrapped(*expr);
+                }
                 let mut s = self.emit_expr(*expr, ctx)?;
                 // A float zero renders bare as `0` where a sibling pins the
                 // type, and `-0` re-parses as the ABSTRACT INTEGER zero, which
@@ -1049,12 +1158,12 @@ impl<'a> Generator<'a> {
                 // a vector, or the result type changes.
                 let is_arith = is_arithmetic_op(*op);
                 let left_scalar = if is_arith {
-                    self.try_splat_scalar(*left, arena, lc)
+                    self.try_splat_scalar(*left, ctx)
                 } else {
                     None
                 };
                 let right_scalar = if is_arith {
-                    self.try_splat_scalar(*right, arena, rc)
+                    self.try_splat_scalar(*right, ctx)
                 } else {
                     None
                 };
@@ -1089,6 +1198,12 @@ impl<'a> Generator<'a> {
 
                 let wrap_l = child_needs_parens(eff_l, arena, *op, false, eff_lc);
                 let mut wrap_r = child_needs_parens(eff_r, arena, *op, true, eff_rc);
+                ctx.wrapped_operands(
+                    eff_l,
+                    child_needs_parens(eff_l, arena, *op, false, false),
+                    eff_r,
+                    child_needs_parens(eff_r, arena, *op, true, false),
+                );
 
                 // A shift types as its left operand (`e2` is always u32), so a
                 // bare literal there stays abstract: tint concretizes it to
@@ -1151,8 +1266,12 @@ impl<'a> Generator<'a> {
                 let mut s = String::from("select(");
 
                 // `select`'s value operands must share one concrete type, so
-                // a literal takes its typed form.
-                let reject_str = if let naga::Expression::Literal(lit) = &ctx.exprs[*reject] {
+                // an uncached literal takes its typed form (a bound one's
+                // `let` carries the type, and its name keeps the runtime
+                // evaluation a hazard binding exists for).
+                let reject_str = if let naga::Expression::Literal(lit) = &ctx.exprs[*reject]
+                    && !ctx.expr_names.contains_key(reject)
+                {
                     literal_to_wgsl(*lit, &self.options.float_precision)
                 } else {
                     self.emit_expr(*reject, ctx)?
@@ -1168,7 +1287,9 @@ impl<'a> Generator<'a> {
                 }
                 s.push_str(sep);
 
-                let accept_str = if let naga::Expression::Literal(lit) = &ctx.exprs[*accept] {
+                let accept_str = if let naga::Expression::Literal(lit) = &ctx.exprs[*accept]
+                    && !ctx.expr_names.contains_key(accept)
+                {
                     literal_to_wgsl(*lit, &self.options.float_precision)
                 } else {
                     self.emit_expr(*accept, ctx)?
@@ -1267,18 +1388,20 @@ impl<'a> Generator<'a> {
                 // (AbstractInt for `mix(1,2,1)`, AbstractFloat for
                 // `mix(0,1,.25)`) that naga's evaluator cannot concretise for
                 // `mix` / `smoothstep`, and naga is the self-check, so the
-                // WHOLE module drops to naga's emitter; one typed argument makes
-                // it concrete.  An extracted literal renders as its typed
-                // `const` name and pins on its own, which also keeps the forced
-                // text off `literal_extract`'s books.
+                // WHOLE module drops to naga's emitter; the first argument
+                // spelled typed makes it concrete.  An extracted f32 literal
+                // renders as a BARE `const` name (`literal_extract_key` keeps
+                // the declaration abstract) and pins nothing either; only the
+                // widths whose literal is typed wherever it stands
+                // (`literal_needs_typed_form_outside_constructor`) pin on their
+                // own.  `literal_extract` mirrors this pin.
                 let float_needs_pin = !pins_alone && float_scalar.is_some() && {
                     [Some(*arg), *arg1, *arg2, *arg3]
                         .into_iter()
                         .flatten()
                         .all(|h| {
                             self.inline_scalar_literal(h, ctx).is_some_and(|lit| {
-                                let key = literal_extract_key(lit, &self.options.float_precision);
-                                !self.extracted_literals.contains_key(&key)
+                                !literal_needs_typed_form_outside_constructor(lit)
                             })
                         })
                 };
@@ -1352,7 +1475,7 @@ impl<'a> Generator<'a> {
                             width: target_width,
                         },
                     };
-                    let target = self.type_name_for_inner(&target_inner)?;
+                    let target = self.type_name_for_inner(&target_inner, ctx)?;
                     let source = self.emit_expr(*expr, ctx)?;
                     let mut s = target;
                     s.push('(');
@@ -1436,11 +1559,20 @@ impl<'a> Generator<'a> {
                 {
                     return Ok(folded);
                 }
-                let target = self.type_name_for_inner(&target_inner)?;
+                let target = self.type_name_for_inner(&target_inner, ctx)?;
                 let source = if let Some(lit) = self.inline_scalar_literal(*expr, ctx)
-                    && as_operand_keeps_suffix(lit, *kind, *convert, &self.options.float_precision)
+                    && as_operand_keeps_suffix(lit, *kind, *convert)
                 {
                     literal_to_wgsl(lit, &self.options.float_precision)
+                } else if !ctx.expr_names.contains_key(expr)
+                    && matches!(ctx.exprs[*expr], E::Compose { .. } | E::Splat { .. })
+                    && compose_lane_keeps_suffix(ctx.exprs, *expr, *kind, *convert)
+                {
+                    // The constructor's own type keeps every lane typed.
+                    let outer = ctx.pinned_root.replace(*expr);
+                    let text = self.emit_expr(*expr, ctx);
+                    ctx.pinned_root = outer;
+                    text?
                 } else {
                     self.emit_expr(*expr, ctx)?
                 };
@@ -1474,7 +1606,7 @@ impl<'a> Generator<'a> {
             // Free-standing builtin calls with no binding statement (unlike
             // `RayQueryProceedResult`, bound by its `RayQuery` statement) that
             // read the query's CURRENT traversal state, so
-            // `compute_must_bind_loads` tracks them like loads and force-binds
+            // `compute_must_bind` tracks them like loads and force-binds
             // a read that would otherwise re-evaluate past a query-mutating
             // statement.
             E::RayQueryGetIntersection { query, committed } => {
@@ -1539,10 +1671,12 @@ impl<'a> Generator<'a> {
     }
 
     /// `(annotation, initializer)` of a hazard `let`. A `let` initializer
-    /// pins nothing (`let a=5;` is i32), so a concrete literal takes its
-    /// typed form and everything else (extracted or named constants,
-    /// constructors) an explicit type; abstract operands bind bare since
-    /// the default is their type.
+    /// pins nothing (`let a=5;` is i32), so an unextracted concrete literal
+    /// takes its typed form and everything else (extracted or named
+    /// constants, constructors, `16 + 16` for a shift amount the folder
+    /// declined) an explicit type; an abstract operand binds bare since the
+    /// default is its type, as does a bare `override` name, typed by its
+    /// declaration.
     pub(super) fn const_hazard_binding_value(
         &self,
         operand: naga::Handle<naga::Expression>,
@@ -1567,11 +1701,12 @@ impl<'a> Generator<'a> {
                 ..
             })
         );
-        let annotation = if abstract_typed {
-            None
-        } else {
-            Some(self.type_name_for_inner(inner)?)
-        };
+        let annotation =
+            if abstract_typed || matches!(ctx.exprs[operand], naga::Expression::Override(_)) {
+                None
+            } else {
+                Some(self.type_name_for_inner(inner, ctx)?)
+            };
         Ok((annotation, self.emit_expr(operand, ctx)?))
     }
 
@@ -1605,7 +1740,10 @@ impl<'a> Generator<'a> {
     // MARK: Global expression emission
 
     /// A module-scope expression (constant, override or global initializer)
-    /// through the one emitter, under [`Generator::module_ctx`].  A root
+    /// through the one emitter, under a [`Generator::module_ctx`] the caller
+    /// owns: building one costs a clone of every constant name, so the
+    /// declaration sections share a single context and name each constant
+    /// in it as they go instead of rebuilding per declaration.  A root
     /// literal keeps its suffix unless the bare spelling infers the same
     /// concrete type: nothing pins a declaration's initializer, so `256`
     /// would turn a `u32` constant abstract and `i32` at its next `let`.
@@ -1613,19 +1751,6 @@ impl<'a> Generator<'a> {
     /// or constructor - the `const` emitter drops `: T` on exactly those
     /// shapes, and an abstract `7` or `vec2(42,43)` is then a different type
     /// that naga's front end folds away instead of declaring.
-    pub(super) fn emit_global_expr(
-        &self,
-        expr: naga::Handle<naga::Expression>,
-        self_typed: bool,
-    ) -> Result<String, Error> {
-        let mut ctx = self.module_ctx();
-        self.emit_global_expr_in(expr, self_typed, &mut ctx)
-    }
-
-    /// [`Generator::emit_global_expr`] against a caller-owned context.  Building
-    /// one costs a clone of every constant name, so the declaration sections
-    /// share a single context and name each constant in it as they go instead
-    /// of rebuilding per declaration.
     pub(super) fn emit_global_expr_in(
         &self,
         expr: naga::Handle<naga::Expression>,
@@ -1656,7 +1781,7 @@ impl<'a> Generator<'a> {
         operand: naga::Handle<naga::Expression>,
         target: naga::Scalar,
         target_inner: &naga::TypeInner,
-        ctx: &FunctionCtx<'a, '_>,
+        ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<Option<String>, Error> {
         let lits: Vec<naga::Literal> = match &ctx.exprs[operand] {
             naga::Expression::Compose { components, .. } => {
@@ -1682,7 +1807,7 @@ impl<'a> Generator<'a> {
                 None => return Ok(None),
             }
         }
-        let mut s = self.type_name_for_inner(target_inner)?;
+        let mut s = self.type_name_for_inner(target_inner, ctx)?;
         s.push('(');
         // Splat form when all components are bit-equal (`-0` stays distinct
         // from `0`).
@@ -1709,7 +1834,15 @@ impl<'a> Generator<'a> {
     // MARK: Type helpers
 
     /// WGSL name of `inner`, through the alias table.
-    pub(super) fn type_name_for_inner(&self, inner: &naga::TypeInner) -> Result<String, Error> {
+    pub(super) fn type_name_for_inner(
+        &self,
+        inner: &naga::TypeInner,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<String, Error> {
+        // The group's first handle carries its alias, if any.
+        if let Some(&h) = self.inner_to_first.get(inner) {
+            ctx.note_type(h, self.type_spelled_len(h));
+        }
         let res = naga::proc::TypeResolution::Value(inner.clone());
         type_resolution_name(
             &res,
@@ -1724,16 +1857,34 @@ impl<'a> Generator<'a> {
     pub(super) fn expr_type_name(
         &self,
         expr: naga::Handle<naga::Expression>,
-        ctx: &FunctionCtx<'a, '_>,
+        ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
-        let res = &ctx.ty(expr);
-        type_resolution_name(
-            res,
-            self.module,
-            &self.type_names,
-            &self.override_names,
-            &self.shadowed_type_aliases,
-        )
+        match ctx.ty(expr) {
+            naga::proc::TypeResolution::Handle(h) => self.spell_type(*h, ctx),
+            naga::proc::TypeResolution::Value(inner) => self.type_name_for_inner(inner, ctx),
+        }
+    }
+
+    /// Bytes `ty` spells without an alias of its own.
+    pub(super) fn type_spelled_len(&self, ty: naga::Handle<naga::Type>) -> usize {
+        self.type_spelled_len[ty.index()] as usize
+    }
+
+    /// [`Self::type_ref`] in a function's text, noted for the alias plan
+    /// of the render that ships.
+    pub(super) fn spell_type(
+        &self,
+        ty: naga::Handle<naga::Type>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<String, Error> {
+        ctx.note_type(ty, self.type_spelled_len(ty));
+        self.type_ref(ty)
+    }
+
+    /// [`Self::type_ref`] in a declaration, noted likewise.
+    pub(super) fn declare_type(&mut self, ty: naga::Handle<naga::Type>) -> Result<String, Error> {
+        self.type_uses.note(ty, self.type_spelled_len[ty.index()]);
+        self.type_ref(ty)
     }
 
     /// WGSL name of a type handle, alias first.
@@ -1751,14 +1902,14 @@ impl<'a> Generator<'a> {
     }
 
     /// Shortest zero of `ty`: a scalar literal (`0i`, `false`) or `T()`.
-    pub(super) fn zero_value(&self, ty: naga::Handle<naga::Type>) -> Result<String, Error> {
+    pub(super) fn zero_value(
+        &self,
+        ty: naga::Handle<naga::Type>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<String, Error> {
         Ok(match &self.module.types[ty].inner {
             naga::TypeInner::Scalar(s) => scalar_zero(s.kind, s.width).to_string(),
-            naga::TypeInner::Vector { .. }
-            | naga::TypeInner::Matrix { .. }
-            | naga::TypeInner::Array { .. }
-            | naga::TypeInner::Struct { .. } => format!("{}()", self.type_ref(ty)?),
-            _ => format!("{}()", self.type_ref(ty)?),
+            _ => format!("{}()", self.spell_type(ty, ctx)?),
         })
     }
 
@@ -1771,16 +1922,23 @@ impl<'a> Generator<'a> {
     pub(super) fn emit_zero_init_tail(
         &mut self,
         ty: naga::Handle<naga::Type>,
+        ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<(), Error> {
         let type_str = self.type_ref(ty)?;
+        let mut unaliased = self.type_spelled_len(ty);
         if let naga::TypeInner::Scalar(s) = self.module.types[ty].inner {
             let zlit = scalar_zero(s.kind, s.width);
+            // Without an alias the literal is what the site would spell:
+            // what an alias competes with.
+            unaliased = unaliased.min(zlit.len());
             if zlit.len() < type_str.len() {
+                ctx.note_type(ty, unaliased);
                 self.push_assign();
                 self.out.push_str(zlit);
                 return Ok(());
             }
         }
+        ctx.note_type(ty, unaliased);
         self.push_colon();
         self.out.push_str(&type_str);
         Ok(())
@@ -1800,29 +1958,70 @@ impl<'a> Generator<'a> {
     /// `Compose`, so a surviving vector has a runtime component (`ZeroValue`
     /// emits typed either way).  A pass that leaves an unnamed const as the
     /// only non-literal component must revisit this gate.
+    ///
+    /// Returns the name and the bytes the site spells without an alias of
+    /// the type (the bare form where it applies), for the alias plan.
     fn vector_ctor_name(
         &self,
         ty: naga::Handle<naga::Type>,
         components: &[naga::Handle<naga::Expression>],
         ctx: &FunctionCtx<'a, '_>,
-    ) -> Result<String, Error> {
+    ) -> Result<(String, usize), Error> {
         let type_str = self.type_ref(ty)?;
+        let mut unaliased = self.type_spelled_len(ty);
         if let naga::TypeInner::Vector { size, scalar } = self.module.types[ty].inner {
             let bare = format!("vec{}", super::syntax::vector_size_num(size));
-            if bare.len() < type_str.len()
-                && components.iter().any(|&c| match &ctx.exprs[c] {
-                    naga::Expression::Literal(lit) => {
-                        literal_bare_form_pins_scalar(*lit, scalar, &self.options.float_precision)
-                    }
-                    _ => {
-                        type_inner_scalar(ctx.ty(c).inner_with(&self.module.types)) == Some(scalar)
-                    }
-                })
-            {
-                return Ok(bare);
+            let pins = self.lanes_pin_scalar(components, scalar, ctx);
+            if pins {
+                unaliased = unaliased.min(bare.len());
+            }
+            if pins && bare.len() < type_str.len() {
+                return Ok((bare, unaliased));
             }
         }
-        Ok(type_str)
+        Ok((type_str, unaliased))
+    }
+
+    /// Whether a component of a bare `vecN(...)` re-infers `scalar`.
+    fn lanes_pin_scalar(
+        &self,
+        components: &[naga::Handle<naga::Expression>],
+        scalar: naga::Scalar,
+        ctx: &FunctionCtx<'a, '_>,
+    ) -> bool {
+        components.iter().any(|&c| match &ctx.exprs[c] {
+            naga::Expression::Literal(lit) => {
+                literal_bare_form_pins_scalar(*lit, scalar, &self.options.float_precision)
+            }
+            _ => type_inner_scalar(ctx.ty(c).inner_with(&self.module.types)) == Some(scalar),
+        })
+    }
+
+    /// [`Self::vector_ctor_name`] for a `Splat` of `value`: through the
+    /// vector's handle where the arena has one (the alias plan's), else
+    /// by its shape alone.
+    fn splat_ctor_name(
+        &self,
+        expr: naga::Handle<naga::Expression>,
+        value: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<String, Error> {
+        let inner = ctx.ty(expr).inner_with(&self.module.types);
+        let handle = match ctx.ty(expr) {
+            naga::proc::TypeResolution::Handle(h) => Some(*h),
+            naga::proc::TypeResolution::Value(_) => self.inner_to_first.get(inner).copied(),
+        };
+        if let Some(h) = handle {
+            let (name, unaliased) = self.vector_ctor_name(h, &[value], ctx)?;
+            ctx.note_type(h, unaliased);
+            return Ok(name);
+        }
+        if let naga::TypeInner::Vector { size, scalar } = *inner
+            && self.lanes_pin_scalar(&[value], scalar, ctx)
+        {
+            return Ok(format!("vec{}", super::syntax::vector_size_num(size)));
+        }
+        self.type_name_for_inner(inner, ctx)
     }
 
     /// `array(...)` for an array `Compose` when shorter than the full/aliased
@@ -1831,29 +2030,67 @@ impl<'a> Generator<'a> {
     /// consensus), and a bare abstract literal there would re-infer
     /// (`array<u32,2>(1,2)` -> `array<i32,2>`, a silent retype), so that
     /// component must be a `Compose`/`ZeroValue`/`Constant`/`Override` of
-    /// exactly `base`, which always emits concretely typed.  Rewrites the
-    /// constructor name only, never a type annotation.
-    fn array_ctor_name(
+    /// exactly `base`, which always emits concretely typed.  Under an
+    /// ALIASED `base` only a first component the text spells as `D(a,b,..)`
+    /// or `D()` will do: naga keeps an alias as a named type, and a splat
+    /// or a swizzle re-parses to the anonymous `vec4f` (its value's type),
+    /// so `array(D(1),D())` is an `array<vec4f,2>` where `array(D(x,x,x,x),
+    /// D())` and a declared `array<D,2>` are not - two types one `var` or
+    /// parameter cannot take both of.  Rewrites the constructor name only,
+    /// never a type annotation.
+    fn array_ctor_pins(
         &self,
         ty: naga::Handle<naga::Type>,
         components: &[naga::Handle<naga::Expression>],
-        full_name: &str,
-        arena: &naga::Arena<naga::Expression>,
-    ) -> Option<&'static str> {
+        ctx: &FunctionCtx<'a, '_>,
+    ) -> bool {
         let naga::TypeInner::Array { base, .. } = self.module.types[ty].inner else {
-            return None;
+            return false;
         };
-        if components.is_empty() || "array".len() >= full_name.len() {
-            return None;
+        let arena = ctx.exprs;
+        if self.type_names.contains_key(base)
+            && !matches!(
+                self.module.types[base].inner,
+                naga::TypeInner::Struct { .. }
+            )
+        {
+            return components.first().is_some_and(|&c| match &arena[c] {
+                naga::Expression::ZeroValue(zty) => *zty == base,
+                naga::Expression::Compose {
+                    ty: cty,
+                    components: lanes,
+                } => *cty == base && !self.compose_spells_a_value(lanes, ctx),
+                _ => false,
+            });
         }
-        let pins = components.first().is_some_and(|&c| match &arena[c] {
+        components.first().is_some_and(|&c| match &arena[c] {
             naga::Expression::Compose { ty: cty, .. } => *cty == base,
             naga::Expression::ZeroValue(zty) => *zty == base,
             naga::Expression::Constant(h) => self.module.constants[*h].ty == base,
             naga::Expression::Override(h) => self.module.overrides[*h].ty == base,
             _ => false,
-        });
-        pins.then_some("array")
+        })
+    }
+
+    /// A vector `Compose` the text spells as a splat (`D(1)`) or as a
+    /// swizzle of one base (`v.xyz`): a value of the vector type, not a
+    /// constructor naming it.
+    fn compose_spells_a_value(
+        &self,
+        lanes: &[naga::Handle<naga::Expression>],
+        ctx: &FunctionCtx<'a, '_>,
+    ) -> bool {
+        let splat = lanes.len() > 1
+            && compose_is_splat(lanes, ctx.exprs, &|c| ctx.expr_names.contains_key(c));
+        let mut common = None;
+        let swizzle = (2..=4).contains(&lanes.len())
+            && lanes
+                .iter()
+                .all(|&lane| match self.swizzle_component(lane, ctx) {
+                    Some((base, _)) => *common.get_or_insert(base) == base,
+                    None => false,
+                });
+        splat || swizzle
     }
 
     /// Collapse maximal runs of >=2 equal adjacent scalar components into
@@ -1866,47 +2103,32 @@ impl<'a> Generator<'a> {
         &self,
         ty: naga::Handle<naga::Type>,
         components: &[naga::Handle<naga::Expression>],
+        pinned: bool,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<Option<String>, Error> {
         let naga::TypeInner::Vector { size, scalar } = self.module.types[ty].inner else {
             return Ok(None);
         };
         let n = size as usize;
-        if components.len() != n {
+        let bound = |c: naga::Handle<naga::Expression>| ctx.expr_names.contains_key(c);
+        let Some(runs) = subsplat_runs(
+            components,
+            ctx.exprs,
+            n,
+            |c| {
+                matches!(
+                    ctx.ty(c).inner_with(&self.module.types),
+                    naga::TypeInner::Scalar(_)
+                )
+            },
+            &bound,
+        ) else {
             return Ok(None);
-        }
-        // A run forms `vecK(scalar)` only from scalar components.
-        if !components.iter().all(|&c| {
-            matches!(
-                ctx.ty(c).inner_with(&self.module.types),
-                naga::TypeInner::Scalar(_)
-            )
-        }) {
-            return Ok(None);
-        }
-        // Runs are found under an immutable borrow before emission needs
-        // `ctx` mutably.
-        let (runs, zero): (Vec<(usize, usize)>, Vec<bool>) = {
-            let arena = &ctx.exprs;
-            let mut runs = Vec::new();
-            let mut i = 0;
-            while i < n {
-                let mut j = i + 1;
-                while j < n && exprs_splat_eq(&arena[components[i]], &arena[components[j]]) {
-                    j += 1;
-                }
-                runs.push((i, j - i));
-                i = j;
-            }
-            let zero = runs
-                .iter()
-                .map(|&(s, _)| compose_is_all_zero(components[s], arena))
-                .collect();
-            (runs, zero)
         };
-        if !runs.iter().any(|&(_, k)| k >= 2 && k < n) {
-            return Ok(None);
-        }
+        let zero: Vec<bool> = runs
+            .iter()
+            .map(|&(s, _)| compose_is_all_zero(components[s], ctx.exprs, &bound))
+            .collect();
         let mut parts: Vec<String> = Vec::with_capacity(n);
         for (ri, &(s, k)) in runs.iter().enumerate() {
             if k >= 2 && k < n {
@@ -1915,10 +2137,13 @@ impl<'a> Generator<'a> {
                     3 => naga::VectorSize::Tri,
                     _ => naga::VectorSize::Quad,
                 };
-                let sub_name = self.type_name_for_inner(&naga::TypeInner::Vector {
-                    size: sub_size,
-                    scalar,
-                })?;
+                let sub_name = self.type_name_for_inner(
+                    &naga::TypeInner::Vector {
+                        size: sub_size,
+                        scalar,
+                    },
+                    ctx,
+                )?;
                 if zero[ri] {
                     parts.push(format!("{sub_name}()"));
                 } else {
@@ -1933,7 +2158,12 @@ impl<'a> Generator<'a> {
                 }
             }
         }
-        let name = self.vector_ctor_name(ty, components, ctx)?;
+        let (name, unaliased) = if pinned {
+            (self.type_ref(ty)?, self.type_spelled_len(ty))
+        } else {
+            self.vector_ctor_name(ty, components, ctx)?
+        };
+        ctx.note_type(ty, unaliased);
         let sep = self.comma_sep();
         Ok(Some(format!("{name}({})", parts.join(sep))))
     }
@@ -1962,7 +2192,10 @@ impl<'a> Generator<'a> {
             TypeResolution::Value(_) => return None,
         };
         if let Some(h) = ty_handle
-            && let Some(mangled) = self.member_names.get(&(h, index))
+            && let Some(mangled) = self
+                .member_names
+                .get(h)
+                .and_then(|names| names.get(index as usize))
         {
             return Some(mangled.clone());
         }
@@ -2037,9 +2270,10 @@ impl<'a> Generator<'a> {
 
     const SWIZZLE_LETTERS: [char; 4] = ['x', 'y', 'z', 'w'];
 
-    /// `(base, component)` of a swizzle-groupable Compose component: an
-    /// uncached `AccessIndex` on a vector value, or a `Load` of one on a
-    /// pointer to a vector.
+    /// The free [`swizzle_component`] with the emitter's binding rule: a
+    /// bound component renders as its name, which no swizzle absorbs.  The
+    /// base is the first spelling of its value, so lanes read off twins of
+    /// one vector fold as lanes of that vector.
     fn swizzle_component(
         &self,
         handle: naga::Handle<naga::Expression>,
@@ -2048,37 +2282,10 @@ impl<'a> Generator<'a> {
         if ctx.expr_names.contains_key(handle) {
             return None;
         }
-        let arena = &ctx.exprs;
-
-        if let naga::Expression::AccessIndex { base, index } = arena[handle]
-            && index <= 3
-        {
-            let inner = ctx.ty(base).inner_with(&self.module.types);
-            if matches!(inner, naga::TypeInner::Vector { .. }) {
-                return Some((base, index));
-            }
-        }
-
-        if let naga::Expression::Load { pointer } = arena[handle]
-            && let naga::Expression::AccessIndex { base, index } = arena[pointer]
-            && index <= 3
-        {
-            let inner = ctx.ty(base).inner_with(&self.module.types);
-            let is_ptr_to_vec =
-                matches!(
-                    inner,
-                    naga::TypeInner::Pointer { base: bty, .. }
-                        if matches!(
-                            self.module.types[*bty].inner,
-                            naga::TypeInner::Vector { .. }
-                        )
-                ) || matches!(inner, naga::TypeInner::ValuePointer { size: Some(_), .. });
-            if is_ptr_to_vec {
-                return Some((base, index));
-            }
-        }
-
-        None
+        let types = &self.module.types;
+        let (base, idx) =
+            swizzle_component(handle, ctx.exprs, types, &|b| ctx.ty(b).inner_with(types))?;
+        Some((ctx.twins.get(base).copied().unwrap_or(base), idx))
     }
 
     /// The base an uncached identity-swizzle `Compose` (`vecN(b.0,..,b.N-1)`)
@@ -2301,6 +2508,12 @@ impl<'a> Generator<'a> {
                     let rc = ctx.expr_names.contains_key(right);
                     let wrap_l = child_needs_parens(left, arena, op, false, lc);
                     let wrap_r = child_needs_parens(right, arena, op, true, rc);
+                    ctx.wrapped_operands(
+                        left,
+                        child_needs_parens(left, arena, op, false, false),
+                        right,
+                        child_needs_parens(right, arena, op, true, false),
+                    );
                     let ls = self.emit_expr_with_scalar_hint(left, Some(scalar), ctx)?;
                     let rs = self.emit_expr_with_scalar_hint(right, Some(scalar), ctx)?;
                     let op_str = binary_op_str(op);
@@ -2458,7 +2671,7 @@ fn binary_op_str(op: naga::BinaryOperator) -> &'static str {
 /// `parent_op`, per operator precedence, associativity, and the WGSL grammar
 /// levels that forbid bare operands (bitwise, shift, comparison, and the
 /// no-relative-precedence `&&`/`||` mix).
-fn child_needs_parens(
+pub(super) fn child_needs_parens(
     child: naga::Handle<naga::Expression>,
     arena: &naga::Arena<naga::Expression>,
     parent_op: naga::BinaryOperator,
@@ -2579,7 +2792,7 @@ fn child_needs_parens(
 
 /// Every Binary precedence is below Unary, so only an uncached Binary
 /// operand is wrapped.
-fn unary_child_needs_parens(
+pub(super) fn unary_child_needs_parens(
     child: naga::Handle<naga::Expression>,
     arena: &naga::Arena<naga::Expression>,
     is_cached: bool,
@@ -2710,22 +2923,81 @@ pub(super) fn concretize_abstract_literal_via_inner(
 
 // MARK: Splat detection
 
+/// `(base, component)` of a swizzle-groupable `Compose` component: an
+/// `AccessIndex` on a vector VALUE, or a `Load` of one on a pointer to a
+/// vector.  `ty_of` resolves an expression's type - the emitter goes through
+/// `FunctionCtx`, the reference census through `FunctionInfo`, and they must
+/// agree on the SHAPE or the census prices a fold the emitter does not take,
+/// so the shape lives here once.  Neither binding rule is applied: the emitter
+/// declines a component it has already bound, the census a stand-in of its
+/// own.
+pub(super) fn swizzle_component<'a>(
+    handle: naga::Handle<naga::Expression>,
+    arena: &naga::Arena<naga::Expression>,
+    types: &'a naga::UniqueArena<naga::Type>,
+    ty_of: &dyn Fn(naga::Handle<naga::Expression>) -> &'a naga::TypeInner,
+) -> Option<(naga::Handle<naga::Expression>, u32)> {
+    if let naga::Expression::AccessIndex { base, index } = arena[handle]
+        && index <= 3
+        && matches!(ty_of(base), naga::TypeInner::Vector { .. })
+    {
+        return Some((base, index));
+    }
+    if let naga::Expression::Load { pointer } = arena[handle]
+        && let naga::Expression::AccessIndex { base, index } = arena[pointer]
+        && index <= 3
+    {
+        let inner = ty_of(base);
+        let is_ptr_to_vec =
+            matches!(
+                inner,
+                naga::TypeInner::Pointer { base: bty, .. }
+                    if matches!(types[*bty].inner, naga::TypeInner::Vector { .. })
+            ) || matches!(inner, naga::TypeInner::ValuePointer { size: Some(_), .. });
+        if is_ptr_to_vec {
+            return Some((base, index));
+        }
+    }
+    None
+}
+
 /// Every component of a vector `Compose` is provably the same value
 /// (identical handles, or equal under [`exprs_splat_eq`]), so it can render
-/// as the splat `vec3f(x)`.
+/// as the splat `vec3f(x)`.  `bound` is the emitter's name table: a lane
+/// bound to a name renders as that name and equals only itself, since
+/// spelling another lane's literal in its place would hand tint the
+/// const-expression a hazard `let` exists to keep at runtime
+/// (`normalize(vec3f())` fails shader creation, and the self-check then
+/// ships the input lexically compacted).  The pre-emission censuses, which
+/// only price, pass `|_| false`.
 pub(super) fn compose_is_splat(
     components: &[naga::Handle<naga::Expression>],
     arena: &naga::Arena<naga::Expression>,
+    bound: &dyn Fn(naga::Handle<naga::Expression>) -> bool,
 ) -> bool {
     debug_assert!(components.len() > 1);
     let first = components[0];
     if components[1..].iter().all(|&c| c == first) {
         return true;
     }
-    let first_expr = &arena[first];
     components[1..]
         .iter()
-        .all(|&c| exprs_splat_eq(first_expr, &arena[c]))
+        .all(|&c| lanes_render_equal(first, c, arena, bound))
+}
+
+/// [`exprs_splat_eq`] on handles under the emitter's name table: a bound
+/// lane equals the same handle only.
+fn lanes_render_equal(
+    a: naga::Handle<naga::Expression>,
+    b: naga::Handle<naga::Expression>,
+    arena: &naga::Arena<naga::Expression>,
+    bound: &dyn Fn(naga::Handle<naga::Expression>) -> bool,
+) -> bool {
+    if bound(a) || bound(b) {
+        a == b
+    } else {
+        exprs_splat_eq(&arena[a], &arena[b])
+    }
 }
 
 /// Column-major scalar handles of a matrix `Compose` whose every column is a
@@ -2793,19 +3065,54 @@ fn literal_is_strict_numeric_zero(l: naga::Literal) -> bool {
 }
 
 /// Provably all `+0` (strict-zero `Literal`, `ZeroValue`, or `Splat`/`Compose`
-/// of those); drives the `vec2f(0,0)` -> `vec2f()` fold.
-fn compose_is_all_zero(
+/// of those) with no lane bound to a name (`bound`, as in
+/// [`compose_is_splat`]); drives the `vec2f(0,0)` -> `vec2f()` fold.
+pub(super) fn compose_is_all_zero(
     h: naga::Handle<naga::Expression>,
     arena: &naga::Arena<naga::Expression>,
+    bound: &dyn Fn(naga::Handle<naga::Expression>) -> bool,
 ) -> bool {
     use naga::Expression as E;
+    if bound(h) {
+        return false;
+    }
     match &arena[h] {
         E::Literal(l) => literal_is_strict_numeric_zero(*l),
         E::ZeroValue(_) => true,
-        E::Splat { value, .. } => compose_is_all_zero(*value, arena),
-        E::Compose { components, .. } => components.iter().all(|&c| compose_is_all_zero(c, arena)),
+        E::Splat { value, .. } => compose_is_all_zero(*value, arena, bound),
+        E::Compose { components, .. } => components
+            .iter()
+            .all(|&c| compose_is_all_zero(c, arena, bound)),
         _ => false,
     }
+}
+
+/// The runs of equal lanes, as `(start, len)`, of a vector `Compose` of `n`
+/// `components` that may print one as a sub-vector splat: every lane a
+/// scalar (`is_scalar`) and some run 2 to `n - 1` lanes long, else `None`.
+/// Shared by the emitter and the alias planner, so both take the same
+/// constructors.
+pub(super) fn subsplat_runs(
+    components: &[naga::Handle<naga::Expression>],
+    arena: &naga::Arena<naga::Expression>,
+    n: usize,
+    is_scalar: impl Fn(naga::Handle<naga::Expression>) -> bool,
+    bound: &dyn Fn(naga::Handle<naga::Expression>) -> bool,
+) -> Option<Vec<(usize, usize)>> {
+    if components.len() != n || !components.iter().all(|&c| is_scalar(c)) {
+        return None;
+    }
+    let mut runs = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && lanes_render_equal(components[i], components[j], arena, bound) {
+            j += 1;
+        }
+        runs.push((i, j - i));
+        i = j;
+    }
+    runs.iter().any(|&(_, k)| k >= 2 && k < n).then_some(runs)
 }
 
 /// Conservative value equality for splat/run collapse: two `Literal`s with

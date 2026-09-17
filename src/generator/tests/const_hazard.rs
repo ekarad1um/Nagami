@@ -217,14 +217,15 @@ fn f16_conversion_of_an_opaque_integer_binds() {
     );
 }
 
+/// An integer reinterpretation of a literal folds to its exact value, so
+/// the text never spells `i32(3000000000u)`, whose suffix is load-bearing
+/// (`i32(3000000000)` converts the ABSTRACT value and is rejected).
 #[test]
-fn conversion_of_out_of_range_literal_keeps_its_suffix() {
-    // `i32(3000000000)` converts from the ABSTRACT value and is rejected;
-    // `i32(3000000000u)` wraps like the runtime conversion did.
+fn integer_reinterpretation_of_a_literal_folds_to_its_value() {
     let out = minify(&body("let w = 3000000000u; out[0] = u32(i32(w)) + inp[1];"));
-    assert!(out.contains("i32(3000000000u)"), "{out}");
+    assert!(out.contains("=3000000000+"), "{out}");
     let out = minify(&body("let w = -1i; out[0] = u32(w) + inp[1];"));
-    assert!(out.contains("u32(-1i)"), "{out}");
+    assert!(out.contains("=4294967295+"), "{out}");
 }
 
 #[test]
@@ -313,16 +314,17 @@ fn ldexp_limit_follows_the_float_width() {
 }
 
 /// An inlined argument can make both shift operands constant while the
-/// amount hides behind a builtin the hazard evaluator does not model; the
-/// signed overflow is rejected at const-evaluation, so the operand binds.
-/// The literal arrives by inlining: `load_dedup` declines every forward
-/// inside a shift-AMOUNT slot, so the `var v = -100i;` spelling of this
-/// never reaches the hazard.
+/// amount hides behind a builtin neither evaluator models (`unpack4xU8`;
+/// `reverseBits` and the integer conversion fold outright); the signed
+/// overflow is rejected at const-evaluation, so the operand binds.  The
+/// literal arrives by inlining: `load_dedup` declines every forward inside
+/// a shift-AMOUNT slot, so the `var v = -100i;` spelling of this never
+/// reaches the hazard.
 #[test]
 fn unmodeled_constant_shift_amount_binds_the_shifted_literal() {
     let out: String = compact_with_passes(
         "@group(0)@binding(0) var<storage,read_write> out: array<u32>;\
-         fn f(v: i32) -> u32 { return u32(v << (reverseBits(u32(v)) & 31u)); }\
+         fn f(v: i32) -> u32 { return u32(v << (unpack4xU8(u32(v)).x & 31u)); }\
          @compute @workgroup_size(1) fn main() { out[0] = f(-100i); }",
         Profile::Max,
     )
@@ -334,9 +336,10 @@ fn unmodeled_constant_shift_amount_binds_the_shifted_literal() {
 
 /// Const-ness entering a failable slot must be declined for the WHOLE slot:
 /// the top declines (its value IS the error) and an interior node then folds
-/// anyway, leaving `5u / (1u - 1u)`, which no emitter can spell, so the
-/// module ships lexically compacted.  `const_fold` reaches this through a
-/// never-written local, `load_dedup` through a forwarded initialiser.
+/// anyway, leaving `5u / (1u - 1u)`, a manufactured static-error slot
+/// (`arena_static_error_slot`) that rolls the whole pass back.  `const_fold`
+/// reaches this through a never-written local, `load_dedup` through a
+/// forwarded initialiser.
 #[test]
 fn interior_fold_under_a_divisor_keeps_the_slot_runtime() {
     for stmts in [
@@ -413,7 +416,6 @@ fn a_runtime_divisor_keeps_the_forwards_under_it() {
 /// Dawn's MSL for `~u32(i32(x))` is `(~(uint(int(v))) & 3u)`, which Metal
 /// parses as a C-style cast of `&3u`; the inner conversion binds so the
 /// unary operand is `uint(a)`.
-
 #[test]
 fn unary_over_nested_vector_constructors_binds_the_inner_one() {
     // Dawn's Metal backend reads `-(float4(int4(v)))` as a function type, so
@@ -535,6 +537,46 @@ fn an_opaque_argument_rule_operand_binds() {
     assert!(out.contains(&format!(",{n},1)")), "{out}");
 }
 
+/// An index tint evaluates and nagami cannot (`unpack4xU8(..).w`, 8 into a
+/// 4-element array) binds like an opaque operand under a failable operator;
+/// a known in-bounds index and a runtime one bind nothing.
+#[test]
+fn an_opaque_constant_index_binds() {
+    let out = minify(&body(
+        "let a = array<u32,4>(1u, 2u, 3u, 4u); let x = unpack4xU8(0x08000000u).w; \
+         out[0] = a[x] + a[inp[0]] + a[2];",
+    ));
+    let n = bound_name(&out, "unpack4xU8(134217728).w");
+    assert!(out.contains(&format!("[{n}]")), "{out}");
+    assert!(!out.contains("[unpack4xU8("), "{out}");
+    // The runtime index stays inline; the in-bounds literal one folded.
+    assert_eq!(out.matches("let ").count(), 2, "{out}");
+}
+
+/// An `override` in a failable slot binds (`const_tree`: the erased `let`
+/// would move a guarded runtime division to a pipeline failure).  Two slots
+/// on the same override share one `let`, spelled without the annotation the
+/// override's own type makes redundant; a conversion of the override is no
+/// hazard and stays inline.
+#[test]
+fn an_override_in_a_failable_slot_binds_once() {
+    let src = format!(
+        "override N: u32 = 0u; {HEAD} let n = N; \
+         if n > 0u {{ out[0] = (inp[0] / n + inp[1] % n) << (n + 32u); }} \
+         out[1] = u32(f32(N)) + 1u; }}"
+    );
+    let out = minify(&src);
+    let n = bound_name(&out, "N");
+    assert!(
+        out.contains(&format!("/{n}+")) && out.contains(&format!("%{n})")),
+        "{out}"
+    );
+    assert!(out.contains(&format!("<<({n}+32)")), "{out}");
+    assert_eq!(out.matches("let ").count(), 1, "{out}");
+    assert!(!out.contains(&format!("let {n}:")), "{out}");
+    assert!(out.contains("u32(f32(N))+1"), "{out}");
+}
+
 /// `break if` is the last statement INSIDE `continuing`, so the hazard `let`
 /// its condition needs is still in scope when it renders; releasing the
 /// block's bindings first re-inlined the rejected const-expression next to a
@@ -588,23 +630,61 @@ fn whole_float_into_integer_keeps_suffix() {
         "the conversions keep a typed operand: {}",
         out.source
     );
-    // `i32(2147483500)` is not `i32(2147483520f)` (GPU-proven).
+    // In range, a whole float converts exactly and the conversion folds to
+    // the integer itself (`i32(2147483500)` would not be
+    // `i32(2147483520f)`, GPU-proven, which the folded value sidesteps).
     let big = minify(&body(
         "var x = 2147483520.0; out[0] = bitcast<u32>(i32(x)); var y = 33554436.0; out[1] = u32(y);",
     ));
     assert!(
-        big.contains("i32(2147483500f)") && big.contains("u32(33554436f)"),
-        "large whole values keep the f32 spelling: {big}"
+        big.contains("=2147483520;") && big.contains("=33554436;"),
+        "large whole values fold to their exact integers: {big}"
     );
-    // Below 2^24 the token is the value; negative into i32 and whole into
-    // f32 convert the same either way.
+    // A finite in-range float into an integer and a 32-bit integer into
+    // `f32` are exactly-rounded arms of `cast_width4_to`: each folds, taking
+    // the `bitcast` above it along.
     let bare = minify(&body(
         "var x = 3.0; out[0] = u32(x); var y = -3.0; out[1] = bitcast<u32>(i32(y)); \
          var z = 3000000000u; out[2] = bitcast<u32>(f32(z));",
     ));
+    let bits = 3000000000f32.to_bits();
     assert!(
-        bare.contains("u32(3)") && bare.contains("i32(-3)") && bare.contains("f32(3000000000)"),
-        "no needless suffix: {bare}"
+        bare.contains("=3;")
+            && bare.contains("=4294967293;")
+            && bare.contains(&format!("={bits};")),
+        "in-range conversions fold to their values: {bare}"
+    );
+}
+
+/// An extracted f32 literal renders as a bare `const` name, abstract like a
+/// bare literal: an all-literal `mix` whose third argument is extracted still
+/// spells its first argument typed, or the module would drop to naga's
+/// emitter (and ship the input when that text fails too).
+#[test]
+fn all_literal_math_call_pins_past_an_extracted_literal() {
+    let mut stmts = String::from(
+        "out[0] = bitcast<u32>(m(0.0, 4.0, 0.25)); \
+         out[1] = bitcast<u32>(m(bitcast<f32>(inp[1]), 0.25, bitcast<f32>(inp[2])));",
+    );
+    for i in 2..14 {
+        stmts.push_str(&format!(
+            " out[{i}] = bitcast<u32>(bitcast<f32>(inp[{i}]) * 0.25);"
+        ));
+    }
+    let src = format!(
+        "fn m(a: f32, b: f32, t: f32) -> f32 {{ return mix(a, b, t); }} {}",
+        body(&stmts)
+    );
+    let out = crate::run(&src, &Config::default()).expect("run failed");
+    assert!(
+        out.report.fallback.is_none() && out.report.bailout.is_none(),
+        "generator text stands: {}",
+        out.source
+    );
+    assert!(
+        out.source.contains("=.25;") && out.source.contains("mix(0f,4,"),
+        "first argument typed past the extracted `.25`: {}",
+        out.source
     );
 }
 
@@ -626,5 +706,42 @@ fn all_literal_math_call_pins_one_argument() {
         out.source.contains("mix(0f,1,.25)") && out.source.contains("smoothstep(0f,1,.5)"),
         "one argument typed: {}",
         out.source
+    );
+}
+
+/// A hazard `let` on a zero literal that another consumer shares as a lane:
+/// the zero-value, splat and sub-splat folds must spell the lane's name, not
+/// its value - `normalize(vec3f())` is the const-expression the binding
+/// exists to avoid, and the self-check would ship the input lexically
+/// compacted.
+#[test]
+fn a_hazard_bound_zero_lane_keeps_its_name_through_the_value_folds() {
+    let out = minify(&body(
+        "let z = 0.0; out[0] = bitcast<u32>(log(z)); \
+         out[1] = bitcast<u32>(normalize(vec3f(z)).x); \
+         out[2] = bitcast<u32>(normalize(vec2f(z, z)).x); \
+         out[3] = bitcast<u32>(normalize(vec4f(z, z, 1.0, f32(inp[0]))).x);",
+    ));
+    let n = bound_name(&out, "0f");
+    assert!(
+        out.contains(&format!("normalize(vec3f({n}))"))
+            && out.contains(&format!("normalize(vec2f({n}))"))
+            && out.contains(&format!("vec4({n},{n},1,")),
+        "every lane sharing the bound literal spells its name: {out}"
+    );
+    // The splat elision and `select` read the same table: a bound lane is
+    // not the equal of an unbound one.
+    let out = minify(&body(
+        "let z = 0.0; out[0] = bitcast<u32>(log(z)); \
+         let f = f32(inp[0]); \
+         out[1] = bitcast<u32>(log(select(z, f, inp[1] > 0u))); \
+         out[2] = bitcast<u32>(inverseSqrt(dot(vec2f(1.0), vec2f(z, 0.0))));",
+    ));
+    let n = bound_name(&out, "0f");
+    assert!(
+        out.contains(&format!("select({n},"))
+            && !out.contains("vec2f(0)")
+            && !out.contains("vec2f()"),
+        "the bound zero lane stays a name: {out}"
     );
 }

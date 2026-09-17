@@ -3,6 +3,8 @@
 
 mod helpers;
 
+mod binding;
+
 mod compound_assign;
 mod const_hazard;
 mod dead_code;
@@ -11,8 +13,10 @@ mod miscompile_regressions;
 mod names_and_output;
 mod pipeline;
 mod precedence;
+mod price;
 mod roundtrip;
 mod statements;
 mod textures;
+mod twins;
 mod type_alias;
 mod type_elision;

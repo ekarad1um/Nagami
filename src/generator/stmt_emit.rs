@@ -4,7 +4,7 @@
 
 use crate::error::Error;
 
-use super::core::{FunctionCtx, Generator};
+use super::core::{ByteDecision, FunctionCtx, Generator};
 use super::syntax::{expression_kind, statement_kind};
 use crate::handle_set::{HandleMap, HandleSet};
 
@@ -96,6 +96,19 @@ fn elide_tail_void_returns(stmt: &naga::Statement) -> Option<naga::Statement> {
 /// interiors bind at most one node past the cap.
 const MAX_RENDER_DEPTH: u16 = 256;
 
+/// Whether a `let` over a value of `len` bytes, read `refs` times, saves
+/// bytes: inline the text renders at every use, `parens` of them wrapping
+/// it; bound it renders once, in `let N=E;`, and every use spells `name`.
+pub(super) fn binding_pays(
+    refs: usize,
+    parens: usize,
+    len: usize,
+    name: usize,
+    beautify: bool,
+) -> bool {
+    refs * len + 2 * parens > len + name + super::syntax::let_boilerplate(beautify) + refs * name
+}
+
 /// Number of times emitting the tree rooted at `root` materialises `target`, a
 /// for-loop preload result bound to inline `workgroupUniformLoad(&p)` text:
 /// loop-body-dependent intermediates cannot be hoisted to a `let`, so every
@@ -120,7 +133,7 @@ fn count_inline_emissions(
     // Saturating: a chain of shared diamonds has exponentially many paths,
     // and a wrapped count could read as the one the caller accepts.
     let mut total = 0usize;
-    crate::passes::expr_util::visit_expression_children(&expressions[root], |child| {
+    crate::ir::visit::visit_expression_children(&expressions[root], |child| {
         let paths = count_inline_emissions(child, target, expressions, cache);
         total = total.saturating_add(if Some(child) == conditional && paths > 0 {
             2
@@ -201,8 +214,9 @@ pub(super) struct ForLoopShape<'a> {
 /// Parse a `Loop` into a [`ForLoopShape`], or `None` when it is not
 /// for-convertible: a `break_if`, no leading if-break guard (after optional
 /// `Emit` / `WorkGroupUniformLoad` preloads), or more than one core statement
-/// in `continuing`.  Purely structural; every consumer layers its own policy
-/// (preload safety, update-statement kind) on this one parse.
+/// in `continuing`.  Purely structural; [`emittable_for_loop_shape`] layers
+/// every policy (update-statement kind, preload safety, header depth, MSL
+/// cast ambiguity) on this one parse.
 pub(super) fn parse_for_loop_shape<'a>(
     body: &'a naga::Block,
     continuing: &'a naga::Block,
@@ -284,14 +298,6 @@ pub(super) fn parse_for_loop_shape<'a>(
     })
 }
 
-/// `true` when rendering `shape`'s guard condition, update statement, or a
-/// preload pointer inline in the `for(...)` header would exceed
-/// [`MAX_RENDER_DEPTH`].  Header clauses bypass the `S::Emit` depth gate (the
-/// for-conversion consumes their `Emit` ranges), so an over-deep chain must
-/// stay on the plain `loop` path where the gate binds it; init `Emit`s precede
-/// the loop and are gated normally.  Ignores binding state on purpose: the
-/// counter-`var` suppression decision and the emitter both call this on the
-/// same [`ForLoopShape`], so they cannot drift toward "suppressed + undeclared".
 /// `true` when a header expression would render as the `T1(T2(x))` operand
 /// of a unary that Dawn's Metal backend misparses
 /// ([`super::const_hazard::msl_cast_ambiguity_operand`]).  The `for(...)`
@@ -304,9 +310,7 @@ pub(super) fn for_header_has_msl_cast_ambiguity(
 ) -> bool {
     let mut pending = vec![shape.condition];
     if let Some(stmt) = shape.update_stmt {
-        crate::passes::expr_util::visit_statement_expression_handles(stmt, false, &mut |h| {
-            pending.push(h)
-        });
+        crate::ir::visit::visit_statement_expression_handles(stmt, false, &mut |h| pending.push(h));
     }
     // Cone-sized, not arena-sized: a header is small and this runs per loop.
     let mut seen = std::collections::BTreeSet::new();
@@ -318,11 +322,50 @@ pub(super) fn for_header_has_msl_cast_ambiguity(
         {
             return true;
         }
-        crate::passes::expr_util::visit_expression_children(&expressions[h], |c| pending.push(c));
+        crate::ir::visit::visit_expression_children(&expressions[h], |c| pending.push(c));
     }
     false
 }
 
+/// The [`ForLoopShape`] the emitter will render as a `for`, or `None` when
+/// the `Loop` stays a `loop`: every gate but the init-slot decision, which
+/// needs the emission context.  ONE predicate for the emitter and the
+/// counter-`var` analysis (`find_for_loop_vars`), so the two cannot
+/// disagree: a gate added to the emitter alone leaves a counter undeclared,
+/// one added to the analysis alone declares it twice.
+pub(super) fn emittable_for_loop_shape<'a>(
+    body: &'a naga::Block,
+    continuing: &'a naga::Block,
+    break_if: &Option<naga::Handle<naga::Expression>>,
+    expressions: &naga::Arena<naga::Expression>,
+    must_bind: &HandleSet<naga::Expression>,
+) -> Option<ForLoopShape<'a>> {
+    let shape = parse_for_loop_shape(body, continuing, break_if)?;
+    // Only Store / Call / ImageStore fit the update slot.
+    if let Some(stmt) = shape.update_stmt
+        && !matches!(
+            stmt,
+            naga::Statement::Store { .. }
+                | naga::Statement::Call { .. }
+                | naga::Statement::ImageStore { .. }
+        )
+    {
+        return None;
+    }
+    (for_loop_preload_inlining_is_safe(&shape, body, continuing, expressions, must_bind)
+        && !for_header_exceeds_depth_cap(&shape, expressions)
+        && !for_header_has_msl_cast_ambiguity(&shape, expressions))
+    .then_some(shape)
+}
+
+/// `true` when rendering `shape`'s guard condition, update statement, or a
+/// preload pointer inline in the `for(...)` header would exceed
+/// [`MAX_RENDER_DEPTH`].  Header clauses bypass the `S::Emit` depth gate (the
+/// for-conversion consumes their `Emit` ranges), so an over-deep chain must
+/// stay on the plain `loop` path where the gate binds it; init `Emit`s precede
+/// the loop and are gated normally.  Ignores binding state on purpose:
+/// [`emittable_for_loop_shape`] is asked by the counter-`var` analysis before
+/// any name is bound and must answer the emitter identically.
 pub(super) fn for_header_exceeds_depth_cap(
     shape: &ForLoopShape,
     expressions: &naga::Arena<naga::Expression>,
@@ -337,7 +380,7 @@ pub(super) fn for_header_exceeds_depth_cap(
             return d;
         }
         let mut children = Vec::new();
-        crate::passes::expr_util::visit_expression_children(&expressions[h], |c| children.push(c));
+        crate::ir::visit::visit_expression_children(&expressions[h], |c| children.push(c));
         let mut max_child = 0u16;
         for child in children {
             max_child = max_child.max(depth(child, expressions, memo));
@@ -353,7 +396,7 @@ pub(super) fn for_header_exceeds_depth_cap(
     let mut memo = std::collections::BTreeMap::new();
     let mut exceeded = depth(shape.condition, expressions, &mut memo) > MAX_RENDER_DEPTH;
     if let Some(stmt) = shape.update_stmt {
-        crate::passes::expr_util::visit_statement_expression_handles(stmt, false, &mut |h| {
+        crate::ir::visit::visit_statement_expression_handles(stmt, false, &mut |h| {
             exceeded |= depth(h, expressions, &mut memo) > MAX_RENDER_DEPTH;
         });
     }
@@ -366,11 +409,8 @@ pub(super) fn for_header_exceeds_depth_cap(
     exceeded
 }
 
-/// Single source of truth for whether a for-shaped loop's
-/// `WorkGroupUniformLoad` preloads may be inlined into the `for(...)` header;
-/// the emitter and the counter-`var` suppression decision both call it on the
-/// same [`ForLoopShape`], so they never disagree (a disagreement would leave
-/// the counter undeclared).
+/// Whether a for-shaped loop's `WorkGroupUniformLoad` preloads may be inlined
+/// into the `for(...)` header, one gate of [`emittable_for_loop_shape`].
 ///
 /// A preload carries a barrier and must execute exactly once per iteration,
 /// yet in a `for` it is materialised only where its `result` is emitted (the
@@ -382,13 +422,14 @@ pub(super) fn for_header_exceeds_depth_cap(
 /// referenced (including a `continuing` with preloads but no core update
 /// statement) would drop the barrier.  Each preload must count exactly one
 /// emission.  The update clause relocates ahead of the body as well, so it
-/// may not read a must-bind `Load` or a result some loop statement binds.
+/// may not read a must-bind `Load` emitted in the loop or a result some loop
+/// statement binds.
 pub(super) fn for_loop_preload_inlining_is_safe(
     shape: &ForLoopShape,
     body: &naga::Block,
     continuing: &naga::Block,
     expressions: &naga::Arena<naga::Expression>,
-    must_bind_loads: &HandleSet<naga::Expression>,
+    must_bind: &HandleSet<naga::Expression>,
 ) -> bool {
     // The update clause is relocated into the header, emitted BEFORE the body,
     // while a must-bind `Load` (its place is overwritten between its `Emit` and
@@ -401,14 +442,30 @@ pub(super) fn for_loop_preload_inlining_is_safe(
     // iteration top it coincides with the body-top load position, outer loads
     // it reads are `let`-bound before the loop, and back-edge writes are
     // covered by the must-bind loop pre-marking.  A guard preload relocated
-    // into the condition IS a barrier, the guard-preload hazard.
-    if !must_bind_loads.is_empty()
+    // into the condition IS a barrier, the guard-preload hazard.  Only a
+    // must-bind handle EMITTED in the loop is the hazard: one bound before
+    // the loop (a pre-marked load, work the loop pin keeps at its depth) has
+    // its `let` ahead of the header and is in scope for every clause.
+    let mut inner_must_bind = HandleSet::default();
+    if !must_bind.is_empty() {
+        for block in [body, continuing] {
+            crate::ir::visit::for_each_statement(block, &mut |s| {
+                if let naga::Statement::Emit(range) = s {
+                    for h in range.clone().filter(|h| must_bind.contains(*h)) {
+                        inner_must_bind.insert(h);
+                    }
+                }
+            });
+        }
+    }
+    let must_bind = &inner_must_bind;
+    if !must_bind.is_empty()
         && let Some(stmt) = shape.update_stmt
     {
-        let update_hazard = stmt_references_any(stmt, must_bind_loads, expressions)
+        let update_hazard = stmt_references_any(stmt, must_bind, expressions)
             || shape.update_preloads.iter().any(|&(pointer, _)| {
                 let mut visited = Default::default();
-                cone_intersects_set(pointer, must_bind_loads, expressions, &mut visited)
+                cone_intersects_set(pointer, must_bind, expressions, &mut visited)
             });
         if update_hazard {
             return false;
@@ -423,7 +480,7 @@ pub(super) fn for_loop_preload_inlining_is_safe(
     if let Some(stmt) = shape.update_stmt {
         let mut loop_bound = HandleSet::default();
         for block in [body, continuing] {
-            crate::passes::expr_util::for_each_statement(block, &mut |s| {
+            crate::ir::visit::for_each_statement(block, &mut |s| {
                 if let Some(result) = crate::passes::expr_util::statement_result(s) {
                     loop_bound.insert(result);
                 }
@@ -445,10 +502,10 @@ pub(super) fn for_loop_preload_inlining_is_safe(
         // value; for-reconstruction would re-emit its `let` in the body or
         // inline it into the condition after the barrier operand, reading the
         // POST-barrier value.  Plain-loop emission keeps the snapshot in place.
-        if !must_bind_loads.is_empty()
+        if !must_bind.is_empty()
             && body_stmts[..shape.guard_idx].iter().any(|s| {
                 matches!(s, naga::Statement::Emit(range)
-                    if range.clone().any(|h| must_bind_loads.contains(h)))
+                    if range.clone().any(|h| must_bind.contains(h)))
             })
         {
             return false;
@@ -508,7 +565,7 @@ fn stmt_references_any(
 ) -> bool {
     let mut visited = Default::default();
     let mut found = false;
-    crate::passes::expr_util::visit_statement_operands(stmt, false, &mut |root| {
+    crate::ir::visit::visit_statement_operands(stmt, false, &mut |root| {
         if !found {
             found = cone_intersects_set(root, set, expressions, &mut visited);
         }
@@ -531,7 +588,7 @@ fn cone_intersects_set(
         return false;
     }
     let mut found = false;
-    crate::passes::expr_util::visit_expression_children(&expressions[root], |child| {
+    crate::ir::visit::visit_expression_children(&expressions[root], |child| {
         if !found {
             found = cone_intersects_set(child, set, expressions, visited);
         }
@@ -557,7 +614,7 @@ fn expr_subtree_contains(
         return false;
     }
     let mut found = false;
-    crate::passes::expr_util::visit_expression_children(&expressions[root], |child| {
+    crate::ir::visit::visit_expression_children(&expressions[root], |child| {
         if !found {
             found = expr_subtree_contains(child, target, expressions, visited);
         }
@@ -580,7 +637,7 @@ fn stmt_uses_expr(
 ) -> bool {
     let mut visited = Default::default();
     let mut found = false;
-    crate::passes::expr_util::visit_statement_expression_handles(
+    crate::ir::visit::visit_statement_expression_handles(
         stmt,
         /*include_emit_handles=*/ true,
         &mut |h| {
@@ -712,6 +769,31 @@ impl<'a> Generator<'a> {
     }
 }
 
+/// Routes a second hazard binding of the same `override` through the first's
+/// name instead of a new `let`: every use of `GRID` holds its own `Override`
+/// handle (`C % GRID`, `C / GRID`), and a binding still on the stack was
+/// emitted in this block or an enclosing one, so its name is in scope.  The
+/// alias is pushed too, so the scope release drops both.
+fn shares_open_override_binding(
+    operand: naga::Handle<naga::Expression>,
+    ctx: &mut FunctionCtx<'_, '_>,
+) -> bool {
+    let naga::Expression::Override(this) = ctx.exprs[operand] else {
+        return false;
+    };
+    let Some(name) = ctx
+        .const_hazard_bindings
+        .iter()
+        .find(|&&b| matches!(ctx.exprs[b], naga::Expression::Override(o) if o == this))
+        .and_then(|b| ctx.expr_names.get(b).cloned())
+    else {
+        return false;
+    };
+    ctx.expr_names.insert(operand, name);
+    ctx.const_hazard_bindings.push(operand);
+    true
+}
+
 /// Hazard bindings are block-scoped `let`s over pre-emitted operands that later
 /// blocks may use again, so every block-emission path pairs a mark with this.
 fn release_hazard_scope(ctx: &mut FunctionCtx<'_, '_>, mark: usize) {
@@ -738,9 +820,7 @@ fn tail_cone_has_stashed_call(tail: &Option<naga::Statement>, ctx: &FunctionCtx<
         if ctx.inlineable_calls.contains(h) {
             return true;
         }
-        crate::passes::expr_util::visit_expression_children(&ctx.exprs[h], |child| {
-            stack.push(child)
-        });
+        crate::ir::visit::visit_expression_children(&ctx.exprs[h], |child| stack.push(child));
     }
     false
 }
@@ -1052,6 +1132,7 @@ impl<'a> Generator<'a> {
             // Bind a tint-rejected const-expression's operand first so the
             // consumer evaluates at runtime as the input did (`const_hazard`).
             if ctx.ref_counts[h.index()] > 0
+                && !ctx.expr_names.contains_key(h)
                 && let Some(operand) = super::const_hazard::creation_error_operand(
                     self.module,
                     ctx,
@@ -1060,6 +1141,7 @@ impl<'a> Generator<'a> {
                 )
                 .or_else(|| super::const_hazard::msl_cast_ambiguity_operand(ctx, h))
                 && !ctx.expr_names.contains_key(operand)
+                && !shares_open_override_binding(operand, ctx)
             {
                 if emitted_any {
                     self.push_newline();
@@ -1068,40 +1150,22 @@ impl<'a> Generator<'a> {
                 emitted_any = true;
                 self.emit_const_hazard_binding(operand, ctx)?;
             }
-            // A `Load` whose place is written between this `Emit` and a use
-            // must be bound or it reads the post-write value; uniformity-pinned
-            // expressions share the force-bind.  Both override the short-name
-            // skip in `should_bind_expression` and the ref-count threshold.
-            let force_bind = ctx.must_bind_loads.contains(h) || self.is_uniformity_pinned(h, ctx);
-            // Both parsers bound nesting ([`MAX_RENDER_DEPTH`]): once inlining
-            // `h` would render past the cap, bind it regardless of byte cost.
-            // Restricted to bindable shapes (never pointers / statement-result
-            // names) and live values; depth passes through unbindable nodes to
-            // their first bindable ancestor.
-            let depth_capped = !force_bind
-                && ctx.ref_counts[h.index()] > 0
-                && self.should_bind_expression(h, ctx)
-                && self.render_depth(h, ctx) > MAX_RENDER_DEPTH;
-            if !force_bind && !depth_capped && !self.should_bind_expression(h, ctx) {
+            let Some(value) = self.binding_decision(h, ctx)? else {
                 continue;
-            }
-            let refs = ctx.ref_counts[h.index()];
-            if !force_bind && !depth_capped && refs < self.min_binding_refs(h, ctx) {
-                continue;
-            }
+            };
             if emitted_any {
                 self.push_newline();
                 self.push_indent();
             }
             emitted_any = true;
             let name = ctx.next_expr_name();
-            let value = self.emit_expr_uncached(h, ctx)?;
             self.out.push_str("let ");
             self.out.push_str(&name);
             self.push_assign();
             self.out.push_str(&value);
             self.out.push(';');
             ctx.expr_names.insert(h, name);
+            ctx.name_twins(h);
         }
         Ok(())
     }
@@ -1217,12 +1281,12 @@ impl<'a> Generator<'a> {
             if !ctx.expr_names.contains_key(value)
                 && crate::passes::load_dedup::is_zero_init(ctx.exprs, *value)
             {
-                self.emit_zero_init_tail(ctx.func.local_variables[lh].ty)?;
+                self.emit_zero_init_tail(ctx.func.local_variables[lh].ty, ctx)?;
             } else {
                 if ctx.needs_declared_type(lh, *value) {
                     self.push_colon();
-                    self.out
-                        .push_str(&self.type_ref(ctx.func.local_variables[lh].ty)?);
+                    let spelled = self.spell_type(ctx.func.local_variables[lh].ty, ctx)?;
+                    self.out.push_str(&spelled);
                 }
                 self.push_assign();
                 // An uncached literal keeps its type suffix so the `var` gets the concrete type.
@@ -1557,7 +1621,7 @@ impl<'a> Generator<'a> {
         }
         // The visitor borrows the arena while the recursion needs `ctx` mutably.
         let mut children = Vec::new();
-        crate::passes::expr_util::visit_expression_children(&ctx.exprs[h], |c| children.push(c));
+        crate::ir::visit::visit_expression_children(&ctx.exprs[h], |c| children.push(c));
         let mut max_child = 0u16;
         for child in children {
             max_child = max_child.max(self.render_depth(child, ctx));
@@ -1569,6 +1633,115 @@ impl<'a> Generator<'a> {
         let depth = max_child.saturating_add(weight);
         ctx.render_depth_memo[h.index()] = depth;
         depth
+    }
+
+    /// Whether the `Emit` of `h` renders a `let` for it - the value's text
+    /// when it does, `None` where `h` renders at its uses: the one binding
+    /// judgement, so a pass pricing a rewrite asks the emitter rather than
+    /// modelling it.  In order: `must_bind` (`compute_must_bind`) and a
+    /// uniformity pin force the `let` past the short-name skip of
+    /// `should_bind_expression` and the byte rule; nesting past
+    /// [`MAX_RENDER_DEPTH`] (both parsers bound it) binds regardless of
+    /// bytes, for bindable shapes (never pointers / statement-result names)
+    /// with live values, depth passing through unbindable nodes to their
+    /// first bindable ancestor; a cone with work in it rendered at several
+    /// uses would run that work once per use, so it binds whatever the
+    /// bytes say ([`Self::cone_repeats_work`]); last the bytes, on the text
+    /// itself ([`binding_pays`]).
+    pub(super) fn binding_decision(
+        &self,
+        h: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<Option<String>, Error> {
+        // A twin its first spelling's `let` already names renders nothing.
+        if ctx.expr_names.contains_key(h) {
+            return Ok(None);
+        }
+        if ctx.must_bind.contains(h) || self.is_uniformity_pinned(h, ctx) {
+            return self.let_value(h, ctx).map(Some);
+        }
+        // The census counts a consumer once; a consumer the rule inlines
+        // renders the value at each of its own uses, so a render's own
+        // counts, where one has been taken, are the truth.
+        let (refs, parens) = match &ctx.measured {
+            Some((renders, parens)) => (
+                usize::try_from(renders[h.index()]).unwrap_or(0),
+                usize::try_from(parens[h.index()]).unwrap_or(0),
+            ),
+            None => (
+                ctx.ref_counts[h.index()],
+                usize::from(ctx.paren_uses[h.index()]),
+            ),
+        };
+        if refs == 0 || !self.should_bind_expression(h, ctx) {
+            return Ok(None);
+        }
+        if self.render_depth(h, ctx) > MAX_RENDER_DEPTH
+            || (refs >= 2 && self.cone_repeats_work(h, ctx))
+        {
+            return self.let_value(h, ctx).map(Some);
+        }
+        if refs < 2 {
+            return Ok(None);
+        }
+        let mark = ctx.mark();
+        let text = self.let_value(h, ctx)?;
+        let name = ctx.peek_expr_name_len();
+        let bound = binding_pays(refs, parens, text.len(), name, self.options.beautify);
+        ctx.decisions.push(ByteDecision {
+            handle: h,
+            len: text.len(),
+            name,
+            bound,
+        });
+        if !bound {
+            // The pricing render is not in the text; the uses render it.
+            ctx.discard_since(mark);
+            return Ok(None);
+        }
+        Ok(Some(text))
+    }
+
+    /// The text of `h` for its `let`, its own rendering not counted as a
+    /// use: the counts hold what the consumers render.
+    fn let_value(
+        &self,
+        h: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<String, Error> {
+        let mark = ctx.mark();
+        let text = self.emit_expr_uncached(h, ctx)?;
+        // The first entry since `mark` is `h`'s own.
+        ctx.discard_range(mark, mark + 1);
+        Ok(text)
+    }
+
+    /// Whether rendering `h` at each of its uses would run something the
+    /// input runs once: a stashed call (its text renders at its one use,
+    /// which `h` would multiply - an impure callee's write repeated, a pure
+    /// one's texture sample doubled) or an expensive operation, in `h` or
+    /// reached through operands that render inline; a bound operand
+    /// renders as its name and ends the walk.  The walk is the size of the
+    /// text `h` would render, the byte rule keeping an inlined cone short.
+    fn cone_repeats_work(
+        &self,
+        h: naga::Handle<naga::Expression>,
+        ctx: &FunctionCtx<'a, '_>,
+    ) -> bool {
+        let mut stack = vec![h];
+        while let Some(e) = stack.pop() {
+            if e != h && ctx.expr_names.contains_key(e) {
+                if ctx.inlineable_calls.contains(e) {
+                    return true;
+                }
+                continue;
+            }
+            if crate::passes::expr_util::is_expensive_expr(&ctx.exprs[e]) {
+                return true;
+            }
+            crate::ir::visit::visit_expression_children(&ctx.exprs[e], |c| stack.push(c));
+        }
+        false
     }
 
     fn should_bind_expression(
@@ -1604,72 +1777,38 @@ impl<'a> Generator<'a> {
         )
     }
 
-    /// Minimum reference count before a `let` pays for itself: `let X=EXPR;`
-    /// costs about `len + 7` bytes and saves `len - 1` per use, so binding wins
-    /// when `refs > (len + 7) / (len - 1)`.
-    fn min_binding_refs(
-        &self,
-        h: naga::Handle<naga::Expression>,
-        ctx: &FunctionCtx<'a, '_>,
-    ) -> usize {
-        use naga::Expression as E;
-        match &ctx.exprs[h] {
-            // `-x` ~= 2 chars -> need 10+ refs to break even
-            E::Unary { expr: child, .. } => {
-                if self.expr_resolves_to_name(*child, ctx) {
-                    return 10;
-                }
-                2
-            }
-            // `v.x` on a vector ~= 3 chars -> need 6+ refs
-            E::AccessIndex { base, .. } => {
-                if self.expr_resolves_to_name(*base, ctx) {
-                    let inner = ctx.ty(*base).inner_with(&self.module.types);
-                    if matches!(inner, naga::TypeInner::Vector { .. }) {
-                        return 6;
-                    }
-                }
-                2
-            }
-            // `a*b` with both operands named ~= 3 chars -> need 6+ refs
-            E::Binary { left, right, .. } => {
-                if self.expr_resolves_to_name(*left, ctx) && self.expr_resolves_to_name(*right, ctx)
-                {
-                    return 6;
-                }
-                2
-            }
-            _ => 2,
+    /// `var name[:type]=value` in a `for` init clause.
+    fn emit_for_init_var(
+        &mut self,
+        lh: naga::Handle<naga::LocalVariable>,
+        value: naga::Handle<naga::Expression>,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        self.out.push_str("var ");
+        self.out.push_str(&ctx.local_names[&lh]);
+        if ctx.needs_declared_type(lh, value) {
+            self.push_colon();
+            let spelled = self.spell_type(ctx.func.local_variables[lh].ty, ctx)?;
+            self.out.push_str(&spelled);
         }
+        self.push_assign();
+        if !ctx.expr_names.contains_key(value)
+            && let naga::Expression::Literal(lit) = ctx.exprs[value]
+        {
+            self.out.push_str(&super::syntax::literal_to_wgsl(
+                lit,
+                &self.options.float_precision,
+            ));
+        } else {
+            self.out.push_str(&self.emit_expr(value, ctx)?);
+        }
+        Ok(())
     }
 
-    /// Whether `h` renders as a short name (1-2 chars) rather than a
-    /// sub-expression.  A stashed single-use call sits in `expr_names` as its
-    /// whole call text and is NOT one: a wrapper priced as cheap over it would
-    /// re-render per use, and each rendering runs the call again - an impure
-    /// callee's write repeated, a pure one's texture sample multiplied.
-    fn expr_resolves_to_name(
-        &self,
-        h: naga::Handle<naga::Expression>,
-        ctx: &FunctionCtx<'a, '_>,
-    ) -> bool {
-        if ctx.expr_names.contains_key(h) {
-            return !ctx.inlineable_calls.contains(h);
-        }
-        use naga::Expression as E;
-        match &ctx.exprs[h] {
-            E::FunctionArgument(_) | E::Constant(_) | E::Override(_) => true,
-            E::Load { pointer } => matches!(
-                ctx.exprs[*pointer],
-                E::LocalVariable(_) | E::GlobalVariable(_)
-            ),
-            _ => false,
-        }
-    }
-
-    /// Emit a `Loop` as `for(init; cond; update)`.  `Ok(false)` means the loop
-    /// is not for-convertible or header inlining is unsafe; nothing has been
-    /// written, so the caller falls back to plain `loop` emission.
+    /// Emit a `Loop` as `for(init; cond; update)`.  `Ok(false)` when
+    /// [`emittable_for_loop_shape`] declines or an external init would leave
+    /// a suppressed counter `var` undeclared; nothing has been written, so
+    /// the caller falls back to plain `loop` emission.
     fn try_emit_for_loop(
         &mut self,
         body: &naga::Block,
@@ -1681,42 +1820,11 @@ impl<'a> Generator<'a> {
         )>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<bool, Error> {
-        if break_if.is_some() {
-            return Ok(false);
-        }
-
-        let Some(shape) = parse_for_loop_shape(body, continuing, break_if) else {
+        let Some(shape) =
+            emittable_for_loop_shape(body, continuing, break_if, ctx.exprs, &ctx.must_bind)
+        else {
             return Ok(false);
         };
-
-        // Only Store / Call / ImageStore fit the update slot.  Every bail-out
-        // precedes the first write so the fallback starts clean.
-        if let Some(stmt) = shape.update_stmt
-            && !matches!(
-                stmt,
-                naga::Statement::Store { .. }
-                    | naga::Statement::Call { .. }
-                    | naga::Statement::ImageStore { .. }
-            )
-        {
-            return Ok(false);
-        }
-
-        if !for_loop_preload_inlining_is_safe(
-            &shape,
-            body,
-            continuing,
-            ctx.exprs,
-            &ctx.must_bind_loads,
-        ) {
-            return Ok(false);
-        }
-
-        if for_header_exceeds_depth_cap(&shape, ctx.exprs)
-            || for_header_has_msl_cast_ambiguity(&shape, ctx.exprs)
-        {
-            return Ok(false);
-        }
 
         let body_stmts: Vec<_> = body.iter().collect();
         let ForLoopShape {
@@ -1729,56 +1837,47 @@ impl<'a> Generator<'a> {
             update_stmt,
         } = shape;
 
-        // Without an external init, absorb a for_loop_var counter; one with no
-        // init value gets a bare `var name:type` in the init clause.
-        let mut decl_only_local: Option<naga::Handle<naga::LocalVariable>> = None;
-
-        let init = if init.is_some() {
-            // An external init occupies the init slot, which would leave a
-            // suppressed-`var` counter undeclared: bail so the Store emits as a
-            // statement and the plain `Loop` path absorbs the counter.
-            if let Some(naga::Statement::Store { pointer, .. }) = update_stmt
-                && let naga::Expression::LocalVariable(lh) = ctx.exprs[*pointer]
-                && ctx.for_loop_vars[lh.index()]
-            {
-                return Ok(false);
-            }
-            init
-        } else if let Some(naga::Statement::Store { pointer, .. }) = update_stmt {
-            if let naga::Expression::LocalVariable(lh) = ctx.exprs[*pointer] {
-                if ctx.for_loop_vars[lh.index()] {
-                    // Consumed: never absorbed twice.
-                    ctx.for_loop_vars[lh.index()] = false;
-                    if let Some(init_handle) = ctx.func.local_variables[lh].init {
-                        Some((*pointer, init_handle))
-                    } else {
-                        decl_only_local = Some(lh);
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // The local the counter-var analysis declares in this header, if
+        // any: at most one per loop, keyed by the loop's guard - which loops
+        // may share (`let c=..;while(c){..}while(c){..}`), so the header
+        // takes the one THIS loop references.
+        let absorbed = ctx
+            .func
+            .local_variables
+            .iter()
+            .map(|(h, _)| h)
+            .filter(|h| ctx.for_loop_vars[h.index()] == Some(condition))
+            .find(|&h| {
+                super::module_emit::local_var_in_stmts(&body_stmts, h, ctx.exprs)
+                    || super::module_emit::local_var_in_stmts(
+                        &continuing.iter().collect::<Vec<_>>(),
+                        h,
+                        ctx.exprs,
+                    )
+            });
+        // An external init occupies the init slot, which would leave the
+        // absorbed local undeclared: bail so the Store emits as a statement
+        // and the retry without one declares the local here.
+        if init.is_some() && absorbed.is_some() {
+            return Ok(false);
+        }
+        if let Some(lh) = absorbed {
+            // Consumed: never absorbed twice.
+            ctx.for_loop_vars[lh.index()] = None;
+        }
 
         // Header expressions render inline, bypassing `generate_emit_stmt`:
         // bind their hazards before the loop, in the enclosing scope.
         let mut pending = vec![condition];
         if let Some(stmt) = update_stmt {
-            crate::passes::expr_util::visit_statement_expression_handles(stmt, false, &mut |h| {
+            crate::ir::visit::visit_statement_expression_handles(stmt, false, &mut |h| {
                 pending.push(h)
             });
         }
         let mut cone = std::collections::BTreeSet::new();
         while let Some(h) = pending.pop() {
             if cone.insert(h) {
-                crate::passes::expr_util::visit_expression_children(&ctx.exprs[h], |c| {
-                    pending.push(c)
-                });
+                crate::ir::visit::visit_expression_children(&ctx.exprs[h], |c| pending.push(c));
             }
         }
         for h in cone {
@@ -1788,6 +1887,7 @@ impl<'a> Generator<'a> {
                 h,
                 &self.options.float_precision,
             ) && !ctx.expr_names.contains_key(operand)
+                && !shares_open_override_binding(operand, ctx)
             {
                 self.push_indent();
                 self.emit_const_hazard_binding(operand, ctx)?;
@@ -1798,47 +1898,33 @@ impl<'a> Generator<'a> {
         self.push_indent();
         self.push_for_open();
 
-        // Init clause.
+        // Init clause.  The for-init declares its local, so a body Store to
+        // it (a counter update that stayed in the body) must assign rather
+        // than re-declare a second `var` that shadows the for-init copy and
+        // freezes the counter; clearing `deferred_vars` is what body
+        // emission sees.
         let mut deferred_for_init_local: Option<naga::Handle<naga::LocalVariable>> = None;
         if let Some((pointer, value)) = init {
             if let naga::Expression::LocalVariable(lh) = ctx.exprs[pointer] {
-                self.out.push_str("var ");
-                self.out.push_str(&ctx.local_names[&lh]);
-                if ctx.needs_declared_type(lh, value) {
-                    self.push_colon();
-                    self.out
-                        .push_str(&self.type_ref(ctx.func.local_variables[lh].ty)?);
-                }
-                self.push_assign();
-                if !ctx.expr_names.contains_key(value) {
-                    if let naga::Expression::Literal(lit) = ctx.exprs[value] {
-                        self.out.push_str(&super::syntax::literal_to_wgsl(
-                            lit,
-                            &self.options.float_precision,
-                        ));
-                    } else {
-                        self.out.push_str(&self.emit_expr(value, ctx)?);
-                    }
-                } else {
-                    self.out.push_str(&self.emit_expr(value, ctx)?);
-                }
-                // The for-init declares `lh`, so a body Store to it (a counter
-                // update that stayed in the body) must assign rather than
-                // re-declare a second `var` that shadows the for-init copy and
-                // freezes the counter; clearing here is what body emission sees.
+                self.emit_for_init_var(lh, value, ctx)?;
                 deferred_for_init_local = Some(lh);
             } else {
                 self.out.push_str(&self.emit_lvalue(pointer, ctx)?);
                 self.push_assign();
                 self.out.push_str(&self.emit_expr(value, ctx)?);
             }
-        } else if let Some(lh) = decl_only_local {
-            // No explicit init (WGSL zero-initialises): the shorter of
-            // `var name:type` / `var name=0i`.
-            self.out.push_str("var ");
-            self.out.push_str(&ctx.local_names[&lh]);
-            let ty = ctx.func.local_variables[lh].ty;
-            self.emit_zero_init_tail(ty)?;
+        } else if let Some(lh) = absorbed {
+            match ctx.func.local_variables[lh].init {
+                Some(value) => self.emit_for_init_var(lh, value, ctx)?,
+                // No explicit init (WGSL zero-initialises): the shorter of
+                // `var name:type` / `var name=0i`.
+                None => {
+                    self.out.push_str("var ");
+                    self.out.push_str(&ctx.local_names[&lh]);
+                    let ty = ctx.func.local_variables[lh].ty;
+                    self.emit_zero_init_tail(ty, ctx)?;
+                }
+            }
             deferred_for_init_local = Some(lh);
         }
         if let Some(lh) = deferred_for_init_local {
@@ -1905,7 +1991,7 @@ impl<'a> Generator<'a> {
         for s in &body_stmts[..guard_idx] {
             if let naga::Statement::Emit(range) = s {
                 for h in range.clone() {
-                    crate::passes::expr_util::visit_expression_children(&ctx.exprs[h], |child| {
+                    crate::ir::visit::visit_expression_children(&ctx.exprs[h], |child| {
                         ctx.ref_counts[child.index()] =
                             ctx.ref_counts[child.index()].saturating_sub(1);
                     });
@@ -1915,7 +2001,7 @@ impl<'a> Generator<'a> {
         for stmt in continuing.iter() {
             if let naga::Statement::Emit(range) = stmt {
                 for h in range.clone() {
-                    crate::passes::expr_util::visit_expression_children(&ctx.exprs[h], |child| {
+                    crate::ir::visit::visit_expression_children(&ctx.exprs[h], |child| {
                         ctx.ref_counts[child.index()] =
                             ctx.ref_counts[child.index()].saturating_sub(1);
                     });
@@ -2178,11 +2264,10 @@ impl<'a> Generator<'a> {
         other: naga::Handle<naga::Expression>,
         ctx: &mut FunctionCtx<'a, '_>,
     ) -> Result<String, Error> {
-        if matches!(cop, "+=" | "-=" | "*=" | "/=" | "%=") {
-            let cached = ctx.expr_names.contains_key(other);
-            if let Some(scalar) = self.try_splat_scalar(other, ctx.exprs, cached) {
-                return self.emit_constructor_arg(scalar, ctx);
-            }
+        if matches!(cop, "+=" | "-=" | "*=" | "/=" | "%=")
+            && let Some(scalar) = self.try_splat_scalar(other, ctx)
+        {
+            return self.emit_constructor_arg(scalar, ctx);
         }
         self.emit_expr(other, ctx)
     }

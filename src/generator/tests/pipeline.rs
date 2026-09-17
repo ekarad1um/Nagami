@@ -189,6 +189,26 @@ fn matrix_cast_emits_and_validates() {
     assert_valid_wgsl(&out);
 }
 
+/// An `f16` constant under a builtin folds in the pass, not only at naga's
+/// re-parse of the output, so a second run has nothing left to shrink.
+#[test]
+fn an_f16_constant_under_a_builtin_folds_in_one_pass() {
+    let src = r#"
+        enable f16;
+        @group(0) @binding(0) var<storage, read_write> out: f16;
+        const c = 1.5703125h;
+
+        @compute @workgroup_size(1)
+        fn main() {
+            var arg = vec3<f16>(0.0h);
+            out = sin(c) + length(arg);
+        }
+    "#;
+    let out = compact_with_passes(src, Profile::Max);
+    assert!(out.contains("= 1h + length(vec3h());"), "{out}");
+    assert_valid_wgsl(&out);
+}
+
 #[test]
 fn deferred_loop_init_not_absorbed_when_var_used_later() {
     let src = r#"
@@ -419,8 +439,8 @@ fn for_loop_preload_used_as_atomic_compare_in_tail_not_dropped() {
 
 #[test]
 fn for_loop_counter_declared_when_preload_used_after_guard() {
-    // `try_emit_for_loop` bails to a plain loop here; `is_for_loop_candidate`
-    // must agree or the counter's `var` is suppressed and left undeclared.
+    // `try_emit_for_loop` bails to a plain loop here, so the counter analysis
+    // must read the same `emittable_for_loop_shape`.
     let src = r#"
         var<workgroup> wg_limit: u32;
         @group(0) @binding(0) var<storage, read_write> sink: array<u32, 64>;

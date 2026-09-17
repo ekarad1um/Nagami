@@ -4,7 +4,7 @@
 //! `@id`, float precision, beautify with mangling, and parenthesisation
 //! edge cases.
 
-use super::super::{GenerateOptions, generate_wgsl};
+use super::super::{GenerateOptions, generate};
 use super::helpers::*;
 
 // MARK: Short expression names
@@ -940,7 +940,7 @@ fn precision_rounds_float() {
 #[test]
 fn significant_figures_round_trips_f16_near_max() {
     // f16 emits through f32 widening, so rounding 65504 up (-> 70000) can
-    // produce an out-of-range `70000h`; driven through `generate_wgsl` so no
+    // produce an out-of-range `70000h`; driven through `generate` so no
     // `run()` fallback masks it.
     let src = r#"
         enable f16;
@@ -1048,7 +1048,7 @@ fn beautify_mangle_roundtrip() {
     )
     .validate(&module)
     .expect("validation failed");
-    let out = generate_wgsl(
+    let out = generate(
         &module,
         &info,
         GenerateOptions {
@@ -1060,7 +1060,7 @@ fn beautify_mangle_roundtrip() {
         },
     )
     .expect("generate failed")
-    .0;
+    .source;
     assert!(
         out.contains('\n'),
         "beautified output should have newlines: {out}"
@@ -1199,4 +1199,96 @@ fn shift_right_under_less_gets_template_guard_parens() {
         out.contains("<("),
         "the shift right-operand must be parenthesised: {out}"
     );
+}
+
+/// Per struct of the re-parsed `out`, the member names and the names of
+/// the types its members spell must be disjoint: WGSL keeps the two
+/// namespaces apart, the C++ naga's MSL writer emits does not, and a
+/// member named like the type of a later member hides it.
+fn assert_members_dodge_member_types(out: &str) {
+    let module = naga::front::wgsl::parse_str(out).expect("re-parse failed");
+    for (_, ty) in module.types.iter() {
+        let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+            continue;
+        };
+        let names: std::collections::HashSet<&str> =
+            members.iter().filter_map(|m| m.name.as_deref()).collect();
+        for member in members {
+            if let Some(spelled) = module.types[member.ty].name.as_deref() {
+                assert!(
+                    !names.contains(spelled),
+                    "struct {:?} has a member named like its member type {spelled}: {out}",
+                    ty.name
+                );
+            }
+        }
+    }
+}
+
+const MEMBER_TYPE_SRC: &str = r#"
+    struct Inner { x: f32, y: f32 }
+    struct Outer { p: f32, q: Inner, r: Inner, t: vec3f, u: vec3f, v: vec3f }
+    @group(0) @binding(0) var<storage> s: Outer;
+    @fragment fn main() -> @location(0) vec4f {
+        return vec4f(s.q.x + s.r.y + s.p, s.t.x, s.u.y, s.v.z);
+    }
+"#;
+
+#[test]
+fn mangled_member_names_dodge_member_type_names() {
+    let out = compact_mangled(MEMBER_TYPE_SRC);
+    assert_valid_wgsl(&out);
+    assert_members_dodge_member_types(&out);
+    // The aliased `vec3f` members spell a minted alias inside the same body.
+    let out = compact_mangled_aliased(MEMBER_TYPE_SRC);
+    assert_valid_wgsl(&out);
+    assert_members_dodge_member_types(&out);
+}
+
+#[test]
+fn member_type_dodge_is_idempotent() {
+    let once = compact_mangled_aliased(MEMBER_TYPE_SRC);
+    let twice = compact_mangled_aliased(&once);
+    assert_eq!(
+        once, twice,
+        "member letters must be a function of the final type names"
+    );
+}
+
+#[test]
+fn preserved_struct_name_keeps_dodging_member_types() {
+    let out = compact_mangled_preserved(MEMBER_TYPE_SRC, &["Outer"]);
+    assert!(out.contains("struct Outer{"), "{out}");
+    assert_valid_wgsl(&out);
+    assert_members_dodge_member_types(&out);
+}
+
+/// The other direction: a member the host reads by name keeps its letter,
+/// so the type letters have to move out of its way.
+#[test]
+fn minted_type_name_dodges_a_kept_member_name() {
+    let src = r#"
+        struct Inner { x: f32 }
+        struct Outer { A: f32, q: Inner }
+        @group(0) @binding(0) var<storage> s: Outer;
+        @fragment fn main() -> @location(0) vec4f { return vec4f(s.A + s.q.x); }
+    "#;
+    let module = naga::front::wgsl::parse_str(src).expect("parse failed");
+    let info = crate::io::validate_module(&module).expect("validation failed");
+    let out = generate(
+        &module,
+        &info,
+        GenerateOptions {
+            beautify: false,
+            indent: 0,
+            mangle: true,
+            preserve_members: ["A".to_string()].into_iter().collect(),
+            ..Default::default()
+        },
+    )
+    .expect("generate failed")
+    .source;
+    assert!(out.contains(".A"), "kept member must survive: {out}");
+    assert_valid_wgsl(&out);
+    assert_members_dodge_member_types(&out);
 }

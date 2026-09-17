@@ -3,13 +3,13 @@
 //! Validation goes through `crate::io::validate_module`, so pointer parameters
 //! naga alone rejects are fixtures too.
 
-use super::super::{GenerateOptions, generate_wgsl};
+use super::super::{GenerateOptions, generate};
 pub use crate::config::{Config, FloatPrecision, PrecisionMode, Profile};
 
 pub fn compact(src: &str) -> String {
     let module = naga::front::wgsl::parse_str(src).expect("parse failed");
     let info = crate::io::validate_module(&module).expect("validation failed");
-    generate_wgsl(
+    generate(
         &module,
         &info,
         GenerateOptions {
@@ -21,7 +21,7 @@ pub fn compact(src: &str) -> String {
         },
     )
     .expect("generate failed")
-    .0
+    .source
 }
 
 pub fn compact_mangled(src: &str) -> String {
@@ -31,7 +31,7 @@ pub fn compact_mangled(src: &str) -> String {
 pub fn compact_aliased(src: &str) -> String {
     let module = naga::front::wgsl::parse_str(src).expect("parse failed");
     let info = crate::io::validate_module(&module).expect("validation failed");
-    generate_wgsl(
+    generate(
         &module,
         &info,
         GenerateOptions {
@@ -44,13 +44,13 @@ pub fn compact_aliased(src: &str) -> String {
         },
     )
     .expect("generate failed")
-    .0
+    .source
 }
 
 pub fn compact_mangled_aliased(src: &str) -> String {
     let module = naga::front::wgsl::parse_str(src).expect("parse failed");
     let info = crate::io::validate_module(&module).expect("validation failed");
-    generate_wgsl(
+    generate(
         &module,
         &info,
         GenerateOptions {
@@ -63,13 +63,13 @@ pub fn compact_mangled_aliased(src: &str) -> String {
         },
     )
     .expect("generate failed")
-    .0
+    .source
 }
 
 pub fn compact_mangled_preserved(src: &str, preserve: &[&str]) -> String {
     let module = naga::front::wgsl::parse_str(src).expect("parse failed");
     let info = crate::io::validate_module(&module).expect("validation failed");
-    generate_wgsl(
+    generate(
         &module,
         &info,
         GenerateOptions {
@@ -82,7 +82,7 @@ pub fn compact_mangled_preserved(src: &str, preserve: &[&str]) -> String {
         },
     )
     .expect("generate failed")
-    .0
+    .source
 }
 
 #[track_caller]
@@ -108,7 +108,7 @@ pub fn assert_valid_wgsl(out: &str) {
 pub fn compact_beautified(src: &str) -> String {
     let module = naga::front::wgsl::parse_str(src).expect("parse failed");
     let info = crate::io::validate_module(&module).expect("validation failed");
-    generate_wgsl(
+    generate(
         &module,
         &info,
         GenerateOptions {
@@ -120,7 +120,7 @@ pub fn compact_beautified(src: &str) -> String {
         },
     )
     .expect("generate failed")
-    .0
+    .source
 }
 
 pub fn compact_with_precision(src: &str, prec: u8) -> String {
@@ -130,7 +130,7 @@ pub fn compact_with_precision(src: &str, prec: u8) -> String {
 pub fn compact_with_float_precision(src: &str, float_precision: FloatPrecision) -> String {
     let module = naga::front::wgsl::parse_str(src).expect("parse failed");
     let info = crate::io::validate_module(&module).expect("validation failed");
-    generate_wgsl(
+    generate(
         &module,
         &info,
         GenerateOptions {
@@ -142,7 +142,7 @@ pub fn compact_with_float_precision(src: &str, float_precision: FloatPrecision) 
         },
     )
     .expect("generate failed")
-    .0
+    .source
 }
 
 pub fn compact_with_passes(src: &str, profile: Profile) -> String {

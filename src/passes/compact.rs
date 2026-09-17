@@ -1,6 +1,5 @@
-//! Dead-code elimination via `naga::compact`.  Library modules (no entry
-//! points) keep every declaration so fragments the caller splices later
-//! are not wiped out.
+//! Dead-code elimination via `naga::compact`; a library module
+//! (`is_library_module`) keeps every declaration.
 
 use crate::error::Error;
 use crate::pipeline::{Pass, PassContext};
@@ -53,20 +52,26 @@ impl Pass for CompactPass {
             )
         }
         let before = arena_shape(module);
-        if module.entry_points.is_empty() {
-            naga::compact::compact(module, naga::compact::KeepUnused::Yes);
-        } else {
-            // naga roots nothing but the entry points, so the declarations
-            // the host names live through a synthetic one: a preserved
-            // resource stays in the pipeline's bind-group layout, a
-            // preserved function keeps its signature callable, and a named
-            // `override` stays a valid pipeline-constant key (Dawn validates
-            // the keys against every declared override, used or not).
-            compact_behind_anchor(module, &|name| {
-                ctx.config.preserve_symbols.iter().any(|p| p == name)
-            });
-        }
+        compact_module(module, &|name| {
+            ctx.config.preserve_symbols.iter().any(|p| p == name)
+        });
         Ok(before != arena_shape(module))
+    }
+}
+
+/// The pass's cull, for a caller that needs it on a scratch module (a
+/// priced rewrite renders what the pipeline will ship, orphans culled).
+pub(crate) fn compact_module(module: &mut naga::Module, preserved: &dyn Fn(&str) -> bool) {
+    if super::expr_util::is_library_module(module) {
+        naga::compact::compact(module, naga::compact::KeepUnused::Yes);
+    } else {
+        // naga roots nothing but the entry points, so the declarations
+        // the host names live through a synthetic one: a preserved
+        // resource stays in the pipeline's bind-group layout, a
+        // preserved function keeps its signature callable, and a named
+        // `override` stays a valid pipeline-constant key (Dawn validates
+        // the keys against every declared override, used or not).
+        compact_behind_anchor(module, preserved);
     }
 }
 
@@ -163,13 +168,8 @@ fn fs_main() -> @location(0) vec4f {
 
         let mut pass = CompactPass;
         let config = Config::default();
-        let ctx = PassContext {
-            config: &config,
-            name_log: None,
-        };
 
-        let changed = pass
-            .run(&mut module, &ctx)
+        let changed = PassContext::run_pass(&mut pass, &mut module, &config)
             .expect("compact pass should run");
 
         assert!(changed, "compact pass should report it ran");
@@ -204,13 +204,8 @@ fn another(y: f32) -> f32 {
 
         let mut pass = CompactPass;
         let config = Config::default();
-        let ctx = PassContext {
-            config: &config,
-            name_log: None,
-        };
 
-        let changed = pass
-            .run(&mut module, &ctx)
+        let changed = PassContext::run_pass(&mut pass, &mut module, &config)
             .expect("compact pass should run");
 
         assert!(
@@ -241,12 +236,7 @@ fn keep_me() -> f32 { return 1.0; }
             preserve_symbols: vec!["b".to_string(), "keep_me".to_string()],
             ..Config::default()
         };
-        let ctx = PassContext {
-            config: &config,
-            name_log: None,
-        };
-        CompactPass
-            .run(&mut module, &ctx)
+        PassContext::run_pass(&mut CompactPass, &mut module, &config)
             .expect("compact pass should run");
         let globals: Vec<_> = module
             .global_variables

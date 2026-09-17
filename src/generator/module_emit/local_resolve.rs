@@ -42,9 +42,9 @@ fn local_var_in_stmt(
         });
     }
     let mut hit = false;
-    crate::passes::expr_util::visit_statement_operands(stmt, false, &mut |h| {
+    crate::ir::visit::visit_statement_operands(stmt, false, &mut |h| {
         hit |= root_local_var(h, expressions) == Some(local);
     });
-    hit || crate::passes::expr_util::nested_blocks(stmt)
+    hit || crate::ir::visit::nested_blocks(stmt)
         .any(|block| local_var_in_block(block, local, expressions))
 }

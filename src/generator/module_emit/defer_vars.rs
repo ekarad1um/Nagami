@@ -16,7 +16,7 @@ fn collect_block_local_refs(
     expr_reads: &[Option<naga::Handle<naga::LocalVariable>>],
     seen: &mut [bool],
 ) {
-    crate::passes::expr_util::for_each_statement(block, &mut |stmt| match stmt {
+    crate::ir::visit::for_each_statement(block, &mut |stmt| match stmt {
         naga::Statement::Emit(range) => {
             for h in range.clone() {
                 if let Some(lh) = expr_reads[h.index()] {
@@ -24,7 +24,7 @@ fn collect_block_local_refs(
                 }
             }
         }
-        other => crate::passes::expr_util::visit_statement_operands(other, false, &mut |h| {
+        other => crate::ir::visit::visit_statement_operands(other, false, &mut |h| {
             if let Some(lh) = root_local_var(h, expressions) {
                 seen[lh.index()] = true;
             }
@@ -83,6 +83,93 @@ pub(in crate::generator) fn find_deferrable_vars(func: &naga::Function) -> (Vec<
     (deferrable, dead)
 }
 
+/// What [`for_each_owned_arm`] hands each arm it descends into: the arm, the
+/// candidates that may still resolve inside it, whether the descent crossed a
+/// `Loop`, and the per-local result table to record into.
+type OwnedArmVisit<'v, R> = dyn FnMut(&naga::Block, &[bool], bool, &mut R) + 'v;
+
+/// Descend into each compound statement that SOLELY owns a candidate, handing
+/// `visit` the arm and the candidates that may still resolve inside it.  A
+/// candidate survives into an arm only where that arm alone references it: an
+/// `If` arm its sibling also touches, or a `Switch` case another case touches,
+/// would move the declaration out from under one of the uses.  A `Block` owns
+/// its candidates outright, and a `Loop`'s `continuing` is a sibling of its
+/// body.
+#[allow(clippy::too_many_arguments)]
+fn for_each_owned_arm<R>(
+    block: &naga::Block,
+    expressions: &naga::Arena<naga::Expression>,
+    expr_reads: &[Option<naga::Handle<naga::LocalVariable>>],
+    candidates: &[bool],
+    result: &mut R,
+    resolved: fn(&R, usize) -> bool,
+    ref_owner: &[Option<usize>],
+    visit: &mut OwnedArmVisit<'_, R>,
+) {
+    let local_len = candidates.len();
+    for (idx, stmt) in block.iter().enumerate() {
+        let owned: Vec<bool> = (0..local_len)
+            .map(|i| candidates[i] && !resolved(result, i) && ref_owner[i] == Some(idx))
+            .collect();
+        if !owned.contains(&true) {
+            continue;
+        }
+        let seen_in = |b: &naga::Block| {
+            let mut s = vec![false; local_len];
+            collect_block_local_refs(b, expressions, expr_reads, &mut s);
+            s
+        };
+        let only = |mine: &[bool], theirs: &[bool]| -> Vec<bool> {
+            (0..local_len)
+                .map(|i| owned[i] && mine[i] && !theirs[i])
+                .collect()
+        };
+        // Choosing every arm's candidates from one `owned` snapshot before any
+        // `visit` runs is exact: the arms of a statement are DISJOINT in their
+        // candidates (each keeps only what it alone references) and a recursion
+        // resolves nothing outside the candidates it was handed, so no arm can
+        // change what a later arm of the same statement would have taken.
+        let arms: Vec<(&naga::Block, Vec<bool>, bool)> = match stmt {
+            naga::Statement::If { accept, reject, .. } => {
+                let (seen_a, seen_r) = (seen_in(accept), seen_in(reject));
+                vec![
+                    (accept, only(&seen_a, &seen_r), false),
+                    (reject, only(&seen_r, &seen_a), false),
+                ]
+            }
+            naga::Statement::Switch { cases, .. } => {
+                let case_seen: Vec<Vec<bool>> =
+                    cases.iter().map(|case| seen_in(&case.body)).collect();
+                cases
+                    .iter()
+                    .enumerate()
+                    .map(|(ci, case)| {
+                        let cands = (0..local_len)
+                            .map(|i| {
+                                owned[i]
+                                    && case_seen[ci][i]
+                                    && !case_seen.iter().enumerate().any(|(cj, s)| cj != ci && s[i])
+                            })
+                            .collect();
+                        (&case.body, cands, false)
+                    })
+                    .collect()
+            }
+            naga::Statement::Block(inner) => vec![(inner, owned.clone(), false)],
+            naga::Statement::Loop {
+                body, continuing, ..
+            } => {
+                let (seen_b, seen_c) = (seen_in(body), seen_in(continuing));
+                vec![(body, only(&seen_b, &seen_c), true)]
+            }
+            _ => Vec::new(),
+        };
+        for (arm, cands, in_loop) in arms {
+            visit(arm, &cands, in_loop, result);
+        }
+    }
+}
+
 /// Mark a candidate deferrable when its first program-order touch at this
 /// block level is a direct whole-variable `Store`, recursing into sub-blocks
 /// that own all of a candidate's references.  `candidates[i]`: local `i` has
@@ -128,121 +215,56 @@ fn scan_block_deferrable_vars(
                 }
             }
             other => {
-                crate::passes::expr_util::visit_statement_operands(other, false, &mut |h| {
+                crate::ir::visit::visit_statement_operands(other, false, &mut |h| {
                     if let Some(lh) = root_local_var(h, expressions)
                         && candidates[lh.index()]
                     {
                         seen[lh.index()] = true;
                     }
                 });
-                for nested in crate::passes::expr_util::nested_blocks(other) {
+                for nested in crate::ir::visit::nested_blocks(other) {
                     collect_block_local_refs(nested, expressions, expr_reads, &mut seen);
                 }
             }
         }
     }
 
-    // A candidate owned by a single compound statement may defer inside it.
-    for (idx, stmt) in block.iter().enumerate() {
-        let any_owned =
-            (0..local_len).any(|i| candidates[i] && !result[i] && ref_owner[i] == Some(idx));
-        if !any_owned {
-            continue;
-        }
-
-        match stmt {
-            naga::Statement::If { accept, reject, .. } => {
-                let mut seen_a = vec![false; local_len];
-                let mut seen_r = vec![false; local_len];
-                collect_block_local_refs(accept, expressions, expr_reads, &mut seen_a);
-                collect_block_local_refs(reject, expressions, expr_reads, &mut seen_r);
-                let a_cands: Vec<bool> = (0..local_len)
-                    .map(|i| {
-                        candidates[i]
-                            && !result[i]
-                            && ref_owner[i] == Some(idx)
-                            && seen_a[i]
-                            && !seen_r[i]
-                    })
-                    .collect();
-                let r_cands: Vec<bool> = (0..local_len)
-                    .map(|i| {
-                        candidates[i]
-                            && !result[i]
-                            && ref_owner[i] == Some(idx)
-                            && seen_r[i]
-                            && !seen_a[i]
-                    })
-                    .collect();
-                scan_block_deferrable_vars(accept, expressions, expr_reads, &a_cands, result);
-                scan_block_deferrable_vars(reject, expressions, expr_reads, &r_cands, result);
-            }
-            naga::Statement::Switch { cases, .. } => {
-                let case_seen: Vec<Vec<bool>> = cases
-                    .iter()
-                    .map(|case| {
-                        let mut s = vec![false; local_len];
-                        collect_block_local_refs(&case.body, expressions, expr_reads, &mut s);
-                        s
-                    })
-                    .collect();
-                for (ci, case) in cases.iter().enumerate() {
-                    let cands: Vec<bool> = (0..local_len)
-                        .map(|i| {
-                            candidates[i]
-                                && !result[i]
-                                && ref_owner[i] == Some(idx)
-                                && case_seen[ci][i]
-                                && !case_seen.iter().enumerate().any(|(cj, s)| cj != ci && s[i])
-                        })
-                        .collect();
-                    scan_block_deferrable_vars(&case.body, expressions, expr_reads, &cands, result);
-                }
-            }
-            naga::Statement::Block(inner) => {
-                let cands: Vec<bool> = (0..local_len)
-                    .map(|i| candidates[i] && !result[i] && ref_owner[i] == Some(idx))
-                    .collect();
-                scan_block_deferrable_vars(inner, expressions, expr_reads, &cands, result);
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                let mut seen_b = vec![false; local_len];
-                let mut seen_c = vec![false; local_len];
-                collect_block_local_refs(body, expressions, expr_reads, &mut seen_b);
-                collect_block_local_refs(continuing, expressions, expr_reads, &mut seen_c);
-                let b_cands: Vec<bool> = (0..local_len)
-                    .map(|i| {
-                        candidates[i]
-                            && !result[i]
-                            && ref_owner[i] == Some(idx)
-                            && seen_b[i]
-                            && !seen_c[i]
-                    })
-                    .collect();
-                scan_block_deferrable_vars(body, expressions, expr_reads, &b_cands, result);
-            }
-            _ => {}
-        }
-    }
+    for_each_owned_arm(
+        block,
+        expressions,
+        expr_reads,
+        candidates,
+        result,
+        |done, i| done[i],
+        &ref_owner,
+        &mut |arm, cands, _in_loop, result| {
+            scan_block_deferrable_vars(arm, expressions, expr_reads, cands, result)
+        },
+    );
 }
 
-/// Per-local bitmap of counters whose references are confined to exactly one
-/// `Loop` (at any depth), absorbable into that loop's `for(var x=init;...)` /
-/// `for(var x:type;...)` header.
+/// Per local, the guard of the for-shaped `Loop` (at any depth) whose header
+/// declares it - `for(var x=init;...)` / `for(var x:type;...)` - because the
+/// loop alone references it.  One local per loop, the most loop-variable-like:
+/// the one `continuing` stores, else - unless `deferred` declares it at its
+/// first store (`var G=i;` there beats `for(var G=0i;..){G=i;`) or a pre-loop
+/// `[Store, Loop]` init holds the header - the one the guard reads, else one
+/// the body whole-stores, ties to the one the body touches first.  The
+/// emitter keys the header on the same guard; loops may share one, so it
+/// also checks the local is its own.
 pub(super) fn find_for_loop_vars(
     func: &naga::Function,
-    must_bind_loads: &HandleSet<naga::Expression>,
-) -> Vec<bool> {
+    must_bind: &HandleSet<naga::Expression>,
+    deferred: &[bool],
+) -> Vec<Option<naga::Handle<naga::Expression>>> {
     let local_len = func.local_variables.len();
     let expr_reads = load_source_locals(func);
 
-    // A local without an explicit init is zero-initialised and still a counter
+    // A local without an explicit init is zero-initialised and still a
     // candidate.
     let candidates = vec![true; local_len];
 
-    let mut result = vec![false; local_len];
+    let mut result = vec![None; local_len];
     scan_block_for_loop_vars(
         &func.body,
         &func.expressions,
@@ -250,7 +272,8 @@ pub(super) fn find_for_loop_vars(
         &expr_reads,
         &candidates,
         &mut result,
-        must_bind_loads,
+        must_bind,
+        deferred,
         false,
     );
     result
@@ -287,13 +310,13 @@ fn compute_block_ownership(
                     }
                 }
             }
-            other => crate::passes::expr_util::visit_statement_operands(other, false, &mut |h| {
+            other => crate::ir::visit::visit_statement_operands(other, false, &mut |h| {
                 if let Some(lh) = root_local_var(h, expressions) {
                     mark_owner(&mut ref_owner, lh.index(), idx);
                 }
             }),
         }
-        let mut nested = crate::passes::expr_util::nested_blocks(stmt).peekable();
+        let mut nested = crate::ir::visit::nested_blocks(stmt).peekable();
         if nested.peek().is_none() {
             continue;
         }
@@ -311,39 +334,57 @@ fn compute_block_ownership(
     ref_owner
 }
 
-/// Whether the emitter will render this `Loop` as a `for`: the same parse,
-/// update-kind check, preload-safety predicate and header depth cap as the
-/// emitter, so counter-`var` suppression can never disagree with the emission
-/// decision (a disagreement leaves the counter undeclared).
-fn is_for_loop_candidate(
-    body: &naga::Block,
-    continuing: &naga::Block,
-    break_if: &Option<naga::Handle<naga::Expression>>,
+/// `true` when `condition`'s cone loads through `local`.
+fn guard_reads(
+    condition: naga::Handle<naga::Expression>,
+    local: naga::Handle<naga::LocalVariable>,
     expressions: &naga::Arena<naga::Expression>,
-    must_bind_loads: &HandleSet<naga::Expression>,
+    expr_reads: &[Option<naga::Handle<naga::LocalVariable>>],
 ) -> bool {
-    let Some(shape) = crate::generator::stmt_emit::parse_for_loop_shape(body, continuing, break_if)
-    else {
-        return false;
-    };
-    if let Some(stmt) = shape.update_stmt
-        && !matches!(
-            stmt,
-            naga::Statement::Store { .. }
-                | naga::Statement::Call { .. }
-                | naga::Statement::ImageStore { .. }
-        )
-    {
-        return false;
+    let mut pending = vec![condition];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(h) = pending.pop() {
+        if !seen.insert(h) {
+            continue;
+        }
+        if expr_reads[h.index()] == Some(local) {
+            return true;
+        }
+        crate::ir::visit::visit_expression_children(&expressions[h], |c| pending.push(c));
     }
-    crate::generator::stmt_emit::for_loop_preload_inlining_is_safe(
-        &shape,
-        body,
-        continuing,
-        expressions,
-        must_bind_loads,
-    ) && !crate::generator::stmt_emit::for_header_exceeds_depth_cap(&shape, expressions)
-        && !crate::generator::stmt_emit::for_header_has_msl_cast_ambiguity(&shape, expressions)
+    false
+}
+
+/// Preorder index of the first statement in `block` whose own operands or
+/// `Emit` loads reference `local`; `usize::MAX` when none does.
+fn first_reference(
+    block: &naga::Block,
+    local: naga::Handle<naga::LocalVariable>,
+    expressions: &naga::Arena<naga::Expression>,
+    expr_reads: &[Option<naga::Handle<naga::LocalVariable>>],
+) -> usize {
+    let (mut pos, mut first) = (0, usize::MAX);
+    crate::ir::visit::for_each_statement(block, &mut |stmt| {
+        if first == usize::MAX {
+            let hit = match stmt {
+                naga::Statement::Emit(range) => {
+                    range.clone().any(|h| expr_reads[h.index()] == Some(local))
+                }
+                other => {
+                    let mut hit = false;
+                    crate::ir::visit::visit_statement_operands(other, false, &mut |h| {
+                        hit |= root_local_var(h, expressions) == Some(local);
+                    });
+                    hit
+                }
+            };
+            if hit {
+                first = pos;
+            }
+        }
+        pos += 1;
+    });
+    first
 }
 
 /// Find for-shaped `Loop`s that fully confine candidate locals, recursing into
@@ -356,8 +397,9 @@ fn scan_block_for_loop_vars(
     local_variables: &naga::Arena<naga::LocalVariable>,
     expr_reads: &[Option<naga::Handle<naga::LocalVariable>>],
     candidates: &[bool],
-    result: &mut Vec<bool>,
-    must_bind_loads: &HandleSet<naga::Expression>,
+    result: &mut Vec<Option<naga::Handle<naga::Expression>>>,
+    must_bind: &HandleSet<naga::Expression>,
+    deferred: &[bool],
     // `true` once the walk has descended through a `Loop`.  Absorbing a counter
     // via its declaration / zero-init (not an explicit pre-loop `Store`) is
     // sound only at top level: nested in another loop that init would
@@ -367,175 +409,119 @@ fn scan_block_for_loop_vars(
     inside_loop: bool,
 ) {
     let local_len = result.len();
-    if !candidates.iter().any(|&b| b) {
+    if inside_loop || !candidates.iter().any(|&b| b) {
         return;
     }
 
     let ref_owner = compute_block_ownership(block, expressions, expr_reads, local_len);
     let stmts: Vec<_> = block.iter().collect();
 
+    // A whole `Store` to a deferred local right before the loop is the
+    // emitter's `[Store, Loop]` init.  It keeps the header unless the loop's
+    // counter claims it: handing the slot to another local is byte-neutral
+    // and detaches the counter from the header, which costs tint its
+    // finiteness proof.
+    let external_init = |owner: usize| {
+        if owner > 0
+            && let naga::Statement::Store { pointer, .. } = stmts[owner - 1]
+            && let naga::Expression::LocalVariable(x) = expressions[*pointer]
+        {
+            deferred[x.index()]
+                && !super::local_var_in_stmts(&stmts[..owner - 1], x, expressions)
+                && !super::local_var_in_stmts(&stmts[owner + 1..], x, expressions)
+        } else {
+            false
+        }
+    };
+
+    // Per loop, the most loop-variable-like of the locals it alone references
+    // takes the header: the one `continuing` stores, else the one the guard
+    // reads, else one the body whole-stores; ties go to the one the body
+    // touches first, then the first declared.  A `for(var i=0;i<n;){..i=i+1..}`
+    // re-parsed from this emitter's own text (naga lowers a top-level `for`
+    // init to a declaration) would otherwise render `var i=0;for(;i<n;)`,
+    // and the rank keeps the choice stable across passes (declaration order
+    // is not).  The header holds one declaration.
+    type Key = (u8, std::cmp::Reverse<usize>);
+    let mut best: Vec<Option<(Key, usize, naga::Handle<naga::Expression>)>> =
+        vec![None; stmts.len()];
     for (h, _local) in local_variables.iter() {
         let i = h.index();
-        if !candidates[i] || result[i] {
+        if !candidates[i] || result[i].is_some() {
             continue;
         }
-        if let Some(owner) = ref_owner[i] {
-            if owner == MULTI_OWNER {
-                continue;
-            }
-            if let naga::Statement::Loop {
-                body,
-                continuing,
-                break_if,
-            } = stmts[owner]
-                && is_for_loop_candidate(body, continuing, break_if, expressions, must_bind_loads)
-            {
-                let has_update = continuing.iter().any(|s| {
-                    if let naga::Statement::Store { pointer, .. } = s {
-                        matches!(
-                            expressions[*pointer],
-                            naga::Expression::LocalVariable(lh) if lh == h
-                        )
-                    } else {
-                        false
-                    }
-                });
-                if has_update && !inside_loop {
-                    result[i] = true;
-                }
-            }
-        }
-    }
-
-    for (idx, stmt) in block.iter().enumerate() {
-        let any_owned =
-            (0..local_len).any(|i| candidates[i] && !result[i] && ref_owner[i] == Some(idx));
-        if !any_owned {
+        let Some(owner) = ref_owner[i] else { continue };
+        if owner == MULTI_OWNER {
             continue;
         }
-
-        match stmt {
-            naga::Statement::If { accept, reject, .. } => {
-                let mut seen_a = vec![false; local_len];
-                let mut seen_r = vec![false; local_len];
-                collect_block_local_refs(accept, expressions, expr_reads, &mut seen_a);
-                collect_block_local_refs(reject, expressions, expr_reads, &mut seen_r);
-                let a_cands: Vec<bool> = (0..local_len)
-                    .map(|i| {
-                        candidates[i]
-                            && !result[i]
-                            && ref_owner[i] == Some(idx)
-                            && seen_a[i]
-                            && !seen_r[i]
-                    })
-                    .collect();
-                let r_cands: Vec<bool> = (0..local_len)
-                    .map(|i| {
-                        candidates[i]
-                            && !result[i]
-                            && ref_owner[i] == Some(idx)
-                            && seen_r[i]
-                            && !seen_a[i]
-                    })
-                    .collect();
-                scan_block_for_loop_vars(
-                    accept,
-                    expressions,
-                    local_variables,
-                    expr_reads,
-                    &a_cands,
-                    result,
-                    must_bind_loads,
-                    inside_loop,
-                );
-                scan_block_for_loop_vars(
-                    reject,
-                    expressions,
-                    local_variables,
-                    expr_reads,
-                    &r_cands,
-                    result,
-                    must_bind_loads,
-                    inside_loop,
-                );
-            }
-            naga::Statement::Switch { cases, .. } => {
-                let case_seen: Vec<Vec<bool>> = cases
-                    .iter()
-                    .map(|case| {
-                        let mut s = vec![false; local_len];
-                        collect_block_local_refs(&case.body, expressions, expr_reads, &mut s);
-                        s
-                    })
-                    .collect();
-                for (ci, case) in cases.iter().enumerate() {
-                    let cands: Vec<bool> = (0..local_len)
-                        .map(|i| {
-                            candidates[i]
-                                && !result[i]
-                                && ref_owner[i] == Some(idx)
-                                && case_seen[ci][i]
-                                && !case_seen.iter().enumerate().any(|(cj, s)| cj != ci && s[i])
-                        })
-                        .collect();
-                    scan_block_for_loop_vars(
-                        &case.body,
-                        expressions,
-                        local_variables,
-                        expr_reads,
-                        &cands,
-                        result,
-                        must_bind_loads,
-                        inside_loop,
-                    );
-                }
-            }
-            naga::Statement::Block(inner) => {
-                let cands: Vec<bool> = (0..local_len)
-                    .map(|i| candidates[i] && !result[i] && ref_owner[i] == Some(idx))
-                    .collect();
-                scan_block_for_loop_vars(
-                    inner,
-                    expressions,
-                    local_variables,
-                    expr_reads,
-                    &cands,
-                    result,
-                    must_bind_loads,
-                    inside_loop,
-                );
-            }
-            naga::Statement::Loop {
-                body, continuing, ..
-            } => {
-                // Whether or not this Loop absorbed a counter, locals confined
-                // to its body may still be absorbed by an inner loop.
-                let mut seen_b = vec![false; local_len];
-                let mut seen_c = vec![false; local_len];
-                collect_block_local_refs(body, expressions, expr_reads, &mut seen_b);
-                collect_block_local_refs(continuing, expressions, expr_reads, &mut seen_c);
-                let b_cands: Vec<bool> = (0..local_len)
-                    .map(|i| {
-                        candidates[i]
-                            && !result[i]
-                            && ref_owner[i] == Some(idx)
-                            && seen_b[i]
-                            && !seen_c[i]
-                    })
-                    .collect();
-                scan_block_for_loop_vars(
-                    body,
-                    expressions,
-                    local_variables,
-                    expr_reads,
-                    &b_cands,
-                    result,
-                    must_bind_loads,
-                    // Inside this Loop a counter is nested.
-                    true,
-                );
-            }
-            _ => {}
+        let naga::Statement::Loop {
+            body,
+            continuing,
+            break_if,
+        } = stmts[owner]
+        else {
+            continue;
+        };
+        let Some(shape) = crate::generator::stmt_emit::emittable_for_loop_shape(
+            body,
+            continuing,
+            break_if,
+            expressions,
+            must_bind,
+        ) else {
+            continue;
+        };
+        let stores_whole = |block: &naga::Block| {
+            let mut hit = false;
+            crate::ir::visit::for_each_statement(block, &mut |s| {
+                hit |= matches!(s, naga::Statement::Store { pointer, .. }
+                    if matches!(expressions[*pointer], naga::Expression::LocalVariable(lh) if lh == h));
+            });
+            hit
+        };
+        let rank = if stores_whole(continuing) {
+            3
+        } else if deferred[i] || external_init(owner) {
+            continue;
+        } else if guard_reads(shape.condition, h, expressions, expr_reads) {
+            2
+        } else if stores_whole(body) {
+            1
+        } else {
+            0
+        };
+        let key = (
+            rank,
+            std::cmp::Reverse(first_reference(body, h, expressions, expr_reads)),
+        );
+        if best[owner].is_none_or(|(k, ..)| key > k) {
+            best[owner] = Some((key, i, shape.condition));
         }
     }
+    for (_, i, condition) in best.into_iter().flatten() {
+        result[i] = Some(condition);
+    }
+
+    for_each_owned_arm(
+        block,
+        expressions,
+        expr_reads,
+        candidates,
+        result,
+        |done, i| done[i].is_some(),
+        &ref_owner,
+        &mut |arm, cands, arm_in_loop, result| {
+            scan_block_for_loop_vars(
+                arm,
+                expressions,
+                local_variables,
+                expr_reads,
+                cands,
+                result,
+                must_bind,
+                deferred,
+                inside_loop || arm_in_loop,
+            )
+        },
+    );
 }

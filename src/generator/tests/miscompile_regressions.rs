@@ -21,9 +21,21 @@ fn on_big_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R 
 }
 
 fn minify(src: &str) -> String {
+    minify_preserving(src, &[])
+}
+
+/// `minify` with `preserve` kept by name: a helper called once is otherwise
+/// spliced into its caller, and these fixtures test the generator's
+/// handling of the CALL.
+fn minify_preserving(src: &str, preserve: &[&str]) -> String {
     let src = src.to_string();
+    let preserve: Vec<String> = preserve.iter().map(|s| s.to_string()).collect();
     on_big_stack(move || {
-        let out = crate::run(&src, &Config::default()).expect("run failed");
+        let config = Config {
+            preserve_symbols: preserve,
+            ..Config::default()
+        };
+        let out = crate::run(&src, &config).expect("run failed");
         assert_valid_wgsl(&out.source);
         out.source
     })
@@ -78,16 +90,16 @@ fn image_load_bound_before_intervening_texture_store() {
         }";
     let out = minify(src);
     assert!(
-        out.contains("let B=textureLoad(A,a);textureStore(A,a,"),
+        out.contains("let a=textureLoad(A,vec2(0));textureStore(A,vec2(0),"),
         "textureLoad must be bound before the intervening textureStore: {out}"
     );
 }
 
-/// Loop CSE must not redirect a `continuing`-block expression to a body `let`
+/// No dedup may redirect a `continuing`-block expression to a body `let`
 /// defined after a `continue` (the continue iteration skips it); the
 /// continuing block must recompute the shared expression.
 #[test]
-fn cse_does_not_share_body_let_into_continuing_past_continue() {
+fn body_let_is_not_shared_into_continuing_past_continue() {
     let src = "@group(0) @binding(0) var<storage, read_write> buf: array<f32, 64>;\
         @group(0) @binding(1) var<uniform> k: f32;\
         @compute @workgroup_size(1)\
@@ -138,7 +150,9 @@ fn neg_zero_conditional_store_is_not_dropped() {
 }
 
 /// Swizzle/member access on a `ptr<function, vecN>` value must emit an
-/// explicit `(*p)` deref - strict WGSL parsers reject `p.xyz`.
+/// explicit `(*p)` deref - strict WGSL parsers reject `p.xyz`.  `rd` is
+/// preserved: its two-site clone renders shorter and would dissolve the
+/// pointer parameter under test.
 #[test]
 fn pointer_value_swizzle_is_dereferenced() {
     let src = "fn rd(q: ptr<function, vec4<f32>>) -> vec3<f32> {\
@@ -150,7 +164,7 @@ fn pointer_value_swizzle_is_dereferenced() {
           let r = rd(&v) + rd(&w);\
           return vec4f(r, 1.0);\
         }";
-    let out = minify(src);
+    let out = minify_preserving(src, &["rd"]);
     assert!(
         out.contains("(*a).xyz"),
         "pointer-value swizzle must be dereferenced as (*p).xyz: {out}"
@@ -214,7 +228,7 @@ fn binding_array_texture_load_bound_before_store() {
         }";
     let out = minify(src);
     assert!(
-        out.contains("let B=textureLoad(A[0],a);textureStore(A[0],a,"),
+        out.contains("let a=textureLoad(A[0],vec2(0));textureStore(A[0],vec2(0),"),
         "binding-array textureLoad must be bound before the intervening store: {out}"
     );
 }
@@ -227,7 +241,7 @@ fn inlined_pointee_load_postfix_base_is_parenthesized() {
     let src = "struct M { mx: vec4<f32>, my: vec4<f32> }\
         fn f(d: ptr<function, M>, s: f32) { let e = (*d); (*d).mx = e.mx + vec4f(s); }\
         @fragment fn main() -> @location(0) vec4f { var m: M; m.my = vec4f(1.0); f(&m, 2.0); return m.mx; }";
-    let out = minify(src);
+    let out = minify_preserving(src, &["f"]);
     // Names are mangled; the deref'd pointer is the first argument `a`.
     assert!(
         out.contains("(*a)."),
@@ -261,14 +275,15 @@ fn immediate_address_space_is_preserved() {
 }
 
 /// The directive scan must catch f16 literals and casts, not just registered
-/// f16 types: `f32(1.0h + 2.0h)` folds to `f32(3h)` and still needs
-/// `enable f16;` or naga rejects the text.
+/// f16 types: `f16(v) + 2.0h` keeps its literal (a runtime operand, so the
+/// conversion cannot fold) and still needs `enable f16;` or naga rejects
+/// the text.
 #[test]
 fn enable_f16_emitted_for_surviving_f16_literal_in_conversion() {
     // No source `enable f16;`: detection injects it on input and the emitter
     // must re-assert it on output.
-    let src = "@fragment fn main() -> @location(0) vec4<f32> { \
-        let x = 1.0h + 2.0h; return vec4<f32>(f32(x), 0.0, 0.0, 1.0); }";
+    let src = "@fragment fn main(@location(0) v: f32) -> @location(0) vec4<f32> { \
+        let x = f16(v) + 2.0h; return vec4<f32>(f32(x), 0.0, 0.0, 1.0); }";
     let out = minify(src);
     assert!(
         out.contains("enable f16;"),
@@ -322,9 +337,10 @@ fn matrix_compound_assign_preserves_non_commutative_order() {
     );
 }
 
-/// `eval_binary` has no F16 arm, so the absorbing `x * 0.0h` fold would clone
-/// the matched zero's sign rather than the product's (`-2.0h * 0.0h` is
-/// `-0.0h`); the fold must decline (the `is_integer_zero` gate).
+/// A float product's zero carries the sign of both operands (`-2.0h * 0.0h`
+/// is `-0.0h`, a literal Dawn on Metal reads as `+0.0`), so the absorber
+/// matches integer zeros only (`Class::IntZero`) and the evaluator never
+/// manufactures a `-0.0`: `x * 0.0h` stays.
 #[test]
 fn f16_multiply_by_zero_is_not_mis_signed() {
     let out = minify(
@@ -379,18 +395,19 @@ fn void_fn_tail_switch_case_returns_are_elided() {
     );
 }
 
-/// Else-elision hoists the reject arm behind the `if`, so the accept arm's
-/// `return;` skips the hoisted store and is load-bearing.
+/// `if c { A; return; } else { B; return; }`, the shape naga's front-end
+/// gives every void tail, must minify to `if c { A } else { B }`: the pin on
+/// `strip_tail_void_returns` running ahead of else-elision.
 #[test]
-fn void_fn_non_tail_return_survives_elision() {
+fn void_fn_arm_returns_fold_into_if_else() {
     let src = "@group(0)@binding(0) var<storage,read_write> o: u32;\
         @compute @workgroup_size(1) fn main() {\
             if o > 3u { o = 1u; return; } else { o = 2u; return; }\
         }";
     let out = minify(src);
     assert!(
-        out.contains("return;}"),
-        "the branch-skipping return must survive: {out}"
+        out.contains("{A=1;}else{A=2;}") && !out.contains("return"),
+        "each store keeps its own arm and no return survives: {out}"
     );
 }
 
@@ -899,7 +916,7 @@ fn ray_query_vertex_return_round_trips() {
 
 /// A constant tree neither evaluator computes (an `unpack*` root, a subnormal
 /// `bitcast`) must not reach a failable operator inline: the input kept the
-/// shift/division at runtime behind a `var`, and forwarding it makes tint
+/// shift/division at runtime behind a local, and forwarding it makes tint
 /// const-evaluate at shader creation (`1 << 31` changes sign, `1/subnormal`
 /// overflows).  A literal integer bitcast folds instead, taking the tree
 /// above it along; a tree the folder merely left alone (a matrix product) was
@@ -922,12 +939,15 @@ fn opaque_constant_tree_binds_before_a_failable_operator() {
     );
     let out = minify(&folded);
     assert!(
-        out.contains("-2147483648") && !out.contains("bitcast"),
-        "a literal bitcast folds and the shift with it: {out}"
+        out.contains("=2147483648;") && !out.contains("bitcast") && !out.contains("<<"),
+        "a literal bitcast folds, and the shift and conversion above it: {out}"
     );
+    // A `let`: a `var` is kept by the forwarders' static-error decline (a
+    // compound const target in a divisor slot) and never reaches the
+    // generator's binding.
     let div = format!(
         "{head}@compute @workgroup_size(1) fn main() {{\
-            var b = bitcast<f32>(1u); out[0] = u32(1.0 / b); }}"
+            let b = bitcast<f32>(1u); out[0] = u32(1.0 / b); }}"
     );
     let out = minify(&div);
     assert!(
@@ -949,7 +969,9 @@ fn opaque_constant_tree_binds_before_a_failable_operator() {
 /// load_dedup must not forward a pre-loop load into a `break_if` read inside
 /// the loop, which would observe the loop-mutated place across the back-edge:
 /// `cond(n)` is loop-invariant, so a never-breaking loop would wrongly
-/// terminate.  The init is a builtin so the pre-loop read cannot fold.
+/// terminate.  The init is a builtin so the pre-loop read cannot fold.  The
+/// comparison over the load is loop-invariant work, which the loop pin binds
+/// ahead of the loop as well.
 #[test]
 fn loop_break_if_does_not_read_loop_mutated_load() {
     let src = "@group(0)@binding(0) var<storage,read_write> out:array<i32>;\
@@ -959,8 +981,9 @@ fn loop_break_if_does_not_read_loop_mutated_load() {
             loop { count = count + 1; out[0] = count;\
                 continuing { n = n + 100; break if c; } } }";
     let out = minify(src);
+    let loop_at = out.find("loop{").expect("loop emitted: {out}");
     assert!(
-        out.contains("let C=A;loop{") && out.contains("break if C>=500"),
+        out[..loop_at].contains("let C=A;") && out[..loop_at].contains("=C>=500;"),
         "loop-invariant break value was relocated into the loop: {out}"
     );
 }
@@ -981,27 +1004,29 @@ fn switch_with_nested_bare_break_keeps_code_after_switch() {
             out[0] = x; }";
     let out = minify(src);
     assert!(
-        out.contains("if b>0{break;}"),
+        out.contains("if B[a.x]>0{break;}"),
         "the bare break inside the case was lost: {out}"
     );
     assert!(
-        out.contains("}A[0]=b;}"),
+        out.contains("}A[0]=B[a.x];}"),
         "post-switch store was wrongly dropped as unreachable: {out}"
     );
 }
 
 /// Single-use inlining must not sink an implicit derivative (`dpdx`) into a
 /// non-uniform branch: WGSL uniformity rules forbid it and Tint/Dawn reject
-/// it, though naga's validator does not.
+/// it, though naga's validator does not.  The arm's store keeps the guard
+/// out of the return merge.
 #[test]
 fn implicit_derivative_not_sunk_into_non_uniform_branch() {
-    let src = "@fragment fn main(@location(0) tc: vec2<f32>) -> @location(0) vec4<f32> {\
+    let src = "var<private> p: f32;\
+        @fragment fn main(@location(0) tc: vec2<f32>) -> @location(0) vec4<f32> {\
         let d = dpdx(tc.x);\
-        if (tc.y > 0.5) { return vec4<f32>(d, 0.0, 0.0, 1.0); }\
+        if (tc.y > 0.5) { p = 1.0; return vec4<f32>(d, 0.0, 0.0, 1.0); }\
         return vec4<f32>(1.0); }";
     let out = minify(src);
     assert!(
-        out.contains("let a=dpdx(A.x);if "),
+        out.contains("=dpdx(A.x);if "),
         "dpdx was sunk out of uniform control flow: {out}"
     );
 }
@@ -1277,15 +1302,14 @@ fn pure_call_lets_inline_in_a_single_pass() {
 #[test]
 fn matrix_scalar_columns_flatten() {
     // Formatted source: a pre-minified input could come out shorter than the
-    // emit (CSE binds cos/sin at break-even) and trip the ship-input guard,
-    // hiding the flattening.
+    // emit and trip the ship-input guard, hiding the flattening.
     let src = "@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {\
         let m = mat2x2f(cos(p.x), sin(p.x), -sin(p.x), cos(p.x));\
         return vec4f(m[0], m[1]);\
     }";
     let out = minify(src);
     assert!(
-        out.contains("mat2x2f(a,B,-B,a)"),
+        out.contains("mat2x2f(cos(A.x),sin(A.x),-sin(A.x),cos(A.x))"),
         "matrix scalar columns were not flattened to the shorter form: {out}"
     );
     assert!(
@@ -1311,11 +1335,13 @@ fn matrix_shared_column_keeps_name_form() {
 /// (`vec2f(...)`) pins drops its template parameters to `array(...)`.
 #[test]
 fn array_type_params_elided_when_concretely_pinned() {
+    // Two call sites: called once, `g` would be spliced into `fs`.
     let src = "fn g(i:u32)->vec2f{var a=array(vec2f(-1.5,0.0),vec2f(1.0,2.0),vec2f(3.0,4.0));return a[i];}\
-        @fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{return vec4f(g(u32(p.x)),0,0);}";
+        @fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{return vec4f(g(u32(p.x)),g(u32(p.y)));}";
     let out = minify(src);
+    // Name-agnostic: the element constructor is a one-letter alias.
     assert!(
-        out.contains("array(c("),
+        out.contains("array(") && !out.contains("array<"),
         "concrete-element array constructor was not elided to array(...): {out}"
     );
 }
@@ -1383,7 +1409,7 @@ fn escaped_local_stores_are_not_removed() {
         fn sink(p:ptr<function,f32>){ g = *p; }\
         @group(0)@binding(0) var<storage,read_write> o:f32;\
         @compute @workgroup_size(1) fn main(){var d=1.0;d=2.0;sink(&d);o=5.0;}";
-    let out = minify(src);
+    let out = minify_preserving(src, &["sink"]);
     assert!(
         out.contains("var "),
         "an escaped local (passed by pointer) was wrongly eliminated: {out}"
@@ -1448,12 +1474,17 @@ fn struct_field_build_coalesces_to_constructor() {
         @fragment fn fs(@builtin(position) p:vec4f)->@location(0) vec4f{\
         let r=mk(p.x,p.y,p.z);return vec4f(r.a,r.b,r.c,1.0);}";
     let out = minify(src);
+    let name = out
+        .split("struct ")
+        .nth(1)
+        .and_then(|rest| rest.split('{').next())
+        .expect("the struct survives");
     assert!(
-        out.contains("return a(") || out.contains("=a("),
+        out.contains(&format!("={name}(")) || out.contains(&format!("return {name}(")),
         "struct field-build was not coalesced into a constructor: {out}"
     );
     assert!(
-        !out.contains(".b="),
+        !out.contains(".b=") && !out.contains(".a="),
         "member stores survived coalescing: {out}"
     );
 }
@@ -1570,19 +1601,19 @@ fn sibling_pure_calls_in_if_condition_both_inline() {
     );
 }
 
-/// Tail-return elision drains `if f() { return; }` to an empty shell whose
-/// condition is the stashed single-use call's only emission site; skipping it
-/// as vacuous deletes the call and its storage write.  The kept `if a(){}`
-/// converges to a bare call on re-minify.
+/// A drained tail shell (`if f() { return; }` -> `if f() {}`) over a stashed
+/// single-use call must keep the call (`tail_cone_has_stashed_call`); with
+/// the IR stripping its tail returns first, the shell is gone before
+/// emission and the call stands as a statement of its own.
 #[test]
 fn vacuous_tail_if_keeps_stashed_impure_call() {
     let src = "@group(0)@binding(0) var<storage,read_write> out:array<u32,4>;\
         fn f()->bool{ out[0]=out[0]+1u; return out[0]>10u; }\
         @compute @workgroup_size(1) fn main(){ out[1]=7u; if f(){ return; } }";
-    let out = minify(src);
+    let out = minify_preserving(src, &["f"]);
     assert!(
-        out.contains("if a(){}"),
-        "the drained tail must keep its shell - its condition is the call's only emission site: {out}"
+        out.contains("f();") && !out.contains("if f()"),
+        "the call must survive its drained consumer as a statement: {out}"
     );
 }
 
@@ -1593,10 +1624,10 @@ fn vacuous_tail_switch_keeps_stashed_selector_call() {
         fn g()->u32{ out[0]=out[0]+1u; return out[0]; }\
         @compute @workgroup_size(1) fn main(){ out[1]=7u;\
             switch g() { case 0u: { return; } default: { return; } } }";
-    let out = minify(src);
+    let out = minify_preserving(src, &["g"]);
     assert!(
-        out.contains("switch a(){"),
-        "the drained switch must keep its shell around the stashed selector call: {out}"
+        out.contains("g();") && !out.contains("switch"),
+        "the selector call must survive its drained switch as a statement: {out}"
     );
 }
 
@@ -1616,11 +1647,11 @@ fn body_call_consumed_in_continuing_stays_bound() {
         @compute @workgroup_size(1) fn main2() { o.y = f(4.0); }";
     let out = minify(src);
     assert!(
-        out.contains("let A=c(a);continuing"),
+        out.contains("let B=a(C);continuing"),
         "the body call must bind before the continuing block that consumes it: {out}"
     );
     assert!(
-        !out.contains("+=c(a)"),
+        !out.contains("+=a(C)"),
         "the call text must not relocate into the continuing block: {out}"
     );
 }
@@ -1639,11 +1670,11 @@ fn body_call_consumed_in_break_if_stays_bound() {
         @compute @workgroup_size(1) fn main2() { o.y = f(4.0); }";
     let out = minify(src);
     assert!(
-        out.contains("let a=b(B);"),
+        out.contains("let B=a(C);"),
         "the body call feeding `break if` must stay bound in the body: {out}"
     );
     assert!(
-        out.contains("break if a>4"),
+        out.contains("break if B>4"),
         "`break if` must read the pre-increment binding: {out}"
     );
 }
@@ -1665,11 +1696,11 @@ fn composed_call_inherits_inner_argument_reads() {
         @compute @workgroup_size(1) fn main2() { o.y = g(3.0) + f(4.0); }";
     let out = minify(src);
     assert!(
-        out.contains("let a=E(D(b));b="),
+        out.contains("let b=c(B(E));E="),
         "the composed call must bind BEFORE the store to the inner argument's local: {out}"
     );
     assert!(
-        !out.contains("+=E(D(b))"),
+        !out.contains("+=c(B(E))"),
         "the composed call text must not relocate past the store to `b`: {out}"
     );
 }
@@ -1780,7 +1811,7 @@ fn switch_meet_keeps_stores_when_case_breaks() {
         "the init must survive - the break path reads it: {out}"
     );
     assert!(
-        out.contains("a=b;}default{a=b;}"),
+        out.contains("a=f32(A.z);}default{a=f32(A.z);}"),
         "case stores must survive - only the fall-through paths write v: {out}"
     );
     assert!(
@@ -1889,11 +1920,10 @@ fn rounded_literals_are_judged_by_the_printed_value() {
 }
 
 /// Inlining can make a divisor or shift amount a const-expression the input's
-/// was not: `5u % (d + 1u - 1u)` called as `f(0u)`.  naga's validator checks
-/// only the LITERAL spelling (`5u % 0u`), so the module validates yet has no
-/// valid WGSL text at all, and the run used to ship lexically compacted with
-/// every optimization lost.  The failable-slot check in `io::validate_module`
-/// reports it so the driver rolls only the inlining back.
+/// was not: `5u % (d + 1u - 1u)` called as `f(0u)`.  naga's validator passes
+/// the manufactured shape (`arena_static_error_slot`); the driver's slot check
+/// in `io::validate_module` reports it, so the run rolls the inlining back
+/// instead of shipping lexically compacted with every optimization lost.
 #[test]
 fn inlined_argument_never_manufactures_a_static_error_slot() {
     // (source, a token proving the IR pipeline ran)
@@ -2153,8 +2183,7 @@ fn a_float_literal_pair_keeps_its_type() {
 /// statement's nested blocks, so a diverging loop in an `if` / `else` /
 /// `switch` arm carries one where nothing at the function tail does.  The
 /// validator then rejects the module on its own INPUT (`InvalidReturnType`)
-/// and it bails out to lexical compaction; `graphicsfuzz/do-while-false-loops`
-/// was losing 354 bytes to this.
+/// and it bails out to lexical compaction.
 #[test]
 fn a_diverging_loop_inside_a_branch_still_minifies() {
     let cases = [
@@ -2236,7 +2265,7 @@ fn an_impure_call_is_not_sunk_into_a_short_circuit_operand() {
              fn main(@builtin(global_invocation_id) g: vec3<u32>) {{\n\
                let t = f();\n  if ({cond}) {{ out[1] = 1u; }}\n  out[0] = c;\n}}"
         );
-        let out = minify(&src);
+        let out = minify_preserving(&src, &["f"]);
         assert!(
             !short_circuit_rhs_text(&out, op).contains('('),
             "the call must stay bound before the `if`: {out}"
@@ -2248,14 +2277,16 @@ fn an_impure_call_is_not_sunk_into_a_short_circuit_operand() {
 /// implicit-LOD sample relocated under a non-uniform `&&` operand is a
 /// uniformity error Dawn rejects, so the carrier never bubbles through a
 /// short-circuit wrapper.  Baseline profile, so the IR inliner does not
-/// dissolve the call first.
+/// dissolve the call first; the arm's store keeps the guard out of the
+/// return merge.
 #[test]
 fn a_pure_call_with_a_derivative_is_not_sunk_into_a_short_circuit_operand() {
     let src = "@group(0) @binding(0) var t: texture_2d<f32>;\n\
                @group(0) @binding(1) var s: sampler;\n\
+               var<private> p: f32;\n\
                fn f(uv: vec2f) -> f32 { return textureSample(t, s, uv).x; }\n\
                @fragment fn main(@location(0) uv: vec2f, @location(1) k: f32) -> @location(0) vec4f {\n\
-                 let v = f(uv);\n  if (k > 0.5 && v > 0.5) { return vec4f(1.0); }\n  return vec4f(0.0);\n}";
+                 let v = f(uv);\n  if (k > 0.5 && v > 0.5) { p = 1.0; return vec4f(1.0); }\n  return vec4f(0.0);\n}";
     let config = Config {
         profile: crate::config::Profile::Baseline,
         ..Config::default()
@@ -2401,6 +2432,7 @@ fn a_cheap_wrapper_over_a_stashed_call_binds_before_reuse() {
     ] {
         let config = Config {
             profile,
+            preserve_symbols: vec!["f".to_string()],
             ..Config::default()
         };
         let out = crate::run(src, &config).expect("run failed").source;
@@ -2458,15 +2490,32 @@ fn matrix_local_passed_by_pointer_keeps_its_declared_type() {
           var a: mat3x3<f32> = u.m;  var b: mat3x3<f32> = u.n;\
           var p: mat3x3<f32> = a * b;  var q: mat3x3<f32> = b * a;  var r: mat3x3<f32> = a + b;\
           _ = f(&p) + f(&q) + f(&r); }";
-    let out = on_big_stack(move || crate::run(src, &Config::default()).expect("run failed"));
+    // Preserved: three clones of `(*p)[0][0]` would price cheaper than the
+    // definition and dissolve the pointer calls this fixture is about.
+    let config = Config {
+        preserve_symbols: vec!["f".to_string()],
+        ..Config::default()
+    };
+    let out = on_big_stack(move || crate::run(src, &config).expect("run failed"));
     assert!(
         out.report.fallback.is_none() && !out.source.contains("_e"),
         "the generator's text must survive the re-parse: {}",
         out.source
     );
+    // Name-agnostic: every `var` initialised from a product keeps `: T`.
+    let typed_var_count = out
+        .source
+        .split("var ")
+        .skip(1)
+        .filter(|rest| {
+            rest.split('=')
+                .next()
+                .is_some_and(|decl| decl.contains(':'))
+        })
+        .count();
     assert!(
-        out.source.contains("var B:E=c*d;") || out.source.contains(":E="),
-        "the pointer-argument local is declared with its type: {}",
+        typed_var_count >= 3,
+        "the pointer-argument locals are declared with their type: {}",
         out.source
     );
 }
@@ -2494,9 +2543,11 @@ fn pointer_argument_locals_spell_the_alias_at_every_declaration_site() {
              f(&m); acc = g2(acc, g3(m, m)); }}\
            out[0] = acc; }}"
     );
-    // No inlining keeps every `mat4x4<f32>` spelling, so an alias is minted.
+    // No inlining (preserved helpers, zero node budget) keeps every
+    // `mat4x4<f32>` spelling, so an alias is minted.
     let config = Config {
         max_inline_node_count: Some(0),
+        preserve_symbols: ["f", "g1", "g2", "g3"].map(String::from).to_vec(),
         ..Config::default()
     };
     for (src, site) in [(copy, "var "), (header, "for(var ")] {
@@ -2532,4 +2583,397 @@ fn pointer_argument_locals_spell_the_alias_at_every_declaration_site() {
         "no alias, no declared type: {}",
         out.source
     );
+}
+
+/// A `let` whose only textual use is a swizzle the emitter merges
+/// (`vec4(a.x,a.y,0,1)` -> `vec4(a.xy,0,1)`) must not be bound: the
+/// slot-per-reference census needs `discount_compose_folds`, or a second pass
+/// reading the merged spelling drops the `let` (non-idempotent).
+#[test]
+fn swizzle_merged_base_is_not_let_bound() {
+    let src = "@group(0) @binding(0) var<uniform> u : vec4f;\
+        @fragment fn fs() -> @location(0) vec4f {\
+        let a = u * 2.0; return vec4f(a.x, a.y, 0.0, 1.0);}";
+    let out = minify(src);
+    assert!(
+        out.contains("vec4((A*2).xy,0,1)"),
+        "the swizzle-merged base was still let-bound: {out}"
+    );
+    assert!(
+        !out.contains("let "),
+        "a single-use let survived the swizzle-merge discount: {out}"
+    );
+    assert_eq!(
+        minify(&out),
+        out,
+        "swizzle-merge pricing must be idempotent"
+    );
+}
+
+/// A splat collapse (`vec4f(d,d,d,d)` -> `vec4f(d)`) is four slots in the
+/// arena and one rendered operand, so `d` is single-use in the text and must
+/// not be let-bound.
+#[test]
+fn splat_collapsed_value_is_not_let_bound() {
+    let src = "@fragment fn fs(@builtin(position) p : vec4f) -> @location(0) vec4f {\
+        let d = pow(p.x, 1.7); return vec4f(d, d, d, d);}";
+    let out = minify(src);
+    assert!(
+        out.contains("return vec4(pow("),
+        "the splat-collapsed value was still let-bound: {out}"
+    );
+    assert_eq!(minify(&out), out, "splat pricing must be idempotent");
+}
+
+/// The swizzle discount declines a base whose cone holds a call result
+/// (`cone_has_call_or_image`): an over-discount there is a second execution
+/// of the call's effects, not a byte loss.
+#[test]
+fn swizzle_base_over_a_call_stays_bound() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o : array<vec4f>;\
+        var<private> n : i32;\
+        fn tick(x : f32) -> vec4f { n = n + 1; o[n] = vec4f(x);\
+        return vec4f(x, x * 2.0, x * 3.0, x * 4.0); }\
+        @fragment fn fs(@builtin(position) p : vec4f) -> @location(0) vec4f {\
+        let a = tick(p.x) * 2.0; return vec4f(a.x, a.y, 0.0, 1.0);}";
+    let out = minify_preserving(src, &["tick"]);
+    assert_eq!(
+        out.matches("tick(").count(),
+        2,
+        "the call must be spelled once at its definition and once at its site: {out}"
+    );
+    assert!(
+        out.contains("=tick("),
+        "a base whose cone holds a call must stay let-bound: {out}"
+    );
+}
+
+/// The splat discount skips a column the matrix arm may flatten
+/// (`discount_compose_folds`): flattened, a single-call result priced at one
+/// use is spelled - and run - twice.
+#[test]
+fn splat_column_of_a_flattened_matrix_keeps_its_call_bound() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o : array<f32>;\
+        var<private> n : u32;\
+        fn tick() -> f32 { n = n + 1u; return f32(n); }\
+        @compute @workgroup_size(1) fn main() {\
+        let v = tick();\
+        let m = mat2x2f(vec2f(v, v), vec2f(1.0, 2.0));\
+        o[0] = m[0][0] + m[1][1];}";
+    let out = minify_preserving(src, &["tick"]);
+    assert_eq!(
+        out.matches("tick(").count(),
+        2,
+        "the call must be spelled once at its definition and once at its site: {out}"
+    );
+    assert!(
+        out.contains("=tick("),
+        "a splat column the matrix arm may flatten must keep its call bound: {out}"
+    );
+}
+
+/// A splat over an image cone keeps its slots (`cone_has_call_or_image`):
+/// discounted to one use, the fetch `loop_sunk_work` priced as bound would
+/// render at its use inside the loop, and the shorter text is why the
+/// never-grow guard cannot catch it.
+#[test]
+fn splat_over_an_image_op_stays_bound_outside_a_loop() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o : array<f32>;\
+        @group(0) @binding(2) var t : texture_2d<f32>;\
+        @compute @workgroup_size(1) fn main() {\
+        let s = textureLoad(t, vec2i(0), 0).x;\
+        let v = vec4f(s, s, s, s);\
+        var acc = 0.0;\
+        for (var i = 0; i < 4; i++) { acc = acc + dot(v, vec4f(f32(i))); }\
+        o[0] = acc;}";
+    let out = minify(src);
+    let (before_loop, in_loop) = out.split_once("for(").expect("a loop survives");
+    assert!(
+        before_loop.contains("textureLoad("),
+        "the fetch must stay bound outside the loop: {out}"
+    );
+    assert!(
+        !in_loop.contains("textureLoad("),
+        "the fetch must not sink into the loop body: {out}"
+    );
+}
+
+// MARK: Splice-gate and emitter regressions
+
+/// The IN-direction splice gates read the caller's arena through the
+/// earlier splices' replacements: `h(f() + 0.0)` with `f` spliced first
+/// hands `h` a const `0.0 + 0.0`, so `-p` / `p * -1.0` would fold to `-0.`
+/// (Dawn on Metal flushes the literal to `+0.0` where the input's runtime
+/// negation kept the sign).  Judged on the `CallResult` the statement still
+/// spelled, the crossing went unseen.
+#[test]
+fn a_nested_call_argument_is_judged_on_the_inner_splices_value() {
+    for (body, spelled) in [
+        ("fn h(p: f32) -> f32 { return -p; }", "-B"),
+        ("fn h(p: f32) -> f32 { return p * -1.0; }", "B*-1"),
+    ] {
+        let src = format!(
+            "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\
+             fn f() -> f32 {{ return 0.0; }}\
+             {body}\
+             @compute @workgroup_size(1) fn main() {{ o[0] = bitcast<u32>(h(f() + 0.0)); }}"
+        );
+        let out = minify(&src);
+        assert!(
+            !out.contains("-0.") && !out.contains("0f*-1"),
+            "the negation must stay a runtime operation: {out}"
+        );
+        assert!(
+            out.contains(spelled),
+            "the sign-sensitive operator survives: {out}"
+        );
+    }
+}
+
+/// The static-error twin: `h(f() - 1u)` with `f` returning `1u` manufactures
+/// `x / (1u - 1u)`, which rolled the whole inlining pass back every sweep
+/// when the argument was read unresolved.
+#[test]
+fn a_nested_call_argument_that_zeroes_a_divisor_keeps_the_outer_call() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\
+        fn f() -> u32 { return 1u; }\
+        fn h(d: u32) -> u32 { return o[1] / d; }\
+        @compute @workgroup_size(1) fn main() { o[0] = h(f() - 1u); }";
+    let out = minify(src);
+    assert!(
+        out.contains("fn ") && !out.contains("/(1-1)") && !out.contains("/0"),
+        "the outer call must survive with a runtime divisor: {out}"
+    );
+}
+
+/// A negative zero the cone COMPUTES crosses a sign-sensitive operator as
+/// surely as a zero leaf: `-f32(p)` with `p = 0u`, `-(p - 1.0)` with
+/// `p = 1.0`.  The gate evaluates the substituted cone and declines on a
+/// `-0.0` lane; the forwarder (`var p = 1f; -(p - 1f)`) does the same.
+#[test]
+fn a_computed_zero_crossing_a_sign_sensitive_operator_stays_runtime() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<u32>;\
+        fn f(p: u32) -> f32 { if (o[2] > 0u) { o[1] = 1u; } return -f32(p); }\
+        fn g(p: f32) -> f32 { if (o[3] > 0u) { o[1] = 1u; } return -(p - 1.0); }\
+        @compute @workgroup_size(1) fn main() {\
+          o[0] = bitcast<u32>(f(0u));\
+          o[4] = bitcast<u32>(g(1.0));\
+          var q = 1.0;\
+          o[5] = bitcast<u32>(-(q - 1.0));\
+          var r = 3.0;\
+          o[6] = bitcast<u32>(-(r - 1.0));\
+        }";
+    let out = minify(src);
+    assert!(
+        !out.contains("-0."),
+        "no negative-zero literal may appear: {out}"
+    );
+    assert!(
+        out.contains("-f32(") && out.contains("-(") && out.contains("var "),
+        "the negations stay runtime, the forwarded var survives: {out}"
+    );
+    assert!(
+        out.contains("3221225472"),
+        "a non-zero result still folds (`-(3-1)` is `-2`): {out}"
+    );
+}
+
+/// An f32 at or past 2^24 under an integer conversion keeps its suffix
+/// whatever the token's shape: bare `i32(3e9)` converts as an ABSTRACT
+/// float to 2147483647 where the typed `i32(3e9f)` the input computed
+/// saturates to 2147483520 (GPU-verified).  A `Compose` operand pins its
+/// constructor type under the same rule, and so does an integer lane the
+/// elided constructor would leave abstract (`vec4u(vec4(37,-7,..))` errors).
+#[test]
+fn an_out_of_range_conversion_operand_keeps_its_type() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\
+        fn conv(x: f32) -> i32 { return i32(x) + 1; }\
+        fn convs(x: f32) -> vec2i { return vec2i(vec2f(x)) + vec2i(1); }\
+        @compute @workgroup_size(1) fn main() {\
+          var f = 3e9; out[0] = bitcast<u32>(i32(f));\
+          var g = 5e9; out[1] = u32(g);\
+          out[2] = bitcast<u32>(conv(3e9));\
+          out[3] = bitcast<u32>(convs(3e9).x);\
+          out[4] = k(1.0);\
+        }\
+        fn k(p: f32) -> u32 { var v0: i32 = i32(p) - 7; v0 = v0 * v0 + 1;\
+          return vec4u(vec4i(v0, -7, -7, -7)).y; }";
+    let out = minify(src);
+    assert!(
+        out.contains("i32(3e9f)") && out.contains("u32(5e9f)"),
+        "scalar operands keep the f32 suffix: {out}"
+    );
+    assert!(
+        out.contains("vec2i(vec2f(3e9))"),
+        "a splat operand spells its constructor type: {out}"
+    );
+    assert!(
+        out.contains("vec4u(vec4i(37,-7,-7,-7))") || out.contains("4294967289"),
+        "an all-literal operand with a negative i32 lane spells its type: {out}"
+    );
+}
+
+/// A single-use call whose result sits in a POINTER chain used more than
+/// once (`let p = &a[f()]; *p = 1; x = *p;`) must stay `let`-bound: the
+/// emitter never binds a pointer-typed expression and spells the chain at
+/// every use, so the stashed call ran once per use (GPU-verified: the
+/// counter read 5 for 2 calls).
+#[test]
+fn a_call_inside_a_shared_pointer_chain_stays_bound() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\
+        fn f() -> u32 { out[8] = out[8] + 1u; return out[8] % 8u; }\
+        @compute @workgroup_size(1) fn main() {\
+          let p = &out[f()]; *p = 100u; out[16] = *p;\
+          let q = &out[f()]; *q = 300u; *q = 500u; out[17] = *q;\
+        }";
+    let out = minify_preserving(src, &["f"]);
+    assert_eq!(
+        out.matches("=f()").count(),
+        2,
+        "each call is spelled once, bound at its own statement: {out}"
+    );
+}
+
+/// An override-sized array's element count is a pipeline-time value: a
+/// const index past 0 made by a splice (`wr(8u)` into `wg[i]`) or naga's
+/// let-erasure (`let x = 8u; wg[x]`) fails Dawn's pipeline creation for a
+/// host value at or below it, where the input's runtime index was clamped.
+/// The writers decline it and the generator binds what the parse left.
+#[test]
+fn a_const_index_into_an_override_sized_array_stays_runtime() {
+    let src = "override N: u32 = 4u;\
+        var<workgroup> wg: array<u32, N>;\
+        @group(0) @binding(0) var<storage, read_write> out: array<u32>;\
+        fn wr(i: u32) { wg[i] = 1u; }\
+        @compute @workgroup_size(1) fn main() {\
+          wr(8u);\
+          let x = 8u; wg[x] = 2u;\
+          var i = 0u; i = 5u; wg[i] = 3u;\
+          wg[0] = 4u;\
+          out[0] = wg[0] + wg[1];\
+        }";
+    let out = minify(src);
+    assert!(!out.contains("[8]") && !out.contains("[5]"), "{out}");
+    assert!(
+        out.contains("[0]=4"),
+        "index 0 is in bounds for every count: {out}"
+    );
+}
+
+/// A run of equal lanes prints as a sub-vector splat (`vec4(vec3f(2),x)`),
+/// a type no expression of the function resolves to; the alias planner
+/// must count that spelling or a local of the function takes the alias's
+/// letter and the constructor reads as a call of the local.
+#[test]
+fn a_subsplat_spelling_counts_as_a_use_of_its_alias() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<vec4f>;\
+        @group(0) @binding(1) var<storage, read_write> p: array<vec3f>;\
+        @compute @workgroup_size(1) fn other(@builtin(global_invocation_id) id: vec3u) {\
+          var q: vec3f = p[id.x] * 2.0;\
+          var r: vec3f = q + vec3f(1.0, 2.0, 3.0);\
+          p[id.y] = q + r + vec3f(4.0, 5.0, 6.0) + vec3f(7.0, 8.0, 9.0) + vec3f(10.0, 11.0, 12.0)\
+            + vec3f(13.0, 14.0, 15.0);\
+        }\
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {\
+          o[id.y] = vec4f(2.0, 2.0, 2.0, f32(id.x));\
+        }";
+    let config = Config::default();
+    let out = crate::run(src, &config).expect("run failed");
+    assert!(
+        out.report.fallback.is_none(),
+        "the generator's text must pass the self-check: {}",
+        out.source
+    );
+}
+
+/// The const-hazard binder's tree walk stops at depth 16; an operand deeper
+/// than that must read as opaque (bind), not as runtime (pass): the
+/// single-call splice manufactures divisors of any depth, and one whose
+/// value tint computes as zero shipped as a shader-creation error.
+#[test]
+fn a_deep_manufactured_divisor_is_bound() {
+    let terms = "+1u".repeat(40);
+    let src = format!(
+        "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\
+         fn f(v: u32) -> u32 {{ return out[1] / (unpack4xU8(v).x{terms}-40u); }}\
+         @compute @workgroup_size(1) fn main() {{ out[0] = f(256u); }}"
+    );
+    let out = minify(&src);
+    assert!(out.contains("let "), "the divisor must be let-bound: {out}");
+}
+
+/// naga's front-end folds `dot`, `length`, `any` / `all`, a composite
+/// `const` member and a vector conversion that nagami's evaluator does not,
+/// so the `let` the generator would bind for such a divisor is evaluated
+/// away at the self-check's re-parse; the gate declines instead of admitting.
+#[test]
+fn a_divisor_only_naga_can_fold_keeps_its_call() {
+    for (helper, call) in [
+        (
+            "fn f() -> vec2u { return vec2u(4u, 4u); }",
+            "out[1] << dot(f(), f())",
+        ),
+        (
+            "const V = vec4u(0u, 1u, 2u, 3u); fn f() -> vec4u { return V; }",
+            "out[1] / f().x",
+        ),
+        (
+            "fn f(v: vec2f) -> u32 { return u32(length(v)); }",
+            "out[1] / f(vec2f(0.0))",
+        ),
+        (
+            "fn f(v: vec2f) -> u32 { return u32(vec2u(v).x); }",
+            "out[1] / f(vec2f(0.0))",
+        ),
+    ] {
+        let src = format!(
+            "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\
+             {helper}\
+             @compute @workgroup_size(1) fn main() {{ out[0] = {call}; }}"
+        );
+        let config = Config::default();
+        let result = crate::run(&src, &config).expect("run failed");
+        assert!(
+            result.report.bailout.is_none(),
+            "the module must not ship compacted: {}",
+            result.source
+        );
+    }
+}
+
+/// A multi-site clone lands at every site or at none: the pre-check judges
+/// each site on the caller before any splice, the gate at the site reads
+/// the caller through its earlier splices (`dot(f(), f())` turns const at
+/// the second site and naga folds `dot`), and a definition kept beside its
+/// clones is pure loss, so the candidate is withdrawn and the run redone.
+#[test]
+fn a_multi_site_clone_declined_at_one_site_lands_at_none() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\
+        fn f() -> vec2u { return vec2u(4u, 4u); }\
+        @compute @workgroup_size(1) fn main() { out[0] = out[1] << dot(f(), f()); }";
+    let out = minify(src);
+    assert_eq!(
+        out.matches("vec2u(4)").count(),
+        1,
+        "the body is spelled once, in the definition: {out}"
+    );
+    assert!(out.contains("dot(a(),a())"), "both calls stay: {out}");
+}
+
+/// An image op bound before a loop and read only by the loop's `break if`
+/// runs in the `continuing` block, once per iteration: it is rendered at
+/// the loop's depth, so it stays bound outside.
+#[test]
+fn an_image_op_read_by_break_if_stays_bound_outside_the_loop() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<vec4f>;\
+        @group(0) @binding(2) var t: texture_2d<f32>;\
+        @compute @workgroup_size(1) fn main() {\
+          let lim = textureLoad(t, vec2i(1, 2), 0);\
+          var i = 0u;\
+          loop { o[i] = vec4f(1.0); i++; continuing { break if f32(i) > lim.x; } }\
+        }";
+    let out = minify(src);
+    let (before_loop, in_loop) = out.split_once("loop{").expect("a loop survives");
+    assert!(before_loop.contains("textureLoad("), "{out}");
+    assert!(!in_loop.contains("textureLoad("), "{out}");
 }

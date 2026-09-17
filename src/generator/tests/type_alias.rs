@@ -2,8 +2,139 @@
 //! interaction, which type categories participate, and round-trip validity.
 
 use super::helpers::{assert_valid_wgsl, compact, compact_aliased, compact_mangled_aliased};
+use crate::config::Config;
+
+// MARK: Priced by the text
+
+/// The shipped render prices an alias by the spellings the tail's render
+/// produced (`GenerateOptions::type_uses`), not the IR census: four
+/// constructors a pinning component lets the text spell `vec3(` are 12
+/// bytes of alias use against a 14-byte declaration - the census, counting
+/// four `vec3f`, declares it and the text grows by two.  The census alone
+/// (`compact_aliased`) still declares it.
+#[test]
+fn an_alias_is_priced_by_what_the_text_spells() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<f32>;\
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {\
+          let x = f32(id.x);\
+          o[0] = dot(vec3f(x, 1.0, 2.0), vec3f(3.0, x, 4.0)) + dot(vec3f(5.0, 6.0, x), vec3f(x, x, 7.0));\
+        }";
+    let census = compact_aliased(src);
+    assert!(census.contains("alias"), "{census}");
+    let out = crate::run(src, &Config::default())
+        .expect("run failed")
+        .source;
+    assert!(
+        !out.contains("alias") && out.contains("vec3(B,1,2)"),
+        "{out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// The census counts constructors and declarations only; a conversion
+/// (`vec3f(v)`) spells the type as well, and four of them beside one
+/// parameter pay for the alias the census never saw.
+#[test]
+fn a_conversion_counts_as_a_spelling_of_its_type() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<f32>;\
+        fn f(v: vec3f) -> f32 { return v.x * v.y - v.z; }\
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {\
+          o[0] = f(vec3f(id)) + f(vec3f(id + 1)) * f(vec3f(id * 2)) - f(vec3f(id ^ vec3u(3)));\
+        }";
+    let census = compact_aliased(src);
+    assert!(!census.contains("alias"), "{census}");
+    let out = crate::run(src, &Config::default())
+        .expect("run failed")
+        .source;
+    assert!(
+        out.contains("alias C=vec3f;") && out.contains("A(C(a))"),
+        "{out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// naga keeps an alias as a named type, and a bare `array(...)` takes its
+/// element type from the first component's: a splat (`D(1)`) resolves to
+/// the anonymous `vec4f`, a full constructor or `D()` to `D`, so one `var`
+/// stored from both forms fails validation.  With `vec4f` aliased and the
+/// array type not, the first form keeps its typed constructor.
+#[test]
+fn a_bare_array_constructor_keeps_its_type_under_an_aliased_element() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<vec4f>;\
+        fn f(a: array<vec4f, 2>) -> vec4f { return a[0] + a[1]; }\
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {\
+          let x = f32(id.x);\
+          var b = array<vec4f, 2>(vec4f(1.0), vec4f());\
+          if x > 2.0 { b = array<vec4f, 2>(vec4f(x, x, 1.0, 2.0), vec4f(x, 1.0, 2.0, 3.0)); }\
+          o[0] = f(b) + vec4f(x, 0.0, 1.0, 2.0) * vec4f(3.0, x, x, x) - vec4f(vec3f(id), 1.0) + vec4f(x);\
+        }";
+    let out = crate::run(src, &Config::default()).expect("run failed");
+    assert!(
+        out.report.fallback.is_none(),
+        "the generator's text must pass the self-check: {}",
+        out.source
+    );
+    assert!(
+        out.source.contains("array<b,2>(b(1),b())") && out.source.contains("=array(b(C,C,1,2)"),
+        "{}",
+        out.source
+    );
+    assert_valid_wgsl(&out.source);
+}
+
+/// A preamble owns its declarations; the text never spells their types, so
+/// an alias for one is a declaration used nowhere.  The tail's render
+/// leaves them out as the shipped one does.
+#[test]
+fn a_type_only_the_preamble_spells_gets_no_alias() {
+    let preamble = "@group(0) @binding(0) var t: texture_2d<f32>;\
+        @group(0) @binding(1) var s: sampler;\
+        @group(0) @binding(2) var u: texture_2d<f32>;\
+        @group(0) @binding(3) var v: texture_2d<f32>;";
+    let src = "@fragment fn main(@location(0) p: vec2f) -> @location(0) vec4f {\
+        return textureSample(t, s, p) + textureSample(u, s, p) + textureSample(v, s, p); }";
+    let config = Config {
+        preamble: Some(preamble.to_string()),
+        ..Config::default()
+    };
+    let out = crate::run(src, &config).expect("run failed").source;
+    assert!(!out.contains("alias"), "{out}");
+}
 
 // MARK: Basic alias thresholds
+
+/// An alias dodges only the locals of functions that spell its type
+/// (`plan_type_aliases`), so a same-named local elsewhere leaves it the
+/// shortest free name.
+#[test]
+fn alias_ignores_locals_of_functions_not_spelling_the_type() {
+    let src = r#"
+        fn f(p: f32) -> f32 { var A = p; var a = A * 2.0; return a; }
+        fn g(q: vec4<f32>, r: vec4<f32>) -> vec4<f32> {
+            let v = vec4<f32>(q.x, r.y, 0.0, 1.0);
+            let w = vec4<f32>(v.x, v.y, 0.0, 1.0);
+            return v + w + q * r;
+        }
+        @fragment fn m() -> @location(0) vec4<f32> {
+            let s = f(1.0);
+            return g(vec4<f32>(s, s, 0.0, 1.0), vec4<f32>(s, 0.0, s, 1.0));
+        }
+    "#;
+    let out = compact_aliased(src);
+    assert_valid_wgsl(&out);
+    assert!(
+        out.contains("alias A=vec4f"),
+        "`A` is a local only in f, which never spells vec4f: {out}"
+    );
+    // The same local inside a spelling function shadows it.
+    let src = src.replace("let v = vec4<f32>(q.x", "var A = q.x; let v = vec4<f32>(A");
+    let out = compact_aliased(&src);
+    assert_valid_wgsl(&out);
+    assert!(
+        out.contains("alias a=vec4f"),
+        "the alias must dodge g's own local `A`: {out}"
+    );
+}
 
 /// Dead locals are never printed, so their type's refs must not count toward
 /// the alias break-even or the `alias` itself is dead text.

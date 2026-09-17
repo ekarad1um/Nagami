@@ -13,30 +13,45 @@
 //! drawn is independent of the order and no downstream generator decision
 //! (struct types, aliases, and extracted literals avoiding the pool) shifts.
 
-use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 
 use crate::error::Error;
 use crate::handle_set::HandleMap;
+use crate::ir::visit::{all_functions, for_each_statement};
 use crate::name_gen;
-use crate::passes::expr_util::{for_each_statement, live_expression_ref_counts};
+use crate::passes::expr_util::live_expression_ref_counts;
 use crate::pipeline::{Pass, PassContext};
 
 /// `preserve` lists names kept verbatim; `mangle` extends renaming to
-/// constants and overrides.
+/// constants and overrides.  `by_render` weighs the names by the text:
+/// the pass renders the module under a provisional plan and ranks by the
+/// occurrences the emitter produced, where the IR census counts a value
+/// the emitter inlines at several uses once.  The tail's instance, whose
+/// names ship, weighs so; a re-parse of its text references each inlined
+/// copy separately and so counts what it rendered, and names it the same.
 #[derive(Debug)]
 pub struct RenamePass {
     preserve: HashSet<String>,
     mangle: bool,
+    by_render: bool,
 }
 
 impl RenamePass {
     /// A pass from the user-facing `preserve_symbols` and the resolved
-    /// `mangle` flag.
+    /// `mangle` flag, weighing by the IR census.
     pub fn new(preserve_symbols: Vec<String>, mangle: bool) -> Self {
         Self {
             preserve: preserve_symbols.into_iter().collect(),
             mangle,
+            by_render: false,
+        }
+    }
+
+    /// [`Self::new`], weighing by the text (`by_render`).
+    pub fn by_render(preserve_symbols: Vec<String>, mangle: bool) -> Self {
+        Self {
+            by_render: true,
+            ..Self::new(preserve_symbols, mangle)
         }
     }
 }
@@ -47,112 +62,226 @@ impl Pass for RenamePass {
     }
 
     fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
-        let mut used_names = collect_reserved_names(module, &self.preserve, self.mangle);
-
-        // Weights are structural (handle-based, name-independent), so the
-        // assignment is deterministic and idempotent at the convergence
-        // fixed point.
-        let weights = compute_weights(module);
-
-        // `seq` is the declaration-order tie-break, so equal weights get a
-        // stable assignment.
-        let mut targets: Vec<(Target, usize, usize)> = Vec::new();
-        let mut seq = 0usize;
-
-        if self.mangle {
-            for (h, c) in module.constants.iter() {
-                if let Some(name) = c.name.as_deref()
-                    && !self.preserve.contains(name)
-                {
-                    push_target(&mut targets, &mut seq, Target::Constant(h), &weights);
-                }
-            }
-            for (h, ov) in module.overrides.iter() {
-                // An `@id`-less override is identified to the host ONLY by
-                // its declaration name (the pipeline `constants` key), so
-                // renaming it breaks host specialization; it is reserved
-                // instead.
-                if let Some(name) = ov.name.as_deref()
-                    && ov.id.is_some()
-                    && !self.preserve.contains(name)
-                {
-                    push_target(&mut targets, &mut seq, Target::Override(h), &weights);
-                }
-            }
-        }
-
-        for (h, global) in module.global_variables.iter() {
-            if let Some(name) = global.name.as_deref()
-                && self.preserve.contains(name)
+        let mut plan = plan_names(module, &self.preserve, self.mangle);
+        if self.by_render {
+            // The provisional names only move a decision at a name-length
+            // boundary; a module the emitter declines keeps them.  The
+            // preamble's declarations are left out as the shipped render
+            // leaves them out, so the type spellings counted are its.
+            let options = crate::generator::GenerateOptions {
+                preamble_names: ctx
+                    .tail
+                    .map(|tail| tail.preamble_names.clone())
+                    .unwrap_or_default(),
+                ..crate::generator::GenerateOptions::from_config(ctx.config)
+            };
+            if let Ok(emission) =
+                crate::generator::generate(&plan.applied(module), ctx.info, options)
             {
-                continue;
+                plan =
+                    plan_names_weighed(module, &self.preserve, self.mangle, emission.name_weights);
+                if let Some(tail) = ctx.tail {
+                    *tail.type_uses.borrow_mut() = Some(emission.type_uses);
+                }
             }
-            push_target(&mut targets, &mut seq, Target::Global(h), &weights);
         }
+        Ok(plan.apply(module, ctx.name_log))
+    }
+}
 
-        let module_scope: HashSet<&str> = name_gen::module_scope_names(module)
-            .chain(name_gen::type_names(module))
-            .collect();
-        for (fh, function) in module.functions.iter() {
-            if !matches!(function.name.as_deref(), Some(n) if self.preserve.contains(n)) {
-                push_target(&mut targets, &mut seq, Target::Function(fh), &weights);
+/// The names one sweep assigns, in rank order, before any is applied: a
+/// pass that prices a rewrite by the text rename will leave reads them
+/// here, and [`RenamePass::run`] applies them.
+#[derive(Clone)]
+pub(crate) struct NamePlan {
+    /// Heaviest first: `(target, weight, declaration sequence)`.
+    targets: Vec<(Target, usize, usize)>,
+    /// Parallel to `targets`.
+    names: Vec<String>,
+    /// Every name the draw may not mint, the drawn ones included, and the
+    /// counter after the last draw: together they continue the sequence.
+    used_names: HashSet<String>,
+    counter: usize,
+}
+
+/// Rank every renameable identifier of `module` by the IR census and
+/// draw its name.
+pub(crate) fn plan_names(
+    module: &naga::Module,
+    preserve: &HashSet<String>,
+    mangle: bool,
+) -> NamePlan {
+    // Weights are structural (handle-based, name-independent), so the
+    // assignment is deterministic and idempotent at the convergence
+    // fixed point.
+    plan_names_weighed(module, preserve, mangle, compute_weights(module))
+}
+
+/// [`plan_names`] under the given occurrence weights.
+pub(crate) fn plan_names_weighed(
+    module: &naga::Module,
+    preserve: &HashSet<String>,
+    mangle: bool,
+    weights: Weights,
+) -> NamePlan {
+    let mut used_names = collect_reserved_names(module, preserve, mangle);
+
+    // `seq` is the declaration-order tie-break, so equal weights get a
+    // stable assignment.
+    let mut targets: Vec<(Target, usize, usize)> = Vec::new();
+    let mut seq = 0usize;
+
+    if mangle {
+        for (h, c) in module.constants.iter() {
+            if let Some(name) = c.name.as_deref()
+                && !preserve.contains(name)
+            {
+                push_target(&mut targets, &mut seq, Target::Constant(h), &weights);
             }
-            enumerate_locals(
-                function,
-                FuncRef::Function(fh),
-                &self.preserve,
-                &module_scope,
-                &weights,
-                &mut targets,
-                &mut seq,
-            );
+        }
+        for (h, ov) in module.overrides.iter() {
+            // An `@id`-less override is identified to the host ONLY by
+            // its declaration name (the pipeline `constants` key), so
+            // renaming it breaks host specialization; it is reserved
+            // instead.
+            if let Some(name) = ov.name.as_deref()
+                && ov.id.is_some()
+                && !preserve.contains(name)
+            {
+                push_target(&mut targets, &mut seq, Target::Override(h), &weights);
+            }
+        }
+    }
+
+    for (h, global) in module.global_variables.iter() {
+        if let Some(name) = global.name.as_deref()
+            && preserve.contains(name)
+        {
+            continue;
+        }
+        push_target(&mut targets, &mut seq, Target::Global(h), &weights);
+    }
+
+    let module_scope: HashSet<&str> = name_gen::module_scope_names(module)
+        .chain(name_gen::type_names(module))
+        .collect();
+    for (fh, function) in module.functions.iter() {
+        if !matches!(function.name.as_deref(), Some(n) if preserve.contains(n)) {
+            push_target(&mut targets, &mut seq, Target::Function(fh), &weights);
+        }
+        enumerate_locals(
+            function,
+            fh.index(),
+            preserve,
+            &module_scope,
+            &weights,
+            &mut targets,
+            &mut seq,
+        );
+    }
+
+    for (ei, entry) in module.entry_points.iter().enumerate() {
+        // Entry-point names are pipeline-bound and never renamed.
+        enumerate_locals(
+            &entry.function,
+            module.functions.len() + ei,
+            preserve,
+            &module_scope,
+            &weights,
+            &mut targets,
+            &mut seq,
+        );
+    }
+
+    // Heaviest first; `seq` is unique per target, so the order is total
+    // and independent of sort stability.
+    targets.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+
+    let mut counter = 0usize;
+    let names = targets
+        .iter()
+        .map(|_| next_available_name(&mut counter, &mut used_names))
+        .collect();
+    NamePlan {
+        targets,
+        names,
+        used_names,
+        counter,
+    }
+}
+
+impl NamePlan {
+    /// Where a further target of `weight` ranks: after every target of at
+    /// least that weight, its sequence number being the largest.
+    fn rank_of_weight(&self, weight: usize) -> usize {
+        self.targets.iter().filter(|t| t.1 >= weight).count()
+    }
+
+    /// Length of the draw at `rank`; the draw is fixed by the reserved set
+    /// alone, whoever takes it.
+    fn draw_len(&self, rank: usize) -> usize {
+        match self.names.get(rank) {
+            Some(name) => name.len(),
+            None => name_gen::next_name_unique(&mut self.counter.clone(), &self.used_names).len(),
+        }
+    }
+
+    /// Length of the name a further target of `weight` would draw.
+    pub(crate) fn name_len_at_weight(&self, weight: usize) -> usize {
+        self.draw_len(self.rank_of_weight(weight))
+    }
+
+    /// Bytes the existing targets pay when a further target of `weight`
+    /// joins: every target ranked below it moves one draw down the
+    /// sequence, which costs an occurrence per byte the draws lengthen
+    /// (the single letters run out at the 52nd).
+    pub(crate) fn insertion_cost(&self, weight: usize) -> usize {
+        let rank = self.rank_of_weight(weight);
+        self.targets[rank..]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| t.1 * (self.draw_len(rank + i + 1) - self.draw_len(rank + i)))
+            .sum()
+    }
+
+    /// A copy of `module` carrying the planned names.
+    pub(crate) fn applied(&self, module: &naga::Module) -> naga::Module {
+        let mut renamed = module.clone();
+        self.clone().apply(&mut renamed, None);
+        renamed
+    }
+
+    /// Write the planned names into `module`; `true` when any slot or
+    /// `named_expressions` changed.  Module-scope renames are logged
+    /// (locals are neither unique nor host-visible), one batch per sweep
+    /// so `record_batch` can resolve swaps.
+    pub(crate) fn apply(
+        self,
+        module: &mut naga::Module,
+        log: Option<&std::cell::RefCell<crate::name_map::NameLog>>,
+    ) -> bool {
+        let mut assigned = AssignedNames::new(module);
+        for ((target, _, _), name) in self.targets.into_iter().zip(self.names) {
+            assigned.insert(target, name);
         }
 
-        for (ei, entry) in module.entry_points.iter().enumerate() {
-            // Entry-point names are pipeline-bound and never renamed.
-            enumerate_locals(
-                &entry.function,
-                FuncRef::Entry(ei),
-                &self.preserve,
-                &module_scope,
-                &weights,
-                &mut targets,
-                &mut seq,
-            );
-        }
-
-        // Heaviest first; `seq` is unique per target, so the order is total
-        // and independent of sort stability.
-        targets.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
-
-        let mut counter = 0usize;
-        let mut assigned = AssignedNames::default();
-        for (target, _, _) in &targets {
-            let name = next_available_name(&mut counter, &mut used_names);
-            assigned.insert(*target, name);
-        }
-
-        // Module-scope only (locals are neither unique nor host-visible),
-        // one batch per sweep so `record_batch` can resolve swaps.
         let mut module_renames: Vec<(String, String)> = Vec::new();
         let mut changed = false;
-        if self.mangle {
-            for (h, c) in module.constants.iter_mut() {
-                apply_module_name(
-                    &mut c.name,
-                    assigned.constant.remove(h),
-                    &mut changed,
-                    &mut module_renames,
-                );
-            }
-            for (h, ov) in module.overrides.iter_mut() {
-                apply_module_name(
-                    &mut ov.name,
-                    assigned.over.remove(h),
-                    &mut changed,
-                    &mut module_renames,
-                );
-            }
+        for (h, c) in module.constants.iter_mut() {
+            apply_module_name(
+                &mut c.name,
+                assigned.constant.remove(h),
+                &mut changed,
+                &mut module_renames,
+            );
+        }
+        for (h, ov) in module.overrides.iter_mut() {
+            apply_module_name(
+                &mut ov.name,
+                assigned.over.remove(h),
+                &mut changed,
+                &mut module_renames,
+            );
         }
         for (h, global) in module.global_variables.iter_mut() {
             apply_module_name(
@@ -169,60 +298,69 @@ impl Pass for RenamePass {
                 &mut changed,
                 &mut module_renames,
             );
-            apply_locals(function, FuncRef::Function(fh), &mut assigned, &mut changed);
+            apply_locals(function, fh.index(), &mut assigned, &mut changed);
             changed |= clear_named_expressions(function);
         }
         for (ei, entry) in module.entry_points.iter_mut().enumerate() {
             apply_locals(
                 &mut entry.function,
-                FuncRef::Entry(ei),
+                module.functions.len() + ei,
                 &mut assigned,
                 &mut changed,
             );
             changed |= clear_named_expressions(&mut entry.function);
         }
-        if let Some(log) = ctx.name_log
+        if let Some(log) = log
             && !module_renames.is_empty()
         {
             log.borrow_mut().record_batch(&module_renames);
         }
-
-        Ok(changed)
+        changed
     }
 }
 
-/// A renameable identifier by arena slot; args and locals carry a
-/// [`FuncRef`] so the same handle in two functions never collides.
+/// A renameable identifier by arena slot; args and locals carry their
+/// [`Body`] so the same handle in two functions never collides.
 #[derive(Clone, Copy)]
 enum Target {
     Constant(naga::Handle<naga::Constant>),
     Override(naga::Handle<naga::Override>),
     Global(naga::Handle<naga::GlobalVariable>),
     Function(naga::Handle<naga::Function>),
-    Arg(FuncRef, usize),
-    Local(FuncRef, naga::Handle<naga::LocalVariable>),
+    Arg(Body, usize),
+    Local(Body, naga::Handle<naga::LocalVariable>),
 }
 
-/// A function body, for argument / local scoping.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum FuncRef {
-    Function(naga::Handle<naga::Function>),
-    Entry(usize),
-}
+/// A function body by position: free functions first, then entry points,
+/// the order of [`all_functions`] and of the generator's per-function
+/// caches; the per-body tables here are indexed by it.
+pub(crate) type Body = usize;
 
 /// Names assigned this sweep, bucketed by arena so application is one
-/// `iter_mut` per arena.
-#[derive(Default)]
+/// `iter_mut` per arena; per body, by argument position and by local.
 struct AssignedNames {
     constant: HandleMap<naga::Constant, String>,
     over: HandleMap<naga::Override, String>,
     global: HandleMap<naga::GlobalVariable, String>,
     function: HandleMap<naga::Function, String>,
-    arg: FxHashMap<(FuncRef, usize), String>,
-    local: FxHashMap<(FuncRef, naga::Handle<naga::LocalVariable>), String>,
+    arg: Vec<Vec<Option<String>>>,
+    local: Vec<HandleMap<naga::LocalVariable, String>>,
 }
 
 impl AssignedNames {
+    fn new(module: &naga::Module) -> Self {
+        Self {
+            constant: Default::default(),
+            over: Default::default(),
+            global: Default::default(),
+            function: Default::default(),
+            arg: all_functions(module)
+                .map(|f| vec![None; f.arguments.len()])
+                .collect(),
+            local: all_functions(module).map(|_| Default::default()).collect(),
+        }
+    }
+
     fn insert(&mut self, target: Target, name: String) {
         match target {
             Target::Constant(h) => {
@@ -237,37 +375,82 @@ impl AssignedNames {
             Target::Function(h) => {
                 self.function.insert(h, name);
             }
-            Target::Arg(f, i) => {
-                self.arg.insert((f, i), name);
-            }
-            Target::Local(f, h) => {
-                self.local.insert((f, h), name);
+            Target::Arg(b, i) => self.arg[b][i] = Some(name),
+            Target::Local(b, h) => {
+                self.local[b].insert(h, name);
             }
         }
     }
 }
 
 /// Occurrence weights; a missing key is a non-renameable handle and counts
-/// as 1.
-#[derive(Default)]
-struct Weights {
+/// as 1.  Per body, by argument position and by local.
+#[derive(Default, Debug)]
+pub(crate) struct Weights {
     global: HandleMap<naga::GlobalVariable, usize>,
     constant: HandleMap<naga::Constant, usize>,
     over: HandleMap<naga::Override, usize>,
     function: HandleMap<naga::Function, usize>,
-    arg: FxHashMap<(FuncRef, usize), usize>,
-    local: FxHashMap<(FuncRef, naga::Handle<naga::LocalVariable>), usize>,
+    arg: Vec<Vec<usize>>,
+    local: Vec<HandleMap<naga::LocalVariable, usize>>,
 }
 
 impl Weights {
+    /// The declaration of every target and every call of a function: what
+    /// the text spells once per statement, whichever way the values in
+    /// the bodies render.
+    pub(crate) fn declared(module: &naga::Module) -> Self {
+        let mut w = Weights::default();
+        for (h, _) in module.global_variables.iter() {
+            *w.global.entry(h).or_insert(0) += 1;
+        }
+        for (h, _) in module.constants.iter() {
+            *w.constant.entry(h).or_insert(0) += 1;
+        }
+        for (h, _) in module.overrides.iter() {
+            *w.over.entry(h).or_insert(0) += 1;
+        }
+        for (h, _) in module.functions.iter() {
+            *w.function.entry(h).or_insert(0) += 1;
+        }
+        for function in all_functions(module) {
+            w.arg.push(vec![1; function.arguments.len()]);
+            w.local.push(
+                function
+                    .local_variables
+                    .iter()
+                    .map(|(lh, _)| (lh, 1))
+                    .collect(),
+            );
+            count_calls(&function.body, &mut w.function);
+        }
+        w
+    }
+
+    /// `count` renderings of `expr` in `body`, for the target it names, if
+    /// any.
+    pub(crate) fn reference(&mut self, body: Body, expr: &naga::Expression, count: usize) {
+        if count == 0 {
+            return;
+        }
+        match expr {
+            naga::Expression::GlobalVariable(g) => *self.global.entry(*g).or_insert(0) += count,
+            naga::Expression::LocalVariable(l) => *self.local[body].entry(*l).or_insert(0) += count,
+            naga::Expression::FunctionArgument(i) => self.arg[body][*i as usize] += count,
+            naga::Expression::Constant(cst) => *self.constant.entry(*cst).or_insert(0) += count,
+            naga::Expression::Override(o) => *self.over.entry(*o).or_insert(0) += count,
+            _ => {}
+        }
+    }
+
     fn of(&self, target: Target) -> usize {
         match target {
             Target::Constant(h) => self.constant.get(h).copied(),
             Target::Override(h) => self.over.get(h).copied(),
             Target::Global(h) => self.global.get(h).copied(),
             Target::Function(h) => self.function.get(h).copied(),
-            Target::Arg(f, i) => self.arg.get(&(f, i)).copied(),
-            Target::Local(f, h) => self.local.get(&(f, h)).copied(),
+            Target::Arg(b, i) => self.arg.get(b).and_then(|arg| arg.get(i)).copied(),
+            Target::Local(b, h) => self.local.get(b).and_then(|local| local.get(h)).copied(),
         }
         .unwrap_or(1)
     }
@@ -285,7 +468,7 @@ fn push_target(
 
 fn enumerate_locals(
     function: &naga::Function,
-    fref: FuncRef,
+    body: Body,
     preserve: &HashSet<String>,
     module_scope: &HashSet<&str>,
     weights: &Weights,
@@ -318,13 +501,13 @@ fn enumerate_locals(
         if keeps_name(&mut kept, preserve, module_scope, argument.name.as_deref()) {
             continue;
         }
-        push_target(targets, seq, Target::Arg(fref, i), weights);
+        push_target(targets, seq, Target::Arg(body, i), weights);
     }
     for (lh, local) in function.local_variables.iter() {
         if keeps_name(&mut kept, preserve, module_scope, local.name.as_deref()) {
             continue;
         }
-        push_target(targets, seq, Target::Local(fref, lh), weights);
+        push_target(targets, seq, Target::Local(body, lh), weights);
     }
 }
 
@@ -355,15 +538,15 @@ fn apply_module_name(
 
 fn apply_locals(
     function: &mut naga::Function,
-    fref: FuncRef,
+    body: Body,
     assigned: &mut AssignedNames,
     changed: &mut bool,
 ) {
     for (i, argument) in function.arguments.iter_mut().enumerate() {
-        apply_name(&mut argument.name, assigned.arg.remove(&(fref, i)), changed);
+        apply_name(&mut argument.name, assigned.arg[body][i].take(), changed);
     }
     for (lh, local) in function.local_variables.iter_mut() {
-        apply_name(&mut local.name, assigned.local.remove(&(fref, lh)), changed);
+        apply_name(&mut local.name, assigned.local[body].remove(lh), changed);
     }
 }
 
@@ -386,61 +569,19 @@ fn clear_named_expressions(function: &mut naga::Function) -> bool {
 /// function or entry body, mirroring the generator's per-function expression
 /// ref counts (for an inlined `GlobalVariable(g)` that count is the textual
 /// occurrences of `g`).  A size heuristic, not an exact count (module-scope
-/// initializers are not counted): an imperfect weight only yields a longer
-/// name, never a collision, which the all-distinct draw alone guarantees.
+/// initializers are not counted, and a value the emitter inlines at several
+/// uses spells its operands once per use): an imperfect weight only yields
+/// a longer name, never a collision, which the all-distinct draw alone
+/// guarantees.
 fn compute_weights(module: &naga::Module) -> Weights {
-    let mut w = Weights::default();
-
-    for (h, _) in module.global_variables.iter() {
-        *w.global.entry(h).or_insert(0) += 1;
+    let mut w = Weights::declared(module);
+    for (body, function) in all_functions(module).enumerate() {
+        let (counts, _live) = live_expression_ref_counts(function);
+        for (h, expr) in function.expressions.iter() {
+            w.reference(body, expr, counts[h.index()]);
+        }
     }
-    for (h, _) in module.constants.iter() {
-        *w.constant.entry(h).or_insert(0) += 1;
-    }
-    for (h, _) in module.overrides.iter() {
-        *w.over.entry(h).or_insert(0) += 1;
-    }
-    for (h, _) in module.functions.iter() {
-        *w.function.entry(h).or_insert(0) += 1;
-    }
-
-    for (fh, function) in module.functions.iter() {
-        accumulate_function_weights(&mut w, FuncRef::Function(fh), function);
-        count_calls(&function.body, &mut w.function);
-    }
-    for (ei, entry) in module.entry_points.iter().enumerate() {
-        accumulate_function_weights(&mut w, FuncRef::Entry(ei), &entry.function);
-        count_calls(&entry.function.body, &mut w.function);
-    }
-
     w
-}
-
-fn accumulate_function_weights(w: &mut Weights, fref: FuncRef, function: &naga::Function) {
-    for i in 0..function.arguments.len() {
-        *w.arg.entry((fref, i)).or_insert(0) += 1;
-    }
-    for (lh, _) in function.local_variables.iter() {
-        *w.local.entry((fref, lh)).or_insert(0) += 1;
-    }
-
-    let (counts, _live) = live_expression_ref_counts(function);
-    for (h, expr) in function.expressions.iter() {
-        let c = counts[h.index()];
-        if c == 0 {
-            continue;
-        }
-        match expr {
-            naga::Expression::GlobalVariable(g) => *w.global.entry(*g).or_insert(0) += c,
-            naga::Expression::LocalVariable(l) => *w.local.entry((fref, *l)).or_insert(0) += c,
-            naga::Expression::FunctionArgument(i) => {
-                *w.arg.entry((fref, *i as usize)).or_insert(0) += c
-            }
-            naga::Expression::Constant(cst) => *w.constant.entry(*cst).or_insert(0) += c,
-            naga::Expression::Override(o) => *w.over.entry(*o).or_insert(0) += c,
-            _ => {}
-        }
-    }
 }
 
 /// Call counts, so a frequently-called function earns a shorter name.
@@ -453,15 +594,19 @@ fn count_calls(block: &naga::Block, calls: &mut HandleMap<naga::Function, usize>
 }
 
 /// The names one rename sweep may not mint.  With `mangle = false`,
-/// constant and override names stay verbatim and are reserved; with
-/// `mangle = true` they are rewritten, and reserving the previous sweep's
-/// assignments would shift every later assignment one slot into a two-sweep
-/// oscillation that never converges.  Every preserve-listed name is
-/// reserved unconditionally, including names absent from every arena (a
-/// preamble binding a prior pass pruned): the scans see only surviving
-/// names, and a re-minted preamble name would make the generator suppress
-/// that body declaration as preamble-owned and rebind every reference to the
-/// host's binding.
+/// constant, override, struct type and member names stay verbatim and are
+/// reserved.  With `mangle = true` the sweep rewrites constants and
+/// overrides, and reserving the previous sweep's assignments would shift
+/// every later assignment one slot into a two-sweep oscillation that never
+/// converges; the generator mints struct type and member names clear of
+/// this pass's assignments, and reserving the source's would make a
+/// re-minify skip the letters the previous run minted for them, shifting
+/// every later assignment by one.  Every preserve-listed name is reserved
+/// unconditionally, including names absent from every arena (a preamble
+/// binding a prior pass pruned): the scans see only surviving names, and a
+/// re-minted preamble name would make the generator suppress that body
+/// declaration as preamble-owned and rebind every reference to the host's
+/// binding.
 fn collect_reserved_names(
     module: &naga::Module,
     preserve: &HashSet<String>,
@@ -500,20 +645,20 @@ fn collect_reserved_names(
         reserved.insert(entry.name.clone());
     }
 
-    // Source struct type and member names, regardless of `mangle`: without
-    // mangling the generator emits them verbatim, so minting one for a
-    // global / function / local puts two same-named symbols in the output
-    // (round-trip validation catches it, but compaction silently halves);
-    // with mangling the generator re-mangles them itself, and reserving
-    // costs only a few short names.
-    for (_, ty) in module.types.iter() {
-        if let Some(name) = ty.name.as_deref() {
-            reserved.insert(name.to_string());
-        }
-        if let naga::TypeInner::Struct { members, .. } = &ty.inner {
-            for m in members {
-                if let Some(name) = m.name.as_deref() {
-                    reserved.insert(name.to_string());
+    // Source struct type and member names, without mangling only: the
+    // generator then emits them verbatim, so minting one for a global /
+    // function / local would put two same-named symbols in the output
+    // (round-trip validation catches it, but compaction silently halves).
+    if !mangle {
+        for (_, ty) in module.types.iter() {
+            if let Some(name) = ty.name.as_deref() {
+                reserved.insert(name.to_string());
+            }
+            if let naga::TypeInner::Struct { members, .. } = &ty.inner {
+                for m in members {
+                    if let Some(name) = m.name.as_deref() {
+                        reserved.insert(name.to_string());
+                    }
                 }
             }
         }
@@ -571,12 +716,9 @@ mod tests {
         let mut module = naga::front::wgsl::parse_str(source).expect("source should parse");
         let mut pass = RenamePass::new(preserve.iter().map(|s| s.to_string()).collect(), mangle);
         let config = Config::default();
-        let ctx = PassContext {
-            config: &config,
-            name_log: None,
-        };
 
-        let changed = pass.run(&mut module, &ctx).expect("rename pass should run");
+        let changed =
+            PassContext::run_pass(&mut pass, &mut module, &config).expect("rename pass should run");
         let _ = crate::io::validate_module(&module).expect("module should remain valid");
         (changed, module)
     }
@@ -720,7 +862,7 @@ fn fs_main() -> @location(0) vec4f {
 
     #[test]
     fn non_coop_module_leaves_role_enumerants_free() {
-        // Reserved ONLY for coop modules, so the rest of the corpus keeps the
+        // Reserved ONLY for coop modules, so every other module keeps the
         // cheapest names.
         let source = "var<private> some_long_global: f32 = 1.0;\n\
             @compute @workgroup_size(1) fn main() { some_long_global = some_long_global + 1.0; }";
@@ -1003,12 +1145,7 @@ fn fs_main() -> @location(0) vec4f {
         let mut module2 = module1.clone();
         let mut pass = RenamePass::new(Vec::new(), true);
         let config = Config::default();
-        let ctx = PassContext {
-            config: &config,
-            name_log: None,
-        };
-        let changed2 = pass
-            .run(&mut module2, &ctx)
+        let changed2 = PassContext::run_pass(&mut pass, &mut module2, &config)
             .expect("second rename should work");
         assert!(
             !changed2,
@@ -1020,11 +1157,47 @@ fn fs_main() -> @location(0) vec4f {
         assert_eq!(names1, names2, "names must be identical across runs");
     }
 
+    /// A deferred `var t = init;` spells `t` once where the IR holds the
+    /// declaration and the initialising store: by the census `t` (5)
+    /// outranks a global read three times (4), by the text they tie and
+    /// the global, declared first, takes the first name - as the re-parse
+    /// of the text will rank them.
+    #[test]
+    fn the_tail_ranks_names_by_what_the_text_spells() {
+        let source = "var<private> g: f32;\
+            @group(0) @binding(0) var<storage, read_write> o: array<f32>;\
+            @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) i: u32) {\
+              var t = f32(i) * 2.0; g = t + t * t; o[0] = g; o[1] = g + 1.0; }";
+        let name_of_g = |pass: RenamePass| {
+            let mut module = naga::front::wgsl::parse_str(source).expect("source should parse");
+            let mut pass = pass;
+            PassContext::run_pass(&mut pass, &mut module, &Config::default()).expect("rename");
+            module
+                .global_variables
+                .iter()
+                .next()
+                .unwrap()
+                .1
+                .name
+                .clone()
+        };
+        assert_eq!(
+            name_of_g(RenamePass::new(Vec::new(), true)).as_deref(),
+            Some("a"),
+            "by the census the local outranks the global"
+        );
+        assert_eq!(
+            name_of_g(RenamePass::by_render(Vec::new(), true)).as_deref(),
+            Some("A"),
+            "by the text the global takes the first name"
+        );
+    }
+
     #[test]
     fn clears_named_expressions_and_reports_change_even_when_nothing_renamed() {
         // Gating the clear on `changed` makes a preserve-all pass exit the
         // convergence loop one sweep early, before downstream DCE can remove
-        // orphaned globals (seen on the Tint corpus).
+        // orphaned globals.
         let source = r#"
 @fragment
 fn fs_main() -> @location(0) vec4f {
@@ -1085,11 +1258,12 @@ fn h(p: f32, q: f32, r: f32) -> A {
         );
     }
 
-    /// Under `mangle = true` the generator re-mangles type / member names
-    /// itself, but reserving them here is safe and forecloses collisions a
-    /// future refactor could expose.
+    /// Under `mangle = true` the generator mints struct type and member
+    /// names clear of the pass's assignments, so reserving the source's
+    /// would cost letters and, on a re-minify, idempotence
+    /// ([`collect_reserved_names`]).
     #[test]
-    fn reserves_source_struct_type_names_with_mangle() {
+    fn does_not_reserve_source_struct_type_names_with_mangle() {
         let src = r#"
 struct A { x: f32 }
 @group(0) @binding(0) var<uniform> g: A;
@@ -1101,13 +1275,36 @@ struct A { x: f32 }
         let preserve = HashSet::new();
         let reserved = collect_reserved_names(&module, &preserve, /*mangle=*/ true);
         assert!(
-            reserved.contains("A"),
-            "source struct type name must be reserved even under mangle"
+            !reserved.contains("A"),
+            "a source struct type name is free under mangle"
         );
         assert!(
-            reserved.contains("x"),
-            "source struct member name must be reserved even under mangle"
+            !reserved.contains("x"),
+            "a source struct member name is free under mangle"
         );
+    }
+
+    /// A further target draws the name at its weight's rank; past the 52nd
+    /// single letter the draws lengthen, and every target ranked below the
+    /// newcomer pays an occurrence per byte its own draw grows.
+    #[test]
+    fn a_planned_name_and_what_the_others_pay_for_it() {
+        let mut src = String::new();
+        for i in 0..52 {
+            src.push_str(&format!("var<private> g{i}: f32;\n"));
+        }
+        src.push_str("@compute @workgroup_size(1) fn main() {}");
+        let module = naga::front::wgsl::parse_str(&src).expect("source should parse");
+        let plan = plan_names(&module, &HashSet::new(), true);
+        assert_eq!(plan.names.len(), 52);
+        assert!(plan.names.iter().all(|n| n.len() == 1));
+        // Weight 1 ties every global and ranks last: the 53rd draw.
+        assert_eq!(plan.name_len_at_weight(1), 2);
+        assert_eq!(plan.insertion_cost(1), 0);
+        // Weight 2 ranks first; the last single-letter holder moves to two
+        // letters at its one occurrence.
+        assert_eq!(plan.name_len_at_weight(2), 1);
+        assert_eq!(plan.insertion_cost(2), 1);
     }
 
     /// naga gives each block-scoped shadowing `var` its own handle under the

@@ -15,11 +15,10 @@
 //! re-validation rejects only structurally invalid IR, so a wrongly
 //! admitted build yields valid-but-wrong IR that slips straight through.
 
-use rustc_hash::{FxHashMap, FxHashSet};
-
 use crate::error::Error;
 use crate::handle_set::HandleMap;
-use crate::passes::expr_util::{for_each_function_mut, root_local_var};
+use crate::ir::visit::for_each_function_mut;
+use crate::passes::expr_util::root_local_var;
 use crate::pipeline::{Pass, PassContext};
 
 /// Collapses member-wise struct builds into one constructor store.
@@ -27,9 +26,9 @@ pub struct StructBuildPass;
 
 /// A `Load` whose pointer roots at `g` anywhere under `h`; rejects a member
 /// value that depends on a sibling member (`t.b = t.a + 1`).  Shared
-/// sub-expressions make an unmemoised walk exponential (a ~1KB shader hangs
-/// the pass), and `memo` records both answers, so one memo serves every query
-/// about the same `g`.
+/// sub-expressions make an unmemoised walk exponential (even a small shader
+/// hangs the pass), and `memo` records both answers, so one memo serves every
+/// query about the same `g`.
 fn expr_loads_local(
     h: naga::Handle<naga::Expression>,
     g: naga::Handle<naga::LocalVariable>,
@@ -48,7 +47,7 @@ fn expr_loads_local(
         _ => false,
     };
     if !found {
-        crate::passes::expr_util::visit_expression_children(&arena[h], |child| {
+        crate::ir::visit::visit_expression_children(&arena[h], |child| {
             if !found {
                 found = expr_loads_local(child, g, arena, memo);
             }
@@ -136,7 +135,9 @@ fn plan_local(
     use naga::Statement as S;
     let arena = &func.expressions;
 
-    let mut members: FxHashMap<u32, (usize, naga::Handle<naga::Expression>)> = Default::default();
+    // Per member: the index of its store and the value stored.
+    let mut members: Vec<Option<(usize, naga::Handle<naga::Expression>)>> =
+        vec![None; member_count];
     let mut ptr: Option<naga::Handle<naga::Expression>> = None;
     let mut last_store_idx: Option<usize> = None;
     let mut first_read_idx: Option<usize> = None;
@@ -150,10 +151,11 @@ fn plan_local(
             match spec {
                 crate::passes::coalescing::ElementSpec::Index(i) => {
                     // A member written twice, or a value that reads `g`, is out.
-                    if members.contains_key(&i) || expr_loads_local(*value, g, arena, loads) {
+                    let slot = members.get_mut(i as usize)?;
+                    if slot.is_some() || expr_loads_local(*value, g, arena, loads) {
                         return None;
                     }
-                    members.insert(i, (idx, *value));
+                    *slot = Some((idx, *value));
                     last_store_idx = Some(idx);
                     if let naga::Expression::AccessIndex { base, .. } = arena[*pointer] {
                         ptr = Some(base);
@@ -178,7 +180,7 @@ fn plan_local(
 
     // Every member covered exactly once; first read strictly after the last
     // member store.
-    if members.len() != member_count {
+    if members.iter().any(Option::is_none) {
         return None;
     }
     let last = last_store_idx?;
@@ -204,10 +206,9 @@ fn plan_local(
 
     let mut components = Vec::with_capacity(member_count);
     let mut store_indices = Vec::with_capacity(member_count);
-    for i in 0..member_count as u32 {
-        let (sidx, val) = members.get(&i)?;
-        components.push(*val);
-        store_indices.push(*sidx);
+    for (sidx, val) in members.into_iter().flatten() {
+        components.push(val);
+        store_indices.push(sidx);
     }
     Some(BuildPlan {
         local: g,
@@ -228,15 +229,15 @@ fn apply_plans(
     types: &naga::UniqueArena<naga::Type>,
     plans: Vec<BuildPlan>,
 ) {
-    // member-store indices to drop, and `insert_at` -> (compose, struct ptr).
-    let mut drop: FxHashSet<usize> = Default::default();
-    let mut splice: FxHashMap<
-        usize,
-        (
+    // Per top-level statement: whether it is a member store to drop, and
+    // the (compose, struct ptr) to splice in at its position.
+    let mut drop = vec![false; func.body.len()];
+    let mut splice: Vec<
+        Option<(
             naga::Handle<naga::Expression>,
             naga::Handle<naga::Expression>,
-        ),
-    > = Default::default();
+        )>,
+    > = vec![None; func.body.len()];
     for plan in plans {
         let struct_ty = func.local_variables[plan.local].ty;
         debug_assert!(matches!(
@@ -254,21 +255,25 @@ fn apply_plans(
             naga::Span::UNDEFINED,
         );
         let insert_at = *plan.store_indices.iter().max().unwrap();
-        drop.extend(plan.store_indices);
-        splice.insert(insert_at, (compose, plan.ptr));
+        for i in plan.store_indices {
+            drop[i] = true;
+        }
+        splice[insert_at] = Some((compose, plan.ptr));
     }
 
-    let original = std::mem::replace(&mut func.body, naga::Block::new());
-    for (idx, (stmt, span)) in original.span_into_iter().enumerate() {
-        if drop.contains(&idx) {
+    let mut idx = 0usize;
+    crate::ir::rewrite::rewrite_statements(&mut func.body, &mut |stmt, span, out| {
+        let here = idx;
+        idx += 1;
+        if drop[here] {
             // At the last member store of a local every member value is
             // already materialised.
-            if let Some(&(compose, ptr)) = splice.get(&idx) {
-                func.body.push(
+            if let Some((compose, ptr)) = splice[here] {
+                out.push(
                     naga::Statement::Emit(naga::Range::new_from_bounds(compose, compose)),
                     naga::Span::UNDEFINED,
                 );
-                func.body.push(
+                out.push(
                     naga::Statement::Store {
                         pointer: ptr,
                         value: compose,
@@ -276,10 +281,10 @@ fn apply_plans(
                     naga::Span::UNDEFINED,
                 );
             }
-            continue;
+            return;
         }
-        func.body.push(stmt, span);
-    }
+        out.push(stmt, span);
+    });
 }
 
 /// Any reference at all (store target, load, operand, escape); conservative
@@ -296,7 +301,7 @@ fn statement_references_local(
             found = true;
         }
     };
-    crate::passes::expr_util::visit_statement_operands(stmt, true, &mut check);
+    crate::ir::visit::visit_statement_operands(stmt, true, &mut check);
     found
 }
 
@@ -314,7 +319,7 @@ fn statement_value_reads_local(
             found = true;
         }
     };
-    crate::passes::expr_util::visit_statement_operands(stmt, true, &mut check);
+    crate::ir::visit::visit_statement_operands(stmt, true, &mut check);
     found
 }
 
@@ -353,7 +358,7 @@ fn expr_mentions_local(
     }
     let mut found = matches!(arena[h], naga::Expression::LocalVariable(l) if l == local);
     if !found {
-        crate::passes::expr_util::visit_expression_children(&arena[h], |child| {
+        crate::ir::visit::visit_expression_children(&arena[h], |child| {
             if !found {
                 found = expr_mentions_local(child, local, arena, memo);
             }
@@ -367,8 +372,8 @@ fn expr_mentions_local(
 /// statements themselves.
 fn walk_nested(body: &naga::Block, f: &mut impl FnMut(&naga::Statement)) {
     for stmt in body.iter() {
-        for nested in crate::passes::expr_util::nested_blocks(stmt) {
-            crate::passes::expr_util::for_each_statement(nested, f);
+        for nested in crate::ir::visit::nested_blocks(stmt) {
+            crate::ir::visit::for_each_statement(nested, f);
         }
     }
 }

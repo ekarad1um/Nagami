@@ -5,11 +5,7 @@ fn run_pass(source: &str) -> (bool, naga::Module) {
     let mut module = naga::front::wgsl::parse_str(source).expect("source should parse");
     let mut pass = DeadBranchPass;
     let config = Config::default();
-    let ctx = PassContext {
-        config: &config,
-        name_log: None,
-    };
-    let changed = pass.run(&mut module, &ctx).expect("pass should run");
+    let changed = PassContext::run_pass(&mut pass, &mut module, &config).expect("pass should run");
 
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
@@ -40,13 +36,12 @@ override OV: f32 = 2.0;
     let (changed, mut module) = run_pass(src);
     assert!(changed, "the `&&` join folds");
     let config = Config::default();
-    let ctx = PassContext {
-        config: &config,
-        name_log: None,
-    };
-    crate::passes::load_dedup::LoadDedupPass
-        .run(&mut module, &ctx)
-        .expect("load_dedup should run");
+    PassContext::run_pass(
+        &mut crate::passes::load_dedup::LoadDedupPass,
+        &mut module,
+        &config,
+    )
+    .expect("load_dedup should run");
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::all(),
@@ -156,7 +151,7 @@ fn log() { out[1] = 7u; }
     );
     let calls = |block: &naga::Block| {
         let mut n = 0;
-        crate::passes::expr_util::for_each_statement(block, &mut |s| {
+        crate::ir::visit::for_each_statement(block, &mut |s| {
             if matches!(s, naga::Statement::Call { .. }) {
                 n += 1;
             }
@@ -1287,13 +1282,15 @@ fn fs(@location(0) v: f32) -> @location(0) vec4f {
     assert!(!changed, "no elision when accept doesn't terminate");
 }
 
+/// The arm's store keeps the guard out of the return merge, so the only
+/// rule in play is elision, which has nothing to elide.
 #[test]
 fn no_else_elision_when_reject_is_empty() {
     let src = r#"
 @fragment
 fn fs(@location(0) v: f32) -> @location(0) vec4f {
     var x = 0.0;
-    if v > 0.5 { return vec4f(1.0); }
+    if v > 0.5 { x = 2.0; return vec4f(x); }
     return vec4f(x);
 }
 "#;
@@ -1302,8 +1299,8 @@ fn fs(@location(0) v: f32) -> @location(0) vec4f {
 }
 
 /// Both arms terminating still elides: the saved `else{...}` outweighs the
-/// residual `if c { return v1; }`, and gating on `!reject.terminates` made
-/// the corpus larger; the only missed collapse is symmetric `return;` arms,
+/// residual `if c { return v1; }`, and gating on `!reject.terminates` only
+/// grows the output; the only missed collapse is symmetric `return;` arms,
 /// which are not folded anyway.
 #[test]
 fn else_elision_fires_when_both_arms_return_values() {
@@ -1381,11 +1378,7 @@ fn empty_nested_block_is_dropped() {
 
     let mut pass = DeadBranchPass;
     let config = Config::default();
-    let ctx = PassContext {
-        config: &config,
-        name_log: None,
-    };
-    let changed = pass.run(&mut module, &ctx).expect("pass should run");
+    let changed = PassContext::run_pass(&mut pass, &mut module, &config).expect("pass should run");
     assert!(
         changed,
         "empty nested Block elision must report `changed = true`"
@@ -1749,8 +1742,7 @@ fn nested_switch_with_last_case_fallthrough_does_not_terminate_beyond() {
 }
 
 /// The single-store forward substitutes the stored value for the one load;
-/// a `-0.0` literal stays a runtime read (Dawn on Metal flushes the
-/// literal but not the runtime negation).
+/// a `-0.0` literal stays a runtime read ([`has_negative_zero_leaf`]).
 #[test]
 fn single_store_forward_keeps_a_negative_zero_store() {
     for (value, forwarded) in [("-(0.0)", false), ("0.5", true)] {
@@ -1765,7 +1757,7 @@ fn single_store_forward_keeps_a_negative_zero_store() {
         let (_, module) = run_pass(&source);
         let function = &module.entry_points[0].function;
         let mut stores = 0;
-        crate::passes::expr_util::for_each_statement(&function.body, &mut |stmt| {
+        crate::ir::visit::for_each_statement(&function.body, &mut |stmt| {
             if let naga::Statement::Store { pointer, .. } = stmt
                 && matches!(
                     function.expressions[*pointer],
@@ -1777,4 +1769,434 @@ fn single_store_forward_keeps_a_negative_zero_store() {
         });
         assert_eq!(stores == 0, forwarded, "value {value}: {stores} stores");
     }
+}
+
+// MARK: Trailing return merging
+
+fn function_named<'a>(module: &'a naga::Module, name: &str) -> &'a naga::Function {
+    module
+        .functions
+        .iter()
+        .find_map(|(_, f)| (f.name.as_deref() == Some(name)).then_some(f))
+        .expect("function should exist")
+}
+
+/// `(condition, accept, reject)` of the `Select` the trailing `Return`
+/// returns, or a panic naming the missing shape.
+fn trailing_select(
+    function: &naga::Function,
+) -> (
+    naga::Handle<naga::Expression>,
+    naga::Handle<naga::Expression>,
+    naga::Handle<naga::Expression>,
+) {
+    let Some(naga::Statement::Return { value: Some(value) }) = function.body.last() else {
+        panic!("body must end in a valued return");
+    };
+    let naga::Expression::Select {
+        condition,
+        accept,
+        reject,
+    } = function.expressions[*value]
+    else {
+        panic!("the trailing return must select");
+    };
+    (condition, accept, reject)
+}
+
+/// `if c { return a; } return b;` becomes `select(b, a, c)`, the guard's
+/// value in the accept slot.
+#[test]
+fn merges_a_guarded_return_into_a_select() {
+    let src = r#"
+fn safe_sqrt(x: f32) -> f32 {
+    if (x < 0.0) { return 0.0; }
+    return sqrt(x);
+}
+@fragment fn fs_main(@location(0) x: f32) -> @location(0) vec4f { return vec4f(safe_sqrt(x)); }
+"#;
+    let (changed, module) = run_pass(src);
+    assert!(changed);
+    let f = function_named(&module, "safe_sqrt");
+    assert_eq!(count_ifs(&f.body), 0);
+    let (condition, accept, reject) = trailing_select(f);
+    assert!(matches!(
+        f.expressions[condition],
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::Less,
+            ..
+        }
+    ));
+    assert!(matches!(
+        f.expressions[accept],
+        naga::Expression::Literal(naga::Literal::F32(v)) if v == 0.0
+    ));
+    assert!(matches!(
+        f.expressions[reject],
+        naga::Expression::Math {
+            fun: naga::MathFunction::Sqrt,
+            ..
+        }
+    ));
+}
+
+/// Guards merge inward, so a chain nests with the FIRST guard outermost:
+/// `select(select(b, a2, c2), a1, c1)`.
+#[test]
+fn merges_a_guard_chain_inward() {
+    let src = r#"
+fn ramp(x: f32) -> f32 {
+    if (x < 0.0) { return 0.0; }
+    if (x < 1.0) { return x; }
+    return 1.0 + sqrt(x);
+}
+@fragment fn fs_main(@location(0) x: f32) -> @location(0) vec4f { return vec4f(ramp(x)); }
+"#;
+    let (_, module) = run_pass(src);
+    let f = function_named(&module, "ramp");
+    assert_eq!(count_ifs(&f.body), 0);
+    let (_, outer_accept, outer_reject) = trailing_select(f);
+    assert!(matches!(
+        f.expressions[outer_accept],
+        naga::Expression::Literal(naga::Literal::F32(v)) if v == 0.0
+    ));
+    let naga::Expression::Select { accept, reject, .. } = f.expressions[outer_reject] else {
+        panic!("the second guard nests inside the first");
+    };
+    assert!(matches!(
+        f.expressions[accept],
+        naga::Expression::FunctionArgument(0)
+    ));
+    assert!(matches!(
+        f.expressions[reject],
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::Add,
+            ..
+        }
+    ));
+}
+
+/// A guard whose arm does more than return, or that is followed by a
+/// statement before the trailing return, has effects `select` cannot
+/// order, so it stays.
+#[test]
+fn keeps_a_guard_with_effects_around_it() {
+    let src = r#"
+var<private> hits: f32;
+fn arm_stores(x: f32) -> f32 {
+    if (x < 0.0) { hits = hits + 1.0; return 0.0; }
+    return sqrt(x);
+}
+fn tail_stores(x: f32) -> f32 {
+    if (x < 0.0) { return 0.0; }
+    hits = hits + 1.0;
+    return sqrt(x);
+}
+@fragment fn fs_main(@location(0) x: f32) -> @location(0) vec4f { return vec4f(arm_stores(x) + tail_stores(x)); }
+"#;
+    let (_, module) = run_pass(src);
+    for name in ["arm_stores", "tail_stores"] {
+        assert_eq!(count_ifs(&function_named(&module, name).body), 1, "{name}");
+    }
+}
+
+/// The single-store forwarder answers to the static-error slots as
+/// `load_dedup`'s own forwarding does (`decline_static_error_forwards`):
+/// `var d = 0u; x / d`, `var s = 40u; x << s` and `var i = 4; a[i + 1]`
+/// forwarded are a const divide by zero, a shift past the width and an
+/// index past the end, each declined with its store kept, while the
+/// in-bounds `k + 1` still forwards.
+#[test]
+fn forwarder_declines_a_store_that_makes_a_static_error_slot_const() {
+    let src = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@group(0) @binding(1) var<storage, read> inp: array<u32>;
+@compute @workgroup_size(1)
+fn main() {
+    var d: u32;
+    d = 0u;
+    var i: i32;
+    i = 4;
+    var s: u32;
+    s = 40u;
+    var k: i32;
+    k = 2;
+    let a = array<u32, 4>(1u, 2u, 3u, 4u);
+    out[0] = inp[0] / d;
+    out[1] = a[i + 1];
+    out[2] = inp[1] << s;
+    out[3] = a[k + 1];
+}
+"#;
+    let (changed, module) = run_pass(src);
+    assert!(changed, "the safe forward (`k`) must still happen");
+    let function = &module.entry_points[0].function;
+    let mut stores = 0;
+    crate::ir::visit::for_each_statement(&function.body, &mut |stmt| {
+        if let naga::Statement::Store { pointer, .. } = stmt
+            && matches!(
+                function.expressions[*pointer],
+                naga::Expression::LocalVariable(_)
+            )
+        {
+            stores += 1;
+        }
+    });
+    assert_eq!(
+        stores, 3,
+        "the three declined forwards keep their stores, the safe one is removed"
+    );
+}
+
+/// An integer `/` `%` or a shift by a runtime operand keeps its guard - it
+/// is what keeps the zero divisor or over-wide shift out - while a literal
+/// divisor and the float twin, IEEE arithmetic on any operand, merge.
+#[test]
+fn keeps_a_guard_over_an_integer_division_by_a_runtime_divisor() {
+    let src = r#"
+fn idiv(n: i32, d: i32) -> i32 {
+    if (d == 0) { return 0; }
+    return n / d;
+}
+fn shl(n: u32, s: u32) -> u32 {
+    if (s >= 32u) { return 0u; }
+    return n << s;
+}
+fn fdiv(n: f32, d: f32) -> f32 {
+    if (d == 0.0) { return 0.0; }
+    return n / d;
+}
+fn by_two(n: i32, d: i32) -> i32 {
+    if (d == 0) { return 0; }
+    return n / 2;
+}
+@fragment fn fs_main(@location(0) x: f32) -> @location(0) vec4f {
+    let n = i32(x);
+    return vec4f(f32(idiv(n, n)), f32(shl(u32(x), u32(x))), fdiv(x, x), f32(by_two(n, n)));
+}
+"#;
+    let (_, module) = run_pass(src);
+    for name in ["idiv", "shl"] {
+        assert_eq!(count_ifs(&function_named(&module, name).body), 1, "{name}");
+    }
+    for name in ["fdiv", "by_two"] {
+        assert_eq!(count_ifs(&function_named(&module, name).body), 0, "{name}");
+    }
+}
+
+/// A derivative or an implicit-LOD sample under a guard is bound to the
+/// guard's control flow by the uniformity rules; a struct result has no
+/// `select`.  All three keep their guard.
+#[test]
+fn keeps_a_guard_over_a_uniformity_bound_value_or_a_struct_result() {
+    let src = r#"
+struct Pair { a: f32, b: f32 }
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
+fn grad(x: f32, c: bool) -> f32 {
+    if (c) { return 0.0; }
+    return dpdx(x);
+}
+fn sample(uv: vec2f, c: bool) -> vec4f {
+    if (c) { return vec4f(0.0); }
+    return textureSample(t, s, uv);
+}
+fn pair(x: f32) -> Pair {
+    if (x < 0.0) { return Pair(0.0, 0.0); }
+    return Pair(x, sqrt(x));
+}
+@fragment fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
+    let c = uv.x > 0.5;
+    return sample(uv, c) + vec4f(grad(uv.y, c) + pair(uv.y).b);
+}
+"#;
+    let (_, module) = run_pass(src);
+    for name in ["grad", "sample", "pair"] {
+        assert_eq!(count_ifs(&function_named(&module, name).body), 1, "{name}");
+    }
+}
+
+/// An image operation is the cost a guard exists to save: a guarded
+/// texture resolve merged into a `select` became unconditional loads on
+/// the GPU.  Every image op declines, in either arm; a pure helper next to
+/// them still merges.
+#[test]
+fn keeps_a_guard_over_an_image_operation() {
+    let src = r#"
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
+fn load(c: bool, p: vec2i) -> vec4f {
+    if (c) { return vec4f(0.0); }
+    return textureLoad(t, p, 0);
+}
+fn level(c: bool, uv: vec2f) -> vec4f {
+    if (c) { return textureSampleLevel(t, s, uv, 0.0); }
+    return vec4f(1.0);
+}
+fn gather(c: bool, uv: vec2f) -> vec4f {
+    if (c) { return vec4f(0.0); }
+    return textureGather(0, t, s, uv);
+}
+fn dims(c: bool) -> u32 {
+    if (c) { return 0u; }
+    return textureDimensions(t).x;
+}
+fn safe_sqrt(x: f32) -> f32 {
+    if (x < 0.0) { return 0.0; }
+    return sqrt(x);
+}
+@fragment fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
+    let c = uv.x > 0.5;
+    return load(c, vec2i(uv)) + level(c, uv) + gather(c, uv) * f32(dims(c)) + vec4f(safe_sqrt(uv.y));
+}
+"#;
+    let (_, module) = run_pass(src);
+    for name in ["load", "level", "gather", "dims"] {
+        assert_eq!(count_ifs(&function_named(&module, name).body), 1, "{name}");
+    }
+    assert_eq!(count_ifs(&function_named(&module, "safe_sqrt").body), 0);
+}
+
+/// Only the work the guard governs matters: a fetch emitted BEFORE the
+/// guard runs either way, and the arithmetic on it merges.
+#[test]
+fn merges_when_the_image_read_precedes_the_guard() {
+    let src = r#"
+@group(0) @binding(0) var t: texture_2d<f32>;
+fn f(c: bool, p: vec2i) -> f32 {
+    let v = textureLoad(t, p, 0).x;
+    if (c) { return 0.0; }
+    return v * 2.0;
+}
+@fragment fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f { return vec4f(f(uv.x > 0.5, vec2i(uv))); }
+"#;
+    let (changed, module) = run_pass(src);
+    assert!(changed);
+    assert_eq!(count_ifs(&function_named(&module, "f").body), 0);
+}
+
+/// The re-sugar hoists the accept arm's `Emit`s above the operator.  A
+/// single-use fetch is forwarded into the right operand, where `&&` guards
+/// it again, so it folds; an implicit-LOD sample (pinned at its `Emit` by
+/// the emitter) and a fetch with a second reference (bound ahead of the
+/// operator) would run unconditionally, so those keep their `if`.
+#[test]
+fn short_circuit_keeps_an_implicit_lod_sample_under_its_guard() {
+    let src = r#"
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
+fn implicit(c: bool, uv: vec2f) -> bool {
+    var d: bool;
+    if c { d = textureSample(t, s, uv).x > 0.5; } else { d = false; }
+    return d;
+}
+fn twice(c: bool, p: vec2i) -> bool {
+    var d: bool;
+    if c { let v = textureLoad(t, p, 0); d = v.x > v.y; } else { d = false; }
+    return d;
+}
+@fragment fn fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+    return vec4f(f32(implicit(uv.x > 0.0, uv)), f32(twice(uv.y > 0.0, vec2i(uv))), 0.0, 1.0);
+}
+"#;
+    let (_, module) = run_pass(src);
+    for name in ["implicit", "twice"] {
+        assert_eq!(count_ifs(&function_named(&module, name).body), 1, "{name}");
+    }
+}
+
+/// The fetch is read once, but its consumer twice: the emitter binds the
+/// consumer (its cone repeats the fetch), and that `let` would put the
+/// fetch ahead of the `&&`.  The fold declines as it does for a fetch read
+/// twice; a two-use consumer that reaches no fetch still folds.
+#[test]
+fn short_circuit_keeps_a_fetch_whose_consumer_binds() {
+    let src = r#"
+@group(0) @binding(0) var t: texture_2d<f32>;
+fn wrapped(c: bool, p: vec2i) -> bool {
+    var d: bool;
+    if c { let s = textureLoad(t, p, 0).xy; d = s.x + s.y > 1.0; } else { d = false; }
+    return d;
+}
+fn cheap(c: bool, p: vec2i) -> bool {
+    var d: bool;
+    if c { let s = vec2f(p) * 0.5; d = s.x + s.y > 1.0; } else { d = false; }
+    return d;
+}
+@fragment fn fs(@location(0) uv: vec2f) -> @location(0) vec4f {
+    return vec4f(f32(wrapped(uv.x > 0.0, vec2i(uv))), f32(cheap(uv.y > 0.0, vec2i(uv))), 0.0, 1.0);
+}
+"#;
+    let (_, module) = run_pass(src);
+    assert_eq!(count_ifs(&function_named(&module, "wrapped").body), 1);
+    assert_eq!(count_ifs(&function_named(&module, "cheap").body), 0);
+}
+
+#[test]
+fn short_circuit_folds_an_explicit_level_sample() {
+    let src = r#"
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
+fn f(c: bool, uv: vec2f) -> bool {
+    var d: bool;
+    if c { d = textureSampleLevel(t, s, uv, 0.0).x > 0.5; } else { d = false; }
+    return d;
+}
+@fragment fn fs(@location(0) uv: vec2f) -> @location(0) vec4f { return vec4f(f32(f(uv.x > 0.0, uv))); }
+"#;
+    let (changed, module) = run_pass(src);
+    assert!(changed);
+    let f = function_named(&module, "f");
+    assert_eq!(count_ifs(&f.body), 0);
+    assert!(f.expressions.iter().any(|(_, e)| matches!(
+        e,
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::LogicalAnd,
+            ..
+        }
+    )));
+}
+
+/// The IR sheds the tail `return;`s naga's front-end synthesises
+/// ([`strip_tail_void_returns`]), so the body the inliner reads has no
+/// `Return` at all; a guard before the rest of the body folds that rest
+/// into its else, and a return inside a loop stays.
+#[test]
+fn strips_tail_void_returns_the_generator_would_elide() {
+    let src = r#"
+var<private> out: u32;
+fn tail(c: bool, d: bool) {
+    if (c) {
+        out = 1u;
+    } else if (d) {
+        out = 2u;
+    }
+}
+fn guarded(c: bool) {
+    if (c) { return; }
+    out = 3u;
+}
+fn looped(c: bool) {
+    loop {
+        if (c) { return; }
+        out = out + 1u;
+    }
+}
+@compute @workgroup_size(1) fn main() { tail(out == 0u, out == 1u); guarded(out == 2u); looped(out == 3u); }
+"#;
+    let (changed, module) = run_pass(src);
+    assert!(changed);
+    assert!(
+        !contains_return(&function_named(&module, "tail").body),
+        "every tail return is stripped"
+    );
+    let guarded = function_named(&module, "guarded");
+    assert!(
+        !contains_return(&guarded.body) && count_ifs(&guarded.body) == 1,
+        "the guard folds the rest of the body into its else"
+    );
+    assert!(
+        contains_return(&function_named(&module, "looped").body),
+        "a return inside a loop stays"
+    );
 }

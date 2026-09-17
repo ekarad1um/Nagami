@@ -14,6 +14,7 @@
 //! when the value is benign.
 
 use super::core::FunctionCtx;
+use crate::analysis::ExprClass;
 use crate::config::FloatPrecision;
 
 /// `Some` when `h` renders as one const-expression: literal / `const` leaves
@@ -23,10 +24,18 @@ use crate::config::FloatPrecision;
 /// computes, so the caller can only bind on the operator's ability to fail.
 /// Any other constant tree the folder left alone (a matrix product, say) was
 /// evaluated by tint in the input too, so an unknown value there binds
-/// nothing; binding those as well costs 9 bytes on 1 corpus file for a hazard
-/// no shader writes (`var v = m * u; v * 1e38`), the accepted residual.
-/// `override` leaves are excluded: an override-expression fails at pipeline
-/// creation exactly as the input's own would.
+/// nothing; binding those as well would pay bytes for a hazard no shader
+/// writes (`var v = m * u; v * 1e38`), the accepted residual.
+/// An `override` leaf is opaque too: its value is the host's, and an
+/// override-expression is evaluated at pipeline creation with the same rules
+/// (Dawn substitutes the values and re-resolves), so `let n = N; if (n > 0u)
+/// { x / n }` emitted as `x / N` fails the pipeline of a host that sets `N`
+/// to zero, where the input's runtime division was guarded.  The direct
+/// form `x / N` binds for nothing, the price of the erased `let`.
+/// A tree deeper than the walk follows reads as opaque, never as runtime:
+/// the single-call splice puts no size cap on the operand it manufactures
+/// (`out[1] / (unpack4xU8(v).x + 1u + ... - 18u)` with `v` substituted), and
+/// an unknown operand of a failable operator must bind, not pass.
 fn const_tree(
     exprs: &naga::Arena<naga::Expression>,
     bound: &dyn Fn(naga::Handle<naga::Expression>) -> bool,
@@ -35,56 +44,40 @@ fn const_tree(
 ) -> Option<bool> {
     use naga::Expression as E;
     use naga::MathFunction as M;
-    if depth > 16 || bound(h) {
+    if bound(h) {
         return None;
     }
-    let sub = |e: naga::Handle<naga::Expression>| const_tree(exprs, bound, e, depth + 1);
-    let all = |es: &[naga::Handle<naga::Expression>]| {
-        es.iter().try_fold(false, |acc, &e| Some(acc | sub(e)?))
-    };
-    match &exprs[h] {
-        E::Literal(_) | E::Constant(_) | E::ZeroValue(_) => Some(false),
-        E::Compose { components, .. } => all(components),
-        E::Splat { value, .. } | E::Swizzle { vector: value, .. } => sub(*value),
-        E::AccessIndex { base, .. } | E::Unary { expr: base, .. } => sub(*base),
-        E::As { expr, convert, .. } => Some(sub(*expr)? | convert.is_none()),
-        E::Relational { argument, .. } => sub(*argument),
-        E::Access { base, index }
-        | E::Binary {
-            left: base,
-            right: index,
-            ..
-        } => all(&[*base, *index]),
-        E::Select {
-            condition,
-            accept,
-            reject,
-        } => all(&[*condition, *accept, *reject]),
-        E::Math {
-            fun,
-            arg,
-            arg1,
-            arg2,
-            arg3,
-        } => {
-            let args: Vec<_> = [Some(*arg), *arg1, *arg2, *arg3]
-                .into_iter()
-                .flatten()
-                .collect();
-            let opaque = matches!(
-                fun,
-                M::Unpack4x8snorm
-                    | M::Unpack4x8unorm
-                    | M::Unpack2x16snorm
-                    | M::Unpack2x16unorm
-                    | M::Unpack2x16float
-                    | M::Unpack4xI8
-                    | M::Unpack4xU8
-            );
-            Some(all(&args)? | opaque)
-        }
-        _ => None,
+    if depth > 16 {
+        return Some(true);
     }
+    let class = ExprClass::node(&exprs[h]);
+    if class.any(ExprClass::CONST_LEAF) {
+        return Some(class.any(ExprClass::OVERRIDE));
+    }
+    if !class.any(ExprClass::PURE_OP) {
+        return None;
+    }
+    // A bitcast reinterprets, an unpack decodes: both opaque to tint's
+    // const-evaluator diagnostics.
+    let opaque = match &exprs[h] {
+        E::As { convert, .. } => convert.is_none(),
+        E::Math { fun, .. } => matches!(
+            fun,
+            M::Unpack4x8snorm
+                | M::Unpack4x8unorm
+                | M::Unpack2x16snorm
+                | M::Unpack2x16unorm
+                | M::Unpack2x16float
+                | M::Unpack4xI8
+                | M::Unpack4xU8
+        ),
+        _ => false,
+    };
+    let mut acc = Some(opaque);
+    crate::ir::visit::visit_expression_children(&exprs[h], |operand| {
+        acc = acc.and_then(|seen| Some(seen | const_tree(exprs, bound, operand, depth + 1)?));
+    });
+    acc
 }
 
 /// Scalar lanes of a constant tree; `None` once anything is runtime, a
@@ -380,6 +373,34 @@ pub(super) fn creation_error_operand(
                 }
             };
             hazard.then_some(*left)
+        }
+        // A const-expression index outside the base's static length is a
+        // shader-creation error.  A value in reach was judged before emission
+        // (naga's validator for the literal, the driver's slot check for the
+        // const-expression), so what arrives here is what neither could see:
+        // a tree the driver's evaluator cannot compute (`unpack4xU8(..).w`)
+        // is opaque and binds, as under any failable operator; a
+        // runtime-sized base bounds only the sign, an override-sized one
+        // everything but index 0.
+        E::Access { base, index } if tree(*index).is_some() => {
+            let bound = crate::passes::expr_util::static_index_bound(
+                ctx.ty(*base).inner_with(&module.types),
+                module,
+            )?
+            .with_index(ctx.ty(*index).inner_with(&module.types));
+            let hazard = match lanes(*index) {
+                Some(l) => l
+                    .iter()
+                    .any(|lit| crate::passes::expr_util::index_is_static_error(bound.len, lit)),
+                None => crate::passes::const_fold::operand_is_static_error(
+                    &module.types,
+                    &crate::passes::const_fold::constant_literals(module),
+                    exprs,
+                    crate::passes::const_fold::Role::index(bound),
+                    *index,
+                ),
+            };
+            hazard.then_some(*index)
         }
         E::Math {
             fun,

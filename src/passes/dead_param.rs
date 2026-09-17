@@ -2,11 +2,9 @@
 //! stripped from the signature and from every call site.  Entry points are
 //! skipped because their signatures are part of the pipeline contract.
 
-use rustc_hash::{FxHashMap, FxHashSet};
-
-use super::expr_util::for_each_function_mut;
 use crate::error::Error;
 use crate::handle_set::{HandleMap, HandleSet};
+use crate::ir::visit::for_each_function_mut;
 use crate::pipeline::{Pass, PassContext};
 
 /// Removes unused parameters from ordinary functions and their call sites;
@@ -43,13 +41,12 @@ impl Pass for DeadParamPass {
             let live = compute_live_expr_set(func);
 
             // One arena pass, so the filter is O(1) per parameter.
-            let mut live_arg_indices: FxHashSet<u32> =
-                FxHashSet::with_capacity_and_hasher(func.arguments.len(), Default::default());
+            let mut live_arg = vec![false; func.arguments.len()];
             for (h, e) in func.expressions.iter() {
                 if let naga::Expression::FunctionArgument(idx) = e
                     && live.contains(h)
                 {
-                    live_arg_indices.insert(*idx);
+                    live_arg[*idx as usize] = true;
                 }
             }
 
@@ -59,7 +56,7 @@ impl Pass for DeadParamPass {
                     if is_non_constructible_type(func.arguments[i].ty, &module.types) {
                         return false;
                     }
-                    !live_arg_indices.contains(&(i as u32))
+                    !live_arg[i]
                 })
                 .collect();
 
@@ -75,9 +72,10 @@ impl Pass for DeadParamPass {
         for (&fh, indices) in &removals {
             let func = &mut module.functions[fh];
 
-            // Removed slots' types, needed after `func.arguments` has shrunk.
-            let removed_types: FxHashMap<usize, naga::Handle<naga::Type>> =
-                indices.iter().map(|&i| (i, func.arguments[i].ty)).collect();
+            // Removed slots' types, parallel to `indices`, needed after
+            // `func.arguments` has shrunk.
+            let removed_types: Vec<naga::Handle<naga::Type>> =
+                indices.iter().map(|&i| func.arguments[i].ty).collect();
 
             // Reverse iteration keeps earlier indices valid.
             for &idx in indices.iter().rev() {
@@ -85,13 +83,13 @@ impl Pass for DeadParamPass {
             }
 
             // Dead args become a typed `ZeroValue`, live args shift down past
-            // removed slots; `indices` is tiny, so linear `contains` beats a
+            // removed slots; `indices` is tiny, so a linear scan beats a
             // hash set.
             for (_, expr) in func.expressions.iter_mut() {
                 if let naga::Expression::FunctionArgument(arg_idx) = expr {
                     let old = *arg_idx as usize;
-                    if indices.contains(&old) {
-                        *expr = naga::Expression::ZeroValue(removed_types[&old]);
+                    if let Some(removed) = indices.iter().position(|&i| i == old) {
+                        *expr = naga::Expression::ZeroValue(removed_types[removed]);
                     } else {
                         let shift = indices.iter().filter(|&&i| i < old).count();
                         *arg_idx = (old - shift) as u32;
@@ -121,7 +119,11 @@ fn remove_call_args_in_block(
     block: &mut naga::Block,
     removals: &HandleMap<naga::Function, Vec<usize>>,
 ) -> Result<(), Error> {
-    for stmt in block.iter_mut() {
+    let mut result = Ok(());
+    crate::ir::visit::for_each_statement_mut(block, &mut |stmt| {
+        if result.is_err() {
+            return;
+        }
         if let naga::Statement::Call {
             function,
             arguments,
@@ -134,20 +136,18 @@ fn remove_call_args_in_block(
                 // not a downstream validation failure under another pass's
                 // name.
                 if idx >= arguments.len() {
-                    return Err(Error::Validation(format!(
+                    result = Err(Error::Validation(format!(
                         "dead_param: removal index {idx} out of bounds for call \
                          site with {} arguments - caller/callee out of sync",
                         arguments.len()
                     )));
+                    return;
                 }
                 arguments.remove(idx);
             }
         }
-        for nested in super::expr_util::nested_blocks_mut(stmt) {
-            remove_call_args_in_block(nested, removals)?;
-        }
-    }
-    Ok(())
+    });
+    result
 }
 
 // MARK: Liveness analysis
@@ -163,7 +163,7 @@ fn compute_live_expr_set(func: &naga::Function) -> HandleSet<naga::Expression> {
         if !live.insert(handle) {
             continue;
         }
-        super::expr_util::visit_expression_children(&func.expressions[handle], |child| {
+        crate::ir::visit::visit_expression_children(&func.expressions[handle], |child| {
             if !live.contains(child) {
                 worklist.push(child);
             }
@@ -178,7 +178,7 @@ fn compute_live_expr_set(func: &naga::Function) -> HandleSet<naga::Expression> {
 /// would under-track liveness and remove a live parameter, which the shared
 /// walker's exhaustive match defends against.
 fn collect_stmt_expr_roots(block: &naga::Block, roots: &mut Vec<naga::Handle<naga::Expression>>) {
-    super::expr_util::visit_block_expression_handles(
+    crate::ir::visit::visit_block_expression_handles(
         block,
         /*include_emit_handles=*/ true,
         &mut |h| roots.push(h),
@@ -214,11 +214,8 @@ mod tests {
         let mut module = naga::front::wgsl::parse_str(source).expect("source should parse");
         let mut pass = DeadParamPass;
         let config = Config::default();
-        let ctx = PassContext {
-            config: &config,
-            name_log: None,
-        };
-        let changed = pass.run(&mut module, &ctx).expect("pass should run");
+        let changed =
+            PassContext::run_pass(&mut pass, &mut module, &config).expect("pass should run");
 
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),

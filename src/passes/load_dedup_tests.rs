@@ -6,14 +6,9 @@ fn run_pass(source: &str) -> (bool, naga::Module) {
     let mut module = naga::front::wgsl::parse_str(source).expect("source should parse");
     let mut pass = LoadDedupPass;
     let config = Config::default();
-    let ctx = PassContext {
-        config: &config,
-        name_log: None,
-    };
 
-    let changed = pass
-        .run(&mut module, &ctx)
-        .expect("load dedup pass should run");
+    let changed =
+        PassContext::run_pass(&mut pass, &mut module, &config).expect("load dedup pass should run");
     let _ = crate::io::validate_module(&module).expect("module should remain valid");
     (changed, module)
 }
@@ -1518,17 +1513,14 @@ fn test_fn() -> f32 {
 fn run_dead_branch_then_load_dedup(source: &str) -> (bool, naga::Module) {
     let mut module = naga::front::wgsl::parse_str(source).expect("source should parse");
     let config = Config::default();
-    let ctx = PassContext {
-        config: &config,
-        name_log: None,
-    };
 
     let mut db = crate::passes::dead_branch::DeadBranchPass;
-    let _ = db.run(&mut module, &ctx).expect("dead_branch should run");
+    let _ = PassContext::run_pass(&mut db, &mut module, &config).expect("dead_branch should run");
     let _ = crate::io::validate_module(&module).expect("valid after dead_branch");
 
     let mut ld = LoadDedupPass;
-    let changed = ld.run(&mut module, &ctx).expect("load_dedup should run");
+    let changed =
+        PassContext::run_pass(&mut ld, &mut module, &config).expect("load_dedup should run");
     let _ = crate::io::validate_module(&module).expect("valid after load_dedup");
 
     (changed, module)
@@ -2380,6 +2372,51 @@ fn f() {
     let (_changed, _module) = run_pass(src);
 }
 
+/// The index slot is the third static-error slot: forwarding `i -> 4` into
+/// `a[i + 1]` reads as `a[5]` to tint and naga's front-end but passes naga's
+/// IR validator (`index_is_static_error`).  `run_pass` validates through
+/// the driver's slot check, so the forward must be declined; an in-bounds
+/// one still goes.
+#[test]
+fn declines_forwarding_an_index_out_of_bounds() {
+    let src = "\
+@compute @workgroup_size(1)
+fn f() {
+    var a = array<u32, 4>(1u, 2u, 3u, 4u);
+    var v = vec4u(1u, 2u, 3u, 4u);
+    var i = 4;
+    var j = 0u;
+    var k = 2;
+    let r = a[i + 1] + a[j - 1u] + v[i] + a[k + 1];
+}";
+    let (changed, module) = run_pass(src);
+    assert!(changed, "the in-bounds index forward must still happen");
+    let function = &module.entry_points[0].function;
+    let mut live: Vec<&str> = function
+        .expressions
+        .iter()
+        .filter_map(|(handle, expr)| match expr {
+            naga::Expression::Load { pointer } => match function.expressions[*pointer] {
+                naga::Expression::LocalVariable(local)
+                    if is_handle_in_any_emit(&function.body, handle) =>
+                {
+                    function.local_variables[local].name.as_deref()
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    live.sort_unstable();
+    live.dedup();
+    // Whole-variable loads only (`a[..]` / `v[..]` load through an `Access`).
+    assert_eq!(
+        live,
+        ["i", "j"],
+        "the out-of-bounds indices keep their load, `k` is forwarded"
+    );
+}
+
 #[test]
 fn still_forwards_legal_shift_and_divisor() {
     // The guard is surgical, not a blanket ban on shift/div RHS.
@@ -2425,8 +2462,8 @@ fn an_overwritten_store_is_dead_across_a_discard() {
     );
 }
 
-/// Dawn on Metal flushes a negative-zero LITERAL to +0 while a runtime
-/// negation keeps the sign, so `-0.0` never forwards into a load: the
+/// A module-scope value the pass cannot show free of a `-0.0`
+/// ([`has_negative_zero_leaf`]) never forwards into a runtime read: the
 /// initializer form and the store form both keep their reads.
 #[test]
 fn module_scope_values_are_not_forwarded_into_a_runtime_read() {
@@ -2519,4 +2556,42 @@ fn float_modulo_operands_are_not_forwarded_into_a_const_expression() {
         let loads = count_loads_from_local(&module.entry_points[0].function);
         assert_eq!(loads == 0, forwarded, "op {op}: {loads} loads");
     }
+}
+
+/// The sign-sensitive guard declines the forward of a stored constant
+/// matrix into `transpose(m) * transpose(m)` - the product would become
+/// const - but not the dedup of the loads among themselves: a load
+/// forwarded to a load reads the same runtime value, as it does after an
+/// init of the same constant, which is never seeded.
+#[test]
+fn a_declined_slot_keeps_its_load_to_load_forwards() {
+    let source = "\
+var<private> o: vec4<f32>;
+fn main_1() {
+    var m: mat2x2<f32>;
+    m = mat2x2<f32>(vec2<f32>(1.0, 2.0), vec2<f32>(3.0, 4.0));
+    let p = transpose(m) * transpose(m);
+    o = p[0].xyxy;
+}
+@fragment fn fs() -> @location(0) vec4f { main_1(); return o; }";
+    let (changed, module) = run_pass(source);
+    assert!(changed);
+    let (_, main_1) = module
+        .functions
+        .iter()
+        .find(|(_, f)| f.name.as_deref() == Some("main_1"))
+        .expect("main_1");
+    assert_eq!(
+        count_loads_from_local(main_1),
+        1,
+        "one load of `m` serves both"
+    );
+    assert!(
+        main_1.expressions.iter().any(|(_, e)| matches!(
+            e,
+            naga::Expression::Load { pointer }
+                if matches!(main_1.expressions[*pointer], naga::Expression::LocalVariable(_))
+        )),
+        "the product still reads `m` at runtime"
+    );
 }

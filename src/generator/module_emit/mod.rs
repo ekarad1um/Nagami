@@ -13,15 +13,26 @@ mod defer_vars;
 mod local_resolve;
 mod must_bind;
 mod ref_counts;
+mod twins;
 
 pub(super) use defer_vars::find_deferrable_vars;
 pub(super) use local_resolve::local_var_in_stmts;
 
+use crate::analysis::compute_fn_effects;
 use crate::handle_set::HandleSet;
-use call_inline::{compute_pure_functions, find_inlineable_calls};
+/// Renders of one function before its binding decisions are taken as they
+/// stand: the first prices by the census, each next by the counts of the
+/// one before; two settle every function seen, and the cap holds a bistable
+/// pair to the state it was found in.
+const RENDER_ROUNDS: usize = 3;
+
+use call_inline::find_inlineable_calls;
 use defer_vars::find_for_loop_vars;
-use must_bind::compute_must_bind_loads;
-use ref_counts::{compute_expression_ref_counts, discount_initializer_refs};
+use must_bind::compute_must_bind;
+use ref_counts::{
+    compute_expression_ref_counts, discount_compose_folds, discount_initializer_refs,
+};
+use twins::structural_twins;
 
 /// The `enable` directives the emitted text needs.  Mirrors naga's own
 /// writer scan except where noted: a liveness gate on 16-bit scalars, the
@@ -39,6 +50,7 @@ struct Enables {
     primitive_index: bool,
     cooperative_matrix: bool,
     ray_tracing: bool,
+    per_vertex: bool,
     ray_query: bool,
     ray_query_vertex_return: bool,
 }
@@ -56,6 +68,10 @@ impl Enables {
                 per_primitive: true,
                 ..
             } => self.mesh_shaders = true,
+            naga::Binding::Location {
+                interpolation: Some(naga::Interpolation::PerVertex),
+                ..
+            } => self.per_vertex = true,
             naga::Binding::BuiltIn(
                 naga::BuiltIn::RayInvocationId
                 | naga::BuiltIn::NumRayInvocations
@@ -201,6 +217,7 @@ impl Enables {
             (self.primitive_index, "enable primitive_index;"),
             (self.cooperative_matrix, "enable wgpu_cooperative_matrix;"),
             (self.ray_tracing, "enable wgpu_ray_tracing_pipeline;"),
+            (self.per_vertex, "enable wgpu_per_vertex;"),
             (self.ray_query, "enable wgpu_ray_query;"),
             (
                 self.ray_query_vertex_return,
@@ -218,7 +235,7 @@ fn any_expression(module: &naga::Module, pred: impl Fn(&naga::Expression) -> boo
     module
         .global_expressions
         .iter()
-        .chain(crate::passes::expr_util::all_functions(module).flat_map(|f| f.expressions.iter()))
+        .chain(crate::ir::visit::all_functions(module).flat_map(|f| f.expressions.iter()))
         .any(|(_, e)| pred(e))
 }
 
@@ -260,33 +277,52 @@ pub(super) fn const_init_has_explicit_type(init: &naga::Expression) -> bool {
     }
 }
 
+/// A declaration the `--preamble` text already carries under `name`: the
+/// consumer splices that text ahead of the output, so emitting it again would
+/// declare it twice.
+fn preamble_owns(preamble: &std::collections::HashSet<String>, name: Option<&str>) -> bool {
+    name.is_some_and(|n| preamble.contains(n))
+}
+
 impl<'a> Generator<'a> {
+    /// The module-wide analyses every function's rendering reads: ref
+    /// counts, callee purity, and the literal extraction (a literal renders
+    /// as its `const` name from here on).  Once, before any text.
+    pub(super) fn prepare(&mut self) {
+        self.ref_count_cache = crate::ir::visit::all_functions(self.module)
+            .map(compute_expression_ref_counts)
+            .collect();
+
+        self.fn_effects = compute_fn_effects(self.module);
+        self.name_weights = crate::passes::rename::Weights::declared(self.module);
+
+        self.scan_and_extract_literals();
+    }
+
+    /// The names a function body's `let`s must dodge.  Preserved names are
+    /// in scope because a `let` shadowing one is legal but would leave the
+    /// name map unable to account for the extra occurrences.
+    /// Function-locals are not: `local_used_names` tracks the ones actually
+    /// in scope.
+    pub(super) fn module_used_names(&self) -> std::collections::HashSet<String> {
+        let mut names: std::collections::HashSet<String> =
+            self.emitted_module_names().map(str::to_owned).collect();
+        names.extend(self.extracted_literals.values().cloned());
+        names
+    }
+
     /// Emit the module: the per-function analyses and literal extraction, then
     /// every declaration section in spec order.
     pub(super) fn generate_module(&mut self) -> Result<(), Error> {
         let mut has_prev_section = false;
 
-        self.ref_count_cache = crate::passes::expr_util::all_functions(self.module)
-            .map(compute_expression_ref_counts)
-            .collect();
-
-        self.pure_functions = compute_pure_functions(self.module);
-
-        self.scan_and_extract_literals();
+        self.prepare();
 
         // One context for every declaration section: rebuilding it per
         // declaration clones every constant name, quadratic on a module that
-        // is mostly constants.  Each emitted constant is named in it below,
+        // is mostly constants.  Each constant is named in it as it is emitted,
         // exactly as `expr_to_const` names it for the function sections.
         let mut decl_ctx = self.module_ctx();
-
-        macro_rules! section_gap {
-            ($self:expr, $has_prev:expr) => {
-                if $has_prev {
-                    $self.push_newline();
-                }
-            };
-        }
 
         let enables = Enables::scan(self.module, &self.live_types);
         for directive in enables.directives() {
@@ -305,7 +341,7 @@ impl<'a> Generator<'a> {
             }
             // Definition order is parent -> child, the reverse of the chain walk.
             if !filters.is_empty() {
-                section_gap!(self, has_prev_section);
+                self.section_gap(has_prev_section);
                 for filter in filters.iter().rev() {
                     self.out.push_str("diagnostic(");
                     self.out.push_str(severity_name(filter.new_severity));
@@ -320,7 +356,7 @@ impl<'a> Generator<'a> {
         }
 
         if !self.type_alias_decls.is_empty() {
-            section_gap!(self, has_prev_section);
+            self.section_gap(has_prev_section);
             let assign_tok = self.assign_sep();
             for i in 0..self.type_alias_decls.len() {
                 self.out.push_str("alias ");
@@ -334,172 +370,10 @@ impl<'a> Generator<'a> {
         }
 
         let preamble = self.options.preamble_names.clone();
-        // naga's predeclared struct types are not declarable WGSL: a declaration
-        // gives the user struct and the predeclared type different type-arena
-        // handles, so constructor expressions fail validation.
-        let special_type_handles = special_struct_handles(self.module);
-        for (h, ty) in self.module.types.iter() {
-            if let naga::TypeInner::Struct { members, span } = &ty.inner {
-                if !self.live_types.contains(h) {
-                    continue;
-                }
-                if special_type_handles.contains(h) {
-                    continue;
-                }
-                // Host-addressable past the special-type gate, preamble-owned
-                // included.
-                self.map_visible_structs.insert(h);
-                if !preamble.is_empty()
-                    && let Some(name) = ty.name.as_deref()
-                    && preamble.contains(name)
-                {
-                    continue;
-                }
-                section_gap!(self, has_prev_section);
-                self.generate_struct(h, members, *span)?;
-                self.push_newline();
-                has_prev_section = true;
-            }
-        }
-
-        let has_constants = self.module.constants.iter().any(|(h, c)| {
-            self.live_constants.contains(h)
-                && c.name.as_deref().is_some_and(|n| !preamble.contains(n))
-        });
-        if has_constants {
-            section_gap!(self, has_prev_section);
-        }
-        for (h, c) in self.module.constants.iter() {
-            if c.name.is_none() {
-                continue;
-            }
-            if !self.live_constants.contains(h) {
-                continue;
-            }
-            if !preamble.is_empty()
-                && let Some(name) = c.name.as_deref()
-                && preamble.contains(name)
-            {
-                continue;
-            }
-            self.out.push_str("const ");
-            self.out.push_str(&self.constant_names[h.index()]);
-            // `: T` only when the init text does not spell its own type.
-            let init_expr = &self.module.global_expressions[c.init];
-            let self_typed = const_init_has_explicit_type(init_expr);
-            if !self_typed {
-                self.push_colon();
-                self.out.push_str(&self.type_ref(c.ty)?);
-            }
-            self.push_assign();
-            let expr = self.emit_global_expr_in(c.init, self_typed, &mut decl_ctx)?;
-            self.out.push_str(&expr);
-            self.out.push(';');
-            self.push_newline();
-            // Later constants sharing this init handle emit the name, not the tree.
-            self.expr_to_const.insert(c.init, h);
-            decl_ctx
-                .expr_names
-                .insert(c.init, self.constant_names[h.index()].clone());
-        }
-        if has_constants {
-            has_prev_section = true;
-        }
-
-        let has_overrides = self
-            .module
-            .overrides
-            .iter()
-            .any(|(_, ov)| ov.name.as_deref().is_none_or(|n| !preamble.contains(n)));
-        if has_overrides {
-            section_gap!(self, has_prev_section);
-        }
-        for (h, ov) in self.module.overrides.iter() {
-            if !preamble.is_empty()
-                && let Some(name) = ov.name.as_deref()
-                && preamble.contains(name)
-            {
-                continue;
-            }
-            if let Some(id) = ov.id {
-                self.out.push_str("@id(");
-                self.out.push_str(&id.to_string());
-                self.out
-                    .push_str(if self.options.beautify { ") " } else { ")" });
-            }
-            self.out.push_str("override ");
-            self.out.push_str(&self.override_names[h.index()]);
-            self.push_colon();
-            self.out.push_str(&self.type_ref(ov.ty)?);
-            if let Some(init) = ov.init {
-                self.push_assign();
-                let text = self.emit_global_expr_in(init, false, &mut decl_ctx)?;
-                self.out.push_str(&text);
-            }
-            self.out.push(';');
-            self.push_newline();
-        }
-        if has_overrides {
-            has_prev_section = true;
-        }
-
-        let has_globals = self
-            .module
-            .global_variables
-            .iter()
-            .any(|(_, g)| g.name.as_deref().is_none_or(|n| !preamble.contains(n)));
-        if has_globals {
-            section_gap!(self, has_prev_section);
-        }
-        for (h, g) in self.module.global_variables.iter() {
-            if !preamble.is_empty()
-                && let Some(name) = g.name.as_deref()
-                && preamble.contains(name)
-            {
-                continue;
-            }
-            if let Some(binding) = g.binding {
-                self.out.push_str("@group(");
-                self.out.push_str(&binding.group.to_string());
-                self.push_binding_sep();
-                self.out.push_str(&binding.binding.to_string());
-                self.push_attr_end();
-            }
-            self.out.push_str("var");
-            match g.space {
-                naga::AddressSpace::Handle => self.out.push(' '),
-                naga::AddressSpace::Storage { access } => {
-                    self.out.push('<');
-                    self.out.push_str("storage");
-                    // Elide the default `read`; compare the resolved name so empty
-                    // / non-LOAD-only flag sets classify via `storage_access`.
-                    let acc_str = storage_access(access);
-                    if acc_str != "read" {
-                        self.push_separator();
-                        self.out.push_str(acc_str);
-                    }
-                    self.push_angle_end();
-                }
-                _ => {
-                    self.out.push('<');
-                    self.out.push_str(address_space(g.space));
-                    self.push_angle_end();
-                }
-            }
-            self.out.push_str(&self.global_names[h.index()]);
-            self.push_colon();
-            self.out.push_str(&self.type_ref(g.ty)?);
-            if let Some(init) = g.init {
-                self.push_assign();
-                let text = self.emit_global_expr_in(init, false, &mut decl_ctx)?;
-                self.out.push_str(&text);
-            }
-            self.out.push(';');
-            self.push_newline();
-        }
-        if has_globals {
-            has_prev_section = true;
-        }
+        self.emit_struct_decls(&preamble, &mut has_prev_section)?;
+        self.emit_constant_decls(&preamble, &mut decl_ctx, &mut has_prev_section)?;
+        self.emit_override_decls(&preamble, &mut decl_ctx, &mut has_prev_section)?;
+        self.emit_global_decls(&preamble, &mut decl_ctx, &mut has_prev_section)?;
 
         // Pre-rendered so the borrow of `extracted_literals` ends before
         // `self.out` is written.
@@ -521,7 +395,7 @@ impl<'a> Generator<'a> {
                 .collect()
         };
         if !extracted_lines.is_empty() {
-            section_gap!(self, has_prev_section);
+            self.section_gap(has_prev_section);
             for line in &extracted_lines {
                 self.out.push_str(line);
                 self.push_newline();
@@ -529,24 +403,13 @@ impl<'a> Generator<'a> {
             has_prev_section = true;
         }
 
-        // Preserved names are in scope because a `let` shadowing one is legal
-        // but would leave the name map unable to account for the extra
-        // occurrences.  Function-locals are not: `local_used_names` tracks the
-        // ones actually in scope.
-        let mut module_used_names: std::collections::HashSet<String> =
-            self.emitted_module_names().map(str::to_owned).collect();
-        module_used_names.extend(self.extracted_literals.values().cloned());
-
-        let num_functions = self.module.functions.len();
+        let module_used_names = self.module_used_names();
 
         for (h, f) in self.module.functions.iter() {
-            if !preamble.is_empty()
-                && let Some(name) = f.name.as_deref()
-                && preamble.contains(name)
-            {
+            if preamble_owns(&preamble, f.name.as_deref()) {
                 continue;
             }
-            section_gap!(self, has_prev_section);
+            self.section_gap(has_prev_section);
             let fn_name = self.function_names[h.index()].clone();
             self.generate_function(
                 &fn_name,
@@ -561,19 +424,12 @@ impl<'a> Generator<'a> {
         }
 
         for (i, ep) in self.module.entry_points.iter().enumerate() {
-            if !preamble.is_empty() && preamble.contains(&ep.name) {
+            if preamble_owns(&preamble, Some(&ep.name)) {
                 continue;
             }
-            section_gap!(self, has_prev_section);
+            self.section_gap(has_prev_section);
 
             self.emit_diagnostic_attrs(ep.function.diagnostic_filter_leaf);
-
-            // This entry point's own recorded payload: scanning for the first
-            // `IncomingRayPayload` global would wire every hit / miss entry point
-            // to the same payload.
-            let incoming_payload_name = ep
-                .incoming_ray_payload
-                .map(|h| self.global_names[h.index()].clone());
 
             match ep.stage {
                 naga::ShaderStage::Vertex => self.out.push_str("@vertex "),
@@ -622,46 +478,28 @@ impl<'a> Generator<'a> {
                         .push_str(if self.options.beautify { ") " } else { ")" });
                 }
                 naga::ShaderStage::RayGeneration => self.out.push_str("@ray_generation "),
-                naga::ShaderStage::AnyHit => {
-                    if let Some(name) = &incoming_payload_name {
+                naga::ShaderStage::AnyHit
+                | naga::ShaderStage::ClosestHit
+                | naga::ShaderStage::Miss => {
+                    self.out.push_str(match ep.stage {
+                        naga::ShaderStage::AnyHit => "@any_hit",
+                        naga::ShaderStage::ClosestHit => "@closest_hit",
+                        _ => "@miss",
+                    });
+                    // This entry point's own recorded payload: scanning for the
+                    // first `IncomingRayPayload` global would wire every hit /
+                    // miss entry point to the same payload.
+                    if let Some(h) = ep.incoming_ray_payload {
                         self.out.push_str(if self.options.beautify {
-                            "@any_hit @incoming_payload("
+                            " @incoming_payload("
                         } else {
-                            "@any_hit@incoming_payload("
+                            "@incoming_payload("
                         });
-                        self.out.push_str(name);
+                        self.out.push_str(&self.global_names[h.index()]);
                         self.out
                             .push_str(if self.options.beautify { ") " } else { ")" });
                     } else {
-                        self.out.push_str("@any_hit ");
-                    }
-                }
-                naga::ShaderStage::ClosestHit => {
-                    if let Some(name) = &incoming_payload_name {
-                        self.out.push_str(if self.options.beautify {
-                            "@closest_hit @incoming_payload("
-                        } else {
-                            "@closest_hit@incoming_payload("
-                        });
-                        self.out.push_str(name);
-                        self.out
-                            .push_str(if self.options.beautify { ") " } else { ")" });
-                    } else {
-                        self.out.push_str("@closest_hit ");
-                    }
-                }
-                naga::ShaderStage::Miss => {
-                    if let Some(name) = &incoming_payload_name {
-                        self.out.push_str(if self.options.beautify {
-                            "@miss @incoming_payload("
-                        } else {
-                            "@miss@incoming_payload("
-                        });
-                        self.out.push_str(name);
-                        self.out
-                            .push_str(if self.options.beautify { ") " } else { ")" });
-                    } else {
-                        self.out.push_str("@miss ");
+                        self.out.push(' ');
                     }
                 }
                 _ => {
@@ -677,7 +515,7 @@ impl<'a> Generator<'a> {
                 self.info.get_entry_point(i),
                 Some(ep.name.as_str()),
                 &module_used_names,
-                num_functions + i,
+                self.module.functions.len() + i,
             )?;
             self.push_newline();
             has_prev_section = true;
@@ -686,6 +524,7 @@ impl<'a> Generator<'a> {
         let trimmed_len = self.out.trim_end().len();
         self.out.truncate(trimmed_len);
         self.push_newline();
+        self.type_uses.absorb(&decl_ctx.type_uses);
 
         Ok(())
     }
@@ -815,7 +654,11 @@ impl<'a> Generator<'a> {
                 self.out
                     .push_str(&binding_attrs(binding, !self.options.beautify)?);
             }
-            if let Some(mangled) = self.member_names.get(&(ty_handle, idx as u32)) {
+            if let Some(mangled) = self
+                .member_names
+                .get(ty_handle)
+                .and_then(|names| names.get(idx))
+            {
                 self.out.push_str(mangled);
             } else if let Some(name) = &member.name {
                 self.out.push_str(name);
@@ -823,7 +666,8 @@ impl<'a> Generator<'a> {
                 self.out.push_str(&format!("m{}", idx));
             }
             self.push_colon();
-            self.out.push_str(&self.type_ref(member.ty)?);
+            let spelled = self.declare_type(member.ty)?;
+            self.out.push_str(&spelled);
             // The last comma is optional; beautify keeps it, compact drops it.
             if idx + 1 < member_count || self.options.beautify {
                 self.out.push(',');
@@ -863,29 +707,228 @@ impl<'a> Generator<'a> {
         }
     }
 
-    fn generate_function(
+    /// [`Generator::push_newline`] pushes nothing in compact output, so this
+    /// is the beautified layout's only blank-line rule: one ahead of each
+    /// section, struct, function and entry point when anything precedes.
+    fn section_gap(&mut self, has_prev: bool) {
+        if has_prev {
+            self.push_newline();
+        }
+    }
+
+    /// The gap ahead of a section's first item, and the section on record:
+    /// called before every item, it acts once.
+    fn section_start(&mut self, has_prev_section: &mut bool, first: &mut bool) {
+        if std::mem::take(first) {
+            self.section_gap(*has_prev_section);
+            *has_prev_section = true;
+        }
+    }
+
+    /// Emit the `struct` declarations: every live, non-predeclared struct the
+    /// preamble does not already own.  Each is recorded host-addressable
+    /// before the preamble filter, so a preamble-owned struct still reaches
+    /// the name map.
+    fn emit_struct_decls(
+        &mut self,
+        preamble: &std::collections::HashSet<String>,
+        has_prev_section: &mut bool,
+    ) -> Result<(), Error> {
+        // naga's predeclared struct types are not declarable WGSL: a declaration
+        // gives the user struct and the predeclared type different type-arena
+        // handles, so constructor expressions fail validation.
+        let special_type_handles = special_struct_handles(self.module);
+        for (h, ty) in self.module.types.iter() {
+            if let naga::TypeInner::Struct { members, span } = &ty.inner {
+                if !self.live_types.contains(h) {
+                    continue;
+                }
+                if special_type_handles.contains(h) {
+                    continue;
+                }
+                self.map_visible_structs.insert(h);
+                if preamble_owns(preamble, ty.name.as_deref()) {
+                    continue;
+                }
+                self.section_gap(*has_prev_section);
+                self.generate_struct(h, members, *span)?;
+                self.push_newline();
+                *has_prev_section = true;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Emit the named `const` declarations, recording each in
+    /// [`Generator::expr_to_const`] and `decl_ctx` as it goes.
+    fn emit_constant_decls(
+        &mut self,
+        preamble: &std::collections::HashSet<String>,
+        decl_ctx: &mut FunctionCtx<'a, 'a>,
+        has_prev_section: &mut bool,
+    ) -> Result<(), Error> {
+        let mut first = true;
+        for (h, c) in self.module.constants.iter() {
+            if c.name.is_none()
+                || !self.live_constants.contains(h)
+                || preamble_owns(preamble, c.name.as_deref())
+            {
+                continue;
+            }
+            self.section_start(has_prev_section, &mut first);
+            self.out.push_str("const ");
+            self.out.push_str(&self.constant_names[h.index()]);
+            let init_expr = &self.module.global_expressions[c.init];
+            let self_typed = const_init_has_explicit_type(init_expr);
+            if !self_typed {
+                self.push_colon();
+                let spelled = self.declare_type(c.ty)?;
+                self.out.push_str(&spelled);
+            }
+            self.push_assign();
+            let expr = self.emit_global_expr_in(c.init, self_typed, decl_ctx)?;
+            self.out.push_str(&expr);
+            self.out.push(';');
+            self.push_newline();
+            self.expr_to_const.insert(c.init, h);
+            decl_ctx
+                .expr_names
+                .insert(c.init, self.constant_names[h.index()].clone());
+        }
+
+        Ok(())
+    }
+
+    fn emit_override_decls(
+        &mut self,
+        preamble: &std::collections::HashSet<String>,
+        decl_ctx: &mut FunctionCtx<'a, 'a>,
+        has_prev_section: &mut bool,
+    ) -> Result<(), Error> {
+        let mut first = true;
+        for (h, ov) in self.module.overrides.iter() {
+            if preamble_owns(preamble, ov.name.as_deref()) {
+                continue;
+            }
+            self.section_start(has_prev_section, &mut first);
+            if let Some(id) = ov.id {
+                self.out.push_str("@id(");
+                self.out.push_str(&id.to_string());
+                self.out
+                    .push_str(if self.options.beautify { ") " } else { ")" });
+            }
+            self.out.push_str("override ");
+            self.out.push_str(&self.override_names[h.index()]);
+            self.push_colon();
+            let spelled = self.declare_type(ov.ty)?;
+            self.out.push_str(&spelled);
+            if let Some(init) = ov.init {
+                self.push_assign();
+                let text = self.emit_global_expr_in(init, false, decl_ctx)?;
+                self.out.push_str(&text);
+            }
+            self.out.push(';');
+            self.push_newline();
+        }
+
+        Ok(())
+    }
+
+    fn emit_global_decls(
+        &mut self,
+        preamble: &std::collections::HashSet<String>,
+        decl_ctx: &mut FunctionCtx<'a, 'a>,
+        has_prev_section: &mut bool,
+    ) -> Result<(), Error> {
+        let mut first = true;
+        for (h, g) in self.module.global_variables.iter() {
+            if preamble_owns(preamble, g.name.as_deref()) {
+                continue;
+            }
+            self.section_start(has_prev_section, &mut first);
+            if let Some(binding) = g.binding {
+                self.out.push_str("@group(");
+                self.out.push_str(&binding.group.to_string());
+                self.push_binding_sep();
+                self.out.push_str(&binding.binding.to_string());
+                self.push_attr_end();
+            }
+            self.out.push_str("var");
+            match g.space {
+                naga::AddressSpace::Handle => self.out.push(' '),
+                naga::AddressSpace::Storage { access } => {
+                    self.out.push('<');
+                    self.out.push_str("storage");
+                    // Elide the default `read`; compare the resolved name so empty
+                    // / non-LOAD-only flag sets classify via `storage_access`.
+                    let acc_str = storage_access(access);
+                    if acc_str != "read" {
+                        self.push_separator();
+                        self.out.push_str(acc_str);
+                    }
+                    self.push_angle_end();
+                }
+                _ => {
+                    self.out.push('<');
+                    self.out.push_str(address_space(g.space));
+                    self.push_angle_end();
+                }
+            }
+            self.out.push_str(&self.global_names[h.index()]);
+            self.push_colon();
+            let spelled = self.declare_type(g.ty)?;
+            self.out.push_str(&spelled);
+            if let Some(init) = g.init {
+                self.push_assign();
+                let text = self.emit_global_expr_in(init, false, decl_ctx)?;
+                self.out.push_str(&text);
+            }
+            self.out.push(';');
+            self.push_newline();
+        }
+        Ok(())
+    }
+
+    /// The context one function body renders in: its analyses over the
+    /// prepared caches (taken, so each function is built once) and its
+    /// argument and local names claimed.  `cache_idx` indexes
+    /// `ref_count_cache` / `defer_cache`: `module.functions` order, then
+    /// the entry points.
+    pub(super) fn function_ctx<'m>(
         &mut self,
         displayed_name: &str,
         func: &'a naga::Function,
         finfo: &'a naga::valid::FunctionInfo,
-        entry_name: Option<&str>,
-        module_used_names: &std::collections::HashSet<String>,
+        module_used_names: &'m std::collections::HashSet<String>,
         cache_idx: usize,
-    ) -> Result<(), Error> {
+    ) -> FunctionCtx<'a, 'm> {
         let mut ref_counts = std::mem::take(&mut self.ref_count_cache[cache_idx].ref_counts);
+        let mut paren_uses = std::mem::take(&mut self.ref_count_cache[cache_idx].paren_uses);
         let (deferred_vars, dead_vars) = std::mem::take(&mut self.defer_cache[cache_idx]);
-        // Must-bind loads first: `find_for_loop_vars` consults them so its
-        // counter-var suppression stays in lockstep with the for-conversion
-        // decision (both reject a loop whose update would inline such a load).
-        let must_bind_loads = compute_must_bind_loads(func, self.module);
-        let for_loop_vars = find_for_loop_vars(func, &must_bind_loads);
-        discount_initializer_refs(func, &for_loop_vars, &mut ref_counts);
-        let inlineable_calls = find_inlineable_calls(
-            &func.body,
-            &ref_counts,
-            &func.expressions,
-            &self.pure_functions,
+        // A value is priced by the uses of all its spellings, so the loop
+        // model below sees it bound where the byte rule will bind it.
+        let twins = structural_twins(
+            func,
+            &self.module.types,
+            finfo,
+            &mut ref_counts,
+            &mut paren_uses,
         );
+        let must_bind = compute_must_bind(func, self.module, &self.fn_effects, &ref_counts);
+        discount_compose_folds(
+            func,
+            finfo,
+            &self.module.types,
+            &must_bind,
+            &self.ref_count_cache[cache_idx].live,
+            &twins,
+            &mut ref_counts,
+        );
+        let for_loop_vars = find_for_loop_vars(func, &must_bind, &deferred_vars);
+        discount_initializer_refs(func, &for_loop_vars, &mut ref_counts);
+        let inlineable_calls =
+            find_inlineable_calls(&func.body, &ref_counts, &func.expressions, &self.fn_effects);
         let typed_pointer_arg_locals =
             typed_pointer_arg_locals(func, &self.module.types, &self.type_names);
         let mut ctx = FunctionCtx {
@@ -897,7 +940,9 @@ impl<'a> Generator<'a> {
             argument_names: Vec::with_capacity(func.arguments.len()),
             local_names: Default::default(),
             expr_names: Default::default(),
+            twins,
             ref_counts,
+            paren_uses,
             deferred_vars,
             dead_vars,
             typed_pointer_arg_locals,
@@ -906,9 +951,15 @@ impl<'a> Generator<'a> {
             module_names: module_used_names,
             local_used_names: std::collections::HashSet::new(),
             inlineable_calls,
-            must_bind_loads,
+            must_bind,
             render_depth_memo: vec![0; func.expressions.len()],
             stashed_call_depth: Default::default(),
+            render_counts: vec![0; func.expressions.len()],
+            paren_counts: vec![0; func.expressions.len()],
+            count_journal: Vec::new(),
+            type_uses: super::core::TypeUses::sized(self.module.types.len()),
+            measured: None,
+            decisions: Vec::new(),
             const_hazard_bindings: Vec::new(),
             display_name: displayed_name.to_string(),
         };
@@ -928,11 +979,94 @@ impl<'a> Generator<'a> {
             }
             ctx.local_names.insert(h, name);
         }
+        ctx
+    }
 
+    /// `body` indexes the per-function caches and the name weights.
+    fn generate_function(
+        &mut self,
+        displayed_name: &str,
+        func: &'a naga::Function,
+        finfo: &'a naga::valid::FunctionInfo,
+        entry_name: Option<&str>,
+        module_used_names: &std::collections::HashSet<String>,
+        body: crate::passes::rename::Body,
+    ) -> Result<(), Error> {
+        let mut ctx = self.function_ctx(displayed_name, func, finfo, module_used_names, body);
         let fn_name = entry_name.unwrap_or(displayed_name);
+        self.generate_function_in(fn_name, func, entry_name.is_some(), &mut ctx)?;
+        for (h, expr) in func.expressions.iter() {
+            let count = usize::try_from(ctx.render_counts[h.index()]).unwrap_or(0);
+            self.name_weights.reference(body, expr, count);
+        }
+        self.type_uses.absorb(&ctx.type_uses);
+        Ok(())
+    }
 
+    /// The declaration of `func` as `fn_name`, from a context in the state
+    /// [`Self::function_ctx`] built it: nothing bound yet.  The text then
+    /// judges its own binding decisions: work the bytes inlined into a loop
+    /// (`loop_sunk_work` over the names given) is pinned, and a `let` the
+    /// text's own counts would decide the other way is repriced by them (a
+    /// consumer the rule inlines renders its operand at each of its uses,
+    /// which the census counted once; a twin's counts are its first
+    /// spelling's, `counts_by_value`), either rendering the function again
+    /// from the context as built; [`RENDER_ROUNDS`] caps a bistable pair at
+    /// a text that is valid but a byte or two off.
+    pub(super) fn generate_function_in(
+        &mut self,
+        fn_name: &str,
+        func: &'a naga::Function,
+        is_entry_point: bool,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
+        let start = self.out.len();
+        let has_loop = must_bind::has_loop(func);
+        for round in 1.. {
+            let mut attempt = ctx.clone();
+            self.render_function(fn_name, func, is_entry_point, &mut attempt)?;
+            let mut sunk = HandleSet::default();
+            if has_loop {
+                must_bind::loop_sunk_work(
+                    func,
+                    self.module,
+                    &must_bind::Bindings::Rendered {
+                        names: &attempt.expr_names,
+                        stashed: &attempt.inlineable_calls,
+                        twins: &attempt.twins,
+                    },
+                    &mut sunk,
+                );
+            }
+            let beautify = self.options.beautify;
+            let (render_counts, paren_counts) = attempt.counts_by_value();
+            let settled = sunk.is_empty()
+                && attempt.decisions.iter().all(|d| {
+                    let i = d.handle.index();
+                    let refs = usize::try_from(render_counts[i]).unwrap_or(0);
+                    let parens = usize::try_from(paren_counts[i]).unwrap_or(0);
+                    super::stmt_emit::binding_pays(refs, parens, d.len, d.name, beautify) == d.bound
+                });
+            if settled || round == RENDER_ROUNDS {
+                *ctx = attempt;
+                return Ok(());
+            }
+            self.out.truncate(start);
+            ctx.must_bind.extend(sunk.iter().copied());
+            ctx.measured = Some((render_counts, paren_counts));
+        }
+        unreachable!("the round cap returns")
+    }
+
+    fn render_function(
+        &mut self,
+        fn_name: &str,
+        func: &'a naga::Function,
+        is_entry_point: bool,
+        ctx: &mut FunctionCtx<'a, '_>,
+    ) -> Result<(), Error> {
         // Entry points emit theirs before the stage attribute.
-        if entry_name.is_none() {
+        if !is_entry_point {
             self.emit_diagnostic_attrs(func.diagnostic_filter_leaf);
         }
 
@@ -949,7 +1083,8 @@ impl<'a> Generator<'a> {
             }
             self.out.push_str(&ctx.argument_names[i]);
             self.push_colon();
-            self.out.push_str(&self.type_ref(arg.ty)?);
+            let spelled = self.spell_type(arg.ty, ctx)?;
+            self.out.push_str(&spelled);
         }
         self.out.push(')');
 
@@ -959,7 +1094,8 @@ impl<'a> Generator<'a> {
                 self.out
                     .push_str(&binding_attrs(binding, !self.options.beautify)?);
             }
-            self.out.push_str(&self.type_ref(result.ty)?);
+            let spelled = self.spell_type(result.ty, ctx)?;
+            self.out.push_str(&spelled);
         }
 
         self.open_brace();
@@ -967,7 +1103,7 @@ impl<'a> Generator<'a> {
         for (h, local) in func.local_variables.iter() {
             if ctx.deferred_vars[h.index()]
                 || ctx.dead_vars[h.index()]
-                || ctx.for_loop_vars[h.index()]
+                || ctx.for_loop_vars[h.index()].is_some()
             {
                 continue;
             }
@@ -976,7 +1112,10 @@ impl<'a> Generator<'a> {
             self.out.push_str(&ctx.local_names[&h]);
             if let Some(init) = local.init {
                 let init_expr = &func.expressions[init];
-                // `:type` is redundant when the init text carries a concrete type.
+                // `:type` is redundant when the init text carries a concrete
+                // type: a constructor, a suffixed literal, or the name of a
+                // constant declared with one (an abstract-typed `const K=5;`
+                // would leave the `var` abstract).
                 let can_elide_type = match init_expr {
                     naga::Expression::Compose { .. }
                     | naga::Expression::ZeroValue(_)
@@ -985,11 +1124,20 @@ impl<'a> Generator<'a> {
                         lit,
                         naga::Literal::AbstractInt(_) | naga::Literal::AbstractFloat(_)
                     ),
+                    naga::Expression::Constant(c) => {
+                        let constant = &self.module.constants[*c];
+                        constant.name.is_some()
+                            && !self.module.types[constant.ty]
+                                .inner
+                                .scalar()
+                                .is_some_and(|s| s.is_abstract())
+                    }
                     _ => false,
                 };
                 if !can_elide_type || ctx.needs_declared_type(h, init) {
                     self.push_colon();
-                    self.out.push_str(&self.type_ref(local.ty)?);
+                    let spelled = self.spell_type(local.ty, ctx)?;
+                    self.out.push_str(&spelled);
                 }
                 self.push_assign();
                 // A concrete literal keeps its suffix so the elided type still infers.
@@ -999,17 +1147,17 @@ impl<'a> Generator<'a> {
                         &self.options.float_precision,
                     ));
                 } else {
-                    self.out.push_str(&self.emit_expr(init, &mut ctx)?);
+                    self.out.push_str(&self.emit_expr(init, ctx)?);
                 }
             } else {
                 // Zero-initialised by WGSL: the shorter of `:type` / `=0i`.
-                self.emit_zero_init_tail(local.ty)?;
+                self.emit_zero_init_tail(local.ty, ctx)?;
             }
             self.out.push(';');
             self.push_newline();
         }
 
-        self.generate_block_elide_trailing_return(&func.body, &mut ctx)?;
+        self.generate_block_elide_trailing_return(&func.body, ctx)?;
 
         // On re-parse naga's `ensure_block_returns` appends an implicit `return;`
         // after a tail `loop` (it never proves a loop non-falling-through), an
@@ -1026,7 +1174,7 @@ impl<'a> Generator<'a> {
             && !block_naga_terminates(&func.body)
             && crate::passes::dead_branch::block_definitely_terminates(&func.body)
         {
-            let zero = self.zero_value(result.ty)?;
+            let zero = self.zero_value(result.ty, ctx)?;
             self.push_indent();
             self.out.push_str("return ");
             self.out.push_str(&zero);
@@ -1047,7 +1195,7 @@ fn typed_pointer_arg_locals(
     type_names: &crate::handle_set::HandleMap<naga::Type, String>,
 ) -> Vec<bool> {
     let mut out = vec![false; func.local_variables.len()];
-    crate::passes::expr_util::for_each_statement(&func.body, &mut |stmt| {
+    crate::ir::visit::for_each_statement(&func.body, &mut |stmt| {
         if let naga::Statement::Call { arguments, .. } = stmt {
             for &arg in arguments {
                 let naga::Expression::LocalVariable(lh) = func.expressions[arg] else {

@@ -3,11 +3,17 @@
 //! optimise, emit via the custom generator with a fallback ladder down to
 //! naga's own emitter and the lexically compacted input.
 
+/// The IR crate [`run_module`] takes; re-exported so a consumer builds its
+/// module with the version this crate validates against.
+pub use naga;
+
+pub(crate) mod analysis;
 pub mod config;
 pub mod error;
 pub mod generator;
 pub(crate) mod handle_set;
 mod io;
+pub(crate) mod ir;
 pub mod json;
 pub mod name_gen;
 pub mod name_map;
@@ -169,6 +175,49 @@ fn preprocess_source_for_naga(source: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Map a parse label from the text naga parsed back to `source`.  The parsed
+/// text is `normalized_source` (`source` behind the injected directive lines,
+/// same length otherwise) with, when a preamble is active, the preamble
+/// spliced between the source's directives and its body starting at
+/// `body_start` (`0`: no preamble, the texts coincide).  A label inside the
+/// injected or preamble text has no position in `source`.
+fn relocate_parse_label(
+    mut err: Error,
+    body_start: usize,
+    normalized_source: &str,
+    source: &str,
+) -> Error {
+    let Error::Parse(diag) = &mut err else {
+        return err;
+    };
+    let Some(loc) = diag.location else {
+        return err;
+    };
+    let offset = loc.offset as usize;
+    let (source_directives, source_body) = split_directives(normalized_source);
+    let in_normalized = if body_start == 0 || offset < source_directives.len() {
+        Some(offset)
+    } else if offset >= body_start {
+        Some(offset - body_start + normalized_source.len() - source_body.len())
+    } else {
+        None
+    };
+    let injected = normalized_source.len() - source.len();
+    // Resolved on the normalized text (same length as `source`, lone CRs
+    // already LF): `Span::location` counts only `\n`.  A label past the end
+    // sits on the newline the preamble splice appended after a body without
+    // one, so it clamps to the end rather than dropping.
+    let normalized = &normalized_source[injected..];
+    diag.location = in_normalized
+        .and_then(|o| o.checked_sub(injected))
+        .map(|start| {
+            let start = start.min(normalized.len());
+            let end = (start + loc.length as usize).min(normalized.len());
+            naga::Span::new(start as u32, end as u32).location(normalized)
+        });
+    err
+}
+
 /// naga's front-end appends `Return { value: None }` after a `loop` tail
 /// (it never proves a loop non-falling-through), which the validator
 /// rejects as `InvalidReturnType` in a non-void function.  Removing it only
@@ -234,11 +283,7 @@ fn strip_front_end_appended_returns(module: &mut naga::Module) {
         }
         strip_block(&mut func.body);
     }
-    passes::expr_util::for_each_function_mut(
-        &mut module.functions,
-        &mut module.entry_points,
-        &mut strip,
-    );
+    ir::visit::for_each_function_mut(&mut module.functions, &mut module.entry_points, &mut strip);
 }
 
 /// naga-only `enable wgpu_*;` directives naga needs to parse a feature and
@@ -395,10 +440,16 @@ pub struct Output {
 /// naga's backend cannot render the final IR.
 pub fn run_module(module: &mut naga::Module, config: &Config) -> Result<Report, Error> {
     let info = io::validate_module(module)?;
+    let mut effective_config = Cow::Borrowed(config);
+    if config.preserve_interface {
+        let (symbols, _) = interface_names(module);
+        effective_config.to_mut().preserve_symbols.extend(symbols);
+    }
+    let config = effective_config.as_ref();
     let before_wgsl = emit_module_for_report(module, &info, config)?;
     let mut report = Report::new(before_wgsl.len());
 
-    let (_, info) = pipeline::run_ir_passes(module, info, config, &mut report)?;
+    let info = pipeline::run_ir_passes(module, info, config, &mut report, HashSet::new())?.info;
 
     let after_wgsl = emit_module_for_report(module, &info, config)?;
     report.output_bytes = after_wgsl.len();
@@ -415,19 +466,7 @@ fn emit_module_for_report(
     config: &Config,
 ) -> Result<String, Error> {
     if module_needs_naga_baseline_skip(module) {
-        let emitted = generate(
-            module,
-            info,
-            GenerateOptions {
-                beautify: config.beautify,
-                indent: config.indent,
-                mangle: config.mangle(),
-                float_precision: config.float_precision,
-                preserve_symbols: config.preserve_symbols.iter().cloned().collect(),
-                type_alias: true,
-                ..Default::default()
-            },
-        )?;
+        let emitted = generate(module, info, GenerateOptions::from_config(config))?;
         Ok(emitted.source)
     } else {
         emit_wgsl_with_naga_safe(module, info)
@@ -448,6 +487,43 @@ fn collect_module_names(module: &naga::Module) -> (HashSet<String>, Vec<String>)
         .map(str::to_owned)
         .collect();
     (declarations, members)
+}
+
+/// The names [`Config::preserve_interface`] keeps, split into declarations
+/// and struct members as [`collect_module_names`] splits a preamble's.
+pub(crate) fn interface_names(module: &naga::Module) -> (Vec<String>, Vec<String>) {
+    let mut symbols: Vec<String> = Vec::new();
+    let mut members = Vec::new();
+    let mut pending: Vec<naga::Handle<naga::Type>> = Vec::new();
+    for (_, gv) in module.global_variables.iter() {
+        if gv.binding.is_some() {
+            symbols.extend(gv.name.clone());
+            pending.push(gv.ty);
+        }
+    }
+    symbols.extend(module.overrides.iter().filter_map(|(_, o)| o.name.clone()));
+    let mut seen = vec![false; module.types.len()];
+    while let Some(ty) = pending.pop() {
+        if std::mem::replace(&mut seen[ty.index()], true) {
+            continue;
+        }
+        match &module.types[ty].inner {
+            naga::TypeInner::Struct {
+                members: fields, ..
+            } => {
+                symbols.extend(module.types[ty].name.clone());
+                for field in fields {
+                    members.extend(field.name.clone());
+                    pending.push(field.ty);
+                }
+            }
+            naga::TypeInner::Array { base, .. }
+            | naga::TypeInner::BindingArray { base, .. }
+            | naga::TypeInner::Pointer { base, .. } => pending.push(*base),
+            _ => {}
+        }
+    }
+    (symbols, members)
 }
 
 /// One emission attempt after the fallback ladder; [`run`] may still veto
@@ -539,6 +615,37 @@ fn resolve_generator_output(
     let has_preamble = effective_preamble.is_some();
     match gen_result {
         Ok(emitted) => {
+            // The preamble owns every directive, so a body whose feature it
+            // never declares ships an invalid [preamble, body] document nagami
+            // cannot repair (WGSL forbids directives after declarations).
+            // Named before the self-check below, whose failure on the same
+            // omission would only quote naga's "extension is not enabled".
+            if let Some(preamble) = effective_preamble {
+                let body = strip_wgsl_comments(split_directives(&emitted.source).1);
+                let preamble = strip_wgsl_comments(preamble);
+                // A binding array is only naga-facing when the source opted
+                // into the extension; otherwise tint consumes it directly
+                // and no directive is due.
+                let needs = [
+                    (cleaned_references_f16_token(&body), "f16"),
+                    (
+                        cleaned_references_whole_token(&body, "binding_array")
+                            && cleaned_has_enable_directive(
+                                &strip_wgsl_comments(source),
+                                "wgpu_binding_array",
+                            ),
+                        "wgpu_binding_array",
+                    ),
+                ];
+                for (needed, ext) in needs {
+                    if needed && !cleaned_has_enable_directive(&preamble, ext) {
+                        return Err(Error::Emit(format!(
+                            "shader body requires `enable {ext};` but the preamble \
+                             does not declare it; add `enable {ext};` to the preamble"
+                        )));
+                    }
+                }
+            }
             // Directives must precede all declarations, so with a preamble the
             // body carries none (the preamble owns them); validate the order
             // the consumer ships, [preamble, body], so a directive the preamble
@@ -587,38 +694,6 @@ fn resolve_generator_output(
                 } else {
                     strip_naga_only_enables(emitted.source, source)
                 };
-                // The preamble owns every directive, so a body whose feature
-                // it never declares ships an invalid [preamble, body] document
-                // nagami cannot repair (WGSL forbids directives after
-                // declarations).  The self-check normalises the preamble with
-                // f16 and the naga-only enables injected, which masks exactly
-                // this, so each feature the body still uses is checked here.
-                if has_preamble {
-                    let body = strip_wgsl_comments(&final_source);
-                    let preamble = strip_wgsl_comments(effective_preamble.unwrap_or(""));
-                    // A binding array is only naga-facing when the source opted
-                    // into the extension; otherwise tint consumes it directly
-                    // and no directive is due.
-                    let needs = [
-                        (cleaned_references_f16_token(&body), "f16"),
-                        (
-                            cleaned_references_whole_token(&body, "binding_array")
-                                && cleaned_has_enable_directive(
-                                    &strip_wgsl_comments(source),
-                                    "wgpu_binding_array",
-                                ),
-                            "wgpu_binding_array",
-                        ),
-                    ];
-                    for (needed, ext) in needs {
-                        if needed && !cleaned_has_enable_directive(&preamble, ext) {
-                            return Err(Error::Emit(format!(
-                                "shader body requires `enable {ext};` but the preamble \
-                                 does not declare it; add `enable {ext};` to the preamble"
-                            )));
-                        }
-                    }
-                }
                 let changed = before_bytes != final_source.len() || differs_from_baseline;
                 Ok(EmitOutcome {
                     source: final_source,
@@ -638,8 +713,8 @@ fn resolve_generator_output(
                      {underlying}",
                 )))
             } else if let Some(naga_output) = naga_output {
-                // The CLI warns from `Report::fallback`; the codespan block
-                // stays trace-gated.
+                // The CLI warns from `Report::fallback`; the diagnostic
+                // itself stays trace-gated.
                 if trace_enabled && let Err(e) = &validation_result {
                     eprintln!("warning: generator WGSL validation error: {e}");
                 }
@@ -683,51 +758,93 @@ fn resolve_generator_output(
     }
 }
 
+/// The text handed to naga, with the preamble's [`collect_module_names`]
+/// lists (empty without one).
+struct SplicedSource<'s> {
+    preamble_names: HashSet<String>,
+    preamble_members: Vec<String>,
+    full_source: Cow<'s, str>,
+    /// Byte offset of the body inside `full_source`; [`relocate_parse_label`]
+    /// maps a parse position back through it.
+    body_start: usize,
+}
+
+/// Splice `normalized_preamble` ahead of `normalized_source`, both sides'
+/// leading directives hoisted ahead of it per [`split_directives`], or pass
+/// the source through when there is none.
+fn splice_preamble<'s>(
+    normalized_source: &Cow<'s, str>,
+    normalized_preamble: Option<&str>,
+) -> Result<SplicedSource<'s>, Error> {
+    let Some(normalized_preamble) = normalized_preamble else {
+        return Ok(SplicedSource {
+            preamble_names: HashSet::new(),
+            preamble_members: Vec::new(),
+            full_source: normalized_source.clone(),
+            body_start: 0,
+        });
+    };
+    let preamble_module = io::parse_wgsl_with_path(normalized_preamble, "<preamble>")?;
+    let (preamble_names, preamble_members) = collect_module_names(&preamble_module);
+    let (source_directives, source_body) = split_directives(normalized_source);
+    let (preamble_directives, preamble_body) = split_directives(normalized_preamble);
+    let full_source = join_with_newline(&[
+        source_directives,
+        preamble_directives,
+        preamble_body,
+        source_body,
+    ]);
+    // The body is the last fragment, plus the newline the join adds.
+    let body_start = full_source.len()
+        - source_body.len()
+        - usize::from(!source_body.is_empty() && !source_body.ends_with('\n'));
+    Ok(SplicedSource {
+        preamble_names,
+        preamble_members,
+        full_source: Cow::Owned(full_source),
+        body_start,
+    })
+}
+
 /// Minify `source` end-to-end: parse (with [`Config::preamble`] prepended),
 /// optimise, and emit via the custom generator, falling back to naga's
 /// emitter when the generator fails or its output does not round-trip -
-/// except with a preamble active, where the fallback is unusable and the
-/// error propagates.  Input naga parses but rejects, and IR with no WGSL text
-/// form, ship the input lexically compacted with [`Report::bailout`] set;
-/// both are typed outcomes of a naga call, never a match on its message.
-/// Fails with [`Error::Parse`], [`Error::Validation`] or [`Error::Emit`]
-/// from the underlying stages.
+/// unless naga's text cannot stand in (a preamble is active, or it would
+/// respell a host-visible name), when the error propagates instead.  Input
+/// naga parses but rejects, and IR with no WGSL text form, ship the input
+/// lexically compacted with [`Report::bailout`] set; both are typed outcomes
+/// of a naga call, never a match on its message.  Fails with
+/// [`Error::Parse`], [`Error::Validation`] or [`Error::Emit`] from the
+/// underlying stages.
 pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     let normalized_source = preprocess_source_for_naga(source);
 
     // Empty or whitespace-only preambles collapse to the no-preamble path,
-    // one predicate downstream; the normalised preamble is reused by the
+    // one predicate downstream.  The preamble gets the body's preprocessing
+    // (`f16` in it would otherwise fail at parse time where the same text
+    // in the body succeeds); the normalised text is reused by the
     // post-emission self-check.
     let effective_preamble = config.preamble.as_deref().filter(|s| !s.trim().is_empty());
     let normalized_preamble: Option<Cow<'_, str>> =
         effective_preamble.map(preprocess_source_for_naga);
-    let (preamble_names, preamble_members, full_source): (
-        HashSet<String>,
-        Vec<String>,
-        Cow<'_, str>,
-    );
-    if let Some(normalized_preamble) = normalized_preamble.as_deref() {
-        // The preamble gets the body's preprocessing, or `f16` in a preamble
-        // would fail at parse time while the same text in the body succeeds.
-        let preamble_module = io::parse_wgsl_with_path(normalized_preamble, "<preamble>")?;
-        (preamble_names, preamble_members) = collect_module_names(&preamble_module);
-        // Directives must precede declarations, so both sides' leading
-        // directives go ahead of the preamble body.
-        let (source_directives, source_body) = split_directives(&normalized_source);
-        let (preamble_directives, preamble_body) = split_directives(normalized_preamble);
-        full_source = Cow::Owned(join_with_newline(&[
-            source_directives,
-            preamble_directives,
-            preamble_body,
-            source_body,
-        ]));
-    } else {
-        preamble_names = HashSet::new();
-        preamble_members = Vec::new();
-        full_source = normalized_source;
-    }
+    let SplicedSource {
+        preamble_names,
+        preamble_members,
+        full_source,
+        body_start,
+    } = splice_preamble(&normalized_source, normalized_preamble.as_deref())?;
 
-    let mut module = io::parse_wgsl(&full_source)?;
+    let mut module = match io::parse_wgsl(&full_source) {
+        Ok(module) => module,
+        Err(err) => {
+            return Err(relocate_parse_label(
+                err,
+                body_start,
+                &normalized_source,
+                source,
+            ));
+        }
+    };
     let mut report = Report::new(source.len());
 
     // Preamble names must survive rename and mangle: user-source accesses
@@ -736,6 +853,13 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
     effective_config
         .preserve_symbols
         .extend(preamble_names.iter().cloned());
+    let mut preserve_members = preamble_members;
+    if config.preserve_interface {
+        let (symbols, members) = interface_names(&module);
+        effective_config.preserve_symbols.extend(symbols);
+        preserve_members.extend(members);
+    }
+    let preserve_members: Vec<String> = preserve_members.into_iter().collect();
 
     // A function ending in a diverging loop is valid WGSL tint/Dawn accept;
     // naga's appended dead return would fail validation.
@@ -783,8 +907,17 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         });
     }
 
-    let (name_log, info) =
-        pipeline::run_ir_passes(&mut module, info, &effective_config, &mut report)?;
+    let pipeline::Converged {
+        name_log,
+        info,
+        type_uses,
+    } = pipeline::run_ir_passes(
+        &mut module,
+        info,
+        &effective_config,
+        &mut report,
+        preamble_names.clone(),
+    )?;
     // Without a baseline the byte count falls back to the input length.
     let naga_output: Option<String> = if module_needs_naga_baseline_skip(&module) {
         None
@@ -799,15 +932,10 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         &module,
         &info,
         GenerateOptions {
-            beautify: config.beautify,
-            indent: config.indent,
-            mangle: config.mangle(),
-            float_precision: config.float_precision,
-            preserve_symbols: effective_config.preserve_symbols.iter().cloned().collect(),
-            preserve_members: preamble_members.into_iter().collect(),
+            preserve_members: preserve_members.iter().cloned().collect(),
             preamble_names,
-            type_alias: true,
-            ..Default::default()
+            type_uses,
+            ..GenerateOptions::from_config(&effective_config)
         },
     );
 
@@ -819,8 +947,12 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         if has_preamble {
             return Some("a preamble is active (the fallback would embed its declarations)".into());
         }
-        name_map::naga_respelled_interface_name(&module, &effective_config.preserve_symbols)
-            .map(|(ir, printed)| format!("naga's emitter would print `{ir}` as `{printed}`"))
+        name_map::naga_respelled_interface_name(
+            &module,
+            &effective_config.preserve_symbols,
+            &preserve_members,
+        )
+        .map(|(ir, printed)| format!("naga's emitter would print `{ir}` as `{printed}`"))
     };
 
     // Taken before `resolve_generator_output` consumes the result.

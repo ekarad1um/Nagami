@@ -380,6 +380,168 @@ fn for_loop_no_update_clause() {
     assert_valid_wgsl(&out);
 }
 
+/// A top-level `for` init re-parsed from this emitter's own text is a
+/// declaration, not a store (naga lowers it so), and the loop may carry no
+/// update clause: the header still declares the local, so the text
+/// re-minifies to itself instead of `var i=0i;for(;i<5;)`.
+#[test]
+fn for_header_declares_a_loop_confined_local_without_an_update_clause() {
+    let src = r#"
+            @group(0) @binding(0) var<storage, read_write> o: array<i32>;
+            @fragment fn main() {
+                for (var i = 0i; i < 5; ) {
+                    let d = i;
+                    i = d + 1;
+                    o[d] = 1;
+                    continue;
+                }
+            }
+        "#;
+    let out = compact(src);
+    assert!(
+        out.contains("for(var"),
+        "the header declares the counter: {out}"
+    );
+    assert_valid_wgsl(&out);
+    let again = compact(&out);
+    assert_eq!(again, out, "the emitter's text re-minifies to itself");
+}
+
+/// The header holds one declaration: the counter its `continuing` stores
+/// takes it, and a second local the loop alone references is declared
+/// ahead of the loop.
+#[test]
+fn for_header_takes_the_counter_over_another_loop_confined_local() {
+    let src = r#"
+            @group(0) @binding(0) var<storage, read_write> o: array<i32>;
+            @fragment fn main() {
+                var acc: i32;
+                for (var i = 0i; i < 5; i++) {
+                    acc = acc + i;
+                    o[i] = acc;
+                }
+            }
+        "#;
+    let out = compact(src);
+    assert!(
+        out.contains("for(var") && out.matches("var ").count() == 2,
+        "one local in the header, the other declared before it: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// Two for-shaped loops may share one guard handle (`let c=..;while(c){..}
+/// while(c){..}`): each header declares the local its own loop references,
+/// whatever the arena order of the locals.
+#[test]
+fn for_header_on_a_shared_guard_declares_its_own_loops_local() {
+    let src = r#"
+            @group(0) @binding(0) var<storage, read_write> o: array<i32>;
+            @fragment fn main() {
+                let c = o[0] < 5;
+                var b: i32;
+                var a: i32;
+                while (c) {
+                    a = a + 1;
+                    o[a] = 1;
+                    if (a > 3) { break; }
+                }
+                while (c) {
+                    b = b + 2;
+                    o[b] = 2;
+                    if (b > 6) { break; }
+                }
+            }
+        "#;
+    let out = compact(src);
+    assert_valid_wgsl(&out);
+    assert_eq!(out.matches("for(var").count(), 2, "{out}");
+}
+
+/// A pre-loop `[Store, Loop]` init (a counter naga could not fold into the
+/// declaration) keeps the header: handing it to a loop-confined local is
+/// byte-neutral and detaches the counter tint's finiteness proof reads.
+#[test]
+fn for_header_keeps_the_stored_counter_over_a_loop_confined_local() {
+    let src = r#"
+            @group(0) @binding(0) var<storage, read_write> o: array<f32>;
+            @fragment fn main() {
+                var t = 1f;
+                for (var h = o[0]; h < o[1]; h += 0.5) {
+                    t = t * 0.9;
+                    o[2] = t;
+                }
+            }
+        "#;
+    let out = compact(src);
+    assert!(
+        out.contains("for(var h=") && out.contains("var t=1f;"),
+        "the counter keeps the header, `t` is declared ahead of it: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// Two loop-confined locals without an update clause: the header takes the
+/// one the guard reads, whatever their declaration order, so the emitter's
+/// own text re-minifies to itself.
+#[test]
+fn for_header_prefers_the_local_its_guard_reads() {
+    let src = r#"
+            @group(0) @binding(0) var<storage, read_write> o: array<i32>;
+            @fragment fn main() {
+                var n = 0i;
+                var b = 1i;
+                for (; b >= 0; ) {
+                    n = n + 1;
+                    o[n] = b;
+                    if (n > 3) { b = -1; }
+                }
+            }
+        "#;
+    let out = compact(src);
+    assert!(
+        out.contains("for(var b=1i;b>=0;)") && out.contains("var n=0i;"),
+        "the guard's local takes the header: {out}"
+    );
+    assert_valid_wgsl(&out);
+    assert_eq!(
+        compact(&out),
+        out,
+        "the emitter's text re-minifies to itself"
+    );
+}
+
+/// Two loop-confined locals the body whole-stores under a `true` guard: the
+/// header takes the one the body touches first, not the first declared, so
+/// the emitter's own text re-minifies to itself.
+#[test]
+fn for_header_prefers_the_local_the_loop_touches_first() {
+    let src = r#"
+            @group(0) @binding(0) var<storage, read_write> o: array<i32>;
+            @fragment fn main() {
+                var n = 0i;
+                var b = 0i;
+                for (; true; ) {
+                    if (b >= 5) { break; }
+                    b = b + 1;
+                    n = n + 2;
+                    o[b] = n;
+                }
+            }
+        "#;
+    let out = compact(src);
+    assert!(
+        out.contains("for(var b=0i;true;)") && out.contains("var n=0i;"),
+        "the first-touched local takes the header: {out}"
+    );
+    assert_valid_wgsl(&out);
+    assert_eq!(
+        compact(&out),
+        out,
+        "the emitter's text re-minifies to itself"
+    );
+}
+
 #[test]
 fn break_if_stays_as_loop() {
     let src = r#"
@@ -1336,7 +1498,11 @@ fn for_loop_update_call_uses_call_emission_rules() {
 
         @compute @workgroup_size(1)
         fn main() {
-            _ = f();
+            // A second call site keeps the stepper a function: called once,
+            // it would be spliced into the update clause.
+            var j = f();
+            increment_counter_stepper(&j);
+            _ = j;
         }
     "#;
     let out = compact_with_passes(src, Profile::Max);
@@ -1557,6 +1723,66 @@ fn array_element_swap_load_must_bind() {
     assert_valid_wgsl(&out);
 }
 
+/// A call stales a load only where its callee's summary writes: `h`
+/// touches neither `buf` nor a pointer argument, so the pre-call `buf[0]`
+/// read inlines past it; `w` writes `buf`, so the read binds.
+#[test]
+fn a_load_crosses_a_call_by_what_the_callee_writes() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32, 4>;
+        fn h(x: i32) -> i32 { var t = x; t = t * 3; return t + 1; }
+        @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) i: u32) {
+            let a = buf[0];
+            let c = h(i32(i));
+            buf[1] = a + c;
+        }
+    "#;
+    let out = compact(src);
+    assert!(
+        out.contains("buf[1]=buf[0]+"),
+        "a load crossing a call that writes no global must stay inline: {out}"
+    );
+    assert_valid_wgsl(&out);
+
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32, 4>;
+        fn w(x: i32) -> i32 { buf[0] = x; return x + 1; }
+        @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) i: u32) {
+            let a = buf[0];
+            let c = w(i32(i));
+            buf[1] = a + c;
+        }
+    "#;
+    let out = compact(src);
+    assert!(
+        out.contains("=buf[0];"),
+        "a load crossing a call that writes its place must bind: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// The callee writes through its pointer parameter, so the pointee's
+/// pre-call read binds while an unrelated local's read stays inline.
+#[test]
+fn a_load_crosses_a_call_by_the_pointers_the_callee_writes() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> buf: array<i32, 4>;
+        fn bump(p: ptr<function, i32>) -> i32 { *p = *p + 1; return *p; }
+        @compute @workgroup_size(1) fn main(@builtin(local_invocation_index) i: u32) {
+            var v = i32(i); var u = i32(i) * 2;
+            let a = v; let b = u;
+            let c = bump(&v);
+            buf[1] = a + b + c;
+        }
+    "#;
+    let out = compact(src);
+    assert!(
+        out.contains("=v;let ") && !out.contains("=u;"),
+        "the written pointee's read binds, the unrelated local's read inlines: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
 /// A function-argument pointer's place is unresolved, so the analysis treats
 /// the `*p = 5` store as invalidating the `*p` snapshot.
 #[test]
@@ -1647,4 +1873,172 @@ fn pointer_parameters_are_pointer_operands_already() {
     }
     assert!(!out.contains('&'), "{out}");
     assert_valid_wgsl(&out);
+}
+
+// MARK: Loop-invariant work stays ahead of the loop
+
+/// Split `out` at its first `for(`; `(before, from the loop on)`.
+fn around_for(out: &str) -> (&str, &str) {
+    let at = out.find("for(").expect("for loop emitted");
+    out.split_at(at)
+}
+
+/// Single-use forwarding would sink a uniform load, the arithmetic over
+/// it and a `normalize` into the loop; the platform compiler does not
+/// hoist them back, so `loop_sunk_work` binds each ahead of the loop.
+#[test]
+fn loop_invariant_global_load_and_arithmetic_are_bound_before_the_loop() {
+    let src = r#"
+        @group(0) @binding(0) var<uniform> u: vec4f;
+        @group(0) @binding(1) var<storage, read_write> o: array<f32>;
+        @compute @workgroup_size(1) fn main() {
+            let scale = u.x * 2.0;
+            let n = normalize(u.xyz);
+            let raw = u.y;
+            var total = 0.0;
+            for (var i = 0; i < 4; i++) {
+                total = total + scale + n.x + raw;
+            }
+            o[0] = total;
+        }
+    "#;
+    let out = compact(src);
+    let (before, body) = around_for(&out);
+    for needle in ["u.x*2", "normalize(u.xyz)", "=u.y;"] {
+        assert!(
+            before.contains(needle) && !body.contains(needle),
+            "{needle} must be bound before the loop: {out}"
+        );
+    }
+    assert_valid_wgsl(&out);
+}
+
+/// A pinned invariant read by the `for` update is bound ahead of the header,
+/// so the `for` shape survives: the must-bind decline in
+/// `for_loop_preload_inlining_is_safe` is for loads emitted INSIDE the loop.
+#[test]
+fn for_update_may_read_a_pre_loop_binding() {
+    let src = r#"
+        @group(0) @binding(0) var<uniform> u: vec4u;
+        @group(0) @binding(1) var<storage, read_write> o: array<u32>;
+        @compute @workgroup_size(1) fn main() {
+            let step = u.x + 1u;
+            var acc = 0u;
+            for (var i = 0u; i < 64u; i += step) { acc += i; }
+            o[0] = acc;
+        }
+    "#;
+    let out = compact(src);
+    let (before, body) = around_for(&out);
+    assert!(
+        before.contains("=u.x+1;") && !body.contains("u.x"),
+        "the step is bound before the loop and the `for` survives: {out}"
+    );
+    assert!(!out.contains("loop{"), "{out}");
+    assert_valid_wgsl(&out);
+}
+
+/// The commonest sink: a two-use `a*b` of named operands, which the byte
+/// rule leaves inline; reached from a loop it is pinned.
+#[test]
+fn two_use_cheap_invariant_reached_from_a_loop_is_pinned() {
+    let src = r#"
+        fn f(a: f32, b: f32) -> f32 {
+            let p = a * b;
+            var t = 0.0;
+            for (var i = 0; i < 4; i++) { t = t + p * f32(i) + p; }
+            return t;
+        }
+        @group(0) @binding(1) var<storage, read_write> o: array<f32>;
+        @compute @workgroup_size(1) fn main() { o[0] = f(o[1], o[2]); }
+    "#;
+    let out = compact(src);
+    let (before, body) = around_for(&out);
+    assert!(
+        before.contains("=a*b;") && !body.contains("a*b"),
+        "the two-use product is bound once, ahead of the loop: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// An array or struct constructor materialises storage per evaluation;
+/// inside a loop it is rebuilt every iteration, so it is pinned like a
+/// fetch.  A vector constructor is not.
+#[test]
+fn loop_invariant_aggregate_constructor_is_bound_before_the_loop() {
+    let src = r#"
+        struct P { a: f32, b: f32 }
+        @group(0) @binding(0) var<uniform> u: vec4f;
+        @group(0) @binding(1) var<storage, read_write> o: array<f32>;
+        @compute @workgroup_size(1) fn main() {
+            let ps = array<P, 2>(P(u.x, u.y), P(u.z, u.w));
+            let v = vec2f(u.x, 1.0);
+            var t = 0.0;
+            for (var i = 0; i < 2; i++) { t = t + ps[i].a + v[i]; }
+            o[0] = t;
+        }
+    "#;
+    let out = compact(src);
+    let (before, body) = around_for(&out);
+    assert!(
+        before.contains("=array(P(") && !body.contains("array("),
+        "the array constructor is bound before the loop: {out}"
+    );
+    assert!(
+        !before.contains("vec2(") && body.contains("vec2("),
+        "the vector constructor still moves (its uniform lane is pinned): {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// A private variable is thread-local and register-promoted downstream:
+/// its load moves into the loop freely.
+#[test]
+fn private_global_load_is_not_pinned() {
+    let src = r#"
+        var<private> arr: array<f32, 4>;
+        @group(0) @binding(1) var<storage, read_write> o: array<f32>;
+        @compute @workgroup_size(1) fn main() {
+            arr[1] = o[0];
+            let v = arr[1];
+            var t = 0.0;
+            for (var i = 0; i < 4; i++) { t = t + v; }
+            o[0] = t;
+        }
+    "#;
+    let out = compact(src);
+    let (before, body) = around_for(&out);
+    assert!(
+        !before.contains("=arr[1];") && body.contains("arr[1]"),
+        "a private load is forwarded into the loop: {out}"
+    );
+    assert_valid_wgsl(&out);
+}
+
+/// End to end: a helper with a counted loop spliced into a loop keeps its
+/// counter's store adjacent to the loop, so the emitter spells `for(var`
+/// and the output re-minifies to itself.
+#[test]
+fn spliced_counter_is_absorbed_into_the_for_header() {
+    let src = r#"
+        @group(0) @binding(0) var<storage, read_write> out: array<f32>;
+        fn accumulate(x: f32) -> f32 {
+            var total = 0.0;
+            total = x;
+            for (var i = 0; i < 4; i++) { total += f32(i) * x; }
+            return total;
+        }
+        @compute @workgroup_size(1) fn main() {
+            for (var k = 0; k < 2; k++) { out[k] = accumulate(f32(k)); }
+        }
+    "#;
+    let out = compact_with_passes(src, Profile::Max);
+    assert_valid_wgsl(&out);
+    assert_eq!(
+        out.matches("for (var ").count(),
+        2,
+        "both loops keep their counter: {out}"
+    );
+    let again = compact_with_passes(&out, Profile::Max);
+    assert_eq!(out, again, "the spliced shape re-minifies to itself");
 }

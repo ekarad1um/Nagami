@@ -57,6 +57,24 @@ pub fn render_output(output: &Output) -> String {
     out
 }
 
+/// `{"error":{code,message,line,column}}`: the failure document the CLI's
+/// `--format json` prints, the same fields the wasm binding's thrown `Error`
+/// carries; `line` / `column` are `null` unless a parse label has them.
+pub fn render_error(err: &crate::error::Error) -> String {
+    let mut out = String::from("{\"error\":{\"code\":");
+    push_string(err.kind(), &mut out);
+    out.push_str(",\"message\":");
+    push_string(err.message(), &mut out);
+    let loc = err.location();
+    let _ = write!(
+        out,
+        ",\"line\":{},\"column\":{}}}}}",
+        opt(loc.map(|l| l.line_number)),
+        opt(loc.map(|l| l.line_position))
+    );
+    out
+}
+
 /// The `NameMap` object, or `null`.
 pub fn render_name_map(map: Option<&NameMap>) -> String {
     let mut out = String::new();
@@ -140,6 +158,24 @@ fn push_string(s: &str, out: &mut String) {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn error_document_carries_code_and_position() {
+        let Err(err) = crate::run("fn bad { }", &crate::config::Config::default()) else {
+            panic!("syntax error must fail");
+        };
+        let doc = render_error(&err);
+        assert!(
+            doc.starts_with("{\"error\":{\"code\":\"parse\",\"message\":\""),
+            "{doc}"
+        );
+        assert!(doc.ends_with(",\"line\":1,\"column\":8}}"), "{doc}");
+        let doc = render_error(&crate::error::Error::Io("gone".into()));
+        assert_eq!(
+            doc,
+            "{\"error\":{\"code\":\"io\",\"message\":\"gone\",\"line\":null,\"column\":null}}"
+        );
+    }
 
     #[test]
     fn strings_escape_quotes_backslashes_and_controls() {

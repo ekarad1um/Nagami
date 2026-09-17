@@ -5,12 +5,13 @@
 
 use rustc_hash::FxHashMap;
 
-use crate::name_gen::next_name_unique;
+use crate::passes::expr_util::{KeyToken, lit_key};
 
 use super::core::Generator;
 use super::expr_emit::{
     ConcretizedAbstract, as_operand_keeps_suffix, compose_is_splat,
     concretize_abstract_literal_via_inner, literal_bare_form_changes_type, literal_is_width8,
+    literal_needs_typed_form_outside_constructor,
 };
 use super::syntax::{LiteralExtractKey, literal_extract_key};
 use crate::handle_set::HandleSet;
@@ -34,6 +35,7 @@ impl<'a> Generator<'a> {
              ref_counts: &[usize],
              live: &[bool],
              deferrable: &[bool],
+             rendered: &mut FxHashMap<KeyToken, LiteralExtractKey>,
              literal_counts: &mut FxHashMap<LiteralExtractKey, (usize, bool)>| {
                 let literal_lit = |h: naga::Handle<naga::Expression>| -> Option<naga::Literal> {
                     match func.expressions[h] {
@@ -137,12 +139,12 @@ impl<'a> Generator<'a> {
                             if !matches!(module.types[*ty].inner, naga::TypeInner::Vector { .. }) {
                                 continue;
                             }
-                            if !compose_is_splat(components, &func.expressions) {
+                            if !compose_is_splat(components, &func.expressions, &|_| false) {
                                 continue;
                             }
                             // Only slot 0 is emitted; one subtraction per later
                             // slot, repeated handles included, exactly cancels
-                            // `count_expr_children`'s per-slot bumps.
+                            // the census's per-slot bumps.
                             for (i, &comp) in components.iter().enumerate() {
                                 if i == 0 {
                                     continue;
@@ -196,15 +198,42 @@ impl<'a> Generator<'a> {
                                 }
                             }
                         }
+                        // A float builtin whose every argument is a bare literal
+                        // spells its first one typed (the emitter's pin against
+                        // an abstract const-expression), so that occurrence
+                        // never renders an extracted name.
+                        naga::Expression::Math {
+                            arg,
+                            arg1,
+                            arg2,
+                            arg3,
+                            ..
+                        } => {
+                            let float_scalar = matches!(
+                                func_info[*arg].ty.inner_with(&module.types),
+                                naga::TypeInner::Scalar(s) if s.kind == naga::ScalarKind::Float
+                            );
+                            if float_scalar
+                                && [Some(*arg), *arg1, *arg2, *arg3].into_iter().flatten().all(
+                                    |a| {
+                                        literal_lit(a).is_some_and(|l| {
+                                            !literal_needs_typed_form_outside_constructor(l)
+                                        })
+                                    },
+                                )
+                            {
+                                adjust[arg.index()] += 1;
+                            }
+                        }
                         // Kept-suffix operands bypass `extracted_literals`.
                         naga::Expression::As {
                             expr: src,
                             kind,
                             convert,
                         } => {
-                            if literal_lit(*src).is_some_and(|l| {
-                                as_operand_keeps_suffix(l, *kind, *convert, precision)
-                            }) {
+                            if literal_lit(*src)
+                                .is_some_and(|l| as_operand_keeps_suffix(l, *kind, *convert))
+                            {
                                 adjust[src.index()] += 1;
                             }
                         }
@@ -255,9 +284,9 @@ impl<'a> Generator<'a> {
                     types: &naga::UniqueArena<naga::Type>,
                     visit: &mut F,
                 ) {
-                    crate::passes::expr_util::for_each_statement(block, &mut |stmt| match stmt {
+                    crate::ir::visit::for_each_statement(block, &mut |stmt| match stmt {
                         naga::Statement::Atomic { fun, value, .. } => {
-                            crate::passes::expr_util::visit_atomic_function_handles(fun, visit);
+                            crate::ir::visit::visit_atomic_function_handles(fun, visit);
                             visit(*value);
                         }
                         naga::Statement::Store { pointer, value }
@@ -266,7 +295,7 @@ impl<'a> Generator<'a> {
                             visit(*value);
                         }
                         naga::Statement::ImageAtomic { fun, value, .. } => {
-                            crate::passes::expr_util::visit_atomic_function_handles(fun, visit);
+                            crate::ir::visit::visit_atomic_function_handles(fun, visit);
                             visit(*value);
                         }
                         _ => {}
@@ -295,7 +324,7 @@ impl<'a> Generator<'a> {
                     consumed: &mut [bool],
                     visit: &mut F,
                 ) {
-                    crate::passes::expr_util::for_each_statement(block, &mut |stmt| match stmt {
+                    crate::ir::visit::for_each_statement(block, &mut |stmt| match stmt {
                         naga::Statement::Store { pointer, value } => {
                             if let naga::Expression::LocalVariable(lh) = expressions[*pointer]
                                 && deferrable[lh.index()]
@@ -346,10 +375,19 @@ impl<'a> Generator<'a> {
                         Some(ConcretizedAbstract::Text(_)) => continue,
                         None => lit,
                     };
-                    let emitted = literal_extract_key(key_lit, precision);
-                    let entry = literal_counts.entry(emitted).or_insert((0, false));
-                    entry.0 += emissions;
-                    entry.1 |= bare_handle[h.index()];
+                    // Rendered once per value: a module spells its few
+                    // literals many times over, and a float's shortest
+                    // spelling is three candidates and a parse back.
+                    let emitted = rendered
+                        .entry(lit_key(key_lit))
+                        .or_insert_with(|| literal_extract_key(key_lit, precision));
+                    let bare = bare_handle[h.index()];
+                    if let Some(entry) = literal_counts.get_mut(emitted) {
+                        entry.0 += emissions;
+                        entry.1 |= bare;
+                    } else {
+                        literal_counts.insert(emitted.clone(), (emissions, bare));
+                    }
                 }
             };
 
@@ -367,49 +405,31 @@ impl<'a> Generator<'a> {
             .iter()
             .map(|(handle, _)| &info[handle])
             .chain((0..module.entry_points.len()).map(|i| info.get_entry_point(i)));
+        let mut rendered: FxHashMap<KeyToken, LiteralExtractKey> = Default::default();
         let mut literal_counts: FxHashMap<LiteralExtractKey, (usize, bool)> = Default::default();
-        for (cache_idx, (func, fn_info)) in crate::passes::expr_util::all_functions(module)
+        for (cache_idx, (func, fn_info)) in crate::ir::visit::all_functions(module)
             .zip(infos)
             .enumerate()
         {
-            let live = std::mem::take(&mut self.ref_count_cache[cache_idx].live);
             count_literals(
                 func,
                 fn_info,
                 &self.ref_count_cache[cache_idx].ref_counts,
-                &live,
+                &self.ref_count_cache[cache_idx].live,
                 &self.defer_cache[cache_idx].0,
+                &mut rendered,
                 &mut literal_counts,
             );
         }
 
-        // Names the extracted `const` must avoid: every module-scope name and,
-        // since function-scope names shadow them, every argument and local.
-        let mut forbidden = std::collections::HashSet::new();
-        for name in self.type_names.values() {
-            forbidden.insert(name.clone());
-        }
-        for name in self.constant_names.iter() {
-            forbidden.insert(name.clone());
-        }
-        for name in self.override_names.iter() {
-            forbidden.insert(name.clone());
-        }
-        for name in self.global_names.iter() {
-            forbidden.insert(name.clone());
-        }
-        for name in self.function_names.iter() {
-            forbidden.insert(name.clone());
-        }
-        for ep in self.module.entry_points.iter() {
-            forbidden.insert(ep.name.clone());
-        }
-        // Preserve-listed names (the preamble's among them) may be absent from
-        // every arena - a pruned preamble binding - yet exist in the
-        // consumer's spliced document.
-        forbidden.extend(self.options.preserve_symbols.iter().cloned());
+        // Names the extracted `const` must avoid: every module-scope name
+        // (the preserve list among them: a pruned preamble binding is in no
+        // arena yet stands in the consumer's spliced document) and, since
+        // function-scope names shadow them, every argument and local.
+        let mut forbidden: crate::name_gen::NameScope =
+            self.emitted_module_names().map(str::to_owned).collect();
         forbidden.extend(
-            crate::passes::expr_util::all_functions(self.module)
+            crate::ir::visit::all_functions(self.module)
                 .flat_map(crate::name_gen::function_local_names)
                 .map(str::to_owned),
         );
@@ -446,12 +466,10 @@ impl<'a> Generator<'a> {
                 .then_with(|| a.1.decl_text.cmp(&b.1.decl_text))
         });
 
-        // Re-price with the real name; on rejection restore the counter so the
-        // short-name slot goes to a later candidate instead of being consumed.
-        let mut counter = 0usize;
+        // Re-price with the real name; a rejected candidate leaves its name
+        // to the next.
         for (_, key, count, has_bare) in candidates {
-            let counter_before = counter;
-            let name = next_name_unique(&mut counter, &forbidden);
+            let name = crate::name_gen::shortest_free_name(&forbidden, &[], &|_| false);
             let n = name.len() as isize;
             let expr_len = key.expr_text.len() as isize;
             let decl_len = key.decl_text.len() as isize;
@@ -462,8 +480,6 @@ impl<'a> Generator<'a> {
             if savings > 0 {
                 forbidden.insert(name.clone());
                 self.extracted_literals.insert(key, name);
-            } else {
-                counter = counter_before;
             }
         }
     }

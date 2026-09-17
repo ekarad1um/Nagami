@@ -639,6 +639,155 @@ pub fn next_name_insert(counter: &mut usize, used: &mut HashSet<String>) -> Stri
     }
 }
 
+// MARK: Short-name scope
+
+/// How many of the generator's first names a [`ShortNames`] tracks: the
+/// single letters and the two-letter names through the `..i` series, more
+/// than a module and the locals of its functions together hold.
+const SHORT_NAMES: usize = 1024;
+
+/// Which of the generator's first [`SHORT_NAMES`] names a scope holds, so
+/// the shortest free name is a word scan instead of an allocation and a
+/// hash probe per name walked past.  Exact: the first clear bit that is
+/// not a reserved word is what [`next_name_unique`] returns, and a scope
+/// holding every short name searches on past them through the full sets.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ShortNames([u64; SHORT_NAMES / 64]);
+
+impl ShortNames {
+    fn insert(&mut self, name: &str) {
+        if let Some(counter) = short_counter(name) {
+            self.set(counter);
+        }
+    }
+
+    fn set(&mut self, counter: usize) {
+        self.0[counter / 64] |= 1 << (counter % 64);
+    }
+
+    fn union_with(&mut self, other: &Self) {
+        for (word, more) in self.0.iter_mut().zip(&other.0) {
+            *word |= more;
+        }
+    }
+
+    fn first_free(mut self) -> Option<String> {
+        loop {
+            let (word, bits) = self
+                .0
+                .iter()
+                .enumerate()
+                .find(|(_, bits)| **bits != u64::MAX)?;
+            let counter = word * 64 + (!bits).trailing_zeros() as usize;
+            let name = name_from_counter(counter);
+            if !is_reserved(&name) {
+                return Some(name);
+            }
+            self.set(counter);
+        }
+    }
+}
+
+/// The counter [`name_from_counter`] maps to `name`, when below
+/// [`SHORT_NAMES`]; a name past the width or outside the alphabet (a
+/// leading `_`) has no bit.
+fn short_counter(name: &str) -> Option<usize> {
+    let mut chars = name.chars();
+    let first = chars
+        .next()
+        .and_then(|c| FIRST_LETTERS.iter().position(|&l| l == c))?;
+    let counter = match chars.next() {
+        None => first,
+        Some(second) if chars.next().is_none() => {
+            let next = NEXT_LETTERS.iter().position(|&l| l == second)?;
+            first + FIRST_LETTERS.len() * (next + 1)
+        }
+        Some(_) => return None,
+    };
+    (counter < SHORT_NAMES).then_some(counter)
+}
+
+/// The names a module-scope minting must dodge: [`ShortNames`] for the
+/// scan and the full set for the search past them.
+#[derive(Clone, Default)]
+pub(crate) struct NameScope {
+    short: ShortNames,
+    all: HashSet<String>,
+}
+
+impl NameScope {
+    pub(crate) fn insert(&mut self, name: String) {
+        self.short.insert(&name);
+        self.all.insert(name);
+    }
+
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.all.contains(name)
+    }
+}
+
+impl Extend<String> for NameScope {
+    fn extend<I: IntoIterator<Item = String>>(&mut self, names: I) {
+        for name in names {
+            self.insert(name);
+        }
+    }
+}
+
+impl FromIterator<String> for NameScope {
+    fn from_iter<I: IntoIterator<Item = String>>(names: I) -> Self {
+        let mut scope = Self::default();
+        scope.extend(names);
+        scope
+    }
+}
+
+/// One function's argument and local names, which shadow a module-scope
+/// name minted equal to one of them.
+pub(crate) struct LocalNames<'a> {
+    short: ShortNames,
+    names: Vec<&'a str>,
+}
+
+impl<'a> LocalNames<'a> {
+    pub(crate) fn of(func: &'a naga::Function) -> Self {
+        let names: Vec<&str> = function_local_names(func).collect();
+        let mut short = ShortNames::default();
+        for name in &names {
+            short.insert(name);
+        }
+        Self { short, names }
+    }
+}
+
+/// The shortest name free in `scope` and in the `locals` of every
+/// function `in_scope` selects: the first clear bit of their
+/// [`ShortNames`], or, once every short name is taken, the first name
+/// past them that no set holds.
+pub(crate) fn shortest_free_name(
+    scope: &NameScope,
+    locals: &[LocalNames<'_>],
+    in_scope: &dyn Fn(usize) -> bool,
+) -> String {
+    let mut short = scope.short;
+    let selected = || locals.iter().enumerate().filter(|(i, _)| in_scope(*i));
+    for (_, function) in selected() {
+        short.union_with(&function.short);
+    }
+    if let Some(name) = short.first_free() {
+        return name;
+    }
+    let mut counter = SHORT_NAMES;
+    loop {
+        let name = next_name(&mut counter);
+        if !scope.all.contains(&name)
+            && !selected().any(|(_, function)| function.names.contains(&name.as_str()))
+        {
+            return name;
+        }
+    }
+}
+
 // MARK: Tests
 
 #[cfg(test)]
@@ -683,6 +832,59 @@ mod tests {
         let name = next_name_insert(&mut counter, &mut used);
         assert_eq!(name, "A");
         assert!(used.contains("A"));
+    }
+
+    /// The bit set mirrors the counter for the first `SHORT_NAMES` names:
+    /// each maps back to its counter, and a reserved one among them
+    /// (`if`) is skipped as `next_name` skips it.
+    #[test]
+    fn short_names_mirror_the_counter() {
+        for counter in 0..SHORT_NAMES {
+            let name = name_from_counter(counter);
+            assert_eq!(short_counter(&name), Some(counter), "{name}");
+        }
+        assert_eq!(short_counter(&name_from_counter(SHORT_NAMES)), None);
+        assert_eq!(short_counter("_A"), None);
+        assert_eq!(short_counter("AAA"), None);
+        assert_eq!(short_counter(""), None);
+
+        let reserved = short_counter("if").expect("a two-letter reserved word in range");
+        let mut scope = NameScope::default();
+        scope.extend((0..reserved).map(name_from_counter));
+        assert_eq!(
+            shortest_free_name(&scope, &[], &|_| false),
+            name_from_counter(reserved + 1)
+        );
+    }
+
+    /// The scan dodges the scope and the locals it is given, and a scope
+    /// holding every short name searches on past them, locals included.
+    #[test]
+    fn the_shortest_free_name_scans_then_searches() {
+        let module = naga::front::wgsl::parse_str(&format!(
+            "fn f(a: i32) {{ var {}: i32; }}",
+            name_from_counter(SHORT_NAMES)
+        ))
+        .expect("parse failed");
+        let locals: Vec<LocalNames> = module
+            .functions
+            .iter()
+            .map(|(_, f)| LocalNames::of(f))
+            .collect();
+        let mut scope = NameScope::default();
+        assert_eq!(shortest_free_name(&scope, &locals, &|_| true), "A");
+        scope.insert("A".into());
+        assert_eq!(shortest_free_name(&scope, &locals, &|_| false), "a");
+        assert_eq!(shortest_free_name(&scope, &locals, &|_| true), "B");
+        scope.extend((0..SHORT_NAMES).map(name_from_counter));
+        assert_eq!(
+            shortest_free_name(&scope, &[], &|_| true),
+            name_from_counter(SHORT_NAMES)
+        );
+        assert_eq!(
+            shortest_free_name(&scope, &locals, &|_| true),
+            name_from_counter(SHORT_NAMES + 1)
+        );
     }
 
     #[test]

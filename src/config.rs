@@ -54,13 +54,14 @@ impl FloatPrecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Profile {
     /// Minimal DCE-driven pipeline: compact, const fold, dead-branch,
-    /// dead-param, emit merge, rename.  No inlining, CSE, or load dedup.
+    /// dead-param, emit merge, rename.  No inlining or load dedup.
     Baseline,
     /// Full pipeline (inlining, load dedup, coalescing) without mangling
     /// unless [`Config::mangle`] requests it.
     Aggressive,
-    /// [`Profile::Aggressive`] plus CSE, higher inlining budgets, and
-    /// identifier mangling on by default.
+    /// [`Profile::Aggressive`] plus higher multi-site inlining budgets,
+    /// identifier mangling on by default and, with mangling on,
+    /// vector-constant hoisting.
     #[default]
     Max,
 }
@@ -77,6 +78,11 @@ pub struct TraceConfig {
     /// Re-validate the WGSL text after every pass and escalate failures to
     /// hard errors instead of rolling back; meant for CI, not daily use.
     pub validate_each_pass: bool,
+    /// Stop accepting IR pass changes after this many, then emit: the
+    /// output carries exactly the first N accepted runs, so a wrong output
+    /// is bisected to one pass run in log2(runs) executions (LLVM's
+    /// `-opt-bisect-limit`).  `None` runs to convergence.
+    pub opt_bisect_limit: Option<u64>,
 }
 
 /// Top-level minification configuration.
@@ -88,6 +94,13 @@ pub struct Config {
     /// uniformly to globals, functions, constants, overrides, arguments,
     /// locals, struct type names, and struct member names.
     pub preserve_symbols: Vec<String>,
+    /// Keep every name a host may address by string: resource-bound
+    /// globals, overrides, and the struct types those globals reach with
+    /// their members; entry points are never renamed and `@location`
+    /// arguments carry their contract in the attribute.  For hosts that
+    /// re-reflect the shipped text by name; [`crate::name_map::NameMap`] is
+    /// the alternative.  Computed into the preserve set at run start.
+    pub preserve_interface: bool,
     /// Explicit mangle override; `None` defers to the profile default
     /// (only [`Profile::Max`] enables mangling implicitly).
     pub mangle: Option<bool>,
@@ -97,10 +110,12 @@ pub struct Config {
     pub indent: u8,
     /// Per-type float-literal precision caps; any non-`Full` mode is lossy.
     pub float_precision: FloatPrecision,
-    /// Per-function expression-node ceiling for inlining; `None` selects
-    /// the profile default.
+    /// Expression-node ceiling for cloning a helper into each of several
+    /// call sites; `None` selects the profile default.  A function called
+    /// once is spliced into its caller whatever its size.
     pub max_inline_node_count: Option<usize>,
-    /// Call-site ceiling for inlining; `None` selects the profile default.
+    /// Call-site ceiling for cloning a helper into its call sites; `None`
+    /// selects the profile default.
     pub max_inline_call_sites: Option<usize>,
     /// Per-pass tracing and diagnostic settings.
     pub trace: TraceConfig,
@@ -117,6 +132,7 @@ impl Default for Config {
         Self {
             profile: Profile::Max,
             preserve_symbols: Vec::new(),
+            preserve_interface: false,
             mangle: None,
             beautify: false,
             indent: 2,

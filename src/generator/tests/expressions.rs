@@ -392,12 +392,14 @@ fn identity_swizzle_collapse_in_constructor_arg_is_not_parenthesized() {
     // An identity swizzle of a binary (`vec3f(c.x,c.y,c.z)`, `c = col*s`)
     // collapses to the bare base; as a comma-delimited constructor argument
     // nothing is appended, so it must stay unparenthesised.  The full pipeline
-    // is needed so CSE first unifies the three components onto one base.
+    // is needed so the single-use `let`s dissolve into their use.
     let src = r#"
         @fragment fn fs(@location(0) col: vec3f, @location(1) s: f32) -> @location(0) vec4f {
+            let c = col * s;
+            let d = col + col;
             let m = mat3x3f(
-                vec3f((col * s).x, (col * s).y, (col * s).z),
-                vec3f((col + col).x, (col + col).y, (col + col).z),
+                vec3f(c.x, c.y, c.z),
+                vec3f(d.x, d.y, d.z),
                 col,
             );
             return vec4f(m[0], 1.);

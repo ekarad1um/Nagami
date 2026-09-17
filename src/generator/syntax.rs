@@ -532,6 +532,12 @@ pub(super) fn decl_boilerplate(beautify: bool) -> usize {
     if beautify { 11 } else { 8 }
 }
 
+/// Fixed overhead of one body binding around its name and value: compact
+/// `let N=E;` = 6, beautify `let N = E;\n` = 9 (its indent is not counted).
+pub(super) fn let_boilerplate(beautify: bool) -> usize {
+    if beautify { 9 } else { 6 }
+}
+
 // MARK: Type rendering
 
 /// The `(expr, decl)` [`LiteralExtractKey`] for [`super::literal_extract`]:
@@ -673,9 +679,8 @@ pub(super) fn type_resolution_name(
             )
         }
         TypeResolution::Value(inner) => {
-            // `UniqueArena` deduplicates by the full `Type` including its
-            // name, so several handles can share one `TypeInner`; any of
-            // them with an alias wins.
+            // Several handles can share one `TypeInner` (`type_groups`); any
+            // of them with an alias wins.
             if let Some(name) = module.types.iter().find_map(|(handle, ty)| {
                 (&ty.inner == inner)
                     .then(|| struct_names.get(handle).cloned())
@@ -862,9 +867,9 @@ pub(super) fn type_ref_from_handle(
 
 // Variant names for "cannot emit this" errors, so those messages never
 // `{:?}` the value: deriving `Debug` for `naga::Expression` / `Statement` /
-// `TypeInner` drags the whole recursive formatter into the binary (33 KB
-// native) to serve paths that already fall back to naga's emitter, and a
-// variant name beats the multi-line tree dump as a diagnostic anyway.
+// `TypeInner` drags the whole recursive formatter into the binary to serve
+// paths that already fall back to naga's emitter, and a variant name beats
+// the multi-line tree dump as a diagnostic anyway.
 
 pub(super) fn expression_kind(expression: &naga::Expression) -> &'static str {
     use naga::Expression as E;
@@ -1272,7 +1277,7 @@ pub(super) fn storage_format_name(format: naga::StorageFormat) -> &'static str {
 }
 
 /// WGSL builtin name; exhaustive so a new naga variant fails the build.
-pub(super) fn math_name(fun: naga::MathFunction) -> &'static str {
+pub(crate) fn math_name(fun: naga::MathFunction) -> &'static str {
     use naga::MathFunction as M;
     match fun {
         M::Abs => "abs",

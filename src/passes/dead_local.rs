@@ -15,9 +15,9 @@
 //! that the next compact culls; if the sweep cap lands first it sits
 //! outside every `Emit` range and is never rendered.
 
-use super::expr_util::for_each_function_mut;
 use crate::error::Error;
 use crate::handle_set::HandleSet;
+use crate::ir::visit::for_each_function_mut;
 use crate::pipeline::{Pass, PassContext};
 
 /// Remove locals no expression references and remap survivors' handles.
@@ -87,12 +87,7 @@ mod tests {
     fn run_pass(source: &str) -> (bool, naga::Module) {
         let mut module = io::parse_wgsl(source).expect("test source parses");
         let config = Config::default();
-        let ctx = PassContext {
-            config: &config,
-            name_log: None,
-        };
-        let changed = DeadLocalPass
-            .run(&mut module, &ctx)
+        let changed = PassContext::run_pass(&mut DeadLocalPass, &mut module, &config)
             .expect("pass must not error");
         io::validate_module(&module).expect("pass output must validate");
         (changed, module)

@@ -79,6 +79,12 @@ struct Args {
 
     #[arg(
         long,
+        help = "Keep every name a host may address by string: bound globals, overrides, and the struct types they reach with their members (for hosts that re-reflect the shipped text; --name-map is the alternative)."
+    )]
+    preserve_interface: bool,
+
+    #[arg(
+        long,
         conflicts_with_all = ["output", "in_place", "trace", "trace_dir", "validate_each_pass", "name_map"],
         help = "Exit with status 1 if minification would change the input. \
                 Read-only - no output, trace, or validation side effects."
@@ -112,6 +118,13 @@ struct Args {
         help = "Re-validate emitted WGSL text after every pass and escalate any failure to a hard error (instead of the default silent per-pass rollback)."
     )]
     validate_each_pass: bool,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Stop accepting IR pass changes after N, then emit."
+    )]
+    opt_bisect_limit: Option<u64>,
 
     #[arg(
         long,
@@ -246,19 +259,47 @@ fn main() -> ExitCode {
 }
 
 fn cli_main() -> ExitCode {
-    match run_cli() {
+    let args = Args::parse();
+    let json = args.format == OutputFormat::Json;
+    match run_cli(args) {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprintln!("{err}");
+            // The JSON contract holds on every failure past argument
+            // parsing: one document on stdout, the diagnostic on stderr,
+            // exit 2.  A failure `nagami::run` did not produce (a file the
+            // CLI could not read or write, `--strict-fallback`) is filed
+            // under the kind nearest to it.
+            if json {
+                let err = match err.downcast::<nagami::error::Error>() {
+                    Ok(err) => *err,
+                    Err(err) if err.is::<StrictFallback>() => {
+                        nagami::error::Error::Emit(err.to_string())
+                    }
+                    Err(err) => nagami::error::Error::Io(err.to_string()),
+                };
+                println!("{}", nagami::json::render_error(&err));
+            }
             ExitCode::from(2)
         }
     }
 }
 
-/// Exit code per the module header; hard failures are the `Err` arm.
-fn run_cli() -> Result<u8, Box<dyn std::error::Error>> {
-    let args = Args::parse();
+/// `--strict-fallback` refusing a bailout: an error of its own kind, so the
+/// JSON document can file it apart from an I/O failure.
+#[derive(Debug)]
+struct StrictFallback(String);
 
+impl std::fmt::Display for StrictFallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StrictFallback {}
+
+/// Exit code per the module header; hard failures are the `Err` arm.
+fn run_cli(args: Args) -> Result<u8, Box<dyn std::error::Error>> {
     if args.in_place && is_dash_path(&args.input) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -355,6 +396,7 @@ fn run_cli() -> Result<u8, Box<dyn std::error::Error>> {
     let config = nagami::config::Config {
         profile: args.profile.into(),
         preserve_symbols: args.preserve_symbols,
+        preserve_interface: args.preserve_interface,
         mangle: match (args.mangle, args.no_mangle) {
             (true, _) => Some(true),
             (_, true) => Some(false),
@@ -369,6 +411,7 @@ fn run_cli() -> Result<u8, Box<dyn std::error::Error>> {
             enabled: args.trace,
             dump_dir: args.trace_dir,
             validate_each_pass: args.validate_each_pass,
+            opt_bisect_limit: args.opt_bisect_limit,
         },
         preamble,
     };
@@ -378,7 +421,7 @@ fn run_cli() -> Result<u8, Box<dyn std::error::Error>> {
 
     // Not gated on --quiet, which silences only the success summary.
     match bailout_notice(output.report.bailout.as_deref(), args.strict_fallback) {
-        Err(reason) => return Err(reason.into()),
+        Err(reason) => return Err(StrictFallback(reason).into()),
         Ok(Some(warning)) => eprintln!("{warning}"),
         Ok(None) => {}
     }
