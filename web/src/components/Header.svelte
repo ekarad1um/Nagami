@@ -15,7 +15,7 @@
       "Baseline: DCE, constant folding, dead-branch and dead-parameter elimination, emit-merge, rename. Fast and safe. Mangle: off.",
     aggressive:
       "Aggressive: baseline + dead-local elimination, function inlining (24 nodes / 3 sites), load-dedup, struct-build coalescing, variable coalescing. Mangle: off.",
-    max: "Max (default): aggressive + higher inlining limits (48 nodes / 6 sites), CSE and vector-constant hoisting (both need mangle on). Mangle: on.",
+    max: "Max (default): aggressive + higher inlining limits (48 nodes / 6 sites) and vector-constant hoisting (needs mangle on). Mangle: on.",
   };
 </script>
 

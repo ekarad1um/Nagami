@@ -71,7 +71,7 @@
       <div class="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-3 text-xs">
         <label
           class="flex items-center justify-between gap-2 text-slate-400"
-          title="Shorten names to reduce size. Default follows profile (on for max, off for baseline/aggressive). Under max, CSE and vector-constant hoisting run only while mangle is on."
+          title="Shorten names to reduce size. Default follows profile (on for max, off for baseline/aggressive). Under max, vector-constant hoisting runs only while mangle is on."
         >
           Mangle
           <input
