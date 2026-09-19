@@ -1,6 +1,6 @@
 use super::*;
 use crate::config::Config;
-use crate::handle_set::{HandleMap, HandleSet};
+use crate::handle_set::HandleSet;
 
 fn run_pass(source: &str) -> (bool, naga::Module) {
     let mut module = naga::front::wgsl::parse_str(source).expect("source should parse");
@@ -475,22 +475,19 @@ fn trace_ray_payload_invalidates_cache_and_marks_escaped() {
     );
     function.body = body;
 
-    let mut replacements = HandleMap::default();
+    let mut fw = Forwards::default();
     let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
-    let mut all_loads = HandleMap::default();
-    let mut seeded_by_store = HandleMap::default();
     let scope_idx = ExpressionScopeIndex::build(&function.body, &function.expressions);
     collect_redundant_loads(
         &function.body,
         &function.expressions,
         &scope_idx,
         &mut cache,
-        &mut replacements,
-        &mut all_loads,
-        &mut seeded_by_store,
+        &mut fw,
         false,
         &mut HandleSet::default(),
     );
+    let replacements = fw.replacements;
 
     assert!(
         !replacements.contains_key(load2),
@@ -593,22 +590,19 @@ fn cooperative_store_through_data_pointer_invalidates_cache() {
     );
     function.body = body;
 
-    let mut replacements = HandleMap::default();
+    let mut fw = Forwards::default();
     let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
-    let mut all_loads = HandleMap::default();
-    let mut seeded_by_store = HandleMap::default();
     let scope_idx = ExpressionScopeIndex::build(&function.body, &function.expressions);
     collect_redundant_loads(
         &function.body,
         &function.expressions,
         &scope_idx,
         &mut cache,
-        &mut replacements,
-        &mut all_loads,
-        &mut seeded_by_store,
+        &mut fw,
         false,
         &mut HandleSet::default(),
     );
+    let replacements = fw.replacements;
 
     assert!(
         !replacements.contains_key(load2),
@@ -714,22 +708,19 @@ fn atomic_invalidates_cache_and_counts_as_store() {
         "Store + Atomic should count as 2 stores"
     );
 
-    let mut replacements = HandleMap::default();
+    let mut fw = Forwards::default();
     let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
-    let mut all_loads = HandleMap::default();
-    let mut seeded_by_store = HandleMap::default();
     let scope_idx = ExpressionScopeIndex::build(&function.body, &function.expressions);
     collect_redundant_loads(
         &function.body,
         &function.expressions,
         &scope_idx,
         &mut cache,
-        &mut replacements,
-        &mut all_loads,
-        &mut seeded_by_store,
+        &mut fw,
         false,
         &mut HandleSet::default(),
     );
+    let replacements = fw.replacements;
 
     assert!(
         !replacements.contains_key(load2),
@@ -2593,5 +2584,104 @@ fn main_1() {
                 if matches!(main_1.expressions[*pointer], naga::Expression::LocalVariable(_))
         )),
         "the product still reads `m` at runtime"
+    );
+}
+
+// MARK: Identity stores
+
+/// Every `Store` in `function`, nested blocks included.
+fn store_count(function: &naga::Function) -> usize {
+    let mut n = 0;
+    for_each_statement(&function.body, &mut |stmt| {
+        n += usize::from(matches!(stmt, naga::Statement::Store { .. }));
+    });
+    n
+}
+
+/// Emitted loads rooted at any local, whole or partial.
+fn loads_rooted_at_locals(function: &naga::Function) -> usize {
+    function
+        .expressions
+        .iter()
+        .filter(|(h, e)| {
+            matches!(e, naga::Expression::Load { pointer }
+                if root_local_var(*pointer, &function.expressions).is_some())
+                && is_handle_in_any_emit(&function.body, *h)
+        })
+        .count()
+}
+
+fn test_function(module: &naga::Module) -> &naga::Function {
+    module
+        .functions
+        .iter()
+        .find(|(_, f)| f.name.as_deref() == Some("test_fn"))
+        .map(|(_, f)| f)
+        .expect("test_fn exists")
+}
+
+const FS_MAIN: &str =
+    "@fragment fn fs_main() -> @location(0) vec4f { return vec4f(f32(test_fn(3))); }";
+
+#[test]
+fn a_store_of_the_value_its_place_holds_is_retired() {
+    // The partial store blocks forwarding `e`, so the rule alone removes
+    // `b = e`.
+    let (changed, module) = run_pass(&format!(
+        "fn test_fn(x: i32) -> i32 {{ var b: vec2i; b.x = x; let e = b; b = e; return e.x + b.y; }} {FS_MAIN}"
+    ));
+    assert!(changed);
+    assert_eq!(
+        store_count(test_function(&module)),
+        1,
+        "only the partial store remains"
+    );
+}
+
+#[test]
+fn a_store_after_an_intervening_write_is_kept() {
+    let (_, module) = run_pass(&format!(
+        "fn test_fn(x: i32) -> i32 {{ var b: vec2i; b.x = x; let e = b; b.y = 1; b = e; return e.x + b.y; }} {FS_MAIN}"
+    ));
+    assert_eq!(store_count(test_function(&module)), 3);
+}
+
+#[test]
+fn an_identity_shared_with_a_live_store_is_kept() {
+    // Both `b = e` carry one `(pointer, value)` identity; the second is a
+    // real write, so neither is retired.
+    let (_, module) = run_pass(&format!(
+        "fn test_fn(x: i32) -> i32 {{ var b: vec2i; b.x = x; let e = b; b = e; b.y = 1; b = e; return e.x + b.y; }} {FS_MAIN}"
+    ));
+    assert_eq!(store_count(test_function(&module)), 4);
+}
+
+#[test]
+fn an_identity_store_inside_a_loop_is_retired() {
+    let (changed, module) = run_pass(&format!(
+        "fn test_fn(x: i32) -> i32 {{ var b: vec2i; var i: i32 = 0; loop {{ b.x = i; let e = b; b = e; if e.x >= x {{ break; }} i = i + 1; }} return b.y; }} {FS_MAIN}"
+    ));
+    assert!(changed);
+    assert_eq!(
+        store_count(test_function(&module)),
+        2,
+        "`b.x = i` and `i = i + 1` remain"
+    );
+}
+
+#[test]
+fn a_field_store_of_its_own_value_is_retired_and_the_cache_stands() {
+    // `b.y = x` seeds `b.y`; the identity store `b.x = t` neither
+    // invalidates that entry nor survives, so the final `b.y` forwards.
+    let (changed, module) = run_pass(&format!(
+        "fn test_fn(x: i32) -> i32 {{ var b: vec2i; b.x = x; b.y = x; let t = b.x; b.x = t; return t + b.y; }} {FS_MAIN}"
+    ));
+    assert!(changed);
+    let f = test_function(&module);
+    assert_eq!(store_count(f), 2, "the two partial stores remain");
+    assert_eq!(
+        loads_rooted_at_locals(f),
+        1,
+        "`t` stays, `b.y` forwards to `x`"
     );
 }

@@ -430,19 +430,29 @@ pub(super) fn creation_error_operand(
                 .into_iter()
                 .flatten()
                 .collect();
-            let opaque = args
-                .iter()
+            // Every argument a const-expression, or the call is runtime and
+            // nothing is evaluated at shader creation.
+            args.iter()
                 .try_fold(false, |acc, &a| Some(acc | tree(a)?))?;
-            let all: Option<Vec<Vec<f64>>> = args
-                .iter()
-                .map(|&a| match values(Some(a)) {
-                    ConstArg::Known(v) => Some(v),
-                    ConstArg::Runtime | ConstArg::Opaque => None,
-                })
-                .collect();
-            let hazard = match all {
-                Some(all) => math_hazard(*fun, &all, width),
-                None => opaque && math_can_fail(*fun),
+            let mut known = Vec::with_capacity(args.len());
+            let mut unknown = false;
+            for &a in &args {
+                match values(Some(a)) {
+                    ConstArg::Known(v) => known.push(v),
+                    // A constant the evaluator cannot compute - a bitcast,
+                    // an unpack, a `dot` or `length` of constant vectors
+                    // that `const_lanes` does not model - is not known to
+                    // be safe: it binds wherever the builtin can fail at all
+                    // (`inverseSqrt(dot(vec2f(1), vec2f(0)))` is `inf` at
+                    // const-evaluation).
+                    ConstArg::Opaque => unknown = true,
+                    ConstArg::Runtime => return None,
+                }
+            }
+            let hazard = if unknown {
+                math_can_fail(*fun)
+            } else {
+                math_hazard(*fun, &known, width)
             };
             hazard.then_some(*arg)
         }

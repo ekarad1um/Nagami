@@ -6,7 +6,10 @@
 use crate::error::Error;
 
 use super::core::{ExprTypes, FunctionAnalyses, FunctionCtx, FunctionExprInfo, Generator};
-use super::syntax::{address_space, binding_attrs, storage_access};
+use super::syntax::{
+    address_space, binding_attrs, early_depth_test_attr, severity_name, storage_access,
+    triggering_rule_name,
+};
 
 mod call_inline;
 mod defer_vars;
@@ -23,8 +26,9 @@ use crate::analysis::compute_fn_effects;
 use crate::handle_set::HandleSet;
 /// Renders of one function before its binding decisions are taken as they
 /// stand: the first prices by the census, each next by the counts of the
-/// one before; two settle every function seen, and the cap holds a bistable
-/// pair to the state it was found in.
+/// one before.  Two settle a function whose decisions converge; a bistable
+/// pair (each consistent state the other's flip) has shown both its states
+/// by the third, and the shorter ships.
 const RENDER_ROUNDS: usize = 3;
 
 use call_inline::find_inlineable_calls;
@@ -319,6 +323,9 @@ impl<'a> Generator<'a> {
     /// Emit the module: the per-function analyses and literal extraction, then
     /// every declaration section in spec order.
     pub(super) fn generate_module(&mut self) -> Result<(), Error> {
+        if let Some(error) = self.unspelled.take() {
+            return Err(error);
+        }
         let mut has_prev_section = false;
 
         self.prepare();
@@ -438,7 +445,16 @@ impl<'a> Generator<'a> {
 
             match ep.stage {
                 naga::ShaderStage::Vertex => self.out.push_str("@vertex "),
-                naga::ShaderStage::Fragment => self.out.push_str("@fragment "),
+                naga::ShaderStage::Fragment => {
+                    self.out.push_str("@fragment");
+                    if let Some(test) = ep.early_depth_test {
+                        if self.options.beautify {
+                            self.out.push(' ');
+                        }
+                        self.out.push_str(early_depth_test_attr(test));
+                    }
+                    self.out.push(' ');
+                }
                 naga::ShaderStage::Compute => {
                     self.out.push_str(if self.options.beautify {
                         "@compute @workgroup_size("
@@ -813,7 +829,8 @@ impl<'a> Generator<'a> {
     ) -> Result<(), Error> {
         let mut first = true;
         for (h, ov) in self.module.overrides.iter() {
-            if preamble_owns(preamble, ov.name.as_deref()) {
+            // An anonymous one is spelled where its array size stands.
+            if ov.name.is_none() || preamble_owns(preamble, ov.name.as_deref()) {
                 continue;
             }
             self.section_start(has_prev_section, &mut first);
@@ -971,6 +988,7 @@ impl<'a> Generator<'a> {
             inlineable_calls,
         } = self.function_analyses(func, finfo, cache_idx);
         let (deferred_vars, dead_vars) = self.analyses.defer[cache_idx].clone();
+        let pins = self.pin_candidates(func);
         let typed_pointer_arg_locals =
             typed_pointer_arg_locals(func, &self.module.types, &self.type_names);
         let mut ctx = FunctionCtx {
@@ -995,6 +1013,7 @@ impl<'a> Generator<'a> {
             local_used_names: std::collections::HashSet::new(),
             inlineable_calls,
             must_bind,
+            pins,
             render_depth_memo: vec![0; func.expressions.len()],
             stashed_call_depth: Default::default(),
             render_counts: vec![0; func.expressions.len()],
@@ -1055,9 +1074,11 @@ impl<'a> Generator<'a> {
     /// consumer the rule inlines renders its operand at each of its uses,
     /// which the census counted once; a twin's counts are its first
     /// spelling's, `counts_by_value`), either rendering the function again
-    /// from the context as built; [`RENDER_ROUNDS`] caps a bistable pair at
-    /// a text that is valid but a byte or two off.  Hands back the context
-    /// as passed, the rendered one in `ctx`.
+    /// from the context as built.  At [`RENDER_ROUNDS`] an unsettled
+    /// function is a bistable pair whose two states are the last two
+    /// renders: the shorter ships, a tie keeping the later, so the text is
+    /// defined by its bytes rather than by which state came first.  Hands
+    /// back the context as passed, the rendered one in `ctx`.
     pub(super) fn generate_function_in<'m>(
         &mut self,
         fn_name: &str,
@@ -1070,6 +1091,9 @@ impl<'a> Generator<'a> {
         // What a further round overwrites in `ctx`, as passed: `must_bind`
         // and `measured`.
         let mut passed = None;
+        // The render before the cap, when it could ship: the pair's other
+        // state.
+        let mut prior: Option<(String, FunctionCtx<'a, 'm>)> = None;
         for round in 1.. {
             let mut attempt = ctx.clone();
             self.render_function(fn_name, func, is_entry_point, &mut attempt)?;
@@ -1096,6 +1120,14 @@ impl<'a> Generator<'a> {
                     super::stmt_emit::binding_pays(refs, parens, d.len, d.name, beautify) == d.bound
                 });
             if settled || round == RENDER_ROUNDS {
+                if !settled
+                    && let Some((text, rendered)) = prior
+                    && text.len() < self.out.len() - start
+                {
+                    self.out.truncate(start);
+                    self.out.push_str(&text);
+                    attempt = rendered;
+                }
                 let mut as_passed = std::mem::replace(ctx, attempt);
                 if let Some((must_bind, measured)) = passed {
                     as_passed.must_bind = must_bind;
@@ -1103,12 +1135,82 @@ impl<'a> Generator<'a> {
                 }
                 return Ok(as_passed);
             }
+            // Work the bytes sank into a loop is pinned in the next round
+            // and never ships, so only a sink-free render is a state.
+            if round + 1 == RENDER_ROUNDS && sunk.is_empty() {
+                prior = Some((self.out[start..].to_owned(), attempt));
+            }
             self.out.truncate(start);
             passed.get_or_insert_with(|| (ctx.must_bind.clone(), ctx.measured.take()));
             ctx.must_bind.extend(sunk.iter().copied());
             ctx.measured = Some((render_counts, paren_counts));
         }
         unreachable!("the round cap returns")
+    }
+
+    /// The pins the body prints (`ctx.pins`, less the globals the text
+    /// mentioned): every printed mention of a global rendered its
+    /// `GlobalVariable` expression through `ctx.rendered`, and the count
+    /// journal undid what the text dropped, so the counts say which
+    /// globals the body mentions - whatever statement the emitter elided
+    /// on the way (a no-op `p = p`, a vacuous tail).  Rendered after the
+    /// body, moved to its start at `body_start`.  WGSL's phony assignment
+    /// takes a constructible value, a pointer, a texture or a sampler - so
+    /// `&` where the store type cannot be loaded (a runtime-sized array,
+    /// an atomic), never on a handle, and the first element of a binding
+    /// array.
+    #[inline(never)]
+    fn emit_pins(&mut self, ctx: &mut FunctionCtx<'a, '_>, body_start: usize) {
+        let pins = std::mem::take(&mut ctx.pins);
+        if pins.is_empty() {
+            return;
+        }
+        let mut mentioned = vec![false; self.module.global_variables.len()];
+        for (h, expr) in ctx.exprs.iter() {
+            if let naga::Expression::GlobalVariable(global) = *expr
+                && ctx.render_counts[h.index()] > 0
+            {
+                mentioned[global.index()] = true;
+            }
+        }
+        let start = self.out.len();
+        for &(handle, global) in &pins {
+            if mentioned[global.index()] {
+                continue;
+            }
+            let global_var = &self.module.global_variables[global];
+            let types = &self.module.types;
+            let element = matches!(
+                types[global_var.ty].inner,
+                naga::TypeInner::BindingArray { .. }
+            );
+            self.push_indent();
+            self.out
+                .push_str(if self.options.beautify { "_ = " } else { "_=" });
+            if global_var.space != naga::AddressSpace::Handle
+                && !types[global_var.ty].inner.is_constructible(types)
+            {
+                self.out.push('&');
+            }
+            self.out.push_str(&self.global_names[global.index()]);
+            if element {
+                self.out.push_str("[0]");
+            }
+            // The name weighs on the global's own expression (an
+            // immediate's pin is the load of it).
+            let spelled = match ctx.exprs[handle] {
+                naga::Expression::Load { pointer } => pointer,
+                _ => handle,
+            };
+            ctx.rendered(spelled);
+            self.out.push(';');
+            self.push_newline();
+        }
+        if self.out.len() > start {
+            let text = self.out.split_off(start);
+            self.out.insert_str(body_start, &text);
+        }
+        ctx.pins = pins;
     }
 
     fn render_function(
@@ -1152,6 +1254,7 @@ impl<'a> Generator<'a> {
         }
 
         self.open_brace();
+        let body_start = self.out.len();
 
         for (h, local) in func.local_variables.iter() {
             if ctx.deferred_vars[h.index()]
@@ -1211,6 +1314,7 @@ impl<'a> Generator<'a> {
         }
 
         self.generate_block_elide_trailing_return(&func.body, ctx)?;
+        self.emit_pins(ctx, body_start);
 
         // On re-parse naga's `ensure_block_returns` appends an implicit `return;`
         // after a tail `loop` (it never proves a loop non-falling-through), an
@@ -1293,30 +1397,5 @@ fn block_naga_terminates(block: &naga::Block) -> bool {
         // `Loop`, `Emit`, `Store`, `Call`, `Atomic`, ... and the empty block
         // (`None`) are exactly naga's "append `Return { None }`" arms.
         _ => false,
-    }
-}
-
-// MARK: Diagnostic directive rendering
-
-fn severity_name(severity: naga::diagnostic_filter::Severity) -> &'static str {
-    use naga::diagnostic_filter::Severity as S;
-    match severity {
-        S::Off => "off",
-        S::Info => "info",
-        S::Warning => "warning",
-        S::Error => "error",
-    }
-}
-
-fn triggering_rule_name(rule: &naga::diagnostic_filter::FilterableTriggeringRule) -> String {
-    use naga::diagnostic_filter::FilterableTriggeringRule as R;
-    match rule {
-        R::Standard(std_rule) => match std_rule {
-            naga::diagnostic_filter::StandardFilterableTriggeringRule::DerivativeUniformity => {
-                "derivative_uniformity".to_string()
-            }
-        },
-        R::Unknown(name) => name.to_string(),
-        R::User(parts) => format!("{}.{}", parts[0], parts[1]),
     }
 }

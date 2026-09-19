@@ -1,17 +1,21 @@
 //! IR-level optimization passes assembled by [`build_ir_passes`].
 //!
+//! # Canonical form
+//!
+//! The driver restores `normalize`'s form before the first pass and
+//! after every accepted change: no declaration or expression the entry
+//! points cannot reach, no local without an expression naming it.  A pass
+//! therefore never reads the orphans another pass left, a dead local is
+//! gone by the time the inliner meets the body it would have vetoed (the
+//! multi-site template refuses bodies with locals), and no sweep is spent
+//! culling.
+//!
 //! # Interaction matrix
 //!
 //! The driver sweeps the sequence to a fixed point, so a missed
 //! opportunity usually costs one extra sweep, not the optimization; the
 //! load-bearing exceptions are exactly these:
 //!
-//! * `compact` -> `dead_local`: only after statement-unreachable
-//!   expressions are culled is "no `LocalVariable` expression" exactly
-//!   "dead local".
-//! * `dead_local` -> `inlining`: clearing dead locals lifts the
-//!   multi-site template's no-locals veto (a single-call body splices
-//!   with its locals).
 //! * `dead_branch` -> `inlining`: a guard chain of pure early returns
 //!   merged into one `select` return is what makes a multi-return
 //!   single-call body spliceable in the same sweep.
@@ -25,7 +29,9 @@
 //!   bodies, or it forwards across a boundary the inliner is about to
 //!   erase.
 //! * `struct_build` -> `coalescing` / `rename`: member-wise struct
-//!   builds collapse to one constructor store first.
+//!   builds collapse to one constructor store first; coalescing itself
+//!   runs only in the second stage, behind forwarding's fixed point
+//!   ([`build_late_passes`]).
 //! * `dead_param` late: a parameter's uses must dissolve before its
 //!   removal is visible, and it rewrites caller arity.
 //! * `emit_merge` late: re-merged `Emit` ranges restore the generator's
@@ -35,9 +41,9 @@
 //! * `const_hoist` runs once, after the fixed point ([`build_tail_passes`]),
 //!   and only under `Max` with mangling on: it prices every hoist by
 //!   rendering the module, so it wants the converged one, and a name of
-//!   one or two characters that only rename's mangling delivers.  The
-//!   `compact` behind it culls the lanes a hoist orphans (the alias planner
-//!   counts every constructor in the arena, culled or not), and the
+//!   one or two characters that only rename's mangling delivers.
+//!   Normalization behind it culls the lanes a hoist orphans (the alias
+//!   planner counts every constructor in the arena, culled or not), and the
 //!   `rename` names the hoisted constant before anything is emitted, or
 //!   re-minified output names it differently (idempotence).  That rename
 //!   ranks by the text (`RenamePass::by_render`): a value the emitter
@@ -65,9 +71,28 @@ pub mod scoped_map;
 pub mod specialize_ptr_params;
 pub mod struct_build;
 
-/// Build the pass pipeline for `config.profile`; ordering rationale
-/// lives in the module-level interaction matrix.
+/// The ring the driver sweeps to a fixed point for `config.profile`;
+/// ordering rationale lives in the module-level interaction matrix.
+/// Coalescing joins it only in the second stage ([`build_late_passes`]).
 pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
+    ring(config, false)
+}
+
+/// The second fixed point: the ring again, coalescing included, for the
+/// profiles that coalesce.  A reused slot is a store between a load and
+/// its uses that forwarding can no longer cross, so coalescing packs the
+/// locals whose lifetimes forwarding has finished shaping, never ones it
+/// is still about to shorten; the passes around it then settle what the
+/// packing changed (a merged local's weight, its stores).  Empty for
+/// `Baseline`, which never coalesces.
+pub fn build_late_passes(config: &Config) -> Vec<Box<dyn Pass>> {
+    match config.profile {
+        Profile::Baseline => Vec::new(),
+        Profile::Aggressive | Profile::Max => ring(config, true),
+    }
+}
+
+fn ring(config: &Config, with_coalescing: bool) -> Vec<Box<dyn Pass>> {
     let rename = Box::new(rename::RenamePass::new(
         config.preserve_symbols.clone(),
         config.mangle(),
@@ -77,8 +102,7 @@ pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
         Profile::Baseline => {
             // Keeps the IR recognisable for debugging: no inlining or load dedup.
             vec![
-                Box::new(compact::CompactPass) as Box<dyn Pass>,
-                Box::new(const_fold::ConstFoldPass),
+                Box::new(const_fold::ConstFoldPass) as Box<dyn Pass>,
                 Box::new(dead_branch::DeadBranchPass),
                 Box::new(dead_param::DeadParamPass),
                 Box::new(emit_merge::EmitMergePass),
@@ -102,25 +126,22 @@ pub fn build_ir_passes(config: &Config) -> Vec<Box<dyn Pass>> {
             ));
 
             let mut passes: Vec<Box<dyn Pass>> = vec![
-                Box::new(compact::CompactPass) as Box<dyn Pass>,
-                Box::new(dead_local::DeadLocalPass),
-                Box::new(const_fold::ConstFoldPass),
+                Box::new(const_fold::ConstFoldPass) as Box<dyn Pass>,
                 Box::new(dead_branch::DeadBranchPass),
                 inline_pass,
-            ];
-
-            passes.extend([
-                Box::new(load_dedup::LoadDedupPass) as Box<dyn Pass>,
+                Box::new(load_dedup::LoadDedupPass),
                 Box::new(const_fold::ConstFoldPass),
                 Box::new(dead_branch::DeadBranchPass),
                 Box::new(struct_build::StructBuildPass),
-                Box::new(coalescing::CoalescingPass),
-                Box::new(dead_param::DeadParamPass),
+            ];
+            if with_coalescing {
+                passes.push(Box::new(coalescing::CoalescingPass));
+            }
+            passes.extend([
+                Box::new(dead_param::DeadParamPass) as Box<dyn Pass>,
                 Box::new(emit_merge::EmitMergePass),
+                rename,
             ]);
-
-            passes.push(rename);
-
             passes
         }
     }
@@ -132,7 +153,6 @@ pub fn build_tail_passes(config: &Config) -> Vec<Box<dyn Pass>> {
     if config.profile == Profile::Max && config.mangle() {
         vec![
             Box::new(const_hoist::ConstHoistPass) as Box<dyn Pass>,
-            Box::new(compact::CompactPass),
             Box::new(rename::RenamePass::by_render(
                 config.preserve_symbols.clone(),
                 config.mangle(),
@@ -143,21 +163,28 @@ pub fn build_tail_passes(config: &Config) -> Vec<Box<dyn Pass>> {
     }
 }
 
+/// The canonical form every pass reads, restored by the driver before the
+/// first pass and after every accepted change: nothing the entry points
+/// cannot reach in any arena, and no local without an expression naming
+/// it.  Compaction and dead-local removal feed each other (a culled store
+/// orphans its local, a removed local orphans its initialiser), so both
+/// repeat until neither removes anything; every round shrinks an arena, so
+/// the loop ends.  `true` when anything was removed.
+pub(crate) fn normalize(module: &mut naga::Module, preserved: &dyn Fn(&str) -> bool) -> bool {
+    let mut removed = false;
+    while compact::compact_module(module, preserved) | dead_local::remove_dead_locals(module) {
+        removed = true;
+    }
+    removed
+}
+
 /// The bytes `module` ships as, for a pass that confirms a priced rewrite
-/// by rendering: what the tail does behind it - named expressions cleared
-/// first (rename clears them, and a splice its caller's; naga's compaction
-/// keeps a named value alive, so a stale source `let` would print a `var`
-/// for a local nothing reads), compacted, renamed - then generated.  `None`
-/// where naga or the emitter declines the module, which reads as "not a
-/// win".  The rewrite is judged against this same rendering of the module
-/// without it, so the two texts differ in the rewrite alone.
+/// by rendering: what the tail does behind it - compacted, renamed - then
+/// generated.  `None` where naga or the emitter declines the module, which
+/// reads as "not a win".  The rewrite is judged against this same rendering
+/// of the module without it, so the two texts differ in the rewrite alone.
 pub(crate) fn shipped_len(mut module: naga::Module, ctx: &PassContext<'_>) -> Option<usize> {
     let preserve: HashSet<String> = ctx.config.preserve_symbols.iter().cloned().collect();
-    crate::ir::visit::for_each_function_mut(
-        &mut module.functions,
-        &mut module.entry_points,
-        &mut |f| f.named_expressions.clear(),
-    );
     compact::compact_module(&mut module, &|name| preserve.contains(name));
     rename::plan_names(&module, &preserve, ctx.config.mangle()).apply(&mut module, None);
     let info = crate::io::validate_module(&module).ok()?;

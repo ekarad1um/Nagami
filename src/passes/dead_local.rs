@@ -1,44 +1,31 @@
-//! Dead-local elimination.  naga's compactor roots every `LocalVariable`
+//! Dead-local elimination, the second half of the driver's normalization
+//! (`super::normalize`).  naga's compactor roots every `LocalVariable`
 //! (user declarations), so a local whose reads and writes were all
-//! optimised away survives DCE forever, pinning its type (transitively
-//! struct declarations and `enable` directives) and vetoing inlining,
-//! which refuses bodies with locals.  Only removing the arena entry, not
-//! skipping the declaration at emit time, unblocks those decisions.
+//! optimised away would survive DCE forever, pinning its type (transitively
+//! struct declarations and `enable` directives) and vetoing inlining, which
+//! refuses bodies with locals.  Only removing the arena entry, not skipping
+//! the declaration at emit time, unblocks those decisions.
 //!
-//! Runs right after `CompactPass`, whose culling of statement-unreachable
+//! Runs after compaction, whose culling of statement-unreachable
 //! expressions makes "no `LocalVariable(h)` expression in the arena" mean
-//! "dead local" without statement walking.  This under-approximates
-//! soundly: compact also roots `named_expressions`, which can keep a
-//! statement-unreachable reference alive.  A local whose last reference
-//! dies later in the sweep is caught by the next sweep's compact ->
-//! dead-local prefix, and an orphaned initialiser is valid floating IR
-//! that the next compact culls; if the sweep cap lands first it sits
-//! outside every `Emit` range and is never rendered.
+//! "dead local" without statement walking; an initialiser the removal
+//! orphans is valid floating IR that the next compaction round culls.
 
-use crate::error::Error;
 use crate::handle_set::HandleSet;
 use crate::ir::visit::for_each_function_mut;
-use crate::pipeline::{Pass, PassContext};
 
-/// Remove locals no expression references and remap survivors' handles.
-#[derive(Debug, Default)]
-pub struct DeadLocalPass;
-
-impl Pass for DeadLocalPass {
-    fn name(&self) -> &'static str {
-        "dead_local_elimination"
-    }
-
-    fn run(&mut self, module: &mut naga::Module, _ctx: &PassContext<'_>) -> Result<bool, Error> {
-        let mut changed = false;
-        for_each_function_mut(&mut module.functions, &mut module.entry_points, &mut |f| {
-            changed |= remove_dead_locals(f);
-        });
-        Ok(changed)
-    }
+/// Remove the locals no expression references, in every body; `true` when
+/// any went.
+pub(crate) fn remove_dead_locals(module: &mut naga::Module) -> bool {
+    let mut changed = false;
+    for_each_function_mut(&mut module.functions, &mut module.entry_points, &mut |f| {
+        changed |= remove_dead_locals_in(f);
+    });
+    changed
 }
 
-fn remove_dead_locals(func: &mut naga::Function) -> bool {
+/// Remove locals no expression references and remap survivors' handles.
+fn remove_dead_locals_in(func: &mut naga::Function) -> bool {
     if func.local_variables.is_empty() {
         return false;
     }
@@ -80,16 +67,12 @@ fn remove_dead_locals(func: &mut naga::Function) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::io;
-    use crate::pipeline::PassContext;
 
-    fn run_pass(source: &str) -> (bool, naga::Module) {
+    fn run(source: &str) -> (bool, naga::Module) {
         let mut module = io::parse_wgsl(source).expect("test source parses");
-        let config = Config::default();
-        let changed = PassContext::run_pass(&mut DeadLocalPass, &mut module, &config)
-            .expect("pass must not error");
-        io::validate_module(&module).expect("pass output must validate");
+        let changed = remove_dead_locals(&mut module);
+        io::validate_module(&module).expect("output must validate");
         (changed, module)
     }
 
@@ -97,7 +80,7 @@ mod tests {
     fn removes_unreferenced_local_and_remaps_survivors() {
         // `dead` precedes `live`, so removal shifts `live`'s handle;
         // validation proves the remap.
-        let (changed, module) = run_pass(
+        let (changed, module) = run(
             "fn f() -> f32 { var dead: f32; var live: f32 = 2.0; live = live + 1.0; return live; }\
              @fragment fn main() -> @location(0) vec4f { return vec4f(f()); }",
         );
@@ -110,7 +93,7 @@ mod tests {
 
     #[test]
     fn keeps_every_referenced_local() {
-        let (changed, module) = run_pass(
+        let (changed, module) = run(
             "fn f() -> f32 { var a: f32 = 1.0; var b: f32 = 2.0; return a + b; }\
              @fragment fn main() -> @location(0) vec4f { return vec4f(f()); }",
         );
@@ -121,7 +104,7 @@ mod tests {
 
     #[test]
     fn cleans_entry_point_locals_too() {
-        let (changed, module) = run_pass(
+        let (changed, module) = run(
             "@fragment fn main() -> @location(0) vec4f { var dead: vec3f; return vec4f(1.0); }",
         );
         assert!(changed);

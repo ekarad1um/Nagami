@@ -47,7 +47,7 @@ pub struct Report {
     /// `true` when the pipeline reached a fixed point before hitting
     /// the sweep cap; `false` when the cap forced an early exit.
     pub converged: bool,
-    /// Number of full pass sweeps executed.
+    /// Number of full pass sweeps executed, across the fixed-point stages.
     pub sweeps: usize,
     /// naga's rendered error, prefixed with the stage that gave up, when
     /// the input shipped compacted instead of the pipeline's output;

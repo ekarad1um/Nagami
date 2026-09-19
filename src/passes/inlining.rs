@@ -706,7 +706,6 @@ fn splice_calls_in_function(
         }
         .apply(caller);
         rebuild_function_expressions(caller);
-        caller.named_expressions.clear();
     }
     spliced
 }
@@ -1163,7 +1162,6 @@ struct Clonable {
 /// it binds plus the returned value - with each parameter read counted per
 /// rendering (a bound root renders once, then as its name).
 struct CalleePrice {
-    name: usize,
     definition: usize,
     body: usize,
     parameter_reads: Vec<usize>,
@@ -1217,7 +1215,6 @@ fn price_callee(
         parameter_reads(root, &function.expressions, &bound, &mut reads);
     }
     Some(CalleePrice {
-        name: pricer.name_len(),
         definition,
         body,
         parameter_reads: reads,
@@ -1293,7 +1290,6 @@ fn paying_clones(
             None => pricer.entry_point(caller - function_handles.len()),
         };
         let let_len = fp.let_name_len();
-        let let_cost = let_len + fp.let_boilerplate();
         let arena = &callers[caller].expressions;
         for &(i, s) in sites {
             let Some(callee) = &callees[i] else {
@@ -1301,13 +1297,22 @@ fn paying_clones(
             };
             let site = &call_sites[clonable[i].function][s];
             let result_reads = site.result.map_or(0, |r| fp.uses(r));
-            // `N(a,b)`, plus the `let` binding its result when the result
-            // is read once but not stashed (an inlined value moves to its
-            // use instead); a result read more than once is bound either
-            // way, one read by nothing dies with the call.
-            let mut call = (callee.name + 2 + site.arguments.len().saturating_sub(1)) as isize;
+            // `N(a,b)` as the emitter renders it, plus the `let` binding its
+            // result when the result is read once but not stashed (an
+            // inlined value moves to its use instead); a result read more
+            // than once is bound either way, one read by nothing dies with
+            // the call.
+            let Some(mut call) = fp
+                .call_len(clonable[i].function, &site.arguments)
+                .map(|len| len as isize)
+            else {
+                clone_cost[i] = None;
+                continue;
+            };
             if result_reads == 1 && site.result.is_some_and(|r| !fp.stashed(r)) {
-                call += let_cost as isize;
+                // The `let N=...;` around the call text and the `N` its one
+                // use spells, which the clone's value stands in for.
+                call += fp.let_cost(1, let_len, 0) as isize;
             }
             let mut clone = if result_reads == 0 {
                 0
@@ -1316,18 +1321,19 @@ fn paying_clones(
             };
             let mut priced = true;
             for (k, &argument) in site.arguments.iter().enumerate() {
+                let Some(rendered) = fp.expr_len(argument) else {
+                    priced = false;
+                    break;
+                };
                 // Bound in the caller already: both sides spell its name
                 // (and its own text, shared, could be long to render).
                 let bound = expression_needs_emit(&arena[argument]) && fp.binds(argument);
                 let len = if bound {
+                    call += let_len as isize - rendered as isize;
                     let_len
-                } else if let Some(len) = fp.expr_len(argument) {
-                    len
                 } else {
-                    priced = false;
-                    break;
+                    rendered
                 };
-                call += len as isize;
                 if result_reads == 0 {
                     continue;
                 }
@@ -1335,7 +1341,7 @@ fn paying_clones(
                 clone += match reads {
                     0 => 0,
                     1 => len,
-                    n => (n * len).min(len + let_cost + n * let_len),
+                    n => (n * len).min(fp.let_cost(n, let_len, len)),
                 } as isize;
                 clone -= (reads * callee.parameter_names[k]) as isize;
             }

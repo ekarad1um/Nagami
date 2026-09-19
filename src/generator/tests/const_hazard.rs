@@ -709,11 +709,53 @@ fn all_literal_math_call_pins_one_argument() {
     );
 }
 
-/// A hazard `let` on a zero literal that another consumer shares as a lane:
-/// the zero-value, splat and sub-splat folds must spell the lane's name, not
-/// its value - `normalize(vec3f())` is the const-expression the binding
-/// exists to avoid, and the self-check would ship the input lexically
-/// compacted.
+/// A constant argument the evaluator cannot compute - `dot` or `length` of
+/// constant vectors, builtins `const_lanes` does not model - is not known
+/// to be safe, so under a builtin that can fail it binds like an opaque
+/// one: `inverseSqrt(dot(vec2f(1), vec2f(0)))` is `inf` at
+/// const-evaluation, which once sent the run to the compacted input.
+#[test]
+fn an_uncomputed_constant_argument_binds_under_a_failable_builtin() {
+    for expr in [
+        "inverseSqrt(dot(vec2f(1.0), vec2f(z)))",
+        "inverseSqrt(length(vec2f(z, z)))",
+        "log(dot(vec2f(1.0), vec2f(z)))",
+    ] {
+        let src = body(&format!("let z = 0.0; out[1] = bitcast<u32>({expr});"));
+        let out = crate::run(&src, &Config::default()).expect("run failed");
+        assert!(
+            out.report.bailout.is_none() && out.report.fallback.is_none(),
+            "{expr} must minify: {}",
+            out.source
+        );
+        assert!(
+            out.source.contains("let ") && !out.source.contains("(dot(vec2f(1),vec2f(0)))"),
+            "{expr}: the uncomputed argument is bound: {}",
+            out.source
+        );
+        // naga's front end folds the bound `dot` / `length` to its literal
+        // on re-parse (nagami's evaluator does not model them), so the text
+        // settles on the second pass.
+        let second = crate::run(&out.source, &Config::default())
+            .expect("run failed")
+            .source;
+        let third = crate::run(&second, &Config::default())
+            .expect("run failed")
+            .source;
+        assert!(
+            second.len() <= out.source.len(),
+            "{expr}: no growth: {second}"
+        );
+        assert_eq!(third, second, "a fixed point by the second pass: {expr}");
+    }
+}
+
+/// A hazard `let` on a zero literal that other consumers share as a lane.
+/// A vector built from it alone is a zero vector, which the fold spells as
+/// `ZeroValue`; under `normalize` that binds on its own (`let b=vec2f();`),
+/// never printing the `normalize(vec2f())` const-expression the binding
+/// exists to avoid, while a vector with a runtime lane keeps the literal's
+/// name in its lanes.
 #[test]
 fn a_hazard_bound_zero_lane_keeps_its_name_through_the_value_folds() {
     let out = minify(&body(
@@ -724,13 +766,14 @@ fn a_hazard_bound_zero_lane_keeps_its_name_through_the_value_folds() {
     ));
     let n = bound_name(&out, "0f");
     assert!(
-        out.contains(&format!("normalize(vec3f({n}))"))
-            && out.contains(&format!("normalize(vec2f({n}))"))
+        !out.contains("normalize(vec3f())")
+            && !out.contains("normalize(vec2f())")
             && out.contains(&format!("vec4({n},{n},1,")),
-        "every lane sharing the bound literal spells its name: {out}"
+        "no `normalize` receives a zero const-expression; the mixed vector spells the name: {out}"
     );
-    // The splat elision and `select` read the same table: a bound lane is
-    // not the equal of an unbound one.
+    // `select` reads the same table: a bound lane is not the equal of an
+    // unbound one; the zero vector beside it is a `ZeroValue` inside a `dot`
+    // the evaluator cannot compute, which binds under `inverseSqrt`.
     let out = minify(&body(
         "let z = 0.0; out[0] = bitcast<u32>(log(z)); \
          let f = f32(inp[0]); \
@@ -739,9 +782,7 @@ fn a_hazard_bound_zero_lane_keeps_its_name_through_the_value_folds() {
     ));
     let n = bound_name(&out, "0f");
     assert!(
-        out.contains(&format!("select({n},"))
-            && !out.contains("vec2f(0)")
-            && !out.contains("vec2f()"),
-        "the bound zero lane stays a name: {out}"
+        out.contains(&format!("select({n},")) && !out.contains("inverseSqrt(dot("),
+        "the bound zero stays a name under `select`; the constant `dot` binds: {out}"
     );
 }

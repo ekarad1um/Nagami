@@ -12,12 +12,14 @@ pub mod config;
 pub mod error;
 pub mod generator;
 pub(crate) mod handle_set;
+pub(crate) mod interface;
 mod io;
 pub(crate) mod ir;
 pub mod json;
 pub mod name_gen;
 pub mod name_map;
 pub mod passes;
+pub(crate) mod pins;
 pub mod pipeline;
 mod text;
 #[cfg(feature = "wasm")]
@@ -436,9 +438,13 @@ pub struct Output {
 
 /// Apply the IR passes to a parsed module in place; text is emitted only
 /// for the report's before/after sizes.  Fails with [`Error::Validation`]
-/// on invalid input or an unrecoverable pass failure, [`Error::Emit`] when
-/// naga's backend cannot render the final IR.
+/// on invalid input (the module then carries the pins planted ahead of
+/// the validation, `pins::plant`, and nothing else), an unrecoverable pass
+/// failure or a host interface the passes changed
+/// (`interface::Interface`), [`Error::Emit`] when naga's backend cannot
+/// render the final IR.
 pub fn run_module(module: &mut naga::Module, config: &Config) -> Result<Report, Error> {
+    pins::plant(module);
     let info = io::validate_module(module)?;
     let mut effective_config = Cow::Borrowed(config);
     if config.preserve_interface {
@@ -446,10 +452,14 @@ pub fn run_module(module: &mut naga::Module, config: &Config) -> Result<Report, 
         effective_config.to_mut().preserve_symbols.extend(symbols);
     }
     let config = effective_config.as_ref();
+    let interface = interface::Interface::of(module, interface::Options::from_config(config));
     let before_wgsl = emit_module_for_report(module, &info, config)?;
     let mut report = Report::new(before_wgsl.len());
 
     let info = pipeline::run_ir_passes(module, info, config, &mut report, HashSet::new())?.info;
+    interface
+        .check(module)
+        .map_err(|e| Error::Validation(format!("the passes {e}")))?;
 
     let after_wgsl = emit_module_for_report(module, &info, config)?;
     report.output_bytes = after_wgsl.len();
@@ -492,35 +502,23 @@ fn collect_module_names(module: &naga::Module) -> (HashSet<String>, Vec<String>)
 /// The names [`Config::preserve_interface`] keeps, split into declarations
 /// and struct members as [`collect_module_names`] splits a preamble's.
 pub(crate) fn interface_names(module: &naga::Module) -> (Vec<String>, Vec<String>) {
-    let mut symbols: Vec<String> = Vec::new();
-    let mut members = Vec::new();
-    let mut pending: Vec<naga::Handle<naga::Type>> = Vec::new();
-    for (_, gv) in module.global_variables.iter() {
-        if gv.binding.is_some() {
-            symbols.extend(gv.name.clone());
-            pending.push(gv.ty);
-        }
-    }
+    let mut symbols: Vec<String> = module
+        .global_variables
+        .iter()
+        .filter(|(_, gv)| gv.binding.is_some())
+        .filter_map(|(_, gv)| gv.name.clone())
+        .collect();
     symbols.extend(module.overrides.iter().filter_map(|(_, o)| o.name.clone()));
-    let mut seen = vec![false; module.types.len()];
-    while let Some(ty) = pending.pop() {
-        if std::mem::replace(&mut seen[ty.index()], true) {
-            continue;
-        }
-        match &module.types[ty].inner {
-            naga::TypeInner::Struct {
+    let mut members = Vec::new();
+    let named = interface::host_named_structs(module);
+    for (handle, ty) in module.types.iter() {
+        if named.contains(handle)
+            && let naga::TypeInner::Struct {
                 members: fields, ..
-            } => {
-                symbols.extend(module.types[ty].name.clone());
-                for field in fields {
-                    members.extend(field.name.clone());
-                    pending.push(field.ty);
-                }
-            }
-            naga::TypeInner::Array { base, .. }
-            | naga::TypeInner::BindingArray { base, .. }
-            | naga::TypeInner::Pointer { base, .. } => pending.push(*base),
-            _ => {}
+            } = &ty.inner
+        {
+            symbols.extend(ty.name.clone());
+            members.extend(fields.iter().filter_map(|field| field.name.clone()));
         }
     }
     (symbols, members)
@@ -547,11 +545,12 @@ struct EmitOutcome {
     naga_fallback: Option<String>,
 }
 
-/// Last rung: generator output and naga fallback both fail text
-/// re-validation, i.e. the optimized IR has no valid WGSL spelling (a
-/// pass-manufactured `5f/0f`, whose value inf is const-eval-rejected).
-/// Ships the input compacted, like the parse/validation bailouts, so a
-/// batch run gets correct output instead of a hard error.
+/// Last rung: generator output and naga fallback both fail the text
+/// self-check, i.e. the optimized IR has no valid WGSL spelling (a
+/// pass-manufactured `5f/0f`, whose value inf is const-eval-rejected) or
+/// the passes changed the host interface.  Ships the input compacted, like
+/// the parse/validation bailouts, so a batch run gets correct output
+/// instead of a hard error.
 fn untextable_ir_bailout(source: &str, reason: String) -> EmitOutcome {
     let compacted = compact_wgsl_text(source);
     EmitOutcome {
@@ -566,19 +565,20 @@ fn untextable_ir_bailout(source: &str, reason: String) -> EmitOutcome {
 
 /// Ship `naga_output` instead of the generator's text.  naga's wgsl-out can
 /// emit tokens its own front-end rejects (an `f32(<f64 literal>)` cast, an
-/// f16 literal whose `enable f16;` it drops), so re-validate first; a
-/// doubly-invalid IR has no WGSL spelling for any consumer and is not
-/// necessarily a pass bug, hence the loud degrade to the compacted input.
-/// `context` names the rung that got here, for that warning.
+/// f16 literal whose `enable f16;` it drops), so it passes `self_check`
+/// first; a doubly-failing IR has no WGSL spelling for any consumer and is
+/// not necessarily a pass bug, hence the loud degrade to the compacted
+/// input.  `context` names the rung that got here, for that warning.
 fn ship_naga_fallback(
     naga_output: String,
     source: &str,
     duration_us: u64,
     context: &str,
+    self_check: &dyn Fn(&str) -> Result<(), Error>,
 ) -> EmitOutcome {
-    if let Err(ve) = io::validate_wgsl_text(&naga_output) {
+    if let Err(ve) = self_check(&naga_output) {
         eprintln!(
-            "warning: {context}; minified IR cannot round-trip WGSL text ({ve}); \
+            "warning: {context}; the minified IR has no shippable text ({ve}); \
              shipping the input lexically compacted"
         );
         return untextable_ir_bailout(source, ve.to_string());
@@ -595,9 +595,10 @@ fn ship_naga_fallback(
 }
 
 /// The fallback ladder: naga's output (`naga_baseline`, rendered when a
-/// rung needs it) when the generator errs or emits invalid WGSL, the
-/// compacted input when that fails re-validation too.  `fallback_blocked`
-/// names why naga's text cannot stand in; then the error propagates.
+/// rung needs it) when the generator errs or emits text that fails
+/// `self_check` (re-parse, validation, the host interface), the compacted
+/// input when that fails it too.  `fallback_blocked` names why naga's text
+/// cannot stand in; then the error propagates.
 #[allow(clippy::too_many_arguments)]
 fn resolve_generator_output(
     gen_result: Result<generator::Emission, Error>,
@@ -607,6 +608,7 @@ fn resolve_generator_output(
     source: &str,
     trace_enabled: bool,
     fallback_blocked: &dyn Fn() -> Option<String>,
+    self_check: &dyn Fn(&str) -> Result<(), Error>,
 ) -> Result<EmitOutcome, Error> {
     let has_preamble = effective_preamble.is_some();
     match gen_result {
@@ -655,9 +657,9 @@ fn resolve_generator_output(
                 let naga_only = naga_only_enable_prefix(&emitted.source);
                 let combined =
                     join_with_newline(&[naga_only.as_str(), pre_directives, pre_body, emit_body]);
-                io::validate_wgsl_text(&combined)
+                self_check(&combined)
             } else {
-                io::validate_wgsl_text(&emitted.source)
+                self_check(&emitted.source)
             };
             if validation_result.is_ok() {
                 let final_source = if has_preamble {
@@ -703,8 +705,8 @@ fn resolve_generator_output(
                     Ok(()) => "(no underlying error)".to_string(),
                 };
                 Err(Error::Emit(format!(
-                    "generator output failed validation; cannot fall back safely: {why}: \
-                     {underlying}",
+                    "generator output failed the text self-check; cannot fall back safely: \
+                     {why}: {underlying}",
                 )))
             } else {
                 let underlying = match &validation_result {
@@ -722,19 +724,20 @@ fn resolve_generator_output(
                             naga_output,
                             source,
                             emitted.duration_us,
-                            "generator output failed text validation",
+                            "generator output failed the text self-check",
+                            self_check,
                         ))
                     }
                     // No baseline (naga's writer-abort set) means no
                     // fallback emitter.
                     Ok(None) => Err(Error::Emit(format!(
-                        "generator output failed validation and no naga fallback \
-                         is available (naga's writer would abort on this module): \
-                         {underlying}"
+                        "generator output failed the text self-check and no naga \
+                         fallback is available (naga's writer would abort on this \
+                         module): {underlying}"
                     ))),
                     Err(writer) => Err(Error::Emit(format!(
-                        "generator output failed validation and naga's writer failed \
-                         too ({writer}): {underlying}"
+                        "generator output failed the text self-check and naga's writer \
+                         failed too ({writer}): {underlying}"
                     ))),
                 }
             }
@@ -749,6 +752,7 @@ fn resolve_generator_output(
                     source,
                     /*duration_us=*/ 0,
                     &format!("generator emit failed ({e})"),
+                    self_check,
                 ))
             }
             // No fallback (writer-abort set): the generator's error is the
@@ -881,6 +885,9 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
             .collect::<HashSet<_>>(),
     );
 
+    // Every static access the input has, carried through the passes.
+    pins::plant(&mut module);
+
     // naga parses some shaders it then rejects at validation (a
     // const-expression division by zero tint/Dawn accept leniently); such
     // input ships compacted rather than breaking a batch run, and validating
@@ -897,6 +904,10 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
             );
         }
     };
+    // The postcondition every shipped text meets: the module it re-parses
+    // to has the input's host interface.
+    let interface =
+        interface::Interface::of(&module, interface::Options::from_config(&effective_config));
     if specialized {
         report.pass_reports.push(PassReport {
             pass_name: "specialize_ptr_params".to_string(),
@@ -972,6 +983,7 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         .as_ref()
         .ok()
         .map(|emission| (emission.structs.clone(), emission.live_const_names.clone()));
+    let self_check = |text: &str| interface.check_text(text);
 
     let EmitOutcome {
         source: final_source,
@@ -988,12 +1000,14 @@ pub fn run(source: &str, config: &Config) -> Result<Output, Error> {
         source,
         config.trace.enabled,
         &fallback_blocked,
+        &self_check,
     )?;
 
     // Same signal as the parse/validation bailouts.
     if let Some(reason) = untextable_reason {
         report.bailout = Some(format!(
-            "the optimized IR has no valid WGSL text form, the input shipped compacted: {reason}"
+            "the optimized IR has no shippable WGSL text form, the input shipped compacted: \
+             {reason}"
         ));
     }
 

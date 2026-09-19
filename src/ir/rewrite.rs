@@ -199,13 +199,15 @@ impl Rewrite<'_> {
 // MARK: Arena rebuild
 
 /// Rebuild `function.expressions` in emission order: only expressions
-/// reachable from the body survive, each appended after its operands and
-/// after everything emitted before it, with the body, the locals' inits,
-/// and the named expressions remapped (names of dropped expressions go
-/// too).  Callers rely on the ORDER as much as on the garbage collection: a
-/// pass that appends a synthesized expression puts it at the END of the
-/// arena, behind consumers that already exist, and a later pass forwarding
-/// it into one of them would create a forward reference naga rejects.
+/// reachable from the body survive - and the named pins (`crate::pins`)
+/// no statement reaches, which naga's compactor roots too - each appended
+/// after its operands and after everything emitted before it, with the
+/// body, the locals' inits, and the named expressions remapped (names of
+/// dropped expressions go too).  Callers rely on the ORDER as much as on
+/// the garbage collection: a pass that appends a synthesized expression
+/// puts it at the END of the arena, behind consumers that already exist,
+/// and a later pass forwarding it into one of them would create a forward
+/// reference naga rejects.
 pub fn rebuild_function_expressions(function: &mut naga::Function) {
     let old_expressions = std::mem::take(&mut function.expressions);
     let mut new_expressions = naga::Arena::new();
@@ -256,7 +258,16 @@ pub fn rebuild_function_expressions(function: &mut naga::Function) {
     let named = std::mem::take(&mut function.named_expressions);
     function.named_expressions = named
         .into_iter()
-        .filter_map(|(h, name)| handle_map.get(h).map(|&m| (m, name)))
+        .filter_map(|(h, name)| {
+            // A pin has no consumer, so its place is free: after the
+            // body's expressions, in no `Emit` range.  Only a pin's shape
+            // is rooted: a name on anything else (a spliced call's result,
+            // in a module whose input names still stand) goes with it.
+            if handle_map.get(h).is_none() && crate::pins::shape(&old_expressions, h).is_some() {
+                clone_expression_handle(h, &old_expressions, &mut new_expressions, &mut handle_map);
+            }
+            handle_map.get(h).map(|&m| (m, name))
+        })
         .collect();
 
     function.expressions = new_expressions;

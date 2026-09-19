@@ -28,7 +28,7 @@ use super::syntax::{
 /// A NON-pinning position breaks the `U32` case: a bare switch selector
 /// re-parses as i32 while its case labels carry `u`, so every new top-level
 /// literal position must force the typed form or hint the scalar through
-/// [`Generator::emit_expr_with_scalar_hint`].  A literal PAIR pins nothing
+/// `Generator::emit_expr_with_scalar_hint_into`.  A literal PAIR pins nothing
 /// either - bare `-1*0` is AbstractInt, not the `f32` the operands were - so
 /// an operand that only becomes a literal mid-pipeline must keep whatever
 /// left it runtime; see [`i32_binary_widens`] for the arithmetic half.
@@ -652,6 +652,24 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// [`Self::try_splat_scalar`] with the zero vector included: an uncached
+    /// `ZeroValue` of a vector type is the splat of its scalar's zero and
+    /// elides to the bare `0` (`e+0`), which re-parses as the splat of the
+    /// same zero.
+    fn splat_elision(
+        &self,
+        handle: naga::Handle<naga::Expression>,
+        ctx: &FunctionCtx<'a, '_>,
+    ) -> Option<Elided> {
+        if let Some(scalar) = self.try_splat_scalar(handle, ctx) {
+            return Some(Elided::Scalar(scalar));
+        }
+        let zero_vector = !ctx.expr_names.contains_key(handle)
+            && matches!(ctx.exprs[handle], naga::Expression::ZeroValue(ty)
+                if matches!(self.module.types[ty].inner, naga::TypeInner::Vector { .. }));
+        zero_vector.then_some(Elided::Zero)
+    }
+
     /// Base of a postfix `.member` / `[index]` / `.xyzw`: postfix binds
     /// tighter than any prefix or infix operator, so a Binary/Unary/Select
     /// base is parenthesised (`(a-b).x`, since `a-b.x` parses as `a-(b.x)`).
@@ -846,11 +864,16 @@ impl<'a> Generator<'a> {
                     ctx.note_type(*ty, unaliased);
                     sf.push('(');
                     let sep = self.comma_sep();
-                    for (i, c) in flat.iter().enumerate() {
+                    for (i, lane) in flat.iter().enumerate() {
                         if i > 0 {
                             sf.push_str(sep);
                         }
-                        self.emit_constructor_arg_into(*c, ctx, &mut sf)?;
+                        match *lane {
+                            FlatLane::Scalar(c) => {
+                                self.emit_constructor_arg_into(c, ctx, &mut sf)?
+                            }
+                            FlatLane::Zero => sf.push('0'),
+                        }
                     }
                     sf.push(')');
                     if sf.len() < out.len() - start {
@@ -1216,12 +1239,12 @@ impl<'a> Generator<'a> {
                 // a vector, or the result type changes.
                 let is_arith = is_arithmetic_op(*op);
                 let left_scalar = if is_arith {
-                    self.try_splat_scalar(*left, ctx)
+                    self.splat_elision(*left, ctx)
                 } else {
                     None
                 };
                 let right_scalar = if is_arith {
-                    self.try_splat_scalar(*right, ctx)
+                    self.splat_elision(*right, ctx)
                 } else {
                     None
                 };
@@ -1241,17 +1264,17 @@ impl<'a> Generator<'a> {
                     (false, false) => (false, false),
                 };
 
-                let (eff_l, eff_lc) = if elide_l {
-                    let h = left_scalar.unwrap();
-                    (h, ctx.expr_names.contains_key(h))
-                } else {
-                    (*left, lc)
+                // The operand the text renders: the splat's scalar, or the
+                // vector itself, which a zero prints as the bare `0`.
+                let (eff_l, eff_lc, zero_l) = match (elide_l, left_scalar) {
+                    (true, Some(Elided::Scalar(h))) => (h, ctx.expr_names.contains_key(h), false),
+                    (true, Some(Elided::Zero)) => (*left, false, true),
+                    _ => (*left, lc, false),
                 };
-                let (eff_r, eff_rc) = if elide_r {
-                    let h = right_scalar.unwrap();
-                    (h, ctx.expr_names.contains_key(h))
-                } else {
-                    (*right, rc)
+                let (eff_r, eff_rc, zero_r) = match (elide_r, right_scalar) {
+                    (true, Some(Elided::Scalar(h))) => (h, ctx.expr_names.contains_key(h), false),
+                    (true, Some(Elided::Zero)) => (*right, false, true),
+                    _ => (*right, rc, false),
                 };
 
                 let wrap_l = child_needs_parens(eff_l, arena, *op, false, eff_lc);
@@ -1294,8 +1317,15 @@ impl<'a> Generator<'a> {
                     && literal_bare_form_changes_type(lit)
                 {
                     Operand::Typed(lit)
+                } else if zero_l {
+                    Operand::Zero
                 } else {
                     Operand::Value(eff_l)
+                };
+                let right = if zero_r {
+                    Operand::Zero
+                } else {
+                    Operand::Value(eff_r)
                 };
                 // `a--b` would lex as a decrement in no-space mode.
                 let guard_minus = elide_r
@@ -1306,7 +1336,7 @@ impl<'a> Generator<'a> {
                     out,
                     ctx,
                     left,
-                    Operand::Value(eff_r),
+                    right,
                     op_str,
                     sp,
                     wrap_l,
@@ -1779,6 +1809,10 @@ impl<'a> Generator<'a> {
                 Ok(())
             }
             Operand::Hinted(h, hint) => self.emit_expr_with_scalar_hint_into(h, hint, ctx, out),
+            Operand::Zero => {
+                out.push('0');
+                Ok(())
+            }
         }
     }
 
@@ -1817,7 +1851,7 @@ impl<'a> Generator<'a> {
     /// constants, constructors, `16 + 16` for a shift amount the folder
     /// declined) an explicit type; an abstract operand binds bare since the
     /// default is its type, as does a bare `override` name, typed by its
-    /// declaration.
+    /// declaration, and a zero value, whose text names its type itself.
     pub(super) fn const_hazard_binding_value(
         &self,
         operand: naga::Handle<naga::Expression>,
@@ -1842,12 +1876,15 @@ impl<'a> Generator<'a> {
                 ..
             })
         );
-        let annotation =
-            if abstract_typed || matches!(ctx.exprs[operand], naga::Expression::Override(_)) {
-                None
-            } else {
-                Some(self.type_name_for_inner(inner, ctx)?)
-            };
+        let annotation = if abstract_typed
+            || matches!(
+                ctx.exprs[operand],
+                naga::Expression::Override(_) | naga::Expression::ZeroValue(_)
+            ) {
+            None
+        } else {
+            Some(self.type_name_for_inner(inner, ctx)?)
+        };
         Ok((annotation, self.emit_expr(operand, ctx)?))
     }
 
@@ -3010,6 +3047,17 @@ enum Operand {
     Typed(naga::Literal),
     /// The value with every bare literal in it spelled to the hint.
     Hinted(naga::Handle<naga::Expression>, Option<naga::Scalar>),
+    /// The bare `0` a zero vector elides to under a mixed operator.
+    Zero,
+}
+
+/// What a splat operand of an arithmetic binary elides to.
+#[derive(Clone, Copy)]
+enum Elided {
+    /// The scalar every lane is.
+    Scalar(naga::Handle<naga::Expression>),
+    /// A zero vector's bare `0`: the splat of its scalar's zero.
+    Zero,
 }
 
 // MARK: Abstract literal concretisation
@@ -3169,21 +3217,31 @@ fn lanes_render_equal(
     }
 }
 
-/// Column-major scalar handles of a matrix `Compose` whose every column is a
-/// vector `Compose` of exactly `rows` components, for the flat form
-/// `mat2x2f(a,b,c,d)`; `None` keeps the column form.  A `vecR` built from
-/// `R` components is necessarily `R` scalars (a vector sub-component would
-/// lower the count), so the structural test needs no per-component type
-/// lookup and works for both function and global arenas.  Splat, variable,
-/// let-bound and swizzle columns are excluded, keeping the rewrite a regroup
-/// of the scalar leaves the column form already emits; both forms lower to
-/// byte-identical IR (f16 and negative leaves included).
+/// A lane of a matrix constructor's flat form: a scalar leaf of a column
+/// `Compose`, or the bare `0` a zero-value column contributes per row.
+#[derive(Clone, Copy)]
+pub(super) enum FlatLane {
+    Scalar(naga::Handle<naga::Expression>),
+    Zero,
+}
+
+/// Column-major lanes of a matrix `Compose` whose every column is a vector
+/// `Compose` of exactly `rows` components or the zero value of that vector
+/// type, for the flat form `mat2x2f(a,b,c,d)`; `None` keeps the column
+/// form.  A `vecR` built from `R` components is necessarily `R` scalars (a
+/// vector sub-component would lower the count), so the structural test
+/// needs no per-component type lookup and works for both function and
+/// global arenas.  Splat, variable, let-bound and swizzle columns are
+/// excluded, keeping the rewrite a regroup of the scalar leaves the column
+/// form already emits; a zero column spells the `0` per row the source
+/// wrote and a re-parse builds again.  Both forms lower to byte-identical
+/// IR (f16 and negative leaves included).
 pub(super) fn matrix_flatten_scalars(
     ty: naga::Handle<naga::Type>,
     components: &[naga::Handle<naga::Expression>],
     types: &naga::UniqueArena<naga::Type>,
     arena: &naga::Arena<naga::Expression>,
-) -> Option<Vec<naga::Handle<naga::Expression>>> {
+) -> Option<Vec<FlatLane>> {
     let naga::TypeInner::Matrix { columns, rows, .. } = types[ty].inner else {
         return None;
     };
@@ -3193,20 +3251,30 @@ pub(super) fn matrix_flatten_scalars(
     let rows = rows as usize;
     let mut flat = Vec::with_capacity(columns as usize * rows);
     for &col in components {
-        let naga::Expression::Compose {
-            ty: col_ty,
-            components: sub,
-        } = &arena[col]
-        else {
-            return None;
-        };
-        let naga::TypeInner::Vector { size, .. } = types[*col_ty].inner else {
-            return None;
-        };
-        if size as usize != rows || sub.len() != rows {
-            return None;
+        match &arena[col] {
+            naga::Expression::Compose {
+                ty: col_ty,
+                components: sub,
+            } => {
+                let naga::TypeInner::Vector { size, .. } = types[*col_ty].inner else {
+                    return None;
+                };
+                if size as usize != rows || sub.len() != rows {
+                    return None;
+                }
+                flat.extend(sub.iter().map(|&h| FlatLane::Scalar(h)));
+            }
+            naga::Expression::ZeroValue(col_ty) => {
+                let naga::TypeInner::Vector { size, .. } = types[*col_ty].inner else {
+                    return None;
+                };
+                if size as usize != rows {
+                    return None;
+                }
+                flat.extend(std::iter::repeat_n(FlatLane::Zero, rows));
+            }
+            _ => return None,
         }
-        flat.extend_from_slice(sub);
     }
     Some(flat)
 }

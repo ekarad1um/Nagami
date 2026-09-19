@@ -141,18 +141,30 @@ fn fold_global_expressions(
             size,
             scalar,
         }) = value
-            && let Some(new_expr) = materialize_vector(
-                handle,
-                components,
-                size,
-                scalar,
-                &literal_cache,
-                vector_type_cache,
-            )
-            && module.global_expressions[handle] != new_expr
         {
-            module.global_expressions[handle] = new_expr;
-            changed += 1;
+            // One spelling for the zero vector here too, so a `const` the
+            // source (or a previous minification) declared as `vec2f(0.0)`
+            // anchors the sites const_hoist keys as `ZeroValue`.
+            let new_expr = if is_zero_vector(components, scalar)
+                && let Some(&ty) = vector_type_cache.get(&(size, scalar))
+            {
+                Some(naga::Expression::ZeroValue(ty))
+            } else {
+                materialize_vector(
+                    handle,
+                    components,
+                    size,
+                    scalar,
+                    &literal_cache,
+                    vector_type_cache,
+                )
+            };
+            if let Some(new_expr) = new_expr
+                && module.global_expressions[handle] != new_expr
+            {
+                module.global_expressions[handle] = new_expr;
+                changed += 1;
+            }
         }
     }
 
@@ -200,10 +212,9 @@ struct RefCensus {
 }
 
 /// `counts` is the data-flow reference count per handle: expression-as-child
-/// uses, statement operands and results, `named_expressions`, and local
-/// initializers.  `Emit` ranges are NOT counted: they fix execution order,
-/// not consumption, and an expression whose only "use" is its Emit entry is
-/// dead.  The identity gate
+/// uses, statement operands and results, and local initializers.  `Emit`
+/// ranges are NOT counted: they fix execution order, not consumption, and
+/// an expression whose only "use" is its Emit entry is dead.  The identity gate
 /// tests `== 1` for impure operands whose Emit entry can go after cloning,
 /// so `saturating_add` is indistinguishable from exact.
 ///
@@ -244,9 +255,6 @@ fn reference_census(function: &naga::Function) -> RefCensus {
     // naga restricts a local init to override-expressions (never impure), so
     // counting it only guards against a relaxation letting the gate drop an
     // impure init's Emit entry.
-    for &handle in function.named_expressions.keys() {
-        bump(&mut counts, handle);
-    }
     for (_, lvar) in function.local_variables.iter() {
         if let Some(init) = lvar.init {
             bump(&mut counts, init);
@@ -1137,16 +1145,30 @@ fn fold_local_expressions(
                 // cache's canonical handles would declare a change that
                 // moves nothing and leaves orphans for `compact` to cull, a
                 // sweep spent on nothing.
-                if crate::passes::expr_util::expression_needs_emit(&arena[handle])
-                    && let Some(new_expr) = materialize_vector(
-                        handle,
-                        components,
-                        size,
-                        scalar,
-                        &literal_cache,
-                        vector_type_cache,
-                    )
-                    && !compose_spells(arena, handle, &new_expr)
+                if !crate::passes::expr_util::expression_needs_emit(&arena[handle]) {
+                    continue;
+                }
+                // The zero vector has one spelling, naga's `ZeroValue`:
+                // built from nothing and declarative like a literal, so it
+                // leaves its `Emit` range and needs no lane literal in the
+                // arena (a zero-init local's read once folded only while its
+                // deleted initializer's lanes were still lying around); it
+                // is what `vec2f()` re-parses as, so a `Compose` or `Splat`
+                // of zeros the source spelled is normalised to it as well,
+                // and const_hoist keys the value by that one spelling.
+                if is_zero_vector(components, scalar)
+                    && let Some(&ty) = vector_type_cache.get(&(size, scalar))
+                {
+                    arena[handle] = naga::Expression::ZeroValue(ty);
+                    folded.insert(handle);
+                } else if let Some(new_expr) = materialize_vector(
+                    handle,
+                    components,
+                    size,
+                    scalar,
+                    &literal_cache,
+                    vector_type_cache,
+                ) && !compose_spells(arena, handle, &new_expr)
                 {
                     arena[handle] = new_expr;
                     simplify_count += 1;
@@ -1945,6 +1967,14 @@ fn eval_const_binary(
 }
 
 // MARK: Materialisation helpers
+
+/// Every lane the `+0` of `scalar`, bit for bit: `-0.0` is not zero here,
+/// and a scalar without a zero literal (none, in practice) has no zero
+/// vector.
+fn is_zero_vector(lanes: &[naga::Literal], scalar: naga::Scalar) -> bool {
+    naga::Literal::zero(scalar)
+        .is_some_and(|zero| lanes.iter().all(|lane| lit_key(*lane) == lit_key(zero)))
+}
 
 /// A `Compose` for a folded vector built from `Literal` handles already in
 /// the arena, or `None` unless every component's handle precedes `target`

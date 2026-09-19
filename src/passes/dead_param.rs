@@ -1,14 +1,18 @@
 //! Dead-parameter elimination: arguments never read inside the callee are
 //! stripped from the signature and from every call site.  Entry points are
-//! skipped because their signatures are part of the pipeline contract.
+//! skipped because their signatures are part of the pipeline contract, and
+//! a library module (no entry point) is left alone: its functions are its
+//! exports, whose arity callers outside the module pass.
 
+use super::expr_util::is_library_module;
 use crate::error::Error;
 use crate::handle_set::{HandleMap, HandleSet};
 use crate::ir::visit::for_each_function_mut;
 use crate::pipeline::{Pass, PassContext};
 
 /// Removes unused parameters from ordinary functions and their call sites;
-/// entry points and preserve-listed functions export a fixed signature.
+/// entry points, preserve-listed functions and every function of a library
+/// module export a fixed signature.
 #[derive(Debug, Default)]
 pub struct DeadParamPass;
 
@@ -18,6 +22,9 @@ impl Pass for DeadParamPass {
     }
 
     fn run(&mut self, module: &mut naga::Module, ctx: &PassContext<'_>) -> Result<bool, Error> {
+        if is_library_module(module) {
+            return Ok(false);
+        }
         // Unused: the `FunctionArgument` handle is unreachable from every
         // statement root.
         let mut removals: HandleMap<naga::Function, Vec<usize>> = Default::default();
@@ -225,6 +232,19 @@ mod tests {
         .expect("module should remain valid after pass");
 
         (changed, module)
+    }
+
+    /// A library's functions are called from outside the module with the
+    /// arity they declare; the name map covers renames, nothing covers an
+    /// arity change.
+    #[test]
+    fn a_library_module_keeps_every_signature() {
+        let (changed, module) = run_pass(
+            "fn helper(x: f32, unused: f32) -> f32 { return x * 2.0; }
+             fn other(a: f32, b: f32) -> f32 { return helper(a, b); }",
+        );
+        assert!(!changed, "a library module must not lose a parameter");
+        assert!(module.functions.iter().all(|(_, f)| f.arguments.len() == 2));
     }
 
     #[test]

@@ -89,12 +89,26 @@ fn elide_tail_void_returns(stmt: &naga::Statement) -> Option<naga::Statement> {
 /// recursion frames.  tint's hard limit is 512 frames: a parenthesized / call
 /// / index level costs ~4, a parenthesized unary level ~8, a flat binary chain
 /// element ~1, and statement braces draw from the same budget; naga's own
-/// frontend stops near 197 nesting levels.  [`Generator::render_depth`] weighs
-/// every node at 4 (8 for `Unary`), so this cap keeps one expression at <= 64
-/// call/paren or 32 unary levels, inside both limits with ~64 brace levels to
-/// spare.  Single-use `let` inlining is the only unbounded depth source; chain
+/// frontend stops near 197 nesting levels.  Both depth walks weigh a node by
+/// [`render_weight`], so this cap keeps one expression at <= 64 call/paren or
+/// 32 unary levels, inside both limits with ~64 brace levels to spare.
+/// Single-use `let` inlining is the only unbounded depth source; chain
 /// interiors bind at most one node past the cap.
 const MAX_RENDER_DEPTH: u16 = 256;
+
+/// One rendered nesting level in the units of [`MAX_RENDER_DEPTH`]: a call,
+/// an index, a parenthesis, or the identifier a bound value renders as.
+const LEVEL_WEIGHT: u16 = 4;
+
+/// What rendering `expr` adds over its deepest operand: a `Unary` costs
+/// tint double (a parenthesized `-(...)` level), anything else one level.
+/// The one table every depth walk weighs by.
+fn render_weight(expr: &naga::Expression) -> u16 {
+    match expr {
+        naga::Expression::Unary { .. } => 2 * LEVEL_WEIGHT,
+        _ => LEVEL_WEIGHT,
+    }
+}
 
 /// Whether a `let` over a value of `len` bytes, read `refs` times, saves
 /// bytes: inline the text renders at every use, `parens` of them wrapping
@@ -106,7 +120,7 @@ pub(super) fn binding_pays(
     name: usize,
     beautify: bool,
 ) -> bool {
-    refs * len + 2 * parens > len + name + super::syntax::let_boilerplate(beautify) + refs * name
+    refs * len + 2 * parens > super::syntax::let_cost(refs, name, len, beautify)
 }
 
 /// Number of times emitting the tree rooted at `root` materialises `target`, a
@@ -385,11 +399,7 @@ pub(super) fn for_header_exceeds_depth_cap(
         for child in children {
             max_child = max_child.max(depth(child, expressions, memo));
         }
-        let weight = match expressions[h] {
-            naga::Expression::Unary { .. } => 8,
-            _ => 4,
-        };
-        let d = max_child.saturating_add(weight);
+        let d = max_child.saturating_add(render_weight(&expressions[h]));
         memo.insert(h, d);
         d
     }
@@ -402,9 +412,10 @@ pub(super) fn for_header_exceeds_depth_cap(
     }
     // A preload result is a childless leaf, so the condition / update walks
     // miss its POINTER, which the header renders inline as
-    // `workgroupUniformLoad(&p)`; the `+4` is that wrapper.
+    // `workgroupUniformLoad(&p)`: that wrapper is the added level.
     for &(pointer, _) in shape.guard_preloads.iter().chain(&shape.update_preloads) {
-        exceeded |= depth(pointer, expressions, &mut memo).saturating_add(4) > MAX_RENDER_DEPTH;
+        exceeded |=
+            depth(pointer, expressions, &mut memo).saturating_add(LEVEL_WEIGHT) > MAX_RENDER_DEPTH;
     }
     exceeded
 }
@@ -1580,11 +1591,10 @@ impl<'a> Generator<'a> {
         crate::passes::expr_util::is_uniformity_constrained_expr(&ctx.exprs[h])
     }
 
-    /// Rendered nesting cost of `h` if inlined at its use site now, in the frame
+    /// Rendered nesting cost of `h` if inlined at its use site now, in the
     /// units of [`MAX_RENDER_DEPTH`]: a bound expression (per `expr_names`)
-    /// renders as an identifier and costs one leaf; anything else adds its
-    /// weight - 8 for `Unary` (a parenthesized `-(...)` level costs tint double),
-    /// 4 otherwise - over its deepest child.  Memoised per function so a
+    /// renders as an identifier and costs one level; anything else adds its
+    /// [`render_weight`] over its deepest child.  Memoised per function so a
     /// whole-arena sweep is linear; unmemoised the walk is 2^depth.
     fn render_depth(
         &self,
@@ -1598,7 +1608,7 @@ impl<'a> Generator<'a> {
             return stashed;
         }
         if ctx.expr_names.contains_key(h) {
-            return 4;
+            return LEVEL_WEIGHT;
         }
         let memoized = ctx.render_depth_memo[h.index()];
         if memoized != 0 {
@@ -1611,11 +1621,7 @@ impl<'a> Generator<'a> {
         for child in children {
             max_child = max_child.max(self.render_depth(child, ctx));
         }
-        let weight = match ctx.exprs[h] {
-            naga::Expression::Unary { .. } => 8,
-            _ => 4,
-        };
-        let depth = max_child.saturating_add(weight);
+        let depth = max_child.saturating_add(render_weight(&ctx.exprs[h]));
         ctx.render_depth_memo[h.index()] = depth;
         depth
     }
@@ -1640,6 +1646,13 @@ impl<'a> Generator<'a> {
     ) -> Result<Option<String>, Error> {
         // A twin its first spelling's `let` already names renders nothing.
         if ctx.expr_names.contains_key(h) {
+            return Ok(None);
+        }
+        // A value with no `Emit` has no statement to bind at: a literal, a
+        // constant, a zero value or an argument renders at every use (the
+        // module-level extraction and const_hoist share those), so a pricer
+        // asking about one hears what the emitter does.
+        if ctx.exprs[h].needs_pre_emit() {
             return Ok(None);
         }
         if ctx.must_bind.contains(h) || self.is_uniformity_pinned(h, ctx) {

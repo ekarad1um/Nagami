@@ -5806,6 +5806,40 @@ fn a_never_written_local_reads_as_its_zero_initialiser() {
     );
 }
 
+/// A never-written vector local reads as its zero even when no lane literal
+/// sits earlier in the arena to build a `Compose` from: the read becomes a
+/// `ZeroValue`, so the fold does not depend on what earlier passes left
+/// behind (the deleted initializer's lanes used to be what it borrowed).
+#[test]
+fn a_never_written_vector_local_reads_as_zero_without_a_lane_literal() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: vec2u;\n\
+        @compute @workgroup_size(1) fn f() {\n  var v: vec2u;\n  out = v;\n}";
+    let mut module = naga::front::wgsl::parse_str(src).expect("source should parse");
+    let function = &module.entry_points[0].function;
+    assert!(
+        !function
+            .expressions
+            .iter()
+            .any(|(_, e)| matches!(e, naga::Expression::Literal(_))),
+        "the fixture must hold no literal the fold could borrow"
+    );
+    assert!(run_pass(&mut module), "the read must fold");
+    let function = &module.entry_points[0].function;
+    assert!(
+        function
+            .expressions
+            .iter()
+            .any(|(_, e)| matches!(e, naga::Expression::ZeroValue(_)))
+            && !function
+                .expressions
+                .iter()
+                .any(|(_, e)| matches!(e, naga::Expression::Load { .. })),
+        "the read becomes a ZeroValue: {:?}",
+        function.expressions
+    );
+    crate::io::validate_module(&module).expect("valid after the fold");
+}
+
 /// Neither write is a whole-variable `Store`, which is why the census
 /// demands that every reference to the local BE one of its loads; relaxing
 /// that ships `out[0] = 0` for both.
@@ -5924,4 +5958,86 @@ fn a_safe_divisor_still_folds_through_the_guard() {
         "a divisor forced non-zero, and a shift amount, must still fold: {}",
         output.source
     );
+}
+
+/// The zero vector has one spelling.  A `Compose` of zero literals and a
+/// `Splat` of one both normalise to `ZeroValue`, which is what `vec2f()`
+/// re-parses as - so the first pass reaches the text's own fixed point -
+/// and const_hoist keys every zero of a type alike.
+#[test]
+fn spelled_zero_vectors_normalise_to_zero_values() {
+    for spelling in ["vec2f(0.0, 0.0)", "vec2f(0.0)"] {
+        let src = format!(
+            "@group(0) @binding(0) var<storage, read_write> out: vec2f;\n\
+             @compute @workgroup_size(1) fn f() {{\n  let z = {spelling};\n  out = z;\n}}"
+        );
+        let mut module = naga::front::wgsl::parse_str(&src).expect("source should parse");
+        assert!(run_pass(&mut module), "{spelling} must normalise");
+        let function = &module.entry_points[0].function;
+        assert!(
+            function
+                .expressions
+                .iter()
+                .any(|(_, e)| matches!(e, naga::Expression::ZeroValue(_)))
+                && !function.expressions.iter().any(|(_, e)| {
+                    matches!(
+                        e,
+                        naga::Expression::Compose { .. } | naga::Expression::Splat { .. }
+                    )
+                }),
+            "{spelling} becomes a ZeroValue: {:?}",
+            function.expressions
+        );
+        crate::io::validate_module(&module).expect("valid after the fold");
+        assert!(!run_pass(&mut module), "second run must be a no-op");
+    }
+}
+
+/// `-0.0` is not zero: a lane carrying the sign keeps the `Compose`, the
+/// only spelling that carries it.
+#[test]
+fn a_negative_zero_lane_keeps_its_compose() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: vec2f;\n\
+        @compute @workgroup_size(1) fn f() {\n  let z = vec2f(-0.0, 0.0);\n  out = z;\n}";
+    let mut module = naga::front::wgsl::parse_str(src).expect("source should parse");
+    run_pass(&mut module);
+    let function = &module.entry_points[0].function;
+    assert!(
+        function
+            .expressions
+            .iter()
+            .any(|(_, e)| matches!(e, naga::Expression::Compose { .. }))
+            && !function
+                .expressions
+                .iter()
+                .any(|(_, e)| matches!(e, naga::Expression::ZeroValue(_))),
+        "the signed zero stays spelled: {:?}",
+        function.expressions
+    );
+}
+
+/// A module constant declared as a zero splat becomes the `ZeroValue`
+/// const_hoist keys its sites by, so a `const` the source or a previous
+/// minification declared anchors them instead of a twin being minted.
+#[test]
+fn a_global_zero_constant_init_normalises_to_a_zero_value() {
+    let src = "const B = vec2f(0.0);\n\
+        @group(0) @binding(0) var<storage, read_write> out: vec2f;\n\
+        @compute @workgroup_size(1) fn f() {\n  out = B;\n}";
+    let mut module = naga::front::wgsl::parse_str(src).expect("source should parse");
+    assert!(run_pass(&mut module), "the init must normalise");
+    let (_, constant) = module
+        .constants
+        .iter()
+        .find(|(_, c)| c.name.as_deref() == Some("B"))
+        .expect("B survives");
+    assert!(
+        matches!(
+            module.global_expressions[constant.init],
+            naga::Expression::ZeroValue(_)
+        ),
+        "the init is a ZeroValue: {:?}",
+        module.global_expressions
+    );
+    crate::io::validate_module(&module).expect("valid after the fold");
 }

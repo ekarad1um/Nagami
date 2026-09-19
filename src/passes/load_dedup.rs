@@ -7,7 +7,8 @@
 //! 2. Load deduplication: repeated `Load`s forward to the most recent
 //!    dominating stored (or init) value through a `ScopedMap`; aliasing
 //!    stores and calls invalidate, and a loop starts from an empty
-//!    cache because its iteration count is unknown.
+//!    cache because its iteration count is unknown.  A store of the value
+//!    the map holds for its place writes nothing and is retired.
 //! 3. Write-only-local elimination: every store, whole or partial, to a
 //!    local nothing ever observes.
 //! 4. Dead-init removal: inits overwritten before any surviving read,
@@ -75,6 +76,30 @@ type StoreInfo = (
     naga::Handle<naga::Expression>,
     bool,
 );
+
+/// What one walk of a body accumulates for the planner.
+#[derive(Default)]
+struct Forwards {
+    /// Forwardable `Load` -> its canonical value.
+    replacements: HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
+    /// Every load rooted at a local, whole or partial, by local: the
+    /// liveness census the dead-local and retired-store judgements read.
+    all_loads: HandleMap<naga::LocalVariable, Vec<naga::Handle<naga::Expression>>>,
+    /// Forwarded load -> the `(pointer, value)` identity of the Store that
+    /// seeded its canonical, so the pricing step can retire a Store once
+    /// every load it seeded is covered.
+    seeded_by_store: HandleMap<naga::Expression, StoreInfo>,
+    /// Every Store by identity: how many statements carry it, and how many
+    /// of those store the value their place already holds.
+    stores: FxHashMap<StoreId, StoreTally>,
+}
+
+/// One Store identity's statements, and the identity stores among them.
+#[derive(Default, Clone, Copy)]
+struct StoreTally {
+    seen: u32,
+    identity: u32,
+}
 
 /// Forwardable location within a local: the whole variable, one
 /// `AccessIndex` field, or one `Access` element.
@@ -930,9 +955,10 @@ struct SlotWalk {
 /// since one offending lane condemns a componentwise op) can be judged
 /// exactly: the slot IS that literal, and a safe one must survive or the
 /// guard costs the dedups this pass exists for.  Deeper, the value proves
-/// nothing alone - `x / (s - 1u)` errors when `s` brings `1u`, `x / (s + 1u
-/// - 1u)` when it brings `0u` - and a COMPOUND target offers no literal at
-/// all, `d = u32(length(vec2f()))` being const the moment `d` is inlined.
+/// nothing alone - `x / (s - 1u)` errors when `s` brings `1u`,
+/// `x / (s + 1u - 1u)` when it brings `0u` - and a COMPOUND target offers
+/// no literal at all, `d = u32(length(vec2f()))` being const the moment
+/// `d` is inlined.
 /// So every forward but the exact one goes, the OUTERMOST first: it keeps
 /// the walk linear, and always suffices because a forward is keyed on a
 /// `Load`, which is never a const-expression.
@@ -987,19 +1013,77 @@ fn decline_slot_forwards(
     }
 }
 
-/// Phase 2 driver: collect forwards, prune the unsafe and unprofitable
-/// ones, then rewrite.
+/// What one walk settled on: the loads to rewrite, the locals every load
+/// of which is forwarded, the stores retired with them, and the stores of
+/// the value their place already holds.
+#[derive(Default)]
+struct ForwardPlan {
+    replacements: HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
+    dead_locals: HandleSet<naga::LocalVariable>,
+    dead_store_ids: FxHashSet<StoreId>,
+    /// Store identities every statement of which stores what its place
+    /// holds.  Retired wherever they stand, a loop included: each
+    /// iteration writes back what it just read.
+    identity_stores: FxHashSet<StoreId>,
+}
+
+impl ForwardPlan {
+    /// The plan when no forward is effective: the identity stores alone,
+    /// or nothing.
+    fn retiring(identity_stores: FxHashSet<StoreId>) -> Option<Self> {
+        (!identity_stores.is_empty()).then(|| Self {
+            identity_stores,
+            ..Self::default()
+        })
+    }
+}
+
+/// Phase 2 driver: plan (collect forwards, prune the unsafe and
+/// unprofitable ones, judge the stores), then rewrite.
 fn dedup_loads_in_function(
     function: &mut naga::Function,
     types: &naga::UniqueArena<naga::Type>,
     const_literals: &super::const_fold::ConstantLiterals,
     access_lens: &[Option<super::expr_util::IndexBound>],
 ) -> bool {
-    let mut replacements = Default::default();
+    let Some(plan) = plan_forwards(function, types, const_literals, access_lens) else {
+        return false;
+    };
+
+    // A dead local with an init would still be declared.
+    for &lh in &plan.dead_locals {
+        function.local_variables[lh].init = None;
+    }
+
+    // The retired stores are keyed on their pre-rewrite `(pointer, value)`,
+    // so they go before the rewrite touches either.
+    drop_retired_stores(&mut function.body, &plan, &function.expressions);
+
+    // `backward_only` blocks illegal forward references (`dead_locals`
+    // mirrors the same guard); a replaced load's `Emit` slot and name go
+    // with it, or the binding would dangle.
+    if !plan.replacements.is_empty() {
+        Rewrite {
+            map: &plan.replacements,
+            backward_only: true,
+            retire_replaced: true,
+        }
+        .apply(function);
+    }
+
+    true
+}
+
+/// One dominance walk of `function` and the pricing of what it found;
+/// `None` when it leaves the body untouched.
+fn plan_forwards(
+    function: &naga::Function,
+    types: &naga::UniqueArena<naga::Type>,
+    const_literals: &super::const_fold::ConstantLiterals,
+    access_lens: &[Option<super::expr_util::IndexBound>],
+) -> Option<ForwardPlan> {
+    let mut fw = Forwards::default();
     let mut cache: ScopedMap<PointerKey, naga::Handle<naga::Expression>> = ScopedMap::new();
-    let mut all_loads: HandleMap<naga::LocalVariable, Vec<naga::Handle<naga::Expression>>> =
-        Default::default();
-    let mut seeded_by_store: HandleMap<naga::Expression, StoreInfo> = Default::default();
 
     // Inits are const-evaluable (runtime inits lower to Stores), so loads
     // can forward to them.  Compose inits are skipped: a renamed variable
@@ -1020,15 +1104,24 @@ fn dedup_loads_in_function(
         &function.expressions,
         &scope_idx,
         &mut cache,
-        &mut replacements,
-        &mut all_loads,
-        &mut seeded_by_store,
+        &mut fw,
         false,
         &mut Default::default(),
     );
+    let Forwards {
+        mut replacements,
+        all_loads,
+        seeded_by_store,
+        stores,
+    } = fw;
+    let identity_stores: FxHashSet<StoreId> = stores
+        .iter()
+        .filter(|(_, tally)| tally.identity == tally.seen)
+        .map(|(&id, _)| id)
+        .collect();
 
     if replacements.is_empty() {
-        return false;
+        return ForwardPlan::retiring(identity_stores);
     }
 
     // Ordering: a declined load stays live, so this must precede the
@@ -1047,7 +1140,7 @@ fn dedup_loads_in_function(
         &mut replacements,
     );
     if replacements.is_empty() {
-        return false;
+        return ForwardPlan::retiring(identity_stores);
     }
 
     let mut escaped: HandleSet<naga::LocalVariable> = Default::default();
@@ -1199,13 +1292,10 @@ fn dedup_loads_in_function(
         !regained_live_load
     });
 
-    // Release the body borrow before mutation.
-    drop(scope_idx);
-
     // Undo may have emptied the map; reporting a change would block
     // convergence.
     if replacements.is_empty() {
-        return false;
+        return ForwardPlan::retiring(identity_stores);
     }
 
     // Load-to-Load dedup on a store-forwarded canonical creates chains;
@@ -1222,34 +1312,15 @@ fn dedup_loads_in_function(
     // change every sweep.
     replacements.retain(|load, target| *target < *load);
     if replacements.is_empty() {
-        return false;
+        return ForwardPlan::retiring(identity_stores);
     }
 
-    // A dead local with an init would still be declared.
-    for &lh in &dead_locals {
-        function.local_variables[lh].init = None;
-    }
-
-    // The retired stores are keyed on their pre-rewrite `(pointer, value)`,
-    // so they go before the rewrite touches either.
-    drop_retired_stores(
-        &mut function.body,
-        &dead_locals,
-        &dead_store_ids,
-        &function.expressions,
-    );
-
-    // `backward_only` blocks illegal forward references (`dead_locals`
-    // mirrors the same guard); a replaced load's `Emit` slot and name go
-    // with it, or the binding would dangle.
-    Rewrite {
-        map: &replacements,
-        backward_only: true,
-        retire_replaced: true,
-    }
-    .apply(function);
-
-    true
+    Some(ForwardPlan {
+        replacements,
+        dead_locals,
+        dead_store_ids,
+        identity_stores,
+    })
 }
 
 /// `None` for anything but a local or a depth-1 `AccessIndex` / `Access`
@@ -1440,12 +1511,9 @@ fn count_stores_recursive(
 }
 
 /// Dominance-aware walker: threads `cache` (`PointerKey` -> canonical
-/// value) through the statement tree, recording each forwardable `Load`
-/// in `replacements` and every load rooted at a local in `all_loads`.
-///
-/// `seeded_by_store` maps a forwarded Load to the `(pointer, value)`
-/// identity of the Store that seeded its canonical, so the pricing step
-/// can retire a Store once every load it seeded is covered.
+/// value) through the statement tree, accumulating into `fw` each
+/// forwardable `Load`, every load rooted at a local, and the Store that
+/// seeded each forwarded load's canonical.
 ///
 /// Every control-flow boundary is a checkpoint: each arm runs from the
 /// pre-boundary state and rolls back, then entries for every local
@@ -1458,15 +1526,12 @@ fn count_stores_recursive(
 /// `modified_out` receives every local `block` (recursively) may write;
 /// each arm collects its own set during the same walk, so the meet and
 /// the invalidation need no separate `collect_modified_locals` pass.
-#[allow(clippy::too_many_arguments)]
 fn collect_redundant_loads<'body>(
     block: &'body naga::Block,
     expressions: &naga::Arena<naga::Expression>,
     scope_idx: &ExpressionScopeIndex<'body>,
     cache: &mut ScopedMap<PointerKey, naga::Handle<naga::Expression>>,
-    replacements: &mut HandleMap<naga::Expression, naga::Handle<naga::Expression>>,
-    all_loads: &mut HandleMap<naga::LocalVariable, Vec<naga::Handle<naga::Expression>>>,
-    seeded_by_store: &mut HandleMap<naga::Expression, StoreInfo>,
+    fw: &mut Forwards,
     in_loop: bool,
     modified_out: &mut HandleSet<naga::LocalVariable>,
 ) {
@@ -1484,7 +1549,7 @@ fn collect_redundant_loads<'body>(
                         if let naga::Expression::CooperativeLoad { data, .. } = &expressions[handle]
                             && let Some(local) = root_local_var(data.pointer, expressions)
                         {
-                            all_loads.entry(local).or_default().push(handle);
+                            fw.all_loads.entry(local).or_default().push(handle);
                         }
                         continue;
                     };
@@ -1494,13 +1559,13 @@ fn collect_redundant_loads<'body>(
                     // dead, its Store dropped, and the surviving load left
                     // reading the zero-default.
                     if let Some(local) = root_local_var(*pointer, expressions) {
-                        all_loads.entry(local).or_default().push(handle);
+                        fw.all_loads.entry(local).or_default().push(handle);
                     }
                     if let Some(key) = get_pointer_key(expressions, *pointer) {
                         if let Some(&canonical) = cache.get(&key) {
-                            replacements.insert(handle, canonical);
+                            fw.replacements.insert(handle, canonical);
                             if let Some(&store_id) = store_source.get(&key) {
-                                seeded_by_store.insert(handle, store_id);
+                                fw.seeded_by_store.insert(handle, store_id);
                             }
                             // Promote the cache to this Load so later
                             // Load-to-Load forwarding chains through a
@@ -1521,32 +1586,46 @@ fn collect_redundant_loads<'body>(
                 }
             }
             naga::Statement::Store { pointer, value } => {
-                if let Some(local) = root_local_var(*pointer, expressions) {
-                    modified_out.insert(local);
-                    invalidate_cache_for_local(cache, local);
-                    invalidate_store_source_for_local(&mut store_source, local);
-                    // Seed with the stored value; the pricing step later
-                    // undoes complex forwards on surviving locals.  A value
-                    // deeper than `SUBSTITUTION_DEPTH_CAP` stays unseeded
-                    // (the stale entry is already gone, so later loads keep
-                    // the variable read), or reassignment chains grow
-                    // without bound.
-                    if let Some(key) = get_pointer_key(expressions, *pointer) {
-                        let mut resolved = *value;
-                        while let Some(&next) = replacements.get(resolved) {
-                            resolved = next;
-                        }
-                        if effective_forwarded_depth(
-                            resolved,
-                            expressions,
-                            replacements,
-                            SUBSTITUTION_DEPTH_CAP,
-                        ) <= SUBSTITUTION_DEPTH_CAP
-                            && !has_negative_zero_leaf(expressions, resolved)
-                        {
-                            cache.insert(key.clone(), resolved);
-                            store_source.insert(key, (*pointer, *value, in_loop));
-                        }
+                let tally = fw.stores.entry((*pointer, *value)).or_default();
+                tally.seen += 1;
+                let Some(local) = root_local_var(*pointer, expressions) else {
+                    continue;
+                };
+                let key = get_pointer_key(expressions, *pointer);
+                // A store of the value its place already holds writes
+                // nothing: the cache stands, the local is not modified, and
+                // the statement is retired once every statement of its
+                // identity proves the same.  Compared by value: a handle
+                // and the canonical it forwards to are one value whether or
+                // not the forward is applied in the end.
+                if let Some(key) = &key
+                    && let Some(&held) = cache.get(key)
+                    && follow(&fw.replacements, held) == follow(&fw.replacements, *value)
+                {
+                    tally.identity += 1;
+                    continue;
+                }
+                modified_out.insert(local);
+                invalidate_cache_for_local(cache, local);
+                invalidate_store_source_for_local(&mut store_source, local);
+                // Seed with the stored value; the pricing step later
+                // undoes complex forwards on surviving locals.  A value
+                // deeper than `SUBSTITUTION_DEPTH_CAP` stays unseeded
+                // (the stale entry is already gone, so later loads keep
+                // the variable read), or reassignment chains grow
+                // without bound.
+                if let Some(key) = key {
+                    let resolved = follow(&fw.replacements, *value);
+                    if effective_forwarded_depth(
+                        resolved,
+                        expressions,
+                        &fw.replacements,
+                        SUBSTITUTION_DEPTH_CAP,
+                    ) <= SUBSTITUTION_DEPTH_CAP
+                        && !has_negative_zero_leaf(expressions, resolved)
+                    {
+                        cache.insert(key.clone(), resolved);
+                        store_source.insert(key, (*pointer, *value, in_loop));
                     }
                 }
             }
@@ -1575,9 +1654,7 @@ fn collect_redundant_loads<'body>(
                     expressions,
                     scope_idx,
                     cache,
-                    replacements,
-                    all_loads,
-                    seeded_by_store,
+                    fw,
                     in_loop,
                     &mut block_modified,
                 );
@@ -1616,9 +1693,7 @@ fn collect_redundant_loads<'body>(
                     expressions,
                     scope_idx,
                     cache,
-                    replacements,
-                    all_loads,
-                    seeded_by_store,
+                    fw,
                     in_loop,
                     &mut accept_modified,
                 );
@@ -1641,9 +1716,7 @@ fn collect_redundant_loads<'body>(
                     expressions,
                     scope_idx,
                     cache,
-                    replacements,
-                    all_loads,
-                    seeded_by_store,
+                    fw,
                     in_loop,
                     &mut reject_modified,
                 );
@@ -1705,9 +1778,7 @@ fn collect_redundant_loads<'body>(
                         expressions,
                         scope_idx,
                         cache,
-                        replacements,
-                        all_loads,
-                        seeded_by_store,
+                        fw,
                         in_loop,
                         &mut case_modified,
                     );
@@ -1769,9 +1840,7 @@ fn collect_redundant_loads<'body>(
                     expressions,
                     scope_idx,
                     cache,
-                    replacements,
-                    all_loads,
-                    seeded_by_store,
+                    fw,
                     true,
                     &mut loop_modified,
                 );
@@ -1782,9 +1851,7 @@ fn collect_redundant_loads<'body>(
                     expressions,
                     scope_idx,
                     cache,
-                    replacements,
-                    all_loads,
-                    seeded_by_store,
+                    fw,
                     true,
                     &mut loop_modified,
                 );
@@ -1915,16 +1982,17 @@ pub(crate) fn collect_modified_locals(
 
 // MARK: Replacement application
 
-/// Drop the stores the forwarding retired: every store to a dead local, and
-/// the dead `(pointer, value)` stores outside loops.  `dead_store_ids` keys
-/// by `(pointer, value)` alone, and an in-loop Store can share that identity
-/// with the retired out-of-loop one (`x = e` before and inside the loop);
-/// in-loop Stores are never candidates, so a match there is a collision the
-/// back edge still reads.
+/// Drop the stores the plan retired: every store to a dead local, the dead
+/// `(pointer, value)` stores outside loops, and the identity stores
+/// anywhere.  `dead_store_ids` keys by `(pointer, value)` alone, and an
+/// in-loop Store can share that identity with the retired out-of-loop one
+/// (`x = e` before and inside the loop); in-loop Stores are never
+/// candidates, so a match there is a collision the back edge still reads.
+/// An identity is retired only once every statement carrying it was judged
+/// an identity store, so those need no scope guard.
 fn drop_retired_stores(
     block: &mut naga::Block,
-    dead_locals: &HandleSet<naga::LocalVariable>,
-    dead_store_ids: &FxHashSet<StoreId>,
+    plan: &ForwardPlan,
     expressions: &naga::Arena<naga::Expression>,
 ) {
     rewrite_block(
@@ -1932,12 +2000,16 @@ fn drop_retired_stores(
         Scope::default(),
         &mut |statement, span, out, scope| {
             if let naga::Statement::Store { pointer, value } = &statement {
+                let id = (*pointer, *value);
+                if plan.identity_stores.contains(&id) {
+                    return;
+                }
                 if let Some(lh) = root_local_var(*pointer, expressions)
-                    && dead_locals.contains(lh)
+                    && plan.dead_locals.contains(lh)
                 {
                     return;
                 }
-                if !scope.in_loop() && dead_store_ids.contains(&(*pointer, *value)) {
+                if !scope.in_loop() && plan.dead_store_ids.contains(&id) {
                     return;
                 }
             }

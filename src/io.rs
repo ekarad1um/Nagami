@@ -199,10 +199,15 @@ pub fn validate_module_with_source(
     }
 }
 
-pub fn validate_wgsl_text(source: &str) -> Result<(), Error> {
+/// The module `source` parses to, validated against its text.
+pub fn parse_and_validate_wgsl_text(source: &str) -> Result<naga::Module, Error> {
     let module = parse_wgsl(source)?;
-    let _ = validate_module_with_source(&module, source)?;
-    Ok(())
+    validate_module_with_source(&module, source)?;
+    Ok(module)
+}
+
+pub fn validate_wgsl_text(source: &str) -> Result<(), Error> {
+    parse_and_validate_wgsl_text(source).map(|_| ())
 }
 
 #[cfg(test)]

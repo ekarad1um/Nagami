@@ -450,23 +450,28 @@ impl<'a> Generator<'a> {
                 .map(str::to_owned),
         );
 
-        // Estimated savings `K * (L - N) - (BOILERPLATE + N + D)`: `K` uses, `L`
-        // per-use length, `N` the name length (1 for this filter), `D` the
-        // declaration text.  A needs-typed literal (F16/F64/I64/U64, the only
-        // kinds whose `decl_text` carries a suffix `expr_text` lacks) emits the
-        // typed form at every standalone use and is priced there, unless it also
+        // Estimated savings: the `count` uses as they render today against
+        // the `const` (`decl_cost`: the declaration text under a name, the
+        // name at every use; a one-letter name for this filter).  A
+        // needs-typed literal (F16/F64/I64/U64, the only kinds whose
+        // `decl_text` carries a suffix `expr_text` lacks) emits the typed
+        // form at every standalone use and is priced there, unless it also
         // appears bare (`has_bare`), where the shorter `expr_text` keeps the
-        // estimate conservative; for every other kind the two texts are equal.
-        let boilerplate = super::syntax::decl_boilerplate(self.options.beautify) as isize;
+        // estimate conservative; for every other kind the two texts are
+        // equal.
+        let beautify = self.options.beautify;
         let mut candidates: Vec<(isize, LiteralExtractKey, usize, bool)> = literal_counts
             .iter()
             .filter_map(|(key, &(count, has_bare))| {
-                let expr_len = key.expr_text.len() as isize;
-                let decl_len = key.decl_text.len() as isize;
+                let decl_len = key.decl_text.len();
                 let typed_only = !has_bare && key.decl_text != key.expr_text;
-                let use_len = if typed_only { decl_len } else { expr_len };
-                let k = count as isize;
-                let est = k * (use_len - 1) - (boilerplate + 1 + decl_len);
+                let use_len = if typed_only {
+                    decl_len
+                } else {
+                    key.expr_text.len()
+                };
+                let est = (count * use_len) as isize
+                    - super::syntax::decl_cost(count, 1, decl_len, beautify) as isize;
                 if est > 0 {
                     Some((est, key.clone(), count, has_bare))
                 } else {
@@ -486,13 +491,15 @@ impl<'a> Generator<'a> {
         // to the next.
         for (_, key, count, has_bare) in candidates {
             let name = crate::name_gen::shortest_free_name(&forbidden, &[], &|_| false);
-            let n = name.len() as isize;
-            let expr_len = key.expr_text.len() as isize;
-            let decl_len = key.decl_text.len() as isize;
+            let decl_len = key.decl_text.len();
             let typed_only = !has_bare && key.decl_text != key.expr_text;
-            let use_len = if typed_only { decl_len } else { expr_len };
-            let k = count as isize;
-            let savings = k * (use_len - n) - (boilerplate + n + decl_len);
+            let use_len = if typed_only {
+                decl_len
+            } else {
+                key.expr_text.len()
+            };
+            let savings = (count * use_len) as isize
+                - super::syntax::decl_cost(count, name.len(), decl_len, beautify) as isize;
             if savings > 0 {
                 forbidden.insert(name.clone());
                 self.extracted_literals.insert(key, name);

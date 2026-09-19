@@ -9,6 +9,7 @@ use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 
 use crate::config::FloatPrecision;
+use crate::error::Error;
 
 use super::expr_emit::subsplat_runs;
 use super::module_emit::Twins;
@@ -338,6 +339,9 @@ pub(super) struct Generator<'a> {
     /// What this render computed from the arenas, or took over from a
     /// render of the same arenas.
     pub(super) analyses: Analyses,
+    /// The static uses of each function's call graph, memoized as asked
+    /// for (`Self::pin_candidates`).
+    static_uses: crate::interface::StaticUses<'a>,
     /// Per-`module.functions` effect summary: keeps impure single-use calls
     /// bound rather than inlined past a read of what they write, and tells
     /// the forced-binding analysis which loads a call stales.
@@ -356,6 +360,11 @@ pub(super) struct Generator<'a> {
     /// The arena-first handle of each `TypeInner`, for a spelling that has
     /// the inner alone (a conversion's target, a splat's vector).
     pub(super) inner_to_first: FxHashMap<&'a naga::TypeInner, naga::Handle<naga::Type>>,
+    /// What the constructor could not spell (an override-expression array
+    /// size; nothing naga's front-end produces), returned by the render:
+    /// a fallible constructor would have every call site unpack a value of
+    /// this size out of a `Result`.
+    pub(super) unspelled: Option<Error>,
     /// Format tokens fixed at construction from `options.beautify`, so the
     /// hot path never branches per character.
     tok: &'static Tokens,
@@ -485,6 +494,11 @@ pub(super) struct FunctionCtx<'a, 'm> {
     pub(super) inlineable_calls: HandleSet<naga::Expression>,
     /// Expressions `let`-bound whatever the byte cost (`compute_must_bind`).
     pub(super) must_bind: HandleSet<naga::Expression>,
+    /// The pins the body may print, `_=N;` each: those of its function
+    /// whose global no callee's call graph reaches
+    /// (`Generator::pin_candidates`); which of them print is decided once
+    /// the body has rendered (`Generator::emit_pins`).
+    pub(super) pins: Vec<crate::pins::Pin>,
     /// Memo for the rendered-depth cap (`0` = not computed).  Depths are
     /// queried child-first in arena order, so a child bound after its entry was
     /// taken can only make an ancestor's stored depth an overestimate, the safe
@@ -803,6 +817,7 @@ impl<'a> Generator<'a> {
             local_used_names: HashSet::new(),
             inlineable_calls: HandleSet::default(),
             must_bind: HandleSet::default(),
+            pins: Vec::new(),
             render_depth_memo: vec![0; n],
             stashed_call_depth: HandleMap::default(),
             render_counts: vec![0; n],
@@ -814,6 +829,19 @@ impl<'a> Generator<'a> {
             const_hazard_bindings: Vec::new(),
             display_name: String::from("<module>"),
         }
+    }
+
+    /// The pins `func` may print: its own, less those a callee's call
+    /// graph reaches - a callee's text answers for every static use of its
+    /// call graph (its own pins print where its text does not mention the
+    /// global), so a caller needs no pin for one.  An IR fact, so the
+    /// pricer's render of one body and the module's agree on it.
+    pub(super) fn pin_candidates(&mut self, func: &naga::Function) -> Vec<crate::pins::Pin> {
+        let covered = self.static_uses.of_callees(func);
+        crate::pins::of(&self.module.global_variables, func)
+            .into_iter()
+            .filter(|&(_, global)| !covered.contains(global))
+            .collect()
     }
 }
 
@@ -909,11 +937,6 @@ fn count_type_handle_refs(
 struct StructNames {
     type_names: HandleMap<naga::Type, String>,
     member_names: HandleMap<naga::Type, Vec<String>>,
-    /// Struct names assigned under mangling, preserved ones included and
-    /// predeclared ones excluded; [`crate::name_gen::module_scope_names`]
-    /// lists no type, so the anonymous override's minted name dodges these
-    /// explicitly.
-    minted: HashSet<String>,
     /// Names the source or the language fixes (preserved, predeclared), which
     /// [`reassign_type_names_by_use`] must not hand to anything else.
     fixed: HashSet<String>,
@@ -935,7 +958,6 @@ fn mint_struct_names(
     let preserve = &options.preserve_symbols;
     let mut type_names = HandleMap::default();
     let mut member_names = HandleMap::default();
-    let mut minted: HashSet<String> = HashSet::new();
     let mut fixed: HashSet<String> = HashSet::new();
 
     // naga predeclared / special struct types are never renamed: their members
@@ -987,7 +1009,6 @@ fn mint_struct_names(
             }
             None => spelling.shortest_free_name(&module_used, canonical[&h]),
         };
-        minted.insert(name.clone());
         module_used.insert(name.clone());
         type_names.insert(h, name);
     }
@@ -995,7 +1016,6 @@ fn mint_struct_names(
     StructNames {
         type_names,
         member_names,
-        minted,
         fixed,
     }
 }
@@ -1103,7 +1123,6 @@ fn plan_type_aliases(
     let mut minted_aliases = module_names.clone();
     let mut decls: Vec<(String, String)> = Vec::new();
     let mut decl_handles: Vec<naga::Handle<naga::Type>> = Vec::new();
-    let fixed_overhead = super::syntax::decl_boilerplate(options.beautify);
 
     for (h, ty) in module.types.iter() {
         // Structs are already named by `mint_struct_names`.
@@ -1144,12 +1163,10 @@ fn plan_type_aliases(
             .spelling
             .shortest_free_name(&minted_aliases, group_head);
 
-        let decl_cost = fixed_overhead + name_len + type_str.len();
         let spelled = scope.group_bytes.map_or(count * type_str.len(), |bytes| {
             bytes.get(group_head).copied().unwrap_or(0)
         });
-        let total_savings = spelled.saturating_sub(count * name_len);
-        if total_savings > decl_cost {
+        if spelled > super::syntax::decl_cost(count, name_len, type_str.len(), options.beautify) {
             minted_aliases.insert(alias_name.clone());
             decls.push((alias_name.clone(), type_str));
             decl_handles.push(h);
@@ -1353,6 +1370,10 @@ fn spelled_type_groups(
                 add(local.ty, &mut groups);
             }
             for (h, expr) in func.expressions.iter() {
+                // A pin prints as its global's name, never as a type.
+                if crate::pins::pinned_global(&module.global_variables, func, h).is_some() {
+                    continue;
+                }
                 match &finfo[h].ty {
                     naga::proc::TypeResolution::Handle(t) => add(*t, &mut groups),
                     naga::proc::TypeResolution::Value(inner) => {
@@ -1634,27 +1655,6 @@ impl<'a> Generator<'a> {
         let (canonical, inner_to_first) = type_groups(module);
         let analyses =
             prior.unwrap_or_else(|| Analyses::fresh(module, info, &canonical, &inner_to_first));
-        let spelling = SpellingScopes::new(module, &analyses.spelled_groups);
-        let StructNames {
-            mut type_names,
-            mut member_names,
-            minted: minted_types,
-            fixed: fixed_type_names,
-        } = mint_struct_names(module, &options, &canonical, &spelling);
-
-        // The anonymous override's minted name is referenced from module
-        // scope and function bodies alike, so it dodges every name in scope
-        // plus `StructNames::minted`.
-        let mut used_names = HashSet::new();
-        if module.overrides.iter().any(|(_, o)| o.name.is_none()) {
-            used_names.extend(
-                crate::name_gen::module_scope_names(module)
-                    .chain(all_functions(module).flat_map(crate::name_gen::function_local_names))
-                    .map(str::to_owned),
-            );
-            used_names.extend(options.preserve_symbols.iter().cloned());
-            used_names.extend(minted_types.iter().cloned());
-        }
 
         let mut constant_names = Vec::with_capacity(module.constants.len());
         for (h, c) in module.constants.iter() {
@@ -1662,18 +1662,14 @@ impl<'a> Generator<'a> {
             constant_names.push(c.name.clone().unwrap_or_else(|| format!("C{}", h.index())));
         }
 
-        // naga's anonymous override (an override-expression array size) is
-        // declared under a minted name: the positional `O<n>` collided with
-        // user, preserved and preamble names.  Named here rather than in the
-        // IR so a dead one still compacts away instead of being rooted as a
-        // host-visible override.
+        // naga's anonymous override (an override-expression array size) has
+        // no name to print: its slot takes the spelling of its initializer
+        // below, once there is a generator to render it, and before the
+        // alias plan reads the slot.
         let mut override_names = Vec::with_capacity(module.overrides.len());
-        let mut anonymous_counter = 0usize;
         for (h, ov) in module.overrides.iter() {
             debug_assert_eq!(h.index(), override_names.len());
-            override_names.push(ov.name.clone().unwrap_or_else(|| {
-                crate::name_gen::next_name_insert(&mut anonymous_counter, &mut used_names)
-            }));
+            override_names.push(ov.name.clone().unwrap_or_default());
         }
 
         let mut global_names = Vec::with_capacity(module.global_variables.len());
@@ -1714,23 +1710,6 @@ impl<'a> Generator<'a> {
         let live_constants = compute_live_constants(module, &options.preserve_symbols);
         let live_types = compute_live_types(module, &live_constants, &analyses.defer);
 
-        let in_scope = || {
-            emitted_names(
-                module,
-                &options,
-                &type_names,
-                &constant_names,
-                &override_names,
-                &global_names,
-                &function_names,
-            )
-        };
-
-        let shadowed_type_aliases: super::syntax::ShadowedAliases = in_scope()
-            .filter(|name| super::syntax::is_predeclared_type_alias(name))
-            .map(str::to_owned)
-            .collect();
-
         let (ref_counts, ref_bytes) = match &options.type_uses {
             Some(uses) => {
                 let mut sites = HandleMap::default();
@@ -1758,86 +1737,26 @@ impl<'a> Generator<'a> {
                 *group_bytes.entry(first).or_insert(0) += bytes.get(h).copied().unwrap_or(0);
             }
         }
-        let alias_scope = AliasScope {
-            canonical: &canonical,
-            group_ref_count: &group_ref_count,
-            group_bytes: ref_bytes.is_some().then_some(&group_bytes),
-            spelling: &spelling,
-            shadowed_type_aliases: &shadowed_type_aliases,
-        };
-        let (type_alias_decls, decl_handles) = if options.type_alias {
-            plan_type_aliases(
-                module,
-                &options,
-                &mut type_names,
-                &alias_scope,
-                &constant_names,
-                &override_names,
-                &global_names,
-                &function_names,
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
-
-        let mut type_alias_decls = type_alias_decls;
-        if mangle {
-            rank_type_names_by_use(
-                module,
-                &mut type_names,
-                &mut type_alias_decls,
-                &decl_handles,
-                &alias_scope,
-                &ref_counts,
-                &fixed_type_names,
-                &override_names,
-                &options,
-                [
-                    constant_names.as_slice(),
-                    override_names.as_slice(),
-                    global_names.as_slice(),
-                    function_names.as_slice(),
-                ],
-            );
-        }
-        mint_member_names(module, &options, &type_names, &mut member_names);
-        // A struct spells its name; anything else its structure, through
-        // the aliases nested types got.
-        let type_spelled_len = module
-            .types
-            .iter()
-            .map(|(h, ty)| {
-                let spelled = match &ty.inner {
-                    naga::TypeInner::Struct { .. } => type_names.get(h).map_or(0, String::len),
-                    inner => super::syntax::type_inner_name(
-                        inner,
-                        module,
-                        &type_names,
-                        &override_names,
-                        &shadowed_type_aliases,
-                    )
-                    .map_or(0, |s| s.len()),
-                };
-                u32::try_from(spelled).unwrap_or(u32::MAX)
-            })
-            .collect();
-
+        // The generator first, its names on it: the spelling scopes borrow
+        // the analyses for as long as names are minted, and an anonymous
+        // override is spelled by the generator itself, before the alias plan
+        // and the type lengths read its slot.
         let initial_capacity = options.initial_capacity;
-        Self {
+        let mut this = Self {
             module,
             info,
             options,
             out: String::with_capacity(initial_capacity),
             indent_depth: 0,
-            type_names,
-            member_names,
+            type_names: HandleMap::default(),
+            member_names: HandleMap::default(),
             constant_names,
             override_names,
             global_names,
             function_names,
-            shadowed_type_aliases,
+            shadowed_type_aliases: Default::default(),
             extracted_literals: Default::default(),
-            type_alias_decls,
+            type_alias_decls: Vec::new(),
             expr_to_const: Default::default(),
             live_constants,
             live_types,
@@ -1846,14 +1765,139 @@ impl<'a> Generator<'a> {
             layouter_complete,
             ref_count_cache: Vec::new(),
             analyses,
+            static_uses: crate::interface::StaticUses::new(module),
             fn_effects: Vec::new(),
             name_weights: Default::default(),
             type_uses: TypeUses::sized(module.types.len()),
-            type_spelled_len,
+            type_spelled_len: Vec::new(),
             inner_to_first,
             tok,
             indent_unit,
+            unspelled: None,
+        };
+        let spelling = SpellingScopes::new(module, &this.analyses.spelled_groups);
+        let StructNames {
+            type_names,
+            member_names,
+            fixed: fixed_type_names,
+        } = mint_struct_names(module, &this.options, &canonical, &spelling);
+        this.type_names = type_names;
+        this.member_names = member_names;
+        match this.anonymous_override_spellings() {
+            Ok(spellings) => {
+                for (index, text) in spellings {
+                    this.override_names[index] = text;
+                }
+            }
+            Err(error) => this.unspelled = Some(error),
         }
+        this.shadowed_type_aliases = emitted_names(
+            module,
+            &this.options,
+            &this.type_names,
+            &this.constant_names,
+            &this.override_names,
+            &this.global_names,
+            &this.function_names,
+        )
+        .filter(|name| super::syntax::is_predeclared_type_alias(name))
+        .map(str::to_owned)
+        .collect();
+
+        let alias_scope = AliasScope {
+            canonical: &canonical,
+            group_ref_count: &group_ref_count,
+            group_bytes: ref_bytes.is_some().then_some(&group_bytes),
+            spelling: &spelling,
+            shadowed_type_aliases: &this.shadowed_type_aliases,
+        };
+        let decl_handles = if this.options.type_alias {
+            let (decls, handles) = plan_type_aliases(
+                module,
+                &this.options,
+                &mut this.type_names,
+                &alias_scope,
+                &this.constant_names,
+                &this.override_names,
+                &this.global_names,
+                &this.function_names,
+            );
+            this.type_alias_decls = decls;
+            handles
+        } else {
+            Vec::new()
+        };
+
+        if mangle {
+            rank_type_names_by_use(
+                module,
+                &mut this.type_names,
+                &mut this.type_alias_decls,
+                &decl_handles,
+                &alias_scope,
+                &ref_counts,
+                &fixed_type_names,
+                &this.override_names,
+                &this.options,
+                [
+                    this.constant_names.as_slice(),
+                    this.override_names.as_slice(),
+                    this.global_names.as_slice(),
+                    this.function_names.as_slice(),
+                ],
+            );
+        }
+        mint_member_names(
+            module,
+            &this.options,
+            &this.type_names,
+            &mut this.member_names,
+        );
+        // A struct spells its name; anything else its structure, through
+        // the aliases nested types got.
+        this.type_spelled_len = module
+            .types
+            .iter()
+            .map(|(h, ty)| {
+                let spelled = match &ty.inner {
+                    naga::TypeInner::Struct { .. } => this.type_names.get(h).map_or(0, String::len),
+                    inner => super::syntax::type_inner_name(
+                        inner,
+                        module,
+                        &this.type_names,
+                        &this.override_names,
+                        &this.shadowed_type_aliases,
+                    )
+                    .map_or(0, |s| s.len()),
+                };
+                u32::try_from(spelled).unwrap_or(u32::MAX)
+            })
+            .collect();
+        this
+    }
+
+    /// naga's front-end lowers an override-expression array size
+    /// (`array<i32, N * 2>`) to an anonymous override the size refers to.
+    /// It is spelled back in place, parenthesised for the template list,
+    /// where a declaration under a minted name would add a pipeline-constant
+    /// key the source never declared: `(index, spelling)` per anonymous
+    /// override, for its name slot.  The slot doubles as the spelling
+    /// because every array size reads it - the alias plan and the type
+    /// lengths at construction, every declaration and function afterwards.
+    fn anonymous_override_spellings(&self) -> Result<Vec<(usize, String)>, Error> {
+        // The context is arena-sized; almost no module has one to spell.
+        let mut ctx = None;
+        let mut spellings = Vec::new();
+        for (h, ov) in self.module.overrides.iter() {
+            if ov.name.is_none()
+                && let Some(init) = ov.init
+            {
+                let ctx = ctx.get_or_insert_with(|| self.module_ctx());
+                let text = self.emit_global_expr_in(init, false, ctx)?;
+                spellings.push((h.index(), format!("({text})")));
+            }
+        }
+        Ok(spellings)
     }
 
     pub(super) fn into_output(self) -> String {

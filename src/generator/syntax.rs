@@ -526,16 +526,36 @@ pub(super) fn literal_to_wgsl_bare(literal: naga::Literal, precision: &FloatPrec
 /// (`const` and `alias` are both 5 characters): compact `const N=D;` = 8,
 /// beautify `const N = D;\n` = 11.  Callers pass their actual output style;
 /// pricing compact under beautify accepts borderline extractions that
-/// net-cost two bytes per use.  Savings formulas themselves live with the
-/// decisions that make them.
-pub(super) fn decl_boilerplate(beautify: bool) -> usize {
+/// net-cost two bytes per use.
+fn decl_boilerplate(beautify: bool) -> usize {
     if beautify { 11 } else { 8 }
 }
 
 /// Fixed overhead of one body binding around its name and value: compact
 /// `let N=E;` = 6, beautify `let N = E;\n` = 9 (its indent is not counted).
-pub(super) fn let_boilerplate(beautify: bool) -> usize {
+fn let_boilerplate(beautify: bool) -> usize {
     if beautify { 9 } else { 6 }
+}
+
+/// Bytes a value costs once bound: the declaration around `name` and `body`
+/// (`boilerplate` its fixed part) plus the name at each of `uses` sites.
+/// Every binding decision - a `let`, an extracted literal, a hoisted
+/// constant, a type alias, a call's clone - is the bytes the uses spell
+/// today against this and pays when today is the larger.  What a use
+/// spells today and what a new name costs the other names differ between
+/// the decisions and stay with them; this sum does not.
+fn bound_cost(uses: usize, name: usize, boilerplate: usize, body: usize) -> usize {
+    boilerplate + name + body + uses * name
+}
+
+/// [`bound_cost`] of a module-scope `const` / `alias` declaration.
+pub(super) fn decl_cost(uses: usize, name: usize, body: usize, beautify: bool) -> usize {
+    bound_cost(uses, name, decl_boilerplate(beautify), body)
+}
+
+/// [`bound_cost`] of a body `let`.
+pub(super) fn let_cost(uses: usize, name: usize, value: usize, beautify: bool) -> usize {
+    bound_cost(uses, name, let_boilerplate(beautify), value)
 }
 
 // MARK: Type rendering
@@ -940,7 +960,7 @@ pub(super) fn statement_kind(statement: &naga::Statement) -> &'static str {
     }
 }
 
-pub(super) fn type_inner_kind(inner: &naga::TypeInner) -> &'static str {
+pub(crate) fn type_inner_kind(inner: &naga::TypeInner) -> &'static str {
     use naga::TypeInner as T;
     match inner {
         T::Scalar(_) => "Scalar",
@@ -965,7 +985,7 @@ pub(super) fn type_inner_kind(inner: &naga::TypeInner) -> &'static str {
 /// WGSL keyword.  `Function` renders `function` because `ptr<function, T>`
 /// requires it; a `var<function>` declaration leaves the space implicit but
 /// does not use this helper.
-pub(super) fn address_space(space: naga::AddressSpace) -> &'static str {
+pub(crate) fn address_space(space: naga::AddressSpace) -> &'static str {
     match space {
         naga::AddressSpace::Function => "function",
         naga::AddressSpace::Private => "private",
@@ -1001,7 +1021,7 @@ fn pointer_access_suffix(space: naga::AddressSpace) -> String {
 /// WGSL access mode.  `ATOMIC` takes precedence: naga sets it on atomic
 /// storage textures (`texture_storage_2d<r32uint, atomic>`) and the frontend
 /// rejects any other mode there; `var<storage>` never carries it.
-pub(super) fn storage_access(access: naga::StorageAccess) -> &'static str {
+pub(crate) fn storage_access(access: naga::StorageAccess) -> &'static str {
     if access.contains(naga::StorageAccess::ATOMIC) {
         return "atomic";
     }
@@ -1024,7 +1044,7 @@ pub(super) fn storage_access(access: naga::StorageAccess) -> &'static str {
 /// survives only after a bare-word attribute (`@per_primitive`), where
 /// joining with the following identifier would fuse tokens; a `)` joins
 /// safely.
-pub(super) fn binding_attrs(binding: &naga::Binding, compact: bool) -> Result<String, Error> {
+pub(crate) fn binding_attrs(binding: &naga::Binding, compact: bool) -> Result<String, Error> {
     let sep = if compact { "" } else { " " };
     let mut out = match binding {
         naga::Binding::BuiltIn(bi) => {
@@ -1152,7 +1172,7 @@ pub(super) fn builtin_name(bi: naga::BuiltIn) -> Result<&'static str, Error> {
 }
 
 /// WGSL `texture_*` type; [`Error::Emit`] for a combination WGSL lacks.
-pub(super) fn image_type(
+pub(crate) fn image_type(
     dim: naga::ImageDimension,
     arrayed: bool,
     class: naga::ImageClass,
@@ -1362,16 +1382,88 @@ pub(crate) fn math_name(fun: naga::MathFunction) -> &'static str {
     }
 }
 
+/// `@early_depth_test(...)`, naga's extension, spelled as its front-end
+/// reads it.
+pub(crate) fn early_depth_test_attr(test: naga::EarlyDepthTest) -> &'static str {
+    use naga::{ConservativeDepth as D, EarlyDepthTest as T};
+    match test {
+        T::Force => "@early_depth_test(force)",
+        T::Allow {
+            conservative: D::GreaterEqual,
+        } => "@early_depth_test(greater_equal)",
+        T::Allow {
+            conservative: D::LessEqual,
+        } => "@early_depth_test(less_equal)",
+        T::Allow {
+            conservative: D::Unchanged,
+        } => "@early_depth_test(unchanged)",
+    }
+}
+
+// MARK: Diagnostic directive rendering
+
+pub(crate) fn severity_name(severity: naga::diagnostic_filter::Severity) -> &'static str {
+    use naga::diagnostic_filter::Severity as S;
+    match severity {
+        S::Off => "off",
+        S::Info => "info",
+        S::Warning => "warning",
+        S::Error => "error",
+    }
+}
+
+pub(crate) fn triggering_rule_name(
+    rule: &naga::diagnostic_filter::FilterableTriggeringRule,
+) -> String {
+    use naga::diagnostic_filter::FilterableTriggeringRule as R;
+    match rule {
+        R::Standard(std_rule) => match std_rule {
+            naga::diagnostic_filter::StandardFilterableTriggeringRule::DerivativeUniformity => {
+                "derivative_uniformity".to_string()
+            }
+        },
+        R::Unknown(name) => name.to_string(),
+        R::User(parts) => format!("{}.{}", parts[0], parts[1]),
+    }
+}
+
 // MARK: Tests
 
 #[cfg(test)]
 mod tests {
     use super::{
-        FloatPrecision, PrecisionMode, compact_float_literal_token, ensure_bare_float,
-        literal_extract_key, literal_to_wgsl, literal_to_wgsl_bare, round_sig_figs_f64,
+        FloatPrecision, PrecisionMode, compact_float_literal_token, decl_cost, ensure_bare_float,
+        let_cost, literal_extract_key, literal_to_wgsl, literal_to_wgsl_bare, round_sig_figs_f64,
         scalar_zero,
     };
     use half::f16;
+
+    /// The one sum every binding decision prices against: the declaration
+    /// in the output's own style plus the name at every use; the emitter's
+    /// `let` rule is its inline renderings, wrapped ones counted twice,
+    /// against it.
+    #[test]
+    fn a_bound_value_costs_its_declaration_and_a_name_per_use() {
+        assert_eq!(decl_cost(3, 1, 9, false), 8 + 1 + 9 + 3);
+        assert_eq!(decl_cost(3, 1, 9, true), 11 + 1 + 9 + 3);
+        assert_eq!(let_cost(2, 1, 5, false), 6 + 1 + 5 + 2);
+        assert_eq!(let_cost(0, 2, 7, true), 9 + 2 + 7);
+        for refs in 0..5 {
+            for parens in 0..=refs {
+                for len in 0..12 {
+                    for name in 1..3 {
+                        let inline = refs * len + 2 * parens;
+                        let bound = len + name + 6 + refs * name;
+                        assert_eq!(
+                            super::super::stmt_emit::binding_pays(refs, parens, len, name, false),
+                            inline > bound,
+                            "refs {refs} parens {parens} len {len} name {name}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn full() -> FloatPrecision {
         FloatPrecision::default()

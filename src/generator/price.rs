@@ -88,9 +88,11 @@ impl<'m> Pricer<'m> {
         }
     }
 
-    /// Fixed cost of one module-scope `<keyword> <name>=<body>;`.
-    pub(crate) fn decl_boilerplate(&self) -> usize {
-        super::syntax::decl_boilerplate(self.generator.options.beautify)
+    /// Bytes a module-scope declaration of `body` under a name of `name`
+    /// bytes costs, the name spelled at `uses` sites
+    /// ([`super::syntax::decl_cost`]).
+    pub(crate) fn decl_cost(&self, uses: usize, name: usize, body: usize) -> usize {
+        super::syntax::decl_cost(uses, name, body, self.generator.options.beautify)
     }
 
     /// Length of the name rename would give a new module-scope identifier
@@ -130,9 +132,18 @@ impl FunctionPricer<'_, '_> {
         rendered.then_some(len)
     }
 
-    /// Length of the name the declaration prints.
-    pub(crate) fn name_len(&self) -> usize {
-        self.ctx.display_name.len()
+    /// Bytes the call `N(a,b)` of `function` renders here: the arguments as
+    /// they render at a use, the separators, the `&` a pointer parameter
+    /// takes and the parentheses a bare `a<b` argument takes.
+    pub(crate) fn call_len(
+        &mut self,
+        function: naga::Handle<naga::Function>,
+        arguments: &[naga::Handle<naga::Expression>],
+    ) -> Option<usize> {
+        self.generator
+            .emit_call(function, arguments, &mut self.ctx)
+            .ok()
+            .map(|text| text.len())
     }
 
     /// Length of the name parameter `index` reads as.
@@ -149,7 +160,8 @@ impl FunctionPricer<'_, '_> {
             return Some(0);
         };
         let name = self.ctx.next_expr_name();
-        let cost = text.len() + name.len() + self.let_boilerplate();
+        // The uses spell the name where they render and are priced there.
+        let cost = self.let_cost(0, name.len(), text.len());
         self.ctx.expr_names.insert(h, name);
         self.ctx.name_twins(h);
         Some(cost)
@@ -190,10 +202,10 @@ impl FunctionPricer<'_, '_> {
         self.ctx.peek_expr_name_len()
     }
 
-    /// Fixed cost of one body `let <name>=<value>;` around its name and
-    /// value.
-    pub(crate) fn let_boilerplate(&self) -> usize {
-        super::syntax::let_boilerplate(self.generator.options.beautify)
+    /// Bytes a body `let` of `value` under a name of `name` bytes costs,
+    /// the name spelled at `uses` sites ([`super::syntax::let_cost`]).
+    pub(crate) fn let_cost(&self, uses: usize, name: usize, value: usize) -> usize {
+        super::syntax::let_cost(uses, name, value, self.generator.options.beautify)
     }
 
     /// Whether the call producing `result` renders at the result's one use
@@ -205,5 +217,11 @@ impl FunctionPricer<'_, '_> {
     /// How many times the emitter renders `h` (or its `let` name).
     pub(crate) fn uses(&self, h: naga::Handle<naga::Expression>) -> usize {
         self.ctx.ref_counts[h.index()] as usize
+    }
+
+    /// Bytes a `ZeroValue` of `ty` renders with its type spelled in full,
+    /// `vec4f()`: what a use costs once no alias covers the type.
+    pub(crate) fn bare_zero_value_len(&self, ty: naga::Handle<naga::Type>) -> usize {
+        self.generator.type_spelled_len[ty.index()] as usize + "()".len()
     }
 }

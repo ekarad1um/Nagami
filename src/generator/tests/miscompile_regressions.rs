@@ -90,7 +90,7 @@ fn image_load_bound_before_intervening_texture_store() {
         }";
     let out = minify(src);
     assert!(
-        out.contains("let a=textureLoad(A,vec2(0));textureStore(A,vec2(0),"),
+        out.contains("let a=textureLoad(A,vec2i());textureStore(A,vec2i(),"),
         "textureLoad must be bound before the intervening textureStore: {out}"
     );
 }
@@ -228,7 +228,7 @@ fn binding_array_texture_load_bound_before_store() {
         }";
     let out = minify(src);
     assert!(
-        out.contains("let a=textureLoad(A[0],vec2(0));textureStore(A[0],vec2(0),"),
+        out.contains("let a=textureLoad(A[0],vec2i());textureStore(A[0],vec2i(),"),
         "binding-array textureLoad must be bound before the intervening store: {out}"
     );
 }
@@ -1428,29 +1428,25 @@ fn inline_all_zero_vector_folds_to_zero_value() {
     );
 }
 
-/// A `let`-bound multi-use zero vector must stay `vec2f(0)`, not `vec2f()`:
-/// naga re-parses `vec2f()` as a non-emittable `ZeroValue` that can never be
-/// re-bound, forcing inline `vec2f()` at every use on re-minify
-/// (non-idempotent), while `vec2f(0)` re-parses to a bindable `Splat`.
+/// A `let`-bound multi-use zero vector is one `ZeroValue` after the fold -
+/// `vec2f()`, the spelling a re-parse yields - which the emitter never
+/// `let`-binds (no `Emit`); const_hoist shares it through a module `const`
+/// where that pays, so every pass lands on the same text.
 #[test]
-fn bound_multi_use_zero_vector_stays_splat_and_is_idempotent() {
+fn bound_multi_use_zero_vector_is_one_zero_value_shared_by_a_constant() {
     let src = "fn d(a:vec2f,b:vec2f)->f32{return distance(a,b);}\
         @fragment fn fs(@builtin(position) p:vec4f)->@location(0) f32{\
         let h=vec2f(0.0,0.0);return d(h,p.xy)+d(h,p.zw)+d(h,p.yx);}";
     let out = minify(src);
     assert!(
-        out.contains("=vec2f(0);"),
-        "bound multi-use zero was not kept as the round-trip-stable splat vec2f(0): {out}"
+        out.contains("const ") && out.matches("vec2f()").count() == 1,
+        "one zero value declared once for three uses: {out}"
     );
     assert!(
-        !out.contains("=vec2f();"),
-        "bound zero was folded to vec2f() (would over-inline on re-minify): {out}"
+        !out.contains("vec2f(0)"),
+        "the zero vector has no splat spelling left: {out}"
     );
-    assert_eq!(
-        minify(&out),
-        out,
-        "A3 bound-zero handling must be idempotent"
-    );
+    assert_eq!(minify(&out), out, "bound-zero handling must be idempotent");
 }
 
 /// `-0.0` has a non-zero bit pattern, so it must never fold to a zero-value
@@ -2460,10 +2456,12 @@ fn const_float_modulo_pair_stays_runtime() {
     );
 }
 
-/// The anonymous override's positional `O<n>` name collided with a user
-/// `override O2`; it is minted from the generator's pool.
+/// An override-expression array size is naga's anonymous override; it is
+/// spelled back in place, never declared under a minted name (a
+/// pipeline-constant key the source never had, and once the positional
+/// `O<n>` colliding with a user `override O2`).
 #[test]
-fn anonymous_override_never_collides_with_a_user_name() {
+fn an_override_expression_array_size_is_spelled_in_place() {
     let src = "override O2 : i32 = 3;\
         override N : i32;\
         var<workgroup> w : array<i32, N * 2>;\
@@ -2472,10 +2470,98 @@ fn anonymous_override_never_collides_with_a_user_name() {
           w[0] = O2; out[0] = workgroupUniformLoad(&w[0]) + i32(arrayLength(&out)); }";
     let out = minify(src);
     assert!(
-        out.contains("override O2:i32=3;override N:i32;override ")
-            && !out.contains("override O2:i32=N"),
-        "user overrides keep their names and the anonymous one gets a free one: {out}"
+        out.contains("override O2:i32=3;override N:i32;")
+            && out.matches("override ").count() == 2
+            && out.contains("array<i32,(N*2)>"),
+        "user overrides keep their names, the anonymous one is its expression: {out}"
     );
+    let module = crate::io::parse_wgsl(&out).expect("re-parses");
+    let anonymous = module
+        .overrides
+        .iter()
+        .filter(|(_, o)| o.name.is_none())
+        .count();
+    assert_eq!(
+        anonymous, 1,
+        "the size re-parses to one anonymous override: {out}"
+    );
+}
+
+/// The spelling is in the name slot before the alias plan reads it: a
+/// source `alias` gives an override-sized array one type handle, four
+/// declarations make its alias pay, and the alias body spells the size.
+/// Spelled at emission instead, the plan read an empty slot and declared
+/// `alias c=array<u32,>;` - a runtime-sized array, which WGSL's trailing
+/// comma admits - so the text failed the self-check, and naga's writer,
+/// which cannot spell an anonymous override, could not stand in: the run
+/// erred where the release before it shipped.
+#[test]
+fn an_aliased_override_sized_array_spells_its_size_in_the_alias() {
+    let src = "override N: u32 = 4u;        alias T = array<u32, N * 2>;        var<workgroup> w1: T; var<workgroup> w2: T; var<workgroup> w3: T; var<workgroup> w4: T;        @group(0) @binding(0) var<storage, read_write> out: array<u32>;        fn f(p: ptr<workgroup, T>) -> u32 { return (*p)[0] + (*p)[1]; }        @compute @workgroup_size(1) fn main() {          w1[0] = 1u; w2[1] = 2u; w3[2] = 3u; w4[3] = 4u;          out[0] = f(&w1) + f(&w2) + f(&w3) + f(&w4); }";
+    let out = minify(src);
+    assert!(
+        out.starts_with("alias ")
+            && out.contains("=array<u32,(N*2)>;")
+            && !out.contains("array<u32,>")
+            && out.matches("override ").count() == 1,
+        "the alias spells the anonymous override's expression: {out}"
+    );
+    let module = crate::io::parse_wgsl(&out).expect("re-parses");
+    assert!(
+        module.global_variables.iter().all(|(_, g)| {
+            g.space != naga::AddressSpace::WorkGroup
+                || matches!(
+                    module.types[g.ty].inner,
+                    naga::TypeInner::Array {
+                        size: naga::ArraySize::Pending(_),
+                        ..
+                    }
+                )
+        }),
+        "every workgroup array keeps its override size: {out}"
+    );
+}
+
+/// naga's `@early_depth_test(...)` (an extension tint does not read) is a
+/// fragment entry point's contract with the depth test: dropped, a forced
+/// early test or a conservative-depth promise vanishes on wgpu.
+#[test]
+fn a_fragment_entry_point_keeps_its_early_depth_test() {
+    use naga::{ConservativeDepth as D, EarlyDepthTest as T};
+    for (attr, expected) in [
+        ("force", T::Force),
+        (
+            "greater_equal",
+            T::Allow {
+                conservative: D::GreaterEqual,
+            },
+        ),
+        (
+            "less_equal",
+            T::Allow {
+                conservative: D::LessEqual,
+            },
+        ),
+        (
+            "unchanged",
+            T::Allow {
+                conservative: D::Unchanged,
+            },
+        ),
+    ] {
+        let src = format!(
+            "@fragment @early_depth_test({attr}) fn main(@builtin(position) p: vec4f) \
+             -> @builtin(frag_depth) f32 {{ return p.z - 0.1; }}"
+        );
+        let out = minify(&src);
+        assert!(out.contains(&format!("@early_depth_test({attr})")), "{out}");
+        let module = crate::io::parse_wgsl(&out).expect("re-parses");
+        assert_eq!(
+            module.entry_points[0].early_depth_test,
+            Some(expected),
+            "{out}"
+        );
+    }
 }
 
 /// A matrix local passed by address keeps `: T`: an inferred `var b = a * b`

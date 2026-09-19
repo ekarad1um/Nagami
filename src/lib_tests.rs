@@ -2264,8 +2264,9 @@ fn preamble_run_rejects_a_body_only_diagnostic_directive() {
     );
 }
 
-/// A preserved resource stays in the entry point's interface after nagami's
-/// own passes kill its last read, and an unused named override stays a valid
+/// A resource stays in the entry point's interface after nagami's own
+/// passes kill its last read - preserved by name or not, as a phony
+/// assignment - and an unused named override stays a valid
 /// pipeline-constant key.
 #[test]
 fn preserved_resources_and_named_overrides_survive_dce() {
@@ -2279,16 +2280,250 @@ fn preserved_resources_and_named_overrides_survive_dce() {
     };
     let output = run(source, &config).unwrap();
     assert!(
-        output.source.contains("b:array<u32>") && output.source.contains("override unused_ov"),
+        output.source.contains("b:array<u32>")
+            && output.source.contains("{_=&b;")
+            && output.source.contains("override unused_ov"),
         "{}",
         output.source
     );
     let output = run(source, &Config::default()).unwrap();
     assert!(
-        !output.source.contains("binding(1)") && output.source.contains("override unused_ov"),
+        output.source.contains("binding(1)")
+            && output.source.contains("{_=&")
+            && output.source.contains("override unused_ov"),
         "{}",
         output.source
     );
+}
+
+/// The spec's idiom for putting a resource in the interface: every phony
+/// assignment keeps its binding, spelled `_=N;`, or `_=&N;` where the store
+/// type cannot be loaded.  The text passes the self-check, so no rung of
+/// the ladder was taken.
+#[test]
+fn phony_assignments_keep_their_bindings() {
+    let source = "@group(0) @binding(0) var t: texture_2d<f32>;
+        @group(0) @binding(1) var s: sampler;
+        @group(0) @binding(2) var<uniform> u: vec4f;
+        @group(0) @binding(3) var<storage, read_write> big: array<u32>;
+        @group(0) @binding(4) var<storage, read_write> counter: atomic<u32>;
+        @fragment fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
+            _ = t; _ = s; _ = u; _ = &big; _ = &counter;
+            return vec4f(uv, 0.0, 1.0);
+        }";
+    let output = run(source, &Config::default()).unwrap();
+    assert!(output.report.fallback.is_none() && output.report.bailout.is_none());
+    for binding in 0..5 {
+        assert!(
+            output.source.contains(&format!("binding({binding})")),
+            "{}",
+            output.source
+        );
+    }
+    assert_eq!(output.source.matches("_=").count(), 5, "{}", output.source);
+    assert_eq!(output.source.matches("_=&").count(), 2, "{}", output.source);
+    let again = run(&output.source, &Config::default()).unwrap();
+    assert_eq!(again.source, output.source);
+}
+
+/// A read the passes fold away was a static access: the binding, its
+/// struct and one `_=N;` stay, per entry point that had it.
+#[test]
+fn a_dead_read_keeps_the_binding_accessed_per_entry_point() {
+    let source = "struct Inputs { a: f32, b: f32, c: f32 }
+        @group(0) @binding(0) var<uniform> inputs: Inputs;
+        @group(0) @binding(1) var<storage, read_write> o: array<f32>;
+        @compute @workgroup_size(1) fn dead() { let x = inputs.a; let y = inputs.b; o[0] = 1.0; }
+        @compute @workgroup_size(1) fn live() { o[1] = inputs.c; }
+        @compute @workgroup_size(1) fn none() { o[2] = 2.0; }";
+    let output = run(source, &Config::default()).unwrap();
+    assert!(output.report.fallback.is_none() && output.report.bailout.is_none());
+    assert!(output.source.contains("binding(0)"), "{}", output.source);
+    assert_eq!(output.source.matches("_=").count(), 1, "{}", output.source);
+    let dead = output.source.split("fn dead(").nth(1).unwrap();
+    assert!(dead.starts_with(")"), "{}", output.source);
+    assert!(
+        dead.split('}').next().unwrap().contains("{_="),
+        "{}",
+        output.source
+    );
+}
+
+/// What the input never referenced is no access; what it referenced only
+/// beside a live reference needs no phony of its own.
+#[test]
+fn an_unreferenced_binding_goes_and_a_redundant_phony_goes() {
+    let unreferenced = "@group(0) @binding(0) var<uniform> u: vec4f;
+        @group(0) @binding(1) var<storage, read_write> o: vec4f;
+        @compute @workgroup_size(1) fn main() { o = vec4f(1.0); }";
+    let output = run(unreferenced, &Config::default()).unwrap();
+    assert!(
+        !output.source.contains("binding(0)") && !output.source.contains("_="),
+        "{}",
+        output.source
+    );
+    let redundant = "@group(0) @binding(0) var t: texture_2d<f32>;
+        @group(0) @binding(1) var s: sampler;
+        @fragment fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
+            _ = t;
+            return textureSample(t, s, uv);
+        }";
+    let output = run(redundant, &Config::default()).unwrap();
+    assert!(!output.source.contains("_="), "{}", output.source);
+    assert!(output.source.len() < redundant.len());
+}
+
+/// dead_branch rebuilds the arena from the body; the pin, which no
+/// statement reaches, is rooted like naga's compactor roots it.
+#[test]
+fn a_dead_branch_keeps_its_binding_accessed() {
+    let source = "const DEBUG = false;
+        @group(0) @binding(0) var<storage, read> probe: array<u32, 4>;
+        @group(0) @binding(1) var<storage, read_write> o: array<u32>;
+        @compute @workgroup_size(1) fn main() {
+            var x = 1u;
+            if DEBUG { x = probe[0]; }
+            o[0] = x;
+        }";
+    let output = run(source, &Config::default()).unwrap();
+    assert!(output.report.fallback.is_none() && output.report.bailout.is_none());
+    assert!(!output.source.contains("if"), "{}", output.source);
+    assert!(
+        output.source.contains("binding(0)") && output.source.contains("{_="),
+        "{}",
+        output.source
+    );
+    assert!(!output.source.contains("_=&"), "{}", output.source);
+}
+
+/// A helper's dead read is pinned where the helper is: one phony serves
+/// every entry point that calls it, and none appears in the entry points.
+#[test]
+fn a_helper_pins_for_its_callers() {
+    let source = "@group(0) @binding(0) var<uniform> u: vec4f;
+        @group(0) @binding(1) var<storage, read_write> o: array<vec4f>;
+        fn helper(i: u32) -> vec4f { let dead = u; return vec4f(f32(i)); }
+        @compute @workgroup_size(1) fn a() { o[0] = helper(0u); }
+        @compute @workgroup_size(1) fn b() { o[1] = helper(1u); }
+        @compute @workgroup_size(1) fn c() { o[2] = helper(2u); }";
+    let config = Config {
+        // The helper stays a function.
+        preserve_symbols: vec!["helper".to_string()],
+        ..Default::default()
+    };
+    let output = run(source, &config).unwrap();
+    assert!(output.report.fallback.is_none() && output.report.bailout.is_none());
+    assert_eq!(output.source.matches("_=").count(), 1, "{}", output.source);
+    assert!(
+        output
+            .source
+            .split("fn helper(")
+            .nth(1)
+            .unwrap()
+            .contains("{_="),
+        "{}",
+        output.source
+    );
+}
+
+/// A library function keeps the accesses of its call graph: the host
+/// composes it under an entry point whose interface they join.
+#[test]
+fn a_library_function_keeps_its_accesses() {
+    let source = "@group(0) @binding(0) var t: texture_2d<f32>;
+        @group(0) @binding(1) var<uniform> u: vec4f;
+        fn leaf() -> f32 { _ = t; return 1.0; }
+        fn root(x: f32) -> f32 { let dead = u.x; return leaf() + x; }";
+    let output = run(source, &Config::default()).unwrap();
+    assert!(
+        output.report.fallback.is_none() && output.report.bailout.is_none(),
+        "{:?}",
+        output.report
+    );
+    assert_eq!(output.source.matches("_=").count(), 2, "{}", output.source);
+}
+
+/// A binding array is neither a texture nor a pointer, so its pin is its
+/// first element, `_=N[0];`, which tint accepts.
+#[test]
+fn a_binding_array_pins_by_its_first_element() {
+    let source = "@group(0) @binding(0) var textures: binding_array<texture_2d<f32>, 4>;
+        @fragment fn fs() { let dead = textureLoad(textures[0], vec2(0, 0), 0); }";
+    let output = run(source, &Config::default()).unwrap();
+    assert!(output.report.fallback.is_none() && output.report.bailout.is_none());
+    assert!(
+        output.source.contains("{_=") && output.source.contains("[0];}"),
+        "{}",
+        output.source
+    );
+    let again = run(&output.source, &Config::default()).unwrap();
+    assert_eq!(again.source, output.source);
+}
+
+/// naga allows an immediate no bare reference, so its pin is the loaded
+/// form, `_=pc;` all the same; a helper's serves every caller.
+#[test]
+fn an_immediate_pins_as_its_load() {
+    let source = "var<immediate> a: i32;
+        var<immediate> b: i32;
+        var<immediate> c: i32;
+        fn uses_a() { let foo = a; }
+        fn uses_uses_a() { uses_a(); }
+        fn uses_b() { let foo = b; }
+        @compute @workgroup_size(1) fn main1() { uses_a(); }
+        @compute @workgroup_size(1) fn main2() { uses_uses_a(); }
+        @compute @workgroup_size(1) fn main3() { uses_b(); }
+        @compute @workgroup_size(1) fn main4() { }";
+    let output = run(source, &Config::default()).unwrap();
+    assert!(
+        output.report.fallback.is_none() && output.report.bailout.is_none(),
+        "{:?}",
+        output.report
+    );
+    assert_eq!(output.source.matches("_=").count(), 2, "{}", output.source);
+    assert_eq!(
+        output.source.matches("var<immediate>").count(),
+        2,
+        "{}",
+        output.source
+    );
+    let again = run(&output.source, &Config::default()).unwrap();
+    assert_eq!(again.source, output.source);
+}
+
+/// The emitter drops a statement of its own accord - the no-op `p = p`,
+/// where naga's front end left it - so the pin is decided by what the
+/// text rendered, not by what the arena holds: the generator's own text
+/// keeps the access, and no rung of the ladder is taken.
+#[test]
+fn an_identity_store_the_emitter_drops_keeps_the_binding_accessed() {
+    let source = "struct S { m: mat2x2<f32> }
+        @group(0) @binding(0) var<storage, read_write> ssbo: S;
+        @compute @workgroup_size(1) fn f() { let v = ssbo.m; ssbo.m = v; }";
+    let output = run(source, &Config::default()).unwrap();
+    assert!(
+        output.report.fallback.is_none() && output.report.bailout.is_none(),
+        "{:?}",
+        output.report
+    );
+    assert!(
+        output.source.contains("binding(0)") && output.source.ends_with("fn f(){_=A;}"),
+        "{}",
+        output.source
+    );
+}
+
+/// The module API carries the accesses in the IR.
+#[test]
+fn run_module_keeps_a_dead_read_accessed() {
+    let source = "@group(0) @binding(0) var<uniform> u: vec4f;
+        @group(0) @binding(1) var<storage, read_write> o: vec4f;
+        @compute @workgroup_size(1) fn main() { let dead = u; o = vec4f(1.0); }";
+    let mut module = io::parse_wgsl(source).unwrap();
+    run_module(&mut module, &Config::default()).unwrap();
+    assert_eq!(module.global_variables.len(), 2);
+    let pins = crate::pins::of(&module.global_variables, &module.entry_points[0].function);
+    assert_eq!(pins.len(), 2);
 }
 
 /// A mesh shader: the generator refuses the stage, so naga's emitter prints
@@ -2344,6 +2579,7 @@ fn naga_fallback_reports_itself_and_keeps_the_name_map() {
 fn a_failing_writer_on_the_fallback_rung_keeps_the_generators_diagnosis() {
     let writer_fails = || Err(Error::Emit("writer: no arm for this expression".into()));
     let not_blocked = || None;
+    let self_check = |text: &str| io::validate_wgsl_text(text);
     let err = resolve_generator_output(
         Err(Error::Emit("generator: unsupported image class".into())),
         &writer_fails,
@@ -2352,6 +2588,7 @@ fn a_failing_writer_on_the_fallback_rung_keeps_the_generators_diagnosis() {
         "fn f() {}",
         false,
         &not_blocked,
+        &self_check,
     )
     .err()
     .expect("no rung ships");
@@ -2592,6 +2829,77 @@ fn a_two_site_vector_constant_is_hoisted_when_the_output_shrinks() {
     );
     let second = run(&first, &Config::default()).expect("minifies").source;
     assert_eq!(first, second, "idempotent");
+}
+
+/// The zero of a vector type is a `ZeroValue`: pre-emit, so the emitter
+/// never `let`-binds it and every use spells `vec4f()` (or the alias's
+/// `B()`).  Six such uses share one `const`; the shortlist prices them at
+/// the full spelling because the alias they alone justified goes with
+/// them, and the render confirms.  A re-parse keeps the constant.
+#[test]
+fn repeated_zero_vectors_are_hoisted_to_one_constant() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<vec4f>;\
+        fn a(i: u32) { o[i] = vec4f(); o[i + 1u] = vec4f(); }\
+        fn b(i: u32) { o[i + 2u] = vec4f(); o[i + 3u] = vec4f(); }\
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {\
+          a(id.x); b(id.y); o[id.z + 4u] = vec4f(); o[id.z + 5u] = vec4f();\
+        }";
+    let first = run(src, &Config::default()).expect("minifies").source;
+    assert!(
+        first.contains("const ") && first.matches("vec4f()").count() == 1,
+        "one declaration serves six zero vectors: {first}"
+    );
+    let second = run(&first, &Config::default()).expect("minifies").source;
+    assert_eq!(first, second, "idempotent");
+}
+
+/// `let z = vec2f();` names one `ZeroValue` the body uses five times; the
+/// emitter cannot bind it (no `Emit`), so one site rendered five times
+/// hoists as five sites would - the model must not take the `let` the
+/// emitter never writes.
+#[test]
+fn a_zero_vector_bound_in_the_source_is_hoisted() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<vec2f>;\
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {\
+          let z = vec2f();\
+          o[id.x] = z; o[id.y] = z; o[id.z] = z; o[id.x + 1u] = z; o[id.y + 1u] = z;\
+        }";
+    let first = run(src, &Config::default()).expect("minifies").source;
+    assert!(
+        first.contains("const ") && first.matches("vec2f()").count() == 1,
+        "one declaration serves the five uses: {first}"
+    );
+    let second = run(&first, &Config::default()).expect("minifies").source;
+    assert_eq!(first, second, "idempotent");
+}
+
+/// The same five uses with the zero spelled lane by lane: the fold makes
+/// one `ZeroValue` of the `Compose`, and the constant follows.
+#[test]
+fn a_zero_vector_spelled_with_lanes_hoists_alike() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<vec2f>;\
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {\
+          let z = vec2f(0.0, 0.0);\
+          o[id.x] = z; o[id.y] = z; o[id.z] = z; o[id.x + 1u] = z; o[id.y + 1u] = z;\
+        }";
+    let first = run(src, &Config::default()).expect("minifies").source;
+    assert!(
+        first.contains("const ") && first.matches("vec2f()").count() == 1,
+        "one declaration serves the five uses: {first}"
+    );
+    let second = run(&first, &Config::default()).expect("minifies").source;
+    assert_eq!(first, second, "idempotent");
+}
+
+/// Two zero vectors cannot pay for a declaration; no render is spent.
+#[test]
+fn two_zero_vectors_stay_inline() {
+    let src = "@group(0) @binding(0) var<storage, read_write> o: array<vec4f>;\
+        @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id: vec3u) {\
+          o[id.x] = vec4f(); o[id.y] = vec4f();\
+        }";
+    let first = run(src, &Config::default()).expect("minifies").source;
+    assert!(!first.contains("const "), "nothing pays: {first}");
 }
 
 /// A short vector at two sites costs more as a declaration than it saves;

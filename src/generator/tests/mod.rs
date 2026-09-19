@@ -11,6 +11,7 @@ mod dead_code;
 mod expressions;
 mod miscompile_regressions;
 mod names_and_output;
+mod pins;
 mod pipeline;
 mod precedence;
 mod price;

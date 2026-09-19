@@ -3,9 +3,14 @@
 //! key/value pair costs a few inlined methods instead of a hashbrown
 //! instantiation (the largest removable block of the wasm build).  Slots
 //! grow on demand, so a handle appended to the arena after construction
-//! reads as absent until inserted.  Iteration follows FIRST insertion: a
-//! removed and re-inserted handle keeps its original position.  No caller
-//! depends on the order, only on its determinism.
+//! reads as absent until inserted.  The members are also kept in a vector
+//! of their own: naga mints no `Handle` from a bare index, so iteration
+//! cannot walk the slots.  It follows FIRST insertion - a removed and
+//! re-inserted handle keeps its original position - and no caller depends
+//! on the order, only on its determinism.  The sparse set of Briggs and
+//! Torczon would make remove and clear O(1) with no `LISTED` bit, but its
+//! member check is generic over `T` where `Slots` is not: more code for
+//! no time.
 
 use std::borrow::Borrow;
 

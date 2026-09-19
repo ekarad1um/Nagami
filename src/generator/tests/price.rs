@@ -40,7 +40,6 @@ fn f(a: f32, b: f32) -> f32 {
     let mut pricer = Pricer::new(&renamed, &info, &config, &plan);
     let mut fp = pricer.function(fh);
     assert_eq!(fp.definition_len(), Some(declaration.len()));
-    assert_eq!(fp.name_len(), name.len());
     assert_eq!(fp.argument_name_len(0), 1);
 
     let (product, value) = {
@@ -67,4 +66,35 @@ fn f(a: f32, b: f32) -> f32 {
     let bound = fp.expr_len(value).expect("priced");
     assert_eq!(bound, "t*t+a".len());
     assert!(unbound > bound, "{unbound} vs {bound}");
+
+    // The call prices as the entry point renders it, arguments and
+    // separators included; `(` before the name keeps `vec4f(` from
+    // matching a callee named `f`.
+    drop(fp);
+    let (callee, arguments) = renamed.entry_points[0]
+        .function
+        .body
+        .iter()
+        .find_map(|s| match s {
+            naga::Statement::Call {
+                function,
+                arguments,
+                ..
+            } => Some((*function, arguments.clone())),
+            _ => None,
+        })
+        .expect("the call");
+    let call_start = rendered[end..]
+        .find(&format!("({name}("))
+        .expect("the call")
+        + end
+        + 1;
+    let call_end = rendered[call_start..].find(')').expect("its close") + call_start + 1;
+    let mut fp = pricer.entry_point(0);
+    assert_eq!(
+        fp.call_len(callee, &arguments),
+        Some(call_end - call_start),
+        "{}",
+        &rendered[call_start..call_end]
+    );
 }

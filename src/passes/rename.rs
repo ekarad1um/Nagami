@@ -223,9 +223,10 @@ pub(crate) fn plan_names_weighed(
 
 impl NamePlan {
     /// Where a further target of `weight` ranks: after every target of at
-    /// least that weight, its sequence number being the largest.
+    /// least that weight, its sequence number being the largest.  The
+    /// targets stand heaviest first, so that is a partition point.
     fn rank_of_weight(&self, weight: usize) -> usize {
-        self.targets.iter().filter(|t| t.1 >= weight).count()
+        self.targets.partition_point(|t| t.1 >= weight)
     }
 
     /// Length of the draw at `rank`; the draw is fixed by the reserved set
@@ -244,15 +245,23 @@ impl NamePlan {
 
     /// Bytes the existing targets pay when a further target of `weight`
     /// joins: every target ranked below it moves one draw down the
-    /// sequence, which costs an occurrence per byte the draws lengthen
-    /// (the single letters run out at the 52nd).
+    /// sequence, which costs an occurrence per byte the draws lengthen.
+    /// The draws lengthen at the cliffs alone (the single letters run out
+    /// at the 52nd, the pairs some 3,300 draws later), so the sum has one
+    /// term per cliff at or below the rank: the weight of the target
+    /// standing on its edge.
     pub(crate) fn insertion_cost(&self, weight: usize) -> usize {
-        let rank = self.rank_of_weight(weight);
-        self.targets[rank..]
-            .iter()
-            .enumerate()
-            .map(|(i, t)| t.1 * (self.draw_len(rank + i + 1) - self.draw_len(rank + i)))
-            .sum()
+        let mut cost = 0;
+        let mut rank = self.rank_of_weight(weight);
+        while let Some(name) = self.names.get(rank) {
+            // The draws never shorten, so the run of this length ends at a
+            // partition point.
+            let run = self.names[rank..].partition_point(|n| n.len() == name.len());
+            let edge = rank + run - 1;
+            cost += self.targets[edge].1 * (self.draw_len(edge + 1) - name.len());
+            rank = edge + 1;
+        }
+        cost
     }
 
     /// Whether `other` gives every target the name this plan gives it,
@@ -277,10 +286,10 @@ impl NamePlan {
         renamed
     }
 
-    /// Write the planned names into `module`; `true` when any slot or
-    /// `named_expressions` changed.  Module-scope renames are logged
-    /// (locals are neither unique nor host-visible), one batch per sweep
-    /// so `record_batch` can resolve swaps.
+    /// Write the planned names into `module`; `true` when any slot
+    /// changed.  Module-scope renames are logged (locals are neither
+    /// unique nor host-visible), one batch per sweep so `record_batch` can
+    /// resolve swaps.
     pub(crate) fn apply(
         self,
         module: &mut naga::Module,
@@ -325,7 +334,6 @@ impl NamePlan {
                 &mut module_renames,
             );
             apply_locals(function, fh.index(), &mut assigned, &mut changed);
-            changed |= clear_named_expressions(function);
         }
         for (ei, entry) in module.entry_points.iter_mut().enumerate() {
             apply_locals(
@@ -334,7 +342,6 @@ impl NamePlan {
                 &mut assigned,
                 &mut changed,
             );
-            changed |= clear_named_expressions(&mut entry.function);
         }
         if let Some(log) = log
             && !module_renames.is_empty()
@@ -574,19 +581,6 @@ fn apply_locals(
     for (lh, local) in function.local_variables.iter_mut() {
         apply_name(&mut local.name, assigned.local[body].remove(lh), changed);
     }
-}
-
-/// Clear `named_expressions` whenever the function has any and report it as
-/// a change even when nothing was renamed.  The extra convergence sweep
-/// looks like a perf wart but is load-bearing: it lets downstream passes
-/// observe IR that settled only in this sweep's earlier passes (DCE catching
-/// a global orphaned by a phony-assignment load elimination).
-fn clear_named_expressions(function: &mut naga::Function) -> bool {
-    if function.named_expressions.is_empty() {
-        return false;
-    }
-    function.named_expressions.clear();
-    true
 }
 
 // MARK: Occurrence weights
@@ -1219,36 +1213,6 @@ fn fs_main() -> @location(0) vec4f {
         );
     }
 
-    #[test]
-    fn clears_named_expressions_and_reports_change_even_when_nothing_renamed() {
-        // Gating the clear on `changed` makes a preserve-all pass exit the
-        // convergence loop one sweep early, before downstream DCE can remove
-        // orphaned globals.
-        let source = r#"
-@fragment
-fn fs_main() -> @location(0) vec4f {
-    let y = 1.0;
-    return vec4f(y, 0.0, 0.0, 1.0);
-}
-"#;
-        let preserve = ["fs_main", "y"];
-        let (changed, module) = run_pass_with_mangle(source, &preserve, true);
-        assert!(
-            changed,
-            "rename must report `changed = true` when it clears `named_expressions`, \
-             even if no identifier was renamed - downstream convergence depends on it"
-        );
-        let entry = module
-            .entry_points
-            .first()
-            .expect("entry point should exist");
-        assert!(
-            entry.function.named_expressions.is_empty(),
-            "named_expressions must be cleared so the WGSL emitter does not pick up \
-             stale bindings on the next sweep"
-        );
-    }
-
     // MARK: Struct-name reservation regression
 
     /// Without mangling the generator keeps source struct names verbatim, so
@@ -1331,6 +1295,50 @@ struct A { x: f32 }
         // letters at its one occurrence.
         assert_eq!(plan.name_len_at_weight(2), 1);
         assert_eq!(plan.insertion_cost(2), 1);
+    }
+
+    /// The cliff sum is the sum over every target ranked below the
+    /// newcomer of its weight times the bytes its draw grows, at every
+    /// weight; here the edge of the single letters is held by a heavy
+    /// target and two-letter draws follow it.
+    #[test]
+    fn the_insertion_cost_is_the_weight_on_each_cliff() {
+        let mut src = String::new();
+        let mut body = String::new();
+        for i in 0..55 {
+            src.push_str(&format!("var<private> g{i}: f32;\n"));
+            // The first 52 globals are read twice, so they rank ahead of
+            // the last three and the 52nd draw goes to a weight-3 target.
+            if i < 52 {
+                body.push_str(&format!("_ = g{i} + g{i};\n"));
+            }
+        }
+        src.push_str(&format!(
+            "@compute @workgroup_size(1) fn main() {{\n{body}}}"
+        ));
+        let module = naga::front::wgsl::parse_str(&src).expect("source should parse");
+        let plan = plan_names(&module, &HashSet::new(), true);
+        assert_eq!(plan.names.len(), 55);
+        assert_eq!(plan.names[51].len(), 1);
+        assert_eq!(plan.names[52].len(), 2);
+        assert_eq!(plan.targets[51].1, 3);
+        let every_target = |weight: usize| -> usize {
+            let rank = plan.targets.iter().filter(|t| t.1 >= weight).count();
+            (rank..plan.targets.len())
+                .map(|p| plan.targets[p].1 * (plan.draw_len(p + 1) - plan.draw_len(p)))
+                .sum()
+        };
+        for weight in 0..6 {
+            assert_eq!(
+                plan.insertion_cost(weight),
+                every_target(weight),
+                "weight {weight}"
+            );
+        }
+        // A newcomer above the edge pushes the weight-3 holder to two
+        // letters; one below it pushes only two-letter holders, for free.
+        assert_eq!(plan.insertion_cost(4), 3);
+        assert_eq!(plan.insertion_cost(2), 0);
     }
 
     /// naga gives each block-scoped shadowing `var` its own handle under the

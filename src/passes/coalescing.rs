@@ -7,6 +7,10 @@
 //! unambiguously disjoint locals merge.  Locals with initialisers are
 //! excluded (the init would have to be re-materialised at every alias site).
 //!
+//! A merge can turn a copy between its two locals into a store of the
+//! value the shared slot already holds (`let e = b; a = e;` with `a` on
+//! `b`'s slot); load_dedup retires those in the sweep after.
+//!
 //! DFS order alone misses two hazards: a loop body whose first touch of a
 //! local is a read (served by zero-init on iteration 1 and by the back edge
 //! afterwards), and an `if` whose one arm writes while the other reads.  A
@@ -286,10 +290,6 @@ fn coalesce_function_locals(
                 changed += 1;
             }
         }
-    }
-
-    if changed > 0 {
-        function.named_expressions.clear();
     }
 
     changed

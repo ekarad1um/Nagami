@@ -107,3 +107,35 @@ fn a_two_use_value_inlined_into_a_loop_keeps_its_load_outside() {
         "no uniform read inside the loop: {out}"
     );
 }
+
+/// A bistable pair: each consistent state of the binding decisions is the
+/// other's flip, so the rounds never settle.  The third render has shown
+/// both states, and the shorter ships - here the two-use vector's `let`
+/// without the type annotation the other state spells (`let D:c=c(32,255)`
+/// against `let D=c(32,255)`), whichever state the cap lands on.
+#[test]
+fn an_unsettled_render_ships_the_shorter_of_its_two_states() {
+    let src = "@group(0) @binding(0) var<storage, read_write> out: array<u32>;\
+        fn g(a0: i32) -> bool {\
+          var k5 = 0u;\
+          loop {\
+            if (k5 >= 2u) { break; }\
+            if (any((vec2u(3u, 0u) & (vec2u(4294967295u, 0u) * k5)) < vec2u(1u, 1024u))) { break; }\
+            if (((-(a0) - (a0 << (32u & 31u))) > abs((a0 >> (k5 & 31u))))) { break; }\
+            continuing { k5++; break if k5 > 12u; }\
+          }\
+          let v8 = vec2u(255u, 32u).yx;\
+          var arr9 = array<u32, 4>(31u, dot(v8, vec2u((364314348u >> (7u & 31u)), dot(v8, vec2u(3u, 255u))).yx), 3u, 4u);\
+          arr9[600168537u & 3u] += 32u;\
+          let v10 = arr9[0] + arr9[1] + arr9[2] * arr9[3];\
+          return ((true != true) | true);\
+        }\
+        @compute @workgroup_size(1) fn main() { out[0] = u32(g(-100)); out[1] = u32(g(-90)); }";
+    let out = compact(src);
+    let ctor = out.find("(32,255);").expect("the two-use vector's let");
+    let decl = out[..ctor].rfind("let ").expect("bound");
+    assert!(
+        !out[decl..ctor].contains(':'),
+        "the shorter state, without the annotation, ships: {out}"
+    );
+}

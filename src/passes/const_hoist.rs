@@ -1,7 +1,9 @@
 //! Repeated-constant hoisting: a vector or matrix constant built at several
-//! sites (`vec4f(0, 2, 0, 0)` in three functions) becomes one shared module
-//! `const`, so the rename pass can give the now-frequent constant a short
-//! name by its usual frequency model.
+//! sites (`vec4f(0, 2, 0, 0)` in three functions), or the zero of such a
+//! type (`vec4f()`, which the emitter never `let`-binds: a `ZeroValue` has
+//! no `Emit` to bind at), becomes one shared module `const`, so the rename
+//! pass can give the now-frequent constant a short name by its usual
+//! frequency model.
 //!
 //! Done in the IR rather than as a post-rename text substitution so the
 //! result is idempotent: the constant takes part in renaming exactly as it
@@ -117,34 +119,31 @@ enum FuncRef {
 }
 
 /// One hoistable constructor; the rewrite overwrites `handle`'s slot in
-/// place, and `key` groups the sites that build the same value.
+/// place, and `key` groups the sites that build the same value.  `zero`
+/// is the type of a `ZeroValue` site, whose bare spelling the shortlist
+/// prices.
 struct Candidate {
     loc: FuncRef,
     handle: naga::Handle<naga::Expression>,
     key: Vec<KeyToken>,
+    zero: Option<naga::Handle<naga::Type>>,
+    /// Live consumers: how often the site renders unless the emitter
+    /// binds it.
+    uses: u32,
 }
 
-/// What one site costs today and what its `const` reference would: its
-/// text at a use and as a declaration initializer (type spelled), whether
-/// the emitter `let`-binds it (at a name of `let_len` bytes inside
-/// `let_cost` bytes of `let N=;`), and its renderings.
+/// What one site costs today and what its `const` reference would: the
+/// bytes it spells today - `let`-bound by the emitter, the `let` and its
+/// name at every use, else its text at every use - its text as a
+/// declaration initializer (type spelled), and its renderings.  A
+/// `ZeroValue` site that is `B()` under a type alias may be what pays for
+/// the alias, so its today is priced with the type spelled in full: an
+/// upper bound that admits the group to the render, which knows whether
+/// the alias survives the hoist.  A constructor's bare use is its use.
 struct SitePrice {
-    use_len: usize,
+    today: usize,
     decl_len: usize,
-    bound: bool,
-    let_len: usize,
-    let_cost: usize,
     uses: usize,
-}
-
-impl SitePrice {
-    fn today(&self) -> usize {
-        if self.bound {
-            self.use_len + self.let_cost + self.uses * self.let_len
-        } else {
-            self.uses * self.use_len
-        }
-    }
 }
 
 /// The constructors of `func` worth grouping: emitted (in an `Emit` range)
@@ -157,7 +156,10 @@ impl SitePrice {
 /// renders a nested constructor through such a parent (a matrix flattens
 /// its columns to scalars), so the parent is the candidate and its lanes
 /// are priced as part of it.  An array or struct constructor spells its
-/// lanes as they are, so those stay candidates.
+/// lanes as they are, so those stay candidates.  A `ZeroValue` of a
+/// hoistable type is a candidate on the same terms less the range: it is
+/// pre-emit, so consumers are its only liveness, and the counts come from
+/// live consumers alone.
 fn collect(loc: FuncRef, func: &naga::Function, module: &naga::Module, out: &mut Vec<Candidate>) {
     let types = &module.types;
     let arena = &func.expressions;
@@ -177,13 +179,15 @@ fn collect(loc: FuncRef, func: &naga::Function, module: &naga::Module, out: &mut
         }
     }
     for (h, expr) in arena.iter() {
-        if !live[h.index()] || counts[h.index()] == 0 || lane[h.index()] {
+        if counts[h.index()] == 0 || lane[h.index()] {
             continue;
         }
-        let naga::Expression::Compose { ty, .. } = expr else {
-            continue;
+        let (ty, zero) = match *expr {
+            naga::Expression::Compose { ty, .. } if live[h.index()] => (ty, None),
+            naga::Expression::ZeroValue(ty) => (ty, Some(ty)),
+            _ => continue,
         };
-        if !hoistable_type(*ty, types) {
+        if !hoistable_type(ty, types) {
             continue;
         }
         let mut key = Vec::new();
@@ -192,6 +196,8 @@ fn collect(loc: FuncRef, func: &naga::Function, module: &naga::Module, out: &mut
                 loc,
                 handle: h,
                 key,
+                zero,
+                uses: counts[h.index()],
             });
         }
     }
@@ -243,10 +249,13 @@ impl Pass for ConstHoistPass {
         }
 
         // A group is the sites of one value, plus the constant that already
-        // declares it, if any; without one it takes two sites to share a
-        // declaration.  Groups are numbered in order of first site, so const
-        // creation, hence the names rename assigns, does not depend on hash
-        // order (which differs between the native and the wasm build).
+        // declares it, if any; without one it takes two renderings to share
+        // a declaration - two sites, or one site the emitter spells at every
+        // use (a `ZeroValue` is never `let`-bound; a constructor with that
+        // many uses is, and the model declines it without a render).  Groups
+        // are numbered in order of first site, so const creation, hence the
+        // names rename assigns, does not depend on hash order (which differs
+        // between the native and the wasm build).
         let anchors = anchors(module);
         let mut by_key: FxHashMap<&[KeyToken], usize> = Default::default();
         let mut groups: Vec<Group> = Vec::new();
@@ -262,7 +271,14 @@ impl Pass for ConstHoistPass {
                 groups[g].0 = Some(*ch);
             }
         }
-        groups.retain(|(anchor, members)| members.len() >= if anchor.is_some() { 1 } else { 2 });
+        groups.retain(|(anchor, members)| {
+            anchor.is_some()
+                || members
+                    .iter()
+                    .map(|&m| candidates[m].uses as usize)
+                    .sum::<usize>()
+                    >= 2
+        });
         if groups.is_empty() {
             return Ok(false);
         }
@@ -303,22 +319,30 @@ impl Pass for ConstHoistPass {
                         continue;
                     };
                     let let_len = fp.let_name_len();
+                    let bare_use_len = candidates[idx]
+                        .zero
+                        .map_or(use_len, |ty| fp.bare_zero_value_len(ty));
+                    let bound = fp.binds(h);
+                    let uses = fp.uses(h);
+                    let today = if bound {
+                        fp.let_cost(uses, let_len, use_len)
+                    } else {
+                        uses * bare_use_len
+                    };
                     prices[idx] = Some(SitePrice {
-                        use_len,
+                        today,
                         decl_len,
-                        bound: fp.binds(h),
-                        let_len,
-                        let_cost: let_len + fp.let_boilerplate(),
-                        uses: fp.uses(h),
+                        uses,
                     });
                 }
             }
             start = end;
         }
 
-        // Shortlist by the model; confirm by the output.  Decisions are
-        // sequential: an accepted hoist is in the module the next trial
-        // renders, so its name-pool and extraction effects are in the base.
+        // Shortlist by the model (an upper bound on today for zero sites, see
+        // `SitePrice`); confirm by the output.  Decisions are sequential: an
+        // accepted hoist is in the module the next trial renders, so its
+        // name-pool and extraction effects are in the base.
         let mut base_len = None;
         let mut changed = false;
         for (anchor, members) in groups {
@@ -334,14 +358,14 @@ impl Pass for ConstHoistPass {
             // An anchored group pays no declaration.
             let uses: usize = site_prices.iter().map(|p| p.uses).sum();
             let name_len = pricer.name_len_at_weight(1 + uses);
-            let today: usize = site_prices.iter().map(|p| p.today()).sum();
-            let mut hoisted = uses * name_len;
-            if anchor.is_none() {
-                hoisted += pricer.decl_boilerplate()
-                    + name_len
-                    + site_prices[0].decl_len
-                    + pricer.name_insertion_cost(1 + uses);
-            }
+            let today: usize = site_prices.iter().map(|p| p.today).sum();
+            let hoisted = match anchor {
+                Some(_) => uses * name_len,
+                None => {
+                    pricer.decl_cost(uses, name_len, site_prices[0].decl_len)
+                        + pricer.name_insertion_cost(1 + uses)
+                }
+            };
             if hoisted >= today {
                 continue;
             }
@@ -377,9 +401,10 @@ impl Pass for ConstHoistPass {
 /// Point every site at one shared `const` (`anchor`, or a new constant
 /// initialised with the first site's cone cloned into `global_expressions`)
 /// and rebuild the sites' `Emit` ranges: a `Constant` is not emittable, and
-/// the orphaned lanes become dead for the next compaction.  The
-/// expressions keep their arena slots, so topological order is preserved
-/// and the same call on a copy of the module yields the same module.
+/// the orphaned lanes become dead for the next compaction (a `ZeroValue`
+/// site was in no range and leaves no lanes).  The expressions keep their
+/// arena slots, so topological order is preserved and the same call on a
+/// copy of the module yields the same module.
 fn hoist_group(
     module: &mut naga::Module,
     sites: &[(FuncRef, naga::Handle<naga::Expression>)],
@@ -424,8 +449,10 @@ fn declare_hoisted(
         FuncRef::Function(fh) => &module.functions[fh],
         FuncRef::EntryPoint(i) => &module.entry_points[i].function,
     };
-    let naga::Expression::Compose { ty, .. } = rep_func.expressions[rep_handle] else {
-        unreachable!("every candidate is a constructor");
+    let (naga::Expression::Compose { ty, .. } | naga::Expression::ZeroValue(ty)) =
+        rep_func.expressions[rep_handle]
+    else {
+        unreachable!("every candidate is a constructor or a zero value");
     };
     // A const-expression lives in `global_expressions`.
     let mut cloned = HandleMap::default();

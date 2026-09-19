@@ -7,6 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::error::Error;
+use crate::interface::Interface;
 use crate::io;
 
 mod context;
@@ -23,8 +24,9 @@ pub trait Pass {
     /// Short, unique identifier for reports and trace filenames.
     fn name(&self) -> &'static str;
     /// Run against `module`; `Ok(true)` iff it was modified.  The driver
-    /// validates only after a declared change, skips a pass whose input is
-    /// unchanged since it last contributed none, and re-runs accepted
+    /// validates only after a declared change and normalizes the module
+    /// behind it (`crate::passes::normalize`), skips a pass whose input
+    /// is unchanged since it last contributed none, and re-runs accepted
     /// passes to rebuild the pre-failure state after a rollback: a pass
     /// must be a deterministic function of the module and must not touch
     /// it (or the name log) while returning `Ok(false)`.
@@ -81,18 +83,30 @@ enum Validation {
     Lazy,
 }
 
+/// The pass lists of one run: the ring swept to a fixed point, the late
+/// ring swept to its own, the tail run once.
+struct Stages<'p> {
+    ring: &'p mut [Box<dyn Pass>],
+    late: &'p mut [Box<dyn Pass>],
+    tail: &'p mut [Box<dyn Pass>],
+}
+
 #[derive(Clone, Copy)]
 struct Shared<'a> {
     cell: &'a ModuleInfoCell,
     name_log: &'a std::cell::RefCell<crate::name_map::NameLog>,
     tail: &'a TailRender,
     analyses: &'a AnalysisCache,
+    /// Accepted changes so far, across the stages of one run: the bisect
+    /// limit counts them all.
+    version: &'a std::cell::Cell<u64>,
 }
 
 /// Run the IR pipeline: [`crate::passes::build_ir_passes`] to a fixed
-/// point, then [`crate::passes::build_tail_passes`] once.  `info` must
-/// describe `module` as passed in; the returned info describes it as
-/// returned, so a caller never validates the same state twice.
+/// point, [`crate::passes::build_late_passes`] to its own, then
+/// [`crate::passes::build_tail_passes`] once.  `info` must describe
+/// `module` as passed in; the returned info describes it as returned, so a
+/// caller never validates the same state twice.
 pub fn run_ir_passes(
     module: &mut naga::Module,
     info: naga::valid::ModuleInfo,
@@ -104,7 +118,8 @@ pub fn run_ir_passes(
         preamble_names,
         ..TailRender::default()
     };
-    let mut passes = crate::passes::build_ir_passes(config);
+    let mut ring = crate::passes::build_ir_passes(config);
+    let mut late = crate::passes::build_late_passes(config);
     let mut tail_passes = crate::passes::build_tail_passes(config);
     run_lists(
         module,
@@ -112,8 +127,11 @@ pub fn run_ir_passes(
         config,
         report,
         &tail,
-        &mut passes,
-        &mut tail_passes,
+        &mut Stages {
+            ring: &mut ring,
+            late: &mut late,
+            tail: &mut tail_passes,
+        },
     )
 }
 
@@ -129,32 +147,39 @@ fn run_lists(
     config: &Config,
     report: &mut Report,
     tail: &TailRender,
-    passes: &mut [Box<dyn Pass>],
-    tail_passes: &mut [Box<dyn Pass>],
+    stages: &mut Stages<'_>,
 ) -> Result<Converged, Error> {
+    // The front-end's `named_expressions` are an artifact of the input
+    // text: naga's compaction roots them, so a dead value keeps its slot
+    // for as long as its name, and every pass that replaces an expression
+    // would have to retire the name.  The pipeline runs without them, so
+    // no pass clears them and no sweep waits for the clear.  The pins stay
+    // (`crate::pins`): a root is exactly what a static access needs, and
+    // no pass replaces a bare `GlobalVariable`.
+    let globals = &module.global_variables;
+    crate::ir::visit::for_each_function_mut(
+        &mut module.functions,
+        &mut module.entry_points,
+        &mut |f| crate::pins::retain(globals, f),
+    );
     let name_log = std::cell::RefCell::new(crate::name_map::NameLog::default());
     let analyses = AnalysisCache::default();
+    let version = std::cell::Cell::new(0u64);
     let per_pass = config.trace.enabled || config.trace.validate_each_pass;
     let mut cell = ModuleInfoCell::new(info);
     if !per_pass {
         let backup = module.clone();
         let reports = report.pass_reports.len();
         let converged = report.converged;
+        let sweeps = report.sweeps;
         let shared = Shared {
             cell: &cell,
             name_log: &name_log,
             tail,
             analyses: &analyses,
+            version: &version,
         };
-        match run_both(
-            module,
-            config,
-            report,
-            shared,
-            passes,
-            tail_passes,
-            Validation::Lazy,
-        ) {
+        match run_stages(module, config, report, shared, stages, Validation::Lazy) {
             Err(_) if cell.failed() => {}
             outcome => {
                 let info = outcome?;
@@ -171,8 +196,10 @@ fn run_lists(
         *name_log.borrow_mut() = crate::name_map::NameLog::default();
         report.pass_reports.truncate(reports);
         report.converged = converged;
+        report.sweeps = sweeps;
         *tail.render.borrow_mut() = None;
         analyses.clear();
+        version.set(0);
         cell = ModuleInfoCell::new(io::validate_module(module)?);
     }
     let shared = Shared {
@@ -180,16 +207,9 @@ fn run_lists(
         name_log: &name_log,
         tail,
         analyses: &analyses,
+        version: &version,
     };
-    let info = run_both(
-        module,
-        config,
-        report,
-        shared,
-        passes,
-        tail_passes,
-        Validation::PerPass,
-    )?;
+    let info = run_stages(module, config, report, shared, stages, Validation::PerPass)?;
     Ok(Converged {
         name_log: name_log.into_inner(),
         info,
@@ -197,32 +217,42 @@ fn run_lists(
     })
 }
 
-/// The IR list to a fixed point, the tail once, then the info of the
-/// result.
-fn run_both(
+/// The ring to a fixed point, the late ring to its own, the tail once,
+/// then the info of the result.
+fn run_stages(
     module: &mut naga::Module,
     config: &Config,
     report: &mut Report,
     shared: Shared<'_>,
-    passes: &mut [Box<dyn Pass>],
-    tail_passes: &mut [Box<dyn Pass>],
+    stages: &mut Stages<'_>,
     validation: Validation,
 ) -> Result<naga::valid::ModuleInfo, Error> {
     run_ir_passes_with(
         module,
         config,
         report,
-        passes,
+        stages.ring,
         shared,
         Sweeps::ToFixedPoint,
         validation,
     )?;
-    if !tail_passes.is_empty() {
+    if !stages.late.is_empty() {
         run_ir_passes_with(
             module,
             config,
             report,
-            tail_passes,
+            stages.late,
+            shared,
+            Sweeps::ToFixedPoint,
+            validation,
+        )?;
+    }
+    if !stages.tail.is_empty() {
+        run_ir_passes_with(
+            module,
+            config,
+            report,
+            stages.tail,
             shared,
             Sweeps::Once,
             validation,
@@ -269,11 +299,16 @@ fn run_ir_passes_with(
         name_log,
         tail,
         analyses,
+        version,
     } = shared;
     let trace_run_dir = prepare_trace_dir(config)?;
     let mut sweeps = 0usize;
     let trace_enabled = config.trace.enabled;
     let needs_text_validation = config.trace.validate_each_pass;
+    // CI mode also holds every pass to the host interface the run entered
+    // with; the plain path checks it once, on the shipped text.
+    let entry_interface = needs_text_validation
+        .then(|| Interface::of(module, crate::interface::Options::from_config(config)));
     // Trace / CI runs report every pass; the plain path skips idle ones.
     let full_fidelity = trace_enabled || needs_text_validation;
     let lazy = validation == Validation::Lazy;
@@ -281,12 +316,21 @@ fn run_ir_passes_with(
         !(lazy && full_fidelity),
         "per-pass text needs per-pass info"
     );
+    let preserved = |name: &str| config.preserve_symbols.iter().any(|p| p == name);
+    let normalize = Normalize {
+        preserved: &preserved,
+        lazy,
+        trace_run_dir: trace_run_dir.as_deref(),
+        interface: entry_interface.as_ref(),
+    };
+    // Every pass reads the canonical form, the first one included.
+    normalize.step(module, config, report, shared, None, "entry")?;
 
-    // `version` counts accepted changes; `clean_at[i]` is the version at
-    // which pass `i` last contributed none (no change, or rejected).  Passes
-    // are deterministic in the module, so a pass clean at the current
-    // version is skipped; only the report omits the idle runs.
-    let mut version = 0u64;
+    // `version` counts accepted changes across the stages of the run;
+    // `clean_at[i]` is the version at which pass `i` last contributed none
+    // (no change, or rejected).  Passes are deterministic in the module, so
+    // a pass clean at the current version is skipped; only the report omits
+    // the idle runs.
     let mut clean_at: Vec<Option<u64>> = vec![None; passes.len()];
 
     // Per-pass rollback state: module + name log (a stale log would report
@@ -309,13 +353,13 @@ fn run_ir_passes_with(
             if config
                 .trace
                 .opt_bisect_limit
-                .is_some_and(|limit| version >= limit)
+                .is_some_and(|limit| version.get() >= limit)
             {
                 sweeps += 1;
                 report.converged = false;
                 break 'sweeps;
             }
-            if !full_fidelity && clean_at[i] == Some(version) {
+            if !full_fidelity && clean_at[i] == Some(version.get()) {
                 continue;
             }
             if !lazy && backup.is_none() && !needs_text_validation {
@@ -377,7 +421,7 @@ fn run_ir_passes_with(
                 if declared_changed {
                     cell.invalidate();
                     analyses.clear();
-                    version += 1;
+                    version.set(version.get() + 1);
                 }
             } else if declared_changed || needs_text_validation {
                 // No declared change -> the module is still the state the
@@ -385,10 +429,18 @@ fn run_ir_passes_with(
                 // under-reporting pass trips the fingerprint debug_assert.
                 match io::validate_module(module) {
                     Ok(info) => {
+                        if let Some(interface) = &entry_interface
+                            && let Err(e) = interface.check(module)
+                        {
+                            return Err(Error::Validation(format!(
+                                "pass '{}' {e}",
+                                passes[i].name()
+                            )));
+                        }
                         cell.set(info);
                         if declared_changed {
                             analyses.clear();
-                            version += 1;
+                            version.set(version.get() + 1);
                             accepted.push(i);
                         }
                     }
@@ -432,6 +484,7 @@ fn run_ir_passes_with(
                                     analyses,
                                 },
                             )?;
+                            crate::passes::normalize(module, &preserved);
                             analyses.clear();
                             cell.set(io::validate_module(module)?);
                         }
@@ -441,7 +494,7 @@ fn run_ir_passes_with(
                 }
             }
             if !declared_changed || rolled_back {
-                clean_at[i] = Some(version);
+                clean_at[i] = Some(version.get());
             }
 
             let after_text = if rolled_back {
@@ -526,6 +579,10 @@ fn run_ir_passes_with(
             }
 
             report.pass_reports.push(pass_report);
+
+            if declared_changed && !rolled_back {
+                normalize.step(module, config, report, shared, after_text, passes[i].name())?;
+            }
         }
 
         sweeps += 1;
@@ -541,11 +598,10 @@ fn run_ir_passes_with(
                     drop(cell.get(module)?);
                 }
                 report.converged = false;
-                // The report is observable on the `Err` path too, so the
-                // sweep count lands before the CI-mode escalation (a
-                // warning otherwise).
-                report.sweeps = sweeps;
                 if config.trace.validate_each_pass {
+                    // The report is observable on the `Err` path too, so
+                    // the sweep count lands before the escalation.
+                    report.sweeps += sweeps;
                     return Err(Error::Validation(format!(
                         "pipeline did not converge after {MAX_PIPELINE_SWEEPS} sweeps; \
                          a pass is producing oscillating IR"
@@ -557,8 +613,123 @@ fn run_ir_passes_with(
         }
     }
 
-    report.sweeps = sweeps;
+    report.sweeps += sweeps;
     Ok(())
+}
+
+/// The driver's normalization ([`crate::passes::normalize`]): before the
+/// first pass of a list and behind every accepted change, so no pass reads
+/// another's orphans and no sweep is spent culling them.  Part of the
+/// change it follows, not a change of its own: the version, the bisect
+/// count and the replay list never see it (a replay re-normalizes behind
+/// each pass it re-runs).
+struct Normalize<'a> {
+    preserved: &'a dyn Fn(&str) -> bool,
+    lazy: bool,
+    trace_run_dir: Option<&'a std::path::Path>,
+    /// CI mode: the interface the run entered with, held to behind every step.
+    interface: Option<&'a Interface>,
+}
+
+impl Normalize<'_> {
+    /// Normalize `module` behind `after` (a pass name, or `entry`); what
+    /// it removed is reported as a `normalize` step, with text under trace
+    /// / CI (`before_text` being the triggering pass's after text, emitted
+    /// here at entry), and nothing removed is nothing reported.  The info
+    /// follows the validation mode: invalidated, or re-derived now, an
+    /// invalid module being a defect of the normalization itself that no
+    /// rollback can mend.
+    fn step(
+        &self,
+        module: &mut naga::Module,
+        config: &Config,
+        report: &mut Report,
+        shared: Shared<'_>,
+        before_text: Option<String>,
+        after: &str,
+    ) -> Result<(), Error> {
+        let Shared { cell, analyses, .. } = shared;
+        let trace_enabled = config.trace.enabled;
+        let before_text = match before_text {
+            None if trace_enabled => Some(emit_wgsl_with_info(module, &*cell.get(module)?)?),
+            text => text,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let start = Instant::now();
+        if !crate::passes::normalize(module, self.preserved) {
+            return Ok(());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let duration_us = start.elapsed().as_micros() as u64;
+        #[cfg(target_arch = "wasm32")]
+        let duration_us = 0u64;
+        analyses.clear();
+        if self.lazy {
+            cell.invalidate();
+        } else {
+            match io::validate_module(module) {
+                Ok(info) => {
+                    if let Some(interface) = self.interface
+                        && let Err(e) = interface.check(module)
+                    {
+                        return Err(Error::Validation(format!(
+                            "normalization behind '{after}' {e}"
+                        )));
+                    }
+                    cell.set(info);
+                }
+                Err(e) => {
+                    return Err(Error::Validation(format!(
+                        "normalization behind '{after}' produced invalid IR: {e}"
+                    )));
+                }
+            }
+        }
+        let after_text = if trace_enabled || config.trace.validate_each_pass {
+            Some(emit_wgsl_with_info(module, &*cell.get(module)?)?)
+        } else {
+            None
+        };
+        let mut text_validation_ok = None;
+        if config.trace.validate_each_pass && !crate::module_needs_naga_baseline_skip(module) {
+            let verdict = io::validate_wgsl_text(
+                after_text
+                    .as_deref()
+                    .expect("after text must be available for text validation"),
+            );
+            text_validation_ok = Some(verdict.is_ok());
+            if let Err(e) = verdict {
+                return Err(Error::Validation(format!(
+                    "normalization behind '{after}' produced IR that round-trips to invalid WGSL text: {e}"
+                )));
+            }
+        }
+        let pass_report = PassReport {
+            pass_name: "normalize".to_string(),
+            before_bytes: before_text.as_ref().map(|text| text.len()),
+            after_bytes: after_text.as_ref().map(|text| text.len()),
+            changed: true,
+            duration_us,
+            validation_ok: true,
+            text_validation_ok,
+            rolled_back: false,
+        };
+        if let Some(run_dir) = self.trace_run_dir {
+            dump_trace_step(
+                run_dir,
+                report.pass_reports.len(),
+                before_text
+                    .as_deref()
+                    .expect("before text must be available when tracing"),
+                after_text
+                    .as_deref()
+                    .expect("after text must be available when tracing"),
+                &pass_report,
+            )?;
+        }
+        report.pass_reports.push(pass_report);
+        Ok(())
+    }
 }
 
 // MARK: Trace directory allocation
@@ -749,8 +920,8 @@ mod driver_tests {
     use std::rc::Rc;
 
     use super::{
-        AnalysisCache, ModuleInfoCell, Pass, PassContext, Shared, TailRender, Validation, run_both,
-        run_lists,
+        AnalysisCache, ModuleInfoCell, Pass, PassContext, Shared, Stages, TailRender, Validation,
+        run_lists, run_stages,
     };
 
     fn run_to_fixed_point(
@@ -761,8 +932,19 @@ mod driver_tests {
         mut passes: Vec<Box<dyn Pass>>,
     ) -> Result<naga::valid::ModuleInfo, Error> {
         let tail = TailRender::default();
-        run_lists(module, info, config, report, &tail, &mut passes, &mut [])
-            .map(|converged| converged.info)
+        run_lists(
+            module,
+            info,
+            config,
+            report,
+            &tail,
+            &mut Stages {
+                ring: &mut passes,
+                late: &mut [],
+                tail: &mut [],
+            },
+        )
+        .map(|converged| converged.info)
     }
     use crate::config::Config;
     use crate::error::Error;
@@ -780,6 +962,27 @@ mod driver_tests {
                     .expect("test module must have a function or entry point");
                 f
             }
+        }
+    }
+
+    /// Renames the first entry point: valid IR with a changed host interface.
+    struct EntryRenamingPass;
+
+    impl Pass for EntryRenamingPass {
+        fn name(&self) -> &'static str {
+            "synthetic_rename_entry"
+        }
+        fn run(
+            &mut self,
+            module: &mut naga::Module,
+            _ctx: &PassContext<'_>,
+        ) -> Result<bool, Error> {
+            let ep = &mut module.entry_points[0];
+            if ep.name == "renamed" {
+                return Ok(false);
+            }
+            ep.name = "renamed".to_string();
+            Ok(true)
         }
     }
 
@@ -813,8 +1016,9 @@ mod driver_tests {
         }
     }
 
-    /// Adds `var t: u32;` when exactly `.0` locals exist: a valid change the
-    /// rollback tests can watch survive, stageable across sweeps.
+    /// Adds `var t: u32;` and a store to it when exactly `.0` locals
+    /// exist: a valid change the rollback tests can watch survive,
+    /// stageable across sweeps, and live, so normalization keeps it.
     struct AddLocalPass(usize);
 
     impl Pass for AddLocalPass {
@@ -837,7 +1041,7 @@ mod driver_tests {
                 naga::Span::UNDEFINED,
             );
             let function = first_function(module);
-            function.local_variables.append(
+            let local = function.local_variables.append(
                 naga::LocalVariable {
                     name: Some("t".to_owned()),
                     ty,
@@ -845,6 +1049,40 @@ mod driver_tests {
                 },
                 naga::Span::UNDEFINED,
             );
+            let pointer = function.expressions.append(
+                naga::Expression::LocalVariable(local),
+                naga::Span::UNDEFINED,
+            );
+            let value = function.expressions.append(
+                naga::Expression::Literal(naga::Literal::U32(0)),
+                naga::Span::UNDEFINED,
+            );
+            function.body.push(
+                naga::Statement::Store { pointer, value },
+                naga::Span::UNDEFINED,
+            );
+            Ok(true)
+        }
+    }
+
+    /// Empties the first function's body when it has one: everything the
+    /// body reached is unreachable from then on, which normalization culls
+    /// right behind the pass.
+    struct EmptyBodyPass;
+    impl Pass for EmptyBodyPass {
+        fn name(&self) -> &'static str {
+            "synthetic_empty_body"
+        }
+        fn run(
+            &mut self,
+            module: &mut naga::Module,
+            _ctx: &PassContext<'_>,
+        ) -> Result<bool, Error> {
+            let function = first_function(module);
+            if function.body.is_empty() {
+                return Ok(false);
+            }
+            function.body = naga::Block::new();
             Ok(true)
         }
     }
@@ -930,6 +1168,33 @@ mod driver_tests {
         }
     }
 
+    /// The interface postcondition in CI mode names the pass, like an
+    /// invalid IR does; the plain path judges the shipped text once.
+    #[test]
+    fn validate_each_pass_escalates_an_interface_change_to_err() {
+        let mut module = parsed_module();
+        let cfg = baseline_config(/*validate_each_pass=*/ true);
+        let mut report = Report::new(0);
+        let passes: Vec<Box<dyn Pass>> = vec![Box::new(EntryRenamingPass)];
+        let info = io::validate_module(&module).expect("valid input");
+        match run_to_fixed_point(&mut module, info, &cfg, &mut report, passes) {
+            Err(Error::Validation(msg)) => {
+                assert!(msg.contains("synthetic_rename_entry"), "{msg}");
+                assert!(msg.contains("changed the host interface"), "{msg}");
+                assert!(msg.contains("- entry compute main"), "{msg}");
+                assert!(msg.contains("+ entry compute renamed"), "{msg}");
+            }
+            other => panic!("expected Err(Error::Validation(..)), got {other:?}"),
+        }
+        let mut module = parsed_module();
+        let cfg = baseline_config(/*validate_each_pass=*/ false);
+        let mut report = Report::new(0);
+        let passes: Vec<Box<dyn Pass>> = vec![Box::new(EntryRenamingPass)];
+        let info = io::validate_module(&module).expect("valid input");
+        run_to_fixed_point(&mut module, info, &cfg, &mut report, passes)
+            .expect("the plain path leaves the verdict to the shipped text");
+    }
+
     #[test]
     fn without_validate_each_pass_ir_corruption_is_rolled_back() {
         let mut module = parsed_module();
@@ -980,10 +1245,11 @@ mod driver_tests {
             "the accepted pass's change must survive the later rollback"
         );
         assert!(
-            function
-                .body
-                .iter()
-                .all(|s| !matches!(s, naga::Statement::Store { .. })),
+            function.body.iter().all(|s| !matches!(
+                s,
+                naga::Statement::Store { pointer, .. }
+                    if matches!(function.expressions[*pointer], naga::Expression::Literal(_))
+            )),
             "no corrupting store may survive"
         );
         assert!(
@@ -1108,6 +1374,81 @@ mod driver_tests {
         )
     }
 
+    /// The input's `let` names are gone before the first pass runs, so
+    /// no pass has to clear them and nothing waits a sweep for it; the
+    /// pins - a phony access to a binding - stay.
+    #[test]
+    fn named_expressions_are_cleared_at_entry_but_the_pins() {
+        let mut module = io::parse_wgsl(
+            "@group(0) @binding(0) var t: texture_2d<f32>;
+             @compute @workgroup_size(1) fn main() { let x = 1u; _ = x; _ = t; }",
+        )
+        .expect("parses");
+        assert_eq!(module.entry_points[0].function.named_expressions.len(), 2);
+        let cfg = baseline_config(/*validate_each_pass=*/ false);
+        let mut report = Report::new(0);
+        let runs = Rc::new(Cell::new(0usize));
+        let passes: Vec<Box<dyn Pass>> = vec![Box::new(CountingPass(Rc::clone(&runs)))];
+        let info = io::validate_module(&module).expect("valid input");
+        run_to_fixed_point(&mut module, info, &cfg, &mut report, passes).expect("converges");
+        let function = &module.entry_points[0].function;
+        let pins = crate::pins::of(&module.global_variables, function);
+        assert_eq!(function.named_expressions.len(), 1);
+        assert_eq!(pins.len(), 1);
+        assert!(matches!(
+            function.expressions[pins[0].0],
+            naga::Expression::GlobalVariable(g) if g.index() == 0
+        ));
+        assert_eq!(runs.get(), 1);
+        io::validate_module(&module).expect("still valid");
+    }
+
+    /// Normalization runs behind every accepted change, reported as its
+    /// own step only when it removed something, and never counts as a
+    /// change of its own.
+    #[test]
+    fn normalization_follows_every_accepted_change() {
+        let mut module =
+            io::parse_wgsl("@compute @workgroup_size(1) fn main() { var t = 1u; t = t + 1u; }")
+                .expect("parses");
+        let cfg = baseline_config(/*validate_each_pass=*/ false);
+        let mut report = Report::new(0);
+        let passes: Vec<Box<dyn Pass>> = vec![Box::new(EmptyBodyPass)];
+        let info = io::validate_module(&module).expect("valid input");
+        run_to_fixed_point(&mut module, info, &cfg, &mut report, passes).expect("converges");
+        let function = &module.entry_points[0].function;
+        assert!(
+            function.local_variables.is_empty() && function.expressions.is_empty(),
+            "the orphaned local, its initialiser and its expressions are culled"
+        );
+        let changed: Vec<_> = report
+            .pass_reports
+            .iter()
+            .filter(|p| p.changed)
+            .map(|p| p.pass_name.as_str())
+            .collect();
+        assert_eq!(changed, ["synthetic_empty_body", "normalize"]);
+        io::validate_module(&module).expect("still valid");
+
+        // A bisect limit of one keeps the pass AND its normalization.
+        let mut module =
+            io::parse_wgsl("@compute @workgroup_size(1) fn main() { var t = 1u; t = t + 1u; }")
+                .expect("parses");
+        let mut cfg = baseline_config(/*validate_each_pass=*/ false);
+        cfg.trace.opt_bisect_limit = Some(1);
+        let mut report = Report::new(0);
+        let info = io::validate_module(&module).expect("valid input");
+        run_to_fixed_point(
+            &mut module,
+            info,
+            &cfg,
+            &mut report,
+            vec![Box::new(EmptyBodyPass)],
+        )
+        .expect("runs");
+        assert!(module.entry_points[0].function.local_variables.is_empty());
+    }
+
     /// The lazy driver is an optimisation of the per-pass one: module and
     /// report agree whether the run is clean, meets an invalid module a
     /// pass reads, or one nobody reads.
@@ -1146,19 +1487,24 @@ mod driver_tests {
             let tail = TailRender::default();
             let cell = ModuleInfoCell::new(io::validate_module(&module).expect("valid input"));
             let analyses = AnalysisCache::default();
+            let version = Cell::new(0u64);
             let shared = Shared {
                 cell: &cell,
                 name_log: &name_log,
                 tail: &tail,
                 analyses: &analyses,
+                version: &version,
             };
-            run_both(
+            run_stages(
                 &mut module,
                 &cfg,
                 &mut report,
                 shared,
-                &mut list(),
-                &mut [],
+                &mut Stages {
+                    ring: &mut list(),
+                    late: &mut [],
+                    tail: &mut [],
+                },
                 Validation::PerPass,
             )
             .expect("per-pass run converges");
@@ -1184,11 +1530,13 @@ mod driver_tests {
             let tail = TailRender::default();
             let cell = ModuleInfoCell::new(io::validate_module(&module).expect("valid input"));
             let analyses = AnalysisCache::default();
+            let version = Cell::new(0u64);
             let shared = Shared {
                 cell: &cell,
                 name_log: &name_log,
                 tail: &tail,
                 analyses: &analyses,
+                version: &version,
             };
             let mut passes: Vec<Box<dyn Pass>> = vec![Box::new(AddLocalPass(0))];
             if reads {
@@ -1198,13 +1546,16 @@ mod driver_tests {
             if reads {
                 passes.push(Box::new(ReadInfoPass(Rc::new(Cell::new(0)))));
             }
-            run_both(
+            run_stages(
                 &mut module,
                 &cfg,
                 &mut report,
                 shared,
-                &mut passes,
-                &mut [],
+                &mut Stages {
+                    ring: &mut passes,
+                    late: &mut [],
+                    tail: &mut [],
+                },
                 Validation::Lazy,
             )
             .expect("converges");
